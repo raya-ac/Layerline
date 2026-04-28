@@ -122,6 +122,11 @@ pub fn parseInitialHeader(input: []const u8) !InitialHeader {
     return parsed;
 }
 
+pub fn protectedLongPacketLen(input: []const u8) !usize {
+    const parsed = try parseProtectedLongHeader(input);
+    return parsed.packet_number_offset + @as(usize, @intCast(parsed.payload_len));
+}
+
 pub fn encodeVersionNegotiation(
     out: []u8,
     original_dcid: []const u8,
@@ -183,6 +188,13 @@ pub const ProtectedLongPacketInput = struct {
     packet_type: LongPacketType,
     dcid: []const u8,
     scid: []const u8,
+    packet_number: u64,
+    keys: PacketKeys,
+    plaintext: []const u8,
+};
+
+pub const ProtectedShortPacketInput = struct {
+    dcid: []const u8,
     packet_number: u64,
     keys: PacketKeys,
     plaintext: []const u8,
@@ -332,6 +344,55 @@ pub fn decryptProtectedLongPacketWithKeys(
     };
 }
 
+pub fn decryptProtectedShortPacketWithKeys(
+    allocator: std.mem.Allocator,
+    packet: []const u8,
+    dcid_len: usize,
+    keys: PacketKeys,
+) !DecryptedInitial {
+    if (packet.len < 1 + dcid_len + 4 + 16) return error.Truncated;
+    if ((packet[0] & 0x80) != 0 or (packet[0] & 0x40) == 0) return error.InvalidShortHeader;
+
+    const packet_number_offset = 1 + dcid_len;
+    const sample_offset = packet_number_offset + 4;
+    if (packet.len < sample_offset + 16) return error.Truncated;
+    const sample: *const [16]u8 = packet[sample_offset..][0..16];
+
+    const aes = Aes128.initEnc(keys.hp);
+    var mask: [16]u8 = undefined;
+    aes.encrypt(&mask, sample);
+
+    const first = packet[0] ^ (mask[0] & 0x1f);
+    const pn_len = @as(usize, first & 0x03) + 1;
+    if (packet.len < packet_number_offset + pn_len + Aes128Gcm.tag_length) return error.Truncated;
+
+    var header = try allocator.alloc(u8, packet_number_offset + pn_len);
+    defer allocator.free(header);
+    @memcpy(header, packet[0..header.len]);
+    header[0] = first;
+    for (header[packet_number_offset..], 0..) |*b, i| {
+        b.* ^= mask[i + 1];
+    }
+
+    const packet_number = decodePacketNumber(header[packet_number_offset..]);
+    const ciphertext_start = packet_number_offset + pn_len;
+    const tag_start = packet.len - Aes128Gcm.tag_length;
+    const ciphertext = packet[ciphertext_start..tag_start];
+    const tag: [Aes128Gcm.tag_length]u8 = packet[tag_start..][0..Aes128Gcm.tag_length].*;
+
+    var nonce = keys.iv;
+    applyPacketNumberToNonce(&nonce, packet_number);
+
+    const plaintext = try allocator.alloc(u8, ciphertext.len);
+    errdefer allocator.free(plaintext);
+    try Aes128Gcm.decrypt(plaintext, ciphertext, tag, header, nonce, keys.key);
+
+    return .{
+        .packet_number = packet_number,
+        .plaintext = plaintext,
+    };
+}
+
 pub fn buildProtectedLongPacket(
     allocator: std.mem.Allocator,
     input: ProtectedLongPacketInput,
@@ -380,6 +441,50 @@ pub fn buildProtectedLongPacket(
     var mask: [16]u8 = undefined;
     aes.encrypt(&mask, sample);
     packet.items[0] ^= mask[0] & 0x0f;
+    for (packet.items[pn_offset .. pn_offset + pn_len], 0..) |*b, i| {
+        b.* ^= mask[i + 1];
+    }
+
+    return packet.toOwnedSlice(allocator);
+}
+
+pub fn buildProtectedShortPacket(
+    allocator: std.mem.Allocator,
+    input: ProtectedShortPacketInput,
+) ![]u8 {
+    if (input.dcid.len > 20) return error.ConnectionIdTooLong;
+    if (input.plaintext.len < 16) return error.PayloadTooSmallForHeaderProtection;
+
+    const pn_len: usize = 4;
+
+    var packet = std.ArrayListUnmanaged(u8).empty;
+    errdefer packet.deinit(allocator);
+
+    try packet.append(allocator, 0x40 | @as(u8, @intCast(pn_len - 1)));
+    try packet.appendSlice(allocator, input.dcid);
+
+    const pn_offset = packet.items.len;
+    var pn_buf: [4]u8 = undefined;
+    encodePacketNumber(&pn_buf, input.packet_number);
+    try packet.appendSlice(allocator, &pn_buf);
+
+    const header_len = packet.items.len;
+    var nonce = input.keys.iv;
+    applyPacketNumberToNonce(&nonce, input.packet_number);
+
+    const ciphertext_start = packet.items.len;
+    try packet.resize(allocator, packet.items.len + input.plaintext.len + Aes128Gcm.tag_length);
+    const ciphertext = packet.items[ciphertext_start .. ciphertext_start + input.plaintext.len];
+    const tag = packet.items[ciphertext_start + input.plaintext.len ..][0..Aes128Gcm.tag_length];
+    Aes128Gcm.encrypt(ciphertext, tag, input.plaintext, packet.items[0..header_len], nonce, input.keys.key);
+
+    const sample_offset = pn_offset + 4;
+    if (packet.items.len < sample_offset + 16) return error.PayloadTooSmallForHeaderProtection;
+    const sample: *const [16]u8 = packet.items[sample_offset..][0..16];
+    const aes = Aes128.initEnc(input.keys.hp);
+    var mask: [16]u8 = undefined;
+    aes.encrypt(&mask, sample);
+    packet.items[0] ^= mask[0] & 0x1f;
     for (packet.items[pn_offset .. pn_offset + pn_len], 0..) |*b, i| {
         b.* ^= mask[i + 1];
     }
@@ -479,6 +584,58 @@ pub fn appendCryptoData(
                 }
                 offset = end;
             },
+            0x08...0x0f => {
+                const stream_id = try h3.decodeVarInt(plaintext[offset..]);
+                offset += stream_id.len;
+                if ((frame_type & 0x04) != 0) {
+                    const stream_offset = try h3.decodeVarInt(plaintext[offset..]);
+                    offset += stream_offset.len;
+                }
+                const data_len = if ((frame_type & 0x02) != 0) len: {
+                    const len = try h3.decodeVarInt(plaintext[offset..]);
+                    offset += len.len;
+                    break :len @as(usize, @intCast(len.value));
+                } else plaintext.len - offset;
+                if (plaintext.len < offset + data_len) return error.Truncated;
+                offset += data_len;
+            },
+            0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x19 => {
+                const ignored = try h3.decodeVarInt(plaintext[offset..]);
+                offset += ignored.len;
+            },
+            0x11, 0x15 => {
+                const stream_id = try h3.decodeVarInt(plaintext[offset..]);
+                offset += stream_id.len;
+                const value = try h3.decodeVarInt(plaintext[offset..]);
+                offset += value.len;
+            },
+            0x18 => {
+                const sequence = try h3.decodeVarInt(plaintext[offset..]);
+                offset += sequence.len;
+                const retire_prior = try h3.decodeVarInt(plaintext[offset..]);
+                offset += retire_prior.len;
+                if (plaintext.len < offset + 1) return error.Truncated;
+                const cid_len = plaintext[offset];
+                offset += 1;
+                if (plaintext.len < offset + cid_len + 16) return error.Truncated;
+                offset += cid_len + 16;
+            },
+            0x1a, 0x1b => {
+                if (plaintext.len < offset + 8) return error.Truncated;
+                offset += 8;
+            },
+            0x1c, 0x1d => {
+                const error_code = try h3.decodeVarInt(plaintext[offset..]);
+                offset += error_code.len;
+                if (frame_type == 0x1c) {
+                    const failed_frame = try h3.decodeVarInt(plaintext[offset..]);
+                    offset += failed_frame.len;
+                }
+                const reason_len = try h3.decodeVarInt(plaintext[offset..]);
+                offset += reason_len.len + @as(usize, @intCast(reason_len.value));
+                if (offset > plaintext.len) return error.Truncated;
+            },
+            0x1e => {},
             else => return error.UnsupportedFrame,
         }
     }
@@ -513,10 +670,30 @@ pub fn buildCryptoFrame(
     return out.toOwnedSlice(allocator);
 }
 
-pub fn buildDefaultTransportParameters(allocator: std.mem.Allocator) ![]u8 {
+pub fn buildStreamFrame(
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    data: []const u8,
+    fin: bool,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendVarInt(allocator, &out, 0x08 | 0x02 | if (fin) @as(u64, 0x01) else @as(u64, 0));
+    try appendVarInt(allocator, &out, stream_id);
+    try appendVarInt(allocator, &out, data.len);
+    try out.appendSlice(allocator, data);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn buildDefaultTransportParameters(
+    allocator: std.mem.Allocator,
+    original_destination_connection_id: []const u8,
+    initial_source_connection_id: []const u8,
+) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
 
+    try appendBytesTransportParameter(allocator, &out, 0x00, original_destination_connection_id); // original_destination_connection_id
     try appendTransportParameter(allocator, &out, 0x01, 30_000); // max_idle_timeout
     try appendTransportParameter(allocator, &out, 0x04, 1_048_576); // initial_max_data
     try appendTransportParameter(allocator, &out, 0x05, 262_144); // initial_max_stream_data_bidi_local
@@ -525,6 +702,7 @@ pub fn buildDefaultTransportParameters(allocator: std.mem.Allocator) ![]u8 {
     try appendTransportParameter(allocator, &out, 0x08, 64); // initial_max_streams_bidi
     try appendTransportParameter(allocator, &out, 0x09, 16); // initial_max_streams_uni
     try appendTransportParameter(allocator, &out, 0x0e, 2); // active_connection_id_limit
+    try appendBytesTransportParameter(allocator, &out, 0x0f, initial_source_connection_id); // initial_source_connection_id
 
     return out.toOwnedSlice(allocator);
 }
@@ -540,6 +718,17 @@ fn appendTransportParameter(
     try appendVarInt(allocator, out, id);
     try appendVarInt(allocator, out, value_len);
     try out.appendSlice(allocator, value_buf[0..value_len]);
+}
+
+fn appendBytesTransportParameter(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    id: u64,
+    value: []const u8,
+) !void {
+    try appendVarInt(allocator, out, id);
+    try appendVarInt(allocator, out, value.len);
+    try out.appendSlice(allocator, value);
 }
 
 pub fn parseClientHello(crypto_data: []const u8) !ClientHelloInfo {
@@ -957,4 +1146,28 @@ test "build protected Handshake packet with CRYPTO frame" {
     const extracted = try extractCryptoData(allocator, decrypted.plaintext);
     defer allocator.free(extracted);
     try std.testing.expectEqualSlices(u8, handshake_crypto, extracted);
+}
+
+test "build protected 1-RTT short packet with STREAM frame" {
+    const allocator = std.testing.allocator;
+    const keys = PacketKeys{
+        .key = [_]u8{0x44} ** 16,
+        .iv = [_]u8{0x55} ** 12,
+        .hp = [_]u8{0x66} ** 16,
+    };
+    const stream = try buildStreamFrame(allocator, 0, "HTTP/3 payload bytes", true);
+    defer allocator.free(stream);
+
+    const packet = try buildProtectedShortPacket(allocator, .{
+        .dcid = "clientid",
+        .packet_number = 9,
+        .keys = keys,
+        .plaintext = stream,
+    });
+    defer allocator.free(packet);
+
+    const decrypted = try decryptProtectedShortPacketWithKeys(allocator, packet, "clientid".len, keys);
+    defer allocator.free(decrypted.plaintext);
+    try std.testing.expectEqual(@as(u64, 9), decrypted.packet_number);
+    try std.testing.expectEqualSlices(u8, stream, decrypted.plaintext);
 }

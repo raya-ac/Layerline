@@ -26,10 +26,16 @@ pub const ServerHelloInput = struct {
 
 pub const TrafficSecrets = struct {
     handshake_secret: [32]u8,
+    master_secret: [32]u8,
     client_handshake_traffic_secret: [32]u8,
     server_handshake_traffic_secret: [32]u8,
     client_finished_key: [32]u8,
     server_finished_key: [32]u8,
+};
+
+pub const ApplicationSecrets = struct {
+    client_application_traffic_secret: [32]u8,
+    server_application_traffic_secret: [32]u8,
 };
 
 pub const QuicPacketKeys = struct {
@@ -170,6 +176,64 @@ pub fn signCertificateVerifyEd25519(key_pair: Ed25519.KeyPair, transcript_hash_v
     return signature.toBytes();
 }
 
+pub fn buildSelfSignedEd25519Certificate(
+    allocator: std.mem.Allocator,
+    key_pair: Ed25519.KeyPair,
+    common_name: []const u8,
+) ![]u8 {
+    const algorithm_oid = try derOid(allocator, "\x2b\x65\x70");
+    defer allocator.free(algorithm_oid);
+    const algorithm = try derSequenceFromParts(allocator, &.{algorithm_oid});
+    defer allocator.free(algorithm);
+
+    const version_integer = try derInteger(allocator, "\x02");
+    defer allocator.free(version_integer);
+    const version = try derExplicit(allocator, 0, version_integer);
+    defer allocator.free(version);
+
+    const serial = try derInteger(allocator, "\x01\x33\x7a");
+    defer allocator.free(serial);
+
+    const name = try derNameCommonName(allocator, common_name);
+    defer allocator.free(name);
+
+    const not_before = try derUtcTime(allocator, "260101000000Z");
+    defer allocator.free(not_before);
+    const not_after = try derUtcTime(allocator, "360101000000Z");
+    defer allocator.free(not_after);
+    const validity = try derSequenceFromParts(allocator, &.{ not_before, not_after });
+    defer allocator.free(validity);
+
+    const subject_public_key = try derBitString(allocator, &key_pair.public_key.toBytes());
+    defer allocator.free(subject_public_key);
+    const spki = try derSequenceFromParts(allocator, &.{ algorithm, subject_public_key });
+    defer allocator.free(spki);
+
+    const extension_sequence = try buildCertificateExtensions(allocator);
+    defer allocator.free(extension_sequence);
+    const extensions = try derExplicit(allocator, 3, extension_sequence);
+    defer allocator.free(extensions);
+
+    const tbs = try derSequenceFromParts(allocator, &.{
+        version,
+        serial,
+        algorithm,
+        name,
+        validity,
+        name,
+        spki,
+        extensions,
+    });
+    defer allocator.free(tbs);
+
+    const signature = try key_pair.sign(tbs, null);
+    const signature_bytes = signature.toBytes();
+    const signature_value = try derBitString(allocator, &signature_bytes);
+    defer allocator.free(signature_value);
+
+    return derSequenceFromParts(allocator, &.{ tbs, algorithm, signature_value });
+}
+
 pub fn transcriptHash(messages: []const []const u8) [32]u8 {
     var hasher = Sha256.init(.{});
     for (messages) |message| {
@@ -180,19 +244,29 @@ pub fn transcriptHash(messages: []const []const u8) [32]u8 {
 
 pub fn deriveTrafficSecrets(shared_secret: [32]u8, transcript_hash: [32]u8) TrafficSecrets {
     const zero = [_]u8{0} ** 32;
-    const early_secret = HkdfSha256.extract(&zero, "");
+    const early_secret = HkdfSha256.extract(&zero, &zero);
     const empty_hash = hashBytes("");
     const derived = hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
     const handshake_secret = HkdfSha256.extract(&derived, &shared_secret);
+    const application_derived = hkdfExpandLabel(handshake_secret, "derived", &empty_hash, 32);
+    const master_secret = HkdfSha256.extract(&application_derived, &zero);
     const client_hs = hkdfExpandLabel(handshake_secret, "c hs traffic", &transcript_hash, 32);
     const server_hs = hkdfExpandLabel(handshake_secret, "s hs traffic", &transcript_hash, 32);
 
     return .{
         .handshake_secret = handshake_secret,
+        .master_secret = master_secret,
         .client_handshake_traffic_secret = client_hs,
         .server_handshake_traffic_secret = server_hs,
         .client_finished_key = hkdfExpandLabel(client_hs, "finished", "", 32),
         .server_finished_key = hkdfExpandLabel(server_hs, "finished", "", 32),
+    };
+}
+
+pub fn deriveApplicationTrafficSecrets(master_secret: [32]u8, transcript_hash_value: [32]u8) ApplicationSecrets {
+    return .{
+        .client_application_traffic_secret = hkdfExpandLabel(master_secret, "c ap traffic", &transcript_hash_value, 32),
+        .server_application_traffic_secret = hkdfExpandLabel(master_secret, "s ap traffic", &transcript_hash_value, 32),
     };
 }
 
@@ -270,6 +344,147 @@ fn appendU24Bytes(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     try out.append(allocator, @intCast(value & 0xff));
 }
 
+fn buildCertificateExtensions(allocator: std.mem.Allocator) ![]u8 {
+    const basic_constraints_value = try derSequenceFromParts(allocator, &.{});
+    defer allocator.free(basic_constraints_value);
+    const basic_constraints_octets = try derOctetString(allocator, basic_constraints_value);
+    defer allocator.free(basic_constraints_octets);
+    const basic_constraints_oid = try derOid(allocator, "\x55\x1d\x13");
+    defer allocator.free(basic_constraints_oid);
+    const basic_constraints = try derSequenceFromParts(allocator, &.{ basic_constraints_oid, basic_constraints_octets });
+    defer allocator.free(basic_constraints);
+
+    const key_usage_bits = [_]u8{ 0x03, 0x02, 0x07, 0x80 };
+    const key_usage_octets = try derOctetString(allocator, &key_usage_bits);
+    defer allocator.free(key_usage_octets);
+    const key_usage_oid = try derOid(allocator, "\x55\x1d\x0f");
+    defer allocator.free(key_usage_oid);
+    const key_usage = try derSequenceFromParts(allocator, &.{ key_usage_oid, key_usage_octets });
+    defer allocator.free(key_usage);
+
+    const server_auth_oid = try derOid(allocator, "\x2b\x06\x01\x05\x05\x07\x03\x01");
+    defer allocator.free(server_auth_oid);
+    const eku_value = try derSequenceFromParts(allocator, &.{server_auth_oid});
+    defer allocator.free(eku_value);
+    const eku_octets = try derOctetString(allocator, eku_value);
+    defer allocator.free(eku_octets);
+    const eku_oid = try derOid(allocator, "\x55\x1d\x25");
+    defer allocator.free(eku_oid);
+    const eku = try derSequenceFromParts(allocator, &.{ eku_oid, eku_octets });
+    defer allocator.free(eku);
+
+    var san_value_body = std.ArrayListUnmanaged(u8).empty;
+    defer san_value_body.deinit(allocator);
+    try appendDerLengthPrefixed(allocator, &san_value_body, 0x82, "localhost");
+    try appendDerLengthPrefixed(allocator, &san_value_body, 0x87, &.{ 127, 0, 0, 1 });
+    const san_value = try derTlv(allocator, 0x30, san_value_body.items);
+    defer allocator.free(san_value);
+    const san_octets = try derOctetString(allocator, san_value);
+    defer allocator.free(san_octets);
+    const san_oid = try derOid(allocator, "\x55\x1d\x11");
+    defer allocator.free(san_oid);
+    const san = try derSequenceFromParts(allocator, &.{ san_oid, san_octets });
+    defer allocator.free(san);
+
+    return derSequenceFromParts(allocator, &.{ basic_constraints, key_usage, eku, san });
+}
+
+fn derNameCommonName(allocator: std.mem.Allocator, common_name: []const u8) ![]u8 {
+    const cn_oid = try derOid(allocator, "\x55\x04\x03");
+    defer allocator.free(cn_oid);
+    const cn_value = try derUtf8String(allocator, common_name);
+    defer allocator.free(cn_value);
+    const attr = try derSequenceFromParts(allocator, &.{ cn_oid, cn_value });
+    defer allocator.free(attr);
+    const rdn = try derSetFromParts(allocator, &.{attr});
+    defer allocator.free(rdn);
+    return derSequenceFromParts(allocator, &.{rdn});
+}
+
+fn derSequenceFromParts(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return derConstructedFromParts(allocator, 0x30, parts);
+}
+
+fn derSetFromParts(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return derConstructedFromParts(allocator, 0x31, parts);
+}
+
+fn derConstructedFromParts(allocator: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    for (parts) |part| {
+        try body.appendSlice(allocator, part);
+    }
+    return derTlv(allocator, tag, body.items);
+}
+
+fn derExplicit(allocator: std.mem.Allocator, tag_number: u8, content: []const u8) ![]u8 {
+    if (tag_number > 30) return error.UnsupportedDerTag;
+    return derTlv(allocator, 0xa0 | tag_number, content);
+}
+
+fn derInteger(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    return derTlv(allocator, 0x02, value);
+}
+
+fn derOid(allocator: std.mem.Allocator, encoded_oid: []const u8) ![]u8 {
+    return derTlv(allocator, 0x06, encoded_oid);
+}
+
+fn derUtf8String(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    return derTlv(allocator, 0x0c, value);
+}
+
+fn derUtcTime(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    return derTlv(allocator, 0x17, value);
+}
+
+fn derOctetString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    return derTlv(allocator, 0x04, value);
+}
+
+fn derBitString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0);
+    try body.appendSlice(allocator, value);
+    return derTlv(allocator, 0x03, body.items);
+}
+
+fn derTlv(allocator: std.mem.Allocator, tag: u8, value: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, tag);
+    try appendDerLength(allocator, &out, value.len);
+    try out.appendSlice(allocator, value);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendDerLengthPrefixed(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), tag: u8, value: []const u8) !void {
+    try out.append(allocator, tag);
+    try appendDerLength(allocator, out, value.len);
+    try out.appendSlice(allocator, value);
+}
+
+fn appendDerLength(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), len: usize) !void {
+    if (len < 128) {
+        try out.append(allocator, @intCast(len));
+        return;
+    }
+
+    var buf: [8]u8 = undefined;
+    var n = len;
+    var i: usize = buf.len;
+    while (n > 0) {
+        i -= 1;
+        buf[i] = @intCast(n & 0xff);
+        n >>= 8;
+    }
+    const used = buf.len - i;
+    try out.append(allocator, 0x80 | @as(u8, @intCast(used)));
+    try out.appendSlice(allocator, buf[i..]);
+}
+
 test "builds TLS 1.3 ServerHello with X25519 key share" {
     const kp = try X25519.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
     const msg = try buildServerHello(std.testing.allocator, .{
@@ -318,6 +533,17 @@ test "builds TLS 1.3 certificate, certificate verify, and finished messages" {
     defer std.testing.allocator.free(finished);
     try std.testing.expectEqual(@as(u8, 0x14), finished[0]);
     try std.testing.expectEqual(@as(usize, 36), finished.len);
+}
+
+test "builds a self-signed Ed25519 certificate matching its key" {
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const cert = try buildSelfSignedEd25519Certificate(std.testing.allocator, kp, "localhost");
+    defer std.testing.allocator.free(cert);
+
+    try std.testing.expectEqual(@as(u8, 0x30), cert[0]);
+    try std.testing.expect(std.mem.indexOf(u8, cert, "localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cert, &kp.public_key.toBytes()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cert, "\x2b\x65\x70") != null);
 }
 
 test "derives TLS and QUIC handshake keys from X25519 shared secret" {
