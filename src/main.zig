@@ -1,4 +1,6 @@
 const std = @import("std");
+const quic_native = @import("quic_native.zig");
+const tls13_native = @import("tls13_native.zig");
 
 // Boring defaults on purpose: enough room for local dev, with caps before
 // anything can turn into an accidental memory sink.
@@ -17,6 +19,23 @@ const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
+const SERVER_NAME = "Layerline";
+const SERVER_TAGLINE = "Local HTTP runtime";
+const SERVER_HEADER = "Layerline";
+
+const SERVER_ICON_SVG =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+    \\  <title id="title">Layerline</title>
+    \\  <desc id="desc">A layered route mark for the Layerline HTTP server.</desc>
+    \\  <rect width="128" height="128" rx="30" fill="#fbfaf6"/>
+    \\  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#11110f" stroke-opacity=".16" stroke-width="4"/>
+    \\  <path d="M29 33h70L29 96h70" fill="none" stroke="#11110f" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    \\  <path d="M40 48h48M40 80h48" fill="none" stroke="#11110f" stroke-opacity=".18" stroke-width="5" stroke-linecap="round"/>
+    \\  <circle cx="38" cy="39" r="8" fill="#fbfaf6" stroke="#11110f" stroke-width="5"/>
+    \\  <circle cx="90" cy="89" r="8" fill="#fbfaf6" stroke="#11110f" stroke-width="5"/>
+    \\  <circle cx="64" cy="64" r="17" fill="none" stroke="#11110f" stroke-opacity=".28" stroke-width="4"/>
+    \\</svg>
+;
 
 threadlocal var current_io: ?std.Io = null;
 
@@ -110,6 +129,8 @@ const ServerConfig = struct {
     letsencrypt_certbot: []const u8,
     letsencrypt_staging: bool,
     h2_upstream: ?UpstreamConfig,
+    http3_enabled: bool,
+    http3_port: u16,
     max_request_bytes: usize,
     max_body_bytes: usize,
     max_static_file_bytes: usize,
@@ -690,6 +711,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         } else {
             cfg.h2_upstream = try parseUpstream(allocator, v);
         }
+    } else if (std.mem.eql(u8, k, "http3")) {
+        cfg.http3_enabled = parseBool(v) orelse cfg.http3_enabled;
+    } else if (std.mem.eql(u8, k, "http3_port")) {
+        cfg.http3_port = std.fmt.parseInt(u16, v, 10) catch cfg.http3_port;
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_request_bytes;
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -797,29 +822,83 @@ fn contentTypeFromPath(path: []const u8) []const u8 {
     return "text/plain; charset=utf-8";
 }
 
-// Render a branded fallback page instead of sending a plain error line.
+// Render a Memorylayer-style fallback instead of a plain error line.
 fn renderCoolErrorPage(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) ![]const u8 {
+    const eyebrow = if (status_code == 404) "Route not found" else "Request stopped";
+    const headline = if (status_code == 404) "Memory has no path here." else status_text;
+    const route_label = if (status_code == 404) "unresolved route" else "server response";
+    const panel_title = if (status_code == 404) "No matching server surface" else "Boundary held";
+    const panel_text = if (status_code == 404) "Try the root page, health check, or static sample." else "The request stopped inside a controlled response path.";
+
     return std.fmt.allocPrint(
         allocator,
-        "<!doctype html>\n" ++
-            "<html>\n" ++
-            "<head>\n" ++
-            "<meta charset=\"utf-8\">\n" ++
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" ++
-            "<title>{d} {s}</title>\n" ++
-            "</head>\n" ++
-            "<body style=\"margin:0;background:linear-gradient(140deg, #071a2f 0%, #102744 45%, #0f325a 100%);color:#e7efff;font-family:Verdana, 'Trebuchet MS', Arial, sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;\">\n" ++
-            "<div style=\"max-width:760px;padding:36px 42px;border:1px solid rgba(148,163,184,0.35);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,0.35);background:rgba(9, 20, 45, 0.84);\">\n" ++
-            "<div style=\"font-size:0.8rem;letter-spacing:0.22rem;text-transform:uppercase;opacity:0.75;color:#8db1ff;margin-bottom:6px;\">Custom Zig Server</div>\n" ++
-            "<div style=\"font-size:4rem;line-height:1;color:#8db1ff;margin:0 0 8px;font-weight:700;\">{d}</div>\n" ++
-            "<h1 style=\"margin:0 0 16px;font-size:2rem;font-weight:500;\">{s}</h1>\n" ++
-            "<p style=\"margin:0 0 20px;line-height:1.55;color:#d5e3ff;\">{s}</p>\n" ++
-            "<a href=\"/\" style=\"display:inline-block;padding:11px 18px;background:#8db1ff;color:#0b1b2f;text-decoration:none;border-radius:999px;font-weight:600;\">Go Home</a>\n" ++
-            "<div style=\"margin-top:26px;font-size:0.85rem;opacity:0.7;\">Need details? Check the server output logs.</div>\n" ++
-            "</div>\n" ++
-            "</body>\n" ++
-            "</html>\n",
-        .{ status_code, status_text, status_code, status_text, detail },
+        \\<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>{d} · {s}</title>
+        \\<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+        \\</head>
+        \\<body style="box-sizing:border-box;margin:0;min-height:100vh;overflow-x:hidden;background:radial-gradient(circle at 16% -12%, rgba(255,255,255,0.92), transparent 28%),linear-gradient(180deg,#f7f4ed 0%,#f0ece2 46%,#e9e3d6 100%);color:#11110f;font:14px/1.6 Instrument Sans,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">
+        \\<div style="position:fixed;inset:0;z-index:-2;background:linear-gradient(rgba(15,15,12,0.05) 1px, transparent 1px),linear-gradient(90deg, rgba(15,15,12,0.05) 1px, transparent 1px);background-size:64px 64px;pointer-events:none;"></div>
+        \\<div style="position:fixed;inset:0;z-index:-1;background:radial-gradient(circle at 50% 18%, transparent 0 28%, rgba(244,241,234,0.28) 62%, rgba(214,204,186,0.42) 100%),linear-gradient(90deg,rgba(17,17,15,0.035),transparent 18%,transparent 82%,rgba(17,17,15,0.035));pointer-events:none;"></div>
+        \\<main style="max-width:1280px;margin:0 auto;padding:18px 30px 72px;">
+        \\<header style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 auto 10px;padding:10px;border:1px solid rgba(17,17,15,0.12);border-radius:18px;background:rgba(251,250,246,0.82);box-shadow:0 18px 60px rgba(38,34,24,0.09);backdrop-filter:blur(22px);">
+        \\<a href="/" style="display:flex;gap:12px;align-items:center;color:inherit;text-decoration:none;">
+        \\<img src="/favicon.svg" alt="" width="40" height="40" style="display:block;width:40px;height:40px;border-radius:12px;box-shadow:0 18px 36px rgba(17,17,15,0.08);">
+        \\<span><strong style="display:block;font-size:16px;line-height:1.1;font-weight:700;letter-spacing:-0.035em;">{s}</strong><small style="display:block;color:#8b8c84;font-size:11px;line-height:1.1;">{s}</small></span>
+        \\</a>
+        \\<nav style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        \\<a href="/health" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Health</a>
+        \\<a href="/static/hello.txt" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Static</a>
+        \\</nav>
+        \\</header>
+        \\<section style="position:relative;min-height:min(740px,calc(100svh - 130px));display:grid;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr));gap:clamp(28px,6vw,86px);align-items:center;overflow:hidden;margin:0 calc(50% - 50vw) 56px;padding:clamp(42px,8vw,92px) max(30px,calc((100vw - 1280px) / 2 + 30px));border-bottom:1px solid rgba(15,15,12,0.12);background:radial-gradient(circle at 74% 42%,rgba(17,17,15,0.14),transparent 18%),linear-gradient(rgba(17,17,15,0.055) 1px,transparent 1px),linear-gradient(90deg,rgba(17,17,15,0.055) 1px,transparent 1px),linear-gradient(135deg,rgba(251,250,246,0.95),rgba(231,225,212,0.84));background-size:auto,56px 56px,56px 56px,auto;">
+        \\<div style="position:absolute;right:clamp(-36px,3vw,44px);bottom:clamp(-18px,2vw,26px);color:rgba(17,17,15,0.045);font:800 clamp(180px,30vw,420px)/0.78 Instrument Sans,ui-sans-serif,system-ui,sans-serif;letter-spacing:-0.12em;pointer-events:none;">{d}</div>
+        \\<div style="position:relative;z-index:2;max-width:650px;">
+        \\<div style="display:inline-flex;align-items:center;gap:8px;padding:6px 10px;margin-bottom:16px;border-radius:999px;border:1px solid rgba(17,17,15,0.18);background:rgba(255,255,255,0.58);color:#5d5e58;font:11px/1 IBM Plex Mono,ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0.16em;text-transform:uppercase;">{s}</div>
+        \\<h1 style="margin:0 0 18px;max-width:10ch;font-size:clamp(56px,8vw,118px);line-height:0.88;letter-spacing:-0.075em;">{s}</h1>
+        \\<p style="max-width:50ch;margin:0 0 18px;color:#5d5e58;font-size:clamp(16px,1.3vw,19px);">{s}</p>
+        \\<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:24px;">
+        \\<a href="/" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid #11110f;background:#11110f;color:#fbfaf6;text-decoration:none;font-weight:600;box-shadow:0 18px 36px rgba(17,17,15,0.16);">Return home</a>
+        \\<a href="/health" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Check health</a>
+        \\<a href="/static/hello.txt" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Static sample</a>
+        \\</div>
+        \\</div>
+        \\<aside aria-hidden="true" style="position:relative;z-index:1;min-height:420px;width:100%;border:1px solid rgba(17,17,15,0.16);border-radius:28px;overflow:hidden;background:rgba(251,250,246,0.72);box-shadow:0 44px 110px rgba(38,34,24,0.14);backdrop-filter:blur(18px);">
+        \\<div style="position:absolute;inset:0;background:linear-gradient(rgba(17,17,15,0.08) 1px,transparent 1px),linear-gradient(90deg,rgba(17,17,15,0.08) 1px,transparent 1px);background-size:44px 44px;"></div>
+        \\<div style="position:absolute;left:28px;right:28px;top:28px;display:flex;justify-content:space-between;gap:16px;padding:12px 14px;border:1px solid rgba(17,17,15,0.14);border-radius:999px;background:rgba(251,250,246,0.86);color:#8b8c84;font:11px/1.2 IBM Plex Mono,ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0.08em;text-transform:uppercase;"><span>{s}</span><span>/{d}</span></div>
+        \\<div style="position:absolute;left:20%;right:24%;top:48%;height:1px;background:repeating-linear-gradient(90deg,rgba(17,17,15,0.42) 0 12px,transparent 12px 22px);transform:rotate(-9deg);"></div>
+        \\<div style="position:absolute;left:18%;top:34%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
+        \\<div style="position:absolute;right:22%;top:44%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
+        \\<div style="position:absolute;left:46%;bottom:24%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
+        \\<div style="position:absolute;left:28px;right:28px;bottom:28px;display:grid;grid-template-columns:1fr auto;gap:18px;align-items:end;padding:18px;border-top:1px solid rgba(17,17,15,0.12);background:rgba(251,250,246,0.78);">
+        \\<div><strong style="display:block;margin-bottom:5px;font-size:18px;letter-spacing:-0.04em;">{s}</strong><span style="color:#5d5e58;font-size:13px;">{s}</span></div>
+        \\<div style="font:600 48px/0.9 Instrument Sans,ui-sans-serif,system-ui,sans-serif;letter-spacing:-0.08em;">{d}</div>
+        \\</div>
+        \\</aside>
+        \\</section>
+        \\</main>
+        \\</body>
+        \\</html>
+        \\
+    ,
+        .{
+            status_code,
+            SERVER_NAME,
+            SERVER_NAME,
+            SERVER_TAGLINE,
+            status_code,
+            eyebrow,
+            headline,
+            detail,
+            route_label,
+            status_code,
+            panel_title,
+            panel_text,
+            status_code,
+        },
     );
 }
 
@@ -867,7 +946,7 @@ fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: 
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: {s}\r\n",
-        .{ status_code, status_text, "zig-http-server", content_type, body_len, if (close_connection) "close" else "keep-alive" },
+        .{ status_code, status_text, SERVER_HEADER, content_type, body_len, if (close_connection) "close" else "keep-alive" },
     );
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
@@ -897,7 +976,7 @@ fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: {s}\r\n",
-        .{ status_code, status_text, "zig-http-server", content_type, body_len, if (close_connection) "close" else "keep-alive" },
+        .{ status_code, status_text, SERVER_HEADER, content_type, body_len, if (close_connection) "close" else "keep-alive" },
     );
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
@@ -944,6 +1023,10 @@ fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_tex
     } else {
         try sendResponseWithConnection(stream, status_code, status_text, content_type, body, close_connection);
     }
+}
+
+fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
+    try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", SERVER_ICON_SVG, close_connection, is_head);
 }
 
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool) !void {
@@ -1819,13 +1902,229 @@ fn routeRequest(
     const is_head = std.mem.eql(u8, method, "HEAD");
 
     if (std.mem.eql(u8, method, "GET") or is_head) {
+        if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
+            try sendServerIcon(stream, should_close, is_head);
+            return;
+        }
+
         if (std.mem.eql(u8, req.path, "/")) {
             const body =
                 \\<!doctype html>
-                \\<html>
+                \\<html lang="en">
+                \\<head>
+                \\<meta charset="utf-8">
+                \\<meta name="viewport" content="width=device-width, initial-scale=1">
+                \\<title>Layerline</title>
+                \\<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+                \\<style>
+                \\  * { box-sizing: border-box; }
+                \\  body {
+                \\    margin: 0;
+                \\    min-height: 100vh;
+                \\    overflow-x: hidden;
+                \\    color: #11110f;
+                \\    background:
+                \\      radial-gradient(circle at 16% -12%, rgba(255,255,255,.92), transparent 28%),
+                \\      linear-gradient(180deg, #f7f4ed 0%, #f0ece2 46%, #e9e3d6 100%);
+                \\    font: 14px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                \\  }
+                \\  body::before {
+                \\    content: "";
+                \\    position: fixed;
+                \\    inset: 0;
+                \\    z-index: -2;
+                \\    background:
+                \\      linear-gradient(rgba(15,15,12,.05) 1px, transparent 1px),
+                \\      linear-gradient(90deg, rgba(15,15,12,.05) 1px, transparent 1px);
+                \\    background-size: 64px 64px;
+                \\  }
+                \\  main {
+                \\    min-height: 100vh;
+                \\    display: grid;
+                \\    grid-template-columns: minmax(0, 1.05fr) minmax(280px, .95fr);
+                \\    align-items: center;
+                \\    gap: clamp(28px, 6vw, 90px);
+                \\    max-width: 1280px;
+                \\    margin: 0 auto;
+                \\    padding: clamp(28px, 6vw, 72px);
+                \\  }
+                \\  .brand {
+                \\    display: inline-flex;
+                \\    align-items: center;
+                \\    gap: 14px;
+                \\    margin-bottom: 28px;
+                \\    color: inherit;
+                \\    text-decoration: none;
+                \\  }
+                \\  .brand img {
+                \\    width: 54px;
+                \\    height: 54px;
+                \\    border-radius: 16px;
+                \\    box-shadow: 0 22px 48px rgba(17,17,15,.1);
+                \\  }
+                \\  .brand strong {
+                \\    display: block;
+                \\    font-size: 18px;
+                \\    line-height: 1.1;
+                \\    letter-spacing: 0;
+                \\  }
+                \\  .brand small {
+                \\    display: block;
+                \\    color: #6b6c65;
+                \\    font-size: 12px;
+                \\    line-height: 1.2;
+                \\  }
+                \\  h1 {
+                \\    margin: 0;
+                \\    max-width: 8.5ch;
+                \\    font-size: clamp(72px, 11vw, 156px);
+                \\    line-height: .82;
+                \\    letter-spacing: 0;
+                \\  }
+                \\  p {
+                \\    max-width: 46ch;
+                \\    margin: 24px 0 0;
+                \\    color: #5d5e58;
+                \\    font-size: clamp(16px, 1.4vw, 20px);
+                \\  }
+                \\  .actions {
+                \\    display: flex;
+                \\    flex-wrap: wrap;
+                \\    gap: 10px;
+                \\    margin-top: 30px;
+                \\  }
+                \\  a.button {
+                \\    display: inline-flex;
+                \\    min-height: 42px;
+                \\    align-items: center;
+                \\    border: 1px solid rgba(15,15,12,.14);
+                \\    border-radius: 12px;
+                \\    padding: 9px 13px;
+                \\    background: rgba(255,255,255,.5);
+                \\    color: #11110f;
+                \\    text-decoration: none;
+                \\  }
+                \\  a.button.primary {
+                \\    border-color: #11110f;
+                \\    background: #11110f;
+                \\    color: #fbfaf6;
+                \\    box-shadow: 0 18px 36px rgba(17,17,15,.16);
+                \\  }
+                \\  .surface {
+                \\    position: relative;
+                \\    min-height: 470px;
+                \\    border: 1px solid rgba(17,17,15,.16);
+                \\    border-radius: 28px;
+                \\    overflow: hidden;
+                \\    background: rgba(251,250,246,.72);
+                \\    box-shadow: 0 44px 110px rgba(38,34,24,.14);
+                \\    backdrop-filter: blur(18px);
+                \\  }
+                \\  .surface::before {
+                \\    content: "";
+                \\    position: absolute;
+                \\    inset: 0;
+                \\    background:
+                \\      linear-gradient(rgba(17,17,15,.08) 1px, transparent 1px),
+                \\      linear-gradient(90deg, rgba(17,17,15,.08) 1px, transparent 1px);
+                \\    background-size: 44px 44px;
+                \\  }
+                \\  .rail {
+                \\    position: absolute;
+                \\    left: 28px;
+                \\    right: 28px;
+                \\    top: 28px;
+                \\    display: flex;
+                \\    justify-content: space-between;
+                \\    gap: 16px;
+                \\    padding: 12px 14px;
+                \\    border: 1px solid rgba(17,17,15,.14);
+                \\    border-radius: 999px;
+                \\    background: rgba(251,250,246,.86);
+                \\    color: #8b8c84;
+                \\    font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+                \\    letter-spacing: .08em;
+                \\    text-transform: uppercase;
+                \\  }
+                \\  .route {
+                \\    position: absolute;
+                \\    left: 18%;
+                \\    right: 18%;
+                \\    top: 48%;
+                \\    height: 2px;
+                \\    background: repeating-linear-gradient(90deg, rgba(17,17,15,.5) 0 12px, transparent 12px 22px);
+                \\    transform: rotate(-9deg);
+                \\  }
+                \\  .node {
+                \\    position: absolute;
+                \\    width: 12px;
+                \\    height: 12px;
+                \\    border-radius: 999px;
+                \\    background: #11110f;
+                \\    box-shadow: 0 0 0 9px rgba(17,17,15,.08);
+                \\  }
+                \\  .n1 { left: 18%; top: 34%; }
+                \\  .n2 { right: 22%; top: 44%; }
+                \\  .n3 { left: 46%; bottom: 24%; }
+                \\  .footer {
+                \\    position: absolute;
+                \\    left: 28px;
+                \\    right: 28px;
+                \\    bottom: 28px;
+                \\    display: grid;
+                \\    grid-template-columns: 1fr auto;
+                \\    gap: 18px;
+                \\    align-items: end;
+                \\    padding: 18px;
+                \\    border-top: 1px solid rgba(17,17,15,.12);
+                \\    background: rgba(251,250,246,.78);
+                \\  }
+                \\  .footer strong {
+                \\    display: block;
+                \\    margin-bottom: 5px;
+                \\    font-size: 18px;
+                \\  }
+                \\  .footer span {
+                \\    color: #5d5e58;
+                \\    font-size: 13px;
+                \\  }
+                \\  .status {
+                \\    font-size: 48px;
+                \\    line-height: .9;
+                \\  }
+                \\  @media (max-width: 820px) {
+                \\    main { grid-template-columns: 1fr; padding: 24px; }
+                \\    h1 { font-size: clamp(64px, 22vw, 104px); }
+                \\    .surface { min-height: 360px; }
+                \\  }
+                \\</style>
+                \\</head>
                 \\<body>
-                \\  <h1>Custom Zig HTTP server</h1>
-                \\  <p>Try: /health, /time, /api/echo?msg=hello, /static/hello.txt, /index.php</p>
+                \\<main>
+                \\  <section>
+                \\    <a class="brand" href="/" aria-label="Layerline home">
+                \\      <img src="/favicon.svg" alt="">
+                \\      <span><strong>Layerline</strong><small>Local HTTP runtime</small></span>
+                \\    </a>
+                \\    <h1>Layerline</h1>
+                \\    <p>A small Zig origin server with static files, PHP handoff, proxy fallback, edge TLS notes, and guarded request limits.</p>
+                \\    <div class="actions">
+                \\      <a class="button primary" href="/health">Health</a>
+                \\      <a class="button" href="/time">Time</a>
+                \\      <a class="button" href="/api/echo?msg=hello">Echo</a>
+                \\      <a class="button" href="/static/hello.txt">Static</a>
+                \\      <a class="button" href="/favicon.svg">Icon</a>
+                \\    </div>
+                \\  </section>
+                \\  <aside class="surface" aria-hidden="true">
+                \\    <div class="rail"><span>origin surface</span><span>HTTP/1.1</span></div>
+                \\    <div class="route"></div>
+                \\    <div class="node n1"></div>
+                \\    <div class="node n2"></div>
+                \\    <div class="node n3"></div>
+                \\    <div class="footer"><div><strong>ready</strong><span>routes, files, and upstreams stay bounded</span></div><div class="status">200</div></div>
+                \\  </aside>
+                \\</main>
                 \\</body>
                 \\</html>
             ;
@@ -2123,15 +2422,137 @@ fn serveConnectionTask(
     };
 }
 
+fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
+    bindThreadIo(io);
+
+    var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
+        std.debug.print("HTTP/3 bind address error: {}\n", .{err});
+        return;
+    };
+    const socket = address.bind(activeIo(), .{ .mode = .dgram, .protocol = .udp }) catch |err| {
+        std.debug.print("HTTP/3 UDP bind failed on {s}:{d}: {}\n", .{ cfg.host, cfg.http3_port, err });
+        return;
+    };
+    defer socket.close(activeIo());
+
+    std.debug.print("HTTP/3 native UDP listener on udp://{s}:{d}\n", .{ cfg.host, cfg.http3_port });
+    std.debug.print("HTTP/3 status: QUIC Initial decrypt and ClientHello parser active; native TLS server flight still in progress.\n", .{});
+
+    var recv_buf: [4096]u8 = undefined;
+    while (true) {
+        const msg = socket.receive(activeIo(), &recv_buf) catch |err| {
+            std.debug.print("HTTP/3 UDP receive error: {}\n", .{err});
+            continue;
+        };
+
+        const initial = quic_native.parseInitialHeader(msg.data) catch |err| {
+            std.debug.print("HTTP/3 ignored non-initial datagram from {f}: {}\n", .{ msg.from, err });
+            continue;
+        };
+
+        if (!quic_native.isSupportedVersion(initial.long.version)) {
+            var response: [128]u8 = undefined;
+            const len = quic_native.encodeVersionNegotiation(
+                &response,
+                initial.long.dcid.slice(),
+                initial.long.scid.slice(),
+                &.{ @intFromEnum(quic_native.Version.v1), @intFromEnum(quic_native.Version.v2) },
+            ) catch |err| {
+                std.debug.print("HTTP/3 version negotiation build failed: {}\n", .{err});
+                continue;
+            };
+            socket.send(activeIo(), &msg.from, response[0..len]) catch |err| {
+                std.debug.print("HTTP/3 version negotiation send failed: {}\n", .{err});
+            };
+            continue;
+        }
+
+        const decrypted = quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
+            std.debug.print(
+                "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
+                .{
+                    msg.from,
+                    initial.long.version,
+                    initial.long.dcid.len,
+                    initial.long.scid.len,
+                    err,
+                },
+            );
+            continue;
+        };
+        defer std.heap.page_allocator.free(decrypted.plaintext);
+
+        const crypto = quic_native.extractCryptoData(std.heap.page_allocator, decrypted.plaintext) catch |err| {
+            std.debug.print(
+                "HTTP/3 QUIC Initial from {f}: packet_number={d}, plaintext_bytes={d}; CRYPTO extraction failed: {}\n",
+                .{ msg.from, decrypted.packet_number, decrypted.plaintext.len, err },
+            );
+            continue;
+        };
+        defer std.heap.page_allocator.free(crypto);
+
+        const hello = quic_native.parseClientHello(crypto) catch |err| {
+            std.debug.print(
+                "HTTP/3 QUIC Initial from {f}: packet_number={d}, crypto_bytes={d}; ClientHello parse failed: {}\n",
+                .{ msg.from, decrypted.packet_number, crypto.len, err },
+            );
+            continue;
+        };
+
+        std.debug.print(
+            "HTTP/3 ClientHello from {f}: packet_number={d}, alpn={s}, sni={s}, tls13={}, aes128gcm={}, ed25519={}, x25519={}, quic_transport_params={}\n",
+            .{
+                msg.from,
+                decrypted.packet_number,
+                hello.alpn orelse "(none)",
+                hello.server_name orelse "(none)",
+                hello.supports_tls13,
+                hello.supports_aes_128_gcm_sha256,
+                hello.supports_ed25519,
+                hello.x25519_key_share != null,
+                hello.has_quic_transport_parameters,
+            },
+        );
+
+        if (hello.x25519_key_share) |client_key| {
+            var server_random: [32]u8 = undefined;
+            activeIo().random(&server_random);
+            const server_kp = tls13_native.X25519.KeyPair.generate(activeIo());
+            const server_hello = tls13_native.buildServerHello(std.heap.page_allocator, .{
+                .legacy_session_id = hello.legacy_session_id,
+                .random = server_random,
+                .x25519_public_key = server_kp.public_key,
+            }) catch |err| {
+                std.debug.print("HTTP/3 TLS ServerHello build failed for {f}: {}\n", .{ msg.from, err });
+                continue;
+            };
+            defer std.heap.page_allocator.free(server_hello);
+
+            const shared = tls13_native.X25519.scalarmult(server_kp.secret_key, client_key) catch |err| {
+                std.debug.print("HTTP/3 TLS X25519 shared-secret failed for {f}: {}\n", .{ msg.from, err });
+                continue;
+            };
+            const transcript_hash = tls13_native.transcriptHash(&.{ crypto, server_hello });
+            const traffic = tls13_native.deriveTrafficSecrets(shared, transcript_hash);
+            _ = tls13_native.deriveQuicPacketKeys(traffic.server_handshake_traffic_secret);
+
+            std.debug.print(
+                "HTTP/3 TLS prepared server flight for {f}: server_hello_bytes={d}, session_id_bytes={d}\n",
+                .{ msg.from, server_hello.len, hello.legacy_session_id.len },
+            );
+        }
+    }
+}
+
 // Emit current runtime usage, flags, and sample invocations.
 fn usage() void {
     std.debug.print(
-        "custom zig http server\\n\\n" ++
+        "Layerline HTTP server\\n\\n" ++
             "Usage:\\n" ++
             "  zig build run -- [--config server.conf] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] " ++
             "[--proxy http://HOST:PORT[/path]] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
@@ -2139,13 +2560,13 @@ fn usage() void {
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, proxy, h2_upstream, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, proxy, h2_upstream, http3, http3_port, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment\\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "HTTP/3 is expected to be provided by a reverse proxy front-end.\\n\\n" ++
+            "Native HTTP/3 is being built in this binary and currently decrypts QUIC Initial packets, parses ClientHello, and prepares TLS 1.3 ServerHello material.\\n\\n" ++
             "Examples:\\n" ++
             "  zig build run\\n" ++
             "  zig build run -- --port 4000\\n" ++
@@ -2161,8 +2582,8 @@ fn usage() void {
             "  This is a thread-per-connection model for now. For very high fan-in (large counts of\\n" ++
             "  open keep-alive sockets), place this server behind a TLS/HTTP proxy with strict\\n" ++
             "  timeout and connection management policies.\\n" ++
-            "  HTTPS ingress is expected to be terminated by a reverse proxy in front of this\\n" ++
-            "  process (nginx, caddy, or envoy) until TLS listener support is added.\\n",
+            "  Native browser HTTP/3 still needs QUIC server-flight emission, Finished handling,\\n" ++
+            "  and request-stream framing before it can serve the default page to Chrome/Safari.\\n",
         .{},
     );
 }
@@ -2201,6 +2622,8 @@ pub fn main(init: std.process.Init) !void {
         .tls_cert = null,
         .tls_key = null,
         .h2_upstream = null,
+        .http3_enabled = false,
+        .http3_port = 8443,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
@@ -2355,6 +2778,18 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Failed to parse h2-upstream URL: {s}\n", .{value});
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--http3")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http3_enabled = parseBool(value) orelse cfg.http3_enabled;
+        } else if (std.mem.eql(u8, arg, "--http3-port")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http3_port = std.fmt.parseInt(u16, value, 10) catch cfg.http3_port;
         } else if (std.mem.eql(u8, arg, "--max-request-bytes")) {
             const value = args.next() orelse {
                 usage();
@@ -2506,6 +2941,13 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.h2_upstream != null) {
         const hup = cfg.h2_upstream.?;
         std.debug.print("HTTP/2 cleartext passthrough to: {s}:{d} (base {s})\n", .{ hup.host, hup.port, hup.base_path });
+    }
+    if (cfg.http3_enabled) {
+        const h3_worker = std.Thread.spawn(.{}, serveHttp3ProbeTask, .{ init.io, &cfg }) catch |err| {
+            std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
+            return;
+        };
+        h3_worker.detach();
     }
 
     while (true) {

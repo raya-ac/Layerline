@@ -1,7 +1,9 @@
-# Custom HTTP Server (Zig)
+# Layerline (Zig HTTP Server)
 
 This is a practical build that blends local serving with edge-style deployment:
 
+- Named runtime identity with branded root and error pages.
+- Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
 - Reverse-proxy fallback for anything the local server does not handle.
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
@@ -9,7 +11,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Static responses include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - HTTP/2 cleartext passthrough target support through `h2_upstream`.
-- HTTP/3 handled as an edge/proxy concern in this version.
+- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial parsing/decryption, UDP version negotiation, TLS ClientHello parsing, and TLS 1.3 ServerHello key-schedule primitives.
 - Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
@@ -79,7 +81,7 @@ tls = false
 #cf_record_content = 198.51.100.10
 #cf_record_ttl = 300
 #cf_record_proxied = false
-#cf_record_comment = managed by local zig server
+#cf_record_comment = managed by Layerline
 #max_requests_per_connection = 256
 #worker_stack_size = 65536
 #max_php_output_bytes = 2097152
@@ -91,49 +93,17 @@ max_concurrent_connections = 1000000
 
 ## HTTP/2 and HTTP/3
 
-This server is HTTP/1.x first, with protocol handoff at the edge:
+This server is HTTP/1.x first, with native HTTP/3 being built inside the Zig binary:
 
 - HTTP/2 cleartext (`h2c`) passthrough using `--h2-upstream` / `h2_upstream`.
-- HTTP/3 handled by a reverse-proxy front.
-
-Use this when you want modern protocol support at the edge while keeping this binary focused and small:
-
-### Caddy example
-
-```text
-my-site.example.com {
-  reverse_proxy http://127.0.0.1:8080
-}
-```
-
-### NGINX HTTP/2 + HTTP/3 example
-
-```text
-server {
-  listen 443 ssl http2;
-  listen 443 quic reuseport;
-  server_name my-site.example.com;
-
-  ssl_certificate /path/to/fullchain.pem;
-  ssl_certificate_key /path/to/privkey.pem;
-  ssl_protocols TLSv1.3;
-  ssl_early_data off;
-
-  location / {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  }
-}
-```
-
-If you need HTTP/2 framing inside the origin process, run a dedicated HTTP/2-aware component in front.
+- Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
+- The current native HTTP/3 path decrypts QUIC v1 Initial packets, extracts TLS ClientHello data, checks ALPN/SNI/TLS capabilities, and prepares the TLS 1.3 ServerHello key material in-process.
+- Browser-compatible page serving still needs QUIC server-flight emission, client Finished handling, 1-RTT packet protection, stream frames, and HTTP/3 request/response wiring.
 
 Run with:
 
 ```bash
-zig build run -- --config server.conf
+zig build run -- --config server.conf --http3 true --http3-port 8443
 ```
 
 Argument precedence (highest wins):
@@ -150,13 +120,14 @@ Argument precedence (highest wins):
 - Request bodies support fixed `Content-Length` and standards-style `Transfer-Encoding: chunked`; unsupported transfer codings are rejected.
 - `Expect: 100-continue` receives an interim `100 Continue` response before the body is read.
 - Incoming HTTP/2 preface payload is detected and can be tunneled to `--h2-upstream`.
-- HTTP/3 traffic on TCP is rejected with an explicit guidance message; use QUIC proxying in front.
+- HTTP/3 traffic on TCP is rejected with an explicit guidance message; native HTTP/3 uses UDP.
 - Unsupported methods return `501 Method Not Implemented`.
 - Unknown paths can still be handled by reverse proxy mode if configured.
 
 ## Static serving behavior
 
 - `/static/<file>` always maps to that exact file under `dir`.
+- `/favicon.svg` and `/icon.svg` return the built-in Layerline SVG mark.
 - If `serve_static_root` is enabled and a requested GET path is not a known API route (`/health`, `/time`, `/api/*`, `/php/*`),
   the server checks for a matching file in `dir` (for `/` and trailing-slash paths it resolves to `index_file`).
 - If no local static match is found, the reverse proxy (if configured) handles the request.
@@ -195,7 +166,7 @@ zig build run -- \
   --cf-record-name www.example.com \
   --cf-record-type A \
   --cf-record-content 198.51.100.10
-  --cf-record-comment "managed by local zig server"
+  --cf-record-comment "managed by Layerline"
 ```
 
 Behavior:
