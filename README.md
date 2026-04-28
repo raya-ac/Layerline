@@ -9,7 +9,8 @@ This is a practical build that blends local serving with edge-style deployment:
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
-- Static responses include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
+- Static responses stream from disk with bounded buffers, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
+- Prometheus-style runtime metrics at `/metrics`.
 - HTTP/2 cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
 - Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
@@ -25,6 +26,8 @@ This is a practical build that blends local serving with edge-style deployment:
 - `public/hello.txt` – sample static file.
 - `public/index.php` – sample php endpoint (if PHP binary is installed and configured).
 - `server.conf` – sample config file.
+- `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort HTTP/3 ALPN checks.
+- `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - HTTP/2/HTTP/3 deployment notes in this README.
 
 
@@ -130,6 +133,8 @@ Argument precedence (highest wins):
 - `/favicon.svg` and `/icon.svg` return the built-in Layerline SVG mark.
 - If `serve_static_root` is enabled and a requested GET path is not a known API route (`/health`, `/time`, `/api/*`, `/php/*`),
   the server checks for a matching file in `dir` (for `/` and trailing-slash paths it resolves to `index_file`).
+- If a client advertises `br` or `gzip` and a matching `.br` or `.gz` sidecar exists, the full-file static path serves that precompressed asset with `Content-Encoding` and `Vary: Accept-Encoding`.
+- Range requests use the original file representation so byte offsets stay predictable.
 - If no local static match is found, the reverse proxy (if configured) handles the request.
 
 ## TLS options in config / CLI
@@ -204,6 +209,7 @@ Common host limits to revisit before aggressive load tests:
 
 - `GET /` → HTML welcome page.
 - `GET /health` → plain health check.
+- `GET /metrics` → Prometheus-style counters for connections, requests, responses, static bytes, and native H3 packets.
 - `GET /time` → JSON with current epoch seconds.
 - `GET /api/echo?msg=hello` → JSON `{"msg":"hello"}`.
 - `POST /api/echo` → echoes the POST body as plain text.
@@ -219,7 +225,18 @@ curl -X POST --data 'hello zig' http://127.0.0.1:8080/api/echo
 curl -H 'Transfer-Encoding: chunked' --data-binary 'hello chunked zig' http://127.0.0.1:8080/api/echo
 curl http://127.0.0.1:8080/static/hello.txt
 curl -H 'Range: bytes=0-4' http://127.0.0.1:8080/static/hello.txt
+curl http://127.0.0.1:8080/metrics
 ```
+
+## Benchmarking
+
+Run the smoke and benchmark harness against a running server:
+
+```bash
+./scripts/benchmark-layerline.sh
+```
+
+Use `./scripts/benchmark-layerline.sh --verify-only` for deployment checks, or see `docs/benchmarking.md` for concurrency, duration, target, tool, and HTTP/3 smoke-test knobs.
 
 ## Reverse proxy mode
 

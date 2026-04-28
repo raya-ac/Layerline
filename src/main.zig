@@ -631,6 +631,7 @@ const ConcurrencyState = struct {
             const current = self.active_connections.load(.acquire);
             if (current >= limit) return false;
             if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null) {
+                server_metrics.connectionAccepted();
                 return true;
             }
         }
@@ -638,8 +639,112 @@ const ConcurrencyState = struct {
 
     fn release(self: *ConcurrencyState) void {
         _ = self.active_connections.fetchSub(1, .acq_rel);
+        server_metrics.connectionClosed();
     }
 };
+
+const ServerMetrics = struct {
+    active_connections: std.atomic.Value(usize),
+    connections_total: std.atomic.Value(usize),
+    connections_rejected_total: std.atomic.Value(usize),
+    requests_total: std.atomic.Value(usize),
+    request_parse_errors_total: std.atomic.Value(usize),
+    route_errors_total: std.atomic.Value(usize),
+    responses_total: std.atomic.Value(usize),
+    response_2xx_total: std.atomic.Value(usize),
+    response_3xx_total: std.atomic.Value(usize),
+    response_4xx_total: std.atomic.Value(usize),
+    response_5xx_total: std.atomic.Value(usize),
+    response_body_bytes_total: std.atomic.Value(usize),
+    static_responses_total: std.atomic.Value(usize),
+    static_body_bytes_total: std.atomic.Value(usize),
+    h3_responses_total: std.atomic.Value(usize),
+    h3_packets_sent_total: std.atomic.Value(usize),
+
+    fn init() ServerMetrics {
+        return .{
+            .active_connections = std.atomic.Value(usize).init(0),
+            .connections_total = std.atomic.Value(usize).init(0),
+            .connections_rejected_total = std.atomic.Value(usize).init(0),
+            .requests_total = std.atomic.Value(usize).init(0),
+            .request_parse_errors_total = std.atomic.Value(usize).init(0),
+            .route_errors_total = std.atomic.Value(usize).init(0),
+            .responses_total = std.atomic.Value(usize).init(0),
+            .response_2xx_total = std.atomic.Value(usize).init(0),
+            .response_3xx_total = std.atomic.Value(usize).init(0),
+            .response_4xx_total = std.atomic.Value(usize).init(0),
+            .response_5xx_total = std.atomic.Value(usize).init(0),
+            .response_body_bytes_total = std.atomic.Value(usize).init(0),
+            .static_responses_total = std.atomic.Value(usize).init(0),
+            .static_body_bytes_total = std.atomic.Value(usize).init(0),
+            .h3_responses_total = std.atomic.Value(usize).init(0),
+            .h3_packets_sent_total = std.atomic.Value(usize).init(0),
+        };
+    }
+
+    fn load(counter: *const std.atomic.Value(usize)) usize {
+        return counter.load(.monotonic);
+    }
+
+    fn inc(counter: *std.atomic.Value(usize)) void {
+        _ = counter.fetchAdd(1, .monotonic);
+    }
+
+    fn add(counter: *std.atomic.Value(usize), value: usize) void {
+        _ = counter.fetchAdd(value, .monotonic);
+    }
+
+    fn connectionAccepted(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.connections_total);
+        ServerMetrics.inc(&self.active_connections);
+    }
+
+    fn connectionRejected(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.connections_rejected_total);
+    }
+
+    fn connectionClosed(self: *ServerMetrics) void {
+        _ = self.active_connections.fetchSub(1, .monotonic);
+    }
+
+    fn requestStarted(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.requests_total);
+    }
+
+    fn requestParseError(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.request_parse_errors_total);
+    }
+
+    fn routeError(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.route_errors_total);
+    }
+
+    fn responseSent(self: *ServerMetrics, status_code: u16, body_bytes: usize) void {
+        ServerMetrics.inc(&self.responses_total);
+        ServerMetrics.add(&self.response_body_bytes_total, body_bytes);
+        if (status_code >= 200 and status_code < 300) {
+            ServerMetrics.inc(&self.response_2xx_total);
+        } else if (status_code >= 300 and status_code < 400) {
+            ServerMetrics.inc(&self.response_3xx_total);
+        } else if (status_code >= 400 and status_code < 500) {
+            ServerMetrics.inc(&self.response_4xx_total);
+        } else if (status_code >= 500 and status_code < 600) {
+            ServerMetrics.inc(&self.response_5xx_total);
+        }
+    }
+
+    fn staticBodySent(self: *ServerMetrics, body_bytes: usize) void {
+        ServerMetrics.inc(&self.static_responses_total);
+        ServerMetrics.add(&self.static_body_bytes_total, body_bytes);
+    }
+
+    fn h3ResponseSent(self: *ServerMetrics, packet_count: usize) void {
+        ServerMetrics.inc(&self.h3_responses_total);
+        ServerMetrics.add(&self.h3_packets_sent_total, packet_count);
+    }
+};
+
+var server_metrics = ServerMetrics.init();
 
 // Parse CLI/config booleans without crashing on odd values.
 fn parseBool(value: []const u8) ?bool {
@@ -959,6 +1064,7 @@ fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: 
     try streamWriteAll(stream, "\r\n");
 
     if (body_len > 0) try streamWriteAll(stream, body);
+    server_metrics.responseSent(status_code, body_len);
 }
 
 fn sendResponseWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool) !void {
@@ -987,6 +1093,7 @@ fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_
         try streamWriteAll(stream, headers);
     }
     try streamWriteAll(stream, "\r\n");
+    server_metrics.responseSent(status_code, 0);
 }
 
 fn sendResponseNoBodyWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool) !void {
@@ -1032,6 +1139,76 @@ fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_tex
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
     try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", SERVER_ICON_SVG, close_connection, is_head);
+}
+
+fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "# HELP layerline_connections_active Active TCP connections currently owned by Layerline workers.\n" ++
+            "# TYPE layerline_connections_active gauge\n" ++
+            "layerline_connections_active {d}\n" ++
+            "# HELP layerline_connections_total Accepted TCP connections.\n" ++
+            "# TYPE layerline_connections_total counter\n" ++
+            "layerline_connections_total {d}\n" ++
+            "# HELP layerline_connections_rejected_total Connections rejected by the concurrency gate.\n" ++
+            "# TYPE layerline_connections_rejected_total counter\n" ++
+            "layerline_connections_rejected_total {d}\n" ++
+            "# HELP layerline_requests_total Parsed HTTP/1 requests.\n" ++
+            "# TYPE layerline_requests_total counter\n" ++
+            "layerline_requests_total {d}\n" ++
+            "# HELP layerline_request_parse_errors_total Requests rejected by the parser.\n" ++
+            "# TYPE layerline_request_parse_errors_total counter\n" ++
+            "layerline_request_parse_errors_total {d}\n" ++
+            "# HELP layerline_route_errors_total Routed requests that failed before a response completed.\n" ++
+            "# TYPE layerline_route_errors_total counter\n" ++
+            "layerline_route_errors_total {d}\n" ++
+            "# HELP layerline_responses_total HTTP/1 responses by status class.\n" ++
+            "# TYPE layerline_responses_total counter\n" ++
+            "layerline_responses_total{{class=\"2xx\"}} {d}\n" ++
+            "layerline_responses_total{{class=\"3xx\"}} {d}\n" ++
+            "layerline_responses_total{{class=\"4xx\"}} {d}\n" ++
+            "layerline_responses_total{{class=\"5xx\"}} {d}\n" ++
+            "layerline_responses_total{{class=\"all\"}} {d}\n" ++
+            "# HELP layerline_response_body_bytes_total HTTP/1 response body bytes written by normal response helpers.\n" ++
+            "# TYPE layerline_response_body_bytes_total counter\n" ++
+            "layerline_response_body_bytes_total {d}\n" ++
+            "# HELP layerline_static_body_bytes_total Static file body bytes streamed from disk.\n" ++
+            "# TYPE layerline_static_body_bytes_total counter\n" ++
+            "layerline_static_body_bytes_total {d}\n" ++
+            "# HELP layerline_static_responses_total Static file responses streamed from disk.\n" ++
+            "# TYPE layerline_static_responses_total counter\n" ++
+            "layerline_static_responses_total {d}\n" ++
+            "# HELP layerline_h3_responses_total Native HTTP/3 responses sent.\n" ++
+            "# TYPE layerline_h3_responses_total counter\n" ++
+            "layerline_h3_responses_total {d}\n" ++
+            "# HELP layerline_h3_packets_sent_total Protected HTTP/3 1-RTT packets sent for responses.\n" ++
+            "# TYPE layerline_h3_packets_sent_total counter\n" ++
+            "layerline_h3_packets_sent_total {d}\n",
+        .{
+            ServerMetrics.load(&server_metrics.active_connections),
+            ServerMetrics.load(&server_metrics.connections_total),
+            ServerMetrics.load(&server_metrics.connections_rejected_total),
+            ServerMetrics.load(&server_metrics.requests_total),
+            ServerMetrics.load(&server_metrics.request_parse_errors_total),
+            ServerMetrics.load(&server_metrics.route_errors_total),
+            ServerMetrics.load(&server_metrics.response_2xx_total),
+            ServerMetrics.load(&server_metrics.response_3xx_total),
+            ServerMetrics.load(&server_metrics.response_4xx_total),
+            ServerMetrics.load(&server_metrics.response_5xx_total),
+            ServerMetrics.load(&server_metrics.responses_total),
+            ServerMetrics.load(&server_metrics.response_body_bytes_total),
+            ServerMetrics.load(&server_metrics.static_body_bytes_total),
+            ServerMetrics.load(&server_metrics.static_responses_total),
+            ServerMetrics.load(&server_metrics.h3_responses_total),
+            ServerMetrics.load(&server_metrics.h3_packets_sent_total),
+        },
+    );
+}
+
+fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
+    const body = try renderMetrics(allocator);
+    defer allocator.free(body);
+    try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
 }
 
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool) !void {
@@ -1098,14 +1275,72 @@ fn makeStaticEtag(allocator: std.mem.Allocator, stat: std.Io.File.Stat) ![]const
     );
 }
 
-fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8) ![]const u8 {
+fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content_encoding: ?[]const u8) ![]const u8 {
+    if (content_encoding) |encoding| {
+        return std.fmt.allocPrint(
+            allocator,
+            "Accept-Ranges: bytes\r\n" ++
+                "ETag: {s}\r\n" ++
+                "Cache-Control: public, max-age=60\r\n" ++
+                "Vary: Accept-Encoding\r\n" ++
+                "Content-Encoding: {s}\r\n",
+            .{ etag, encoding },
+        );
+    }
+
     return std.fmt.allocPrint(
         allocator,
         "Accept-Ranges: bytes\r\n" ++
             "ETag: {s}\r\n" ++
-            "Cache-Control: public, max-age=60\r\n",
+            "Cache-Control: public, max-age=60\r\n" ++
+            "Vary: Accept-Encoding\r\n",
         .{etag},
     );
+}
+
+fn acceptsContentCoding(request_headers: []const u8, coding: []const u8) bool {
+    const raw = findHeaderValue(request_headers, "Accept-Encoding") orelse return false;
+    var cursor = raw;
+    while (cursor.len > 0) {
+        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
+        const item = trimValue(cursor[0..comma_pos]);
+        const semicolon_pos = std.mem.indexOfScalar(u8, item, ';') orelse item.len;
+        const token = trimValue(item[0..semicolon_pos]);
+        if (std.mem.eql(u8, token, "*") or std.ascii.eqlIgnoreCase(token, coding)) return true;
+        if (comma_pos >= cursor.len) break;
+        cursor = cursor[comma_pos + 1 ..];
+    }
+    return false;
+}
+
+fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
+    const stat = try std.Io.Dir.cwd().statFile(io, file_path, .{});
+    if (stat.kind != .file) return error.NotFile;
+    return stat;
+}
+
+fn streamStaticFileRangeBody(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    file_path: []const u8,
+    start: usize,
+    body_len: usize,
+) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
+    defer file.close(io);
+
+    var buffer: [8 * 1024]u8 = undefined;
+    var sent: usize = 0;
+    while (sent < body_len) {
+        const chunk_len = @min(buffer.len, body_len - sent);
+        var vec: [1][]u8 = .{buffer[0..chunk_len]};
+        const read_n = try file.readPositional(io, &vec, start + sent);
+        if (read_n == 0) return error.UnexpectedEndOfFile;
+        try streamWriteAll(stream, buffer[0..read_n]);
+        sent += read_n;
+    }
+
+    server_metrics.staticBodySent(body_len);
 }
 
 fn serveStatic(
@@ -1129,17 +1364,46 @@ fn serveStatic(
     const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
     defer allocator.free(file_path);
 
-    const stat = std.Io.Dir.cwd().statFile(io, file_path, .{}) catch |err| {
+    var stat = statRegularFile(io, file_path) catch |err| {
         if (err == error.NotDir or err == error.FileNotFound) {
+            try sendNotFoundWithConnection(allocator, stream, close_connection);
+            return;
+        }
+        if (err == error.NotFile) {
             try sendNotFoundWithConnection(allocator, stream, close_connection);
             return;
         }
         return err;
     };
-    if (stat.kind != .file) {
-        try sendNotFoundWithConnection(allocator, stream, close_connection);
-        return;
+
+    const range_header = findHeaderValue(request_headers, "Range");
+    var selected_path = file_path;
+    var encoded_path: ?[]const u8 = null;
+    defer if (encoded_path) |path| allocator.free(path);
+    var content_encoding: ?[]const u8 = null;
+
+    // Serve precompressed assets when present. On-the-fly compression belongs
+    // in a worker/offline build step, not on the hot request path.
+    if (range_header == null) {
+        const candidates = [_]struct { coding: []const u8, suffix: []const u8 }{
+            .{ .coding = "br", .suffix = ".br" },
+            .{ .coding = "gzip", .suffix = ".gz" },
+        };
+        for (candidates) |candidate| {
+            if (!acceptsContentCoding(request_headers, candidate.coding)) continue;
+            const candidate_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ file_path, candidate.suffix });
+            if (statRegularFile(io, candidate_path)) |candidate_stat| {
+                selected_path = candidate_path;
+                encoded_path = candidate_path;
+                stat = candidate_stat;
+                content_encoding = candidate.coding;
+                break;
+            } else |_| {
+                allocator.free(candidate_path);
+            }
+        }
     }
+
     if (stat.size > max_file_bytes) {
         try sendCoolErrorWithConnection(
             stream,
@@ -1153,10 +1417,11 @@ fn serveStatic(
         );
         return;
     }
+    const file_len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
 
     const etag = try makeStaticEtag(allocator, stat);
     defer allocator.free(etag);
-    const base_headers = try makeStaticBaseHeaders(allocator, etag);
+    const base_headers = try makeStaticBaseHeaders(allocator, etag, content_encoding);
     defer allocator.free(base_headers);
 
     if (findHeaderValue(request_headers, "If-None-Match")) |if_none_match| {
@@ -1166,28 +1431,10 @@ fn serveStatic(
         }
     }
 
-    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
-        if (err == error.StreamTooLong) {
-            try sendCoolErrorWithConnection(
-                stream,
-                allocator,
-                413,
-                "Payload Too Large",
-                "Static file is too large for configured limits.",
-                close_connection,
-                false,
-                null,
-            );
-            return;
-        }
-        return err;
-    };
-    defer allocator.free(data);
-
-    if (findHeaderValue(request_headers, "Range")) |range_header| {
-        const range = parseByteRange(range_header, data.len) catch |err| switch (err) {
+    if (range_header) |range_value| {
+        const range = parseByteRange(range_value, file_len) catch |err| switch (err) {
             error.RangeNotSatisfiable => {
-                const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: bytes */{d}\r\n", .{ base_headers, data.len });
+                const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: bytes */{d}\r\n", .{ base_headers, file_len });
                 defer allocator.free(headers);
                 try sendCoolErrorWithConnection(stream, allocator, 416, "Range Not Satisfiable", "Requested byte range cannot be served.", close_connection, is_head, headers);
                 return;
@@ -1198,27 +1445,29 @@ fn serveStatic(
             },
         };
 
-        const content_range = try std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len });
+        const content_range = try std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, file_len });
         defer allocator.free(content_range);
         const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: {s}\r\n", .{ base_headers, content_range });
         defer allocator.free(headers);
-        const body = data[range.start .. range.end + 1];
+        const body_len = range.end - range.start + 1;
 
         if (is_head) {
-            try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body.len, close_connection, headers);
+            try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body_len, close_connection, headers);
             return;
         }
 
-        try sendResponseWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body, close_connection, headers);
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body_len, close_connection, headers);
+        try streamStaticFileRangeBody(io, stream, selected_path, range.start, body_len);
         return;
     }
 
     if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), data.len, close_connection, base_headers);
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
         return;
     }
 
-    try sendResponseWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), data, close_connection, base_headers);
+    try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
+    try streamStaticFileRangeBody(io, stream, selected_path, 0, file_len);
 }
 
 fn serveAcmeChallenge(
@@ -2209,6 +2458,11 @@ fn routeRequest(
             return;
         }
 
+        if (std.mem.eql(u8, req.path, "/metrics")) {
+            try sendMetrics(stream, allocator, should_close, is_head);
+            return;
+        }
+
         if (std.mem.eql(u8, req.path, "/time")) {
             var ts_buf: [64]u8 = undefined;
             const ts = try std.fmt.bufPrint(&ts_buf, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()});
@@ -2362,104 +2616,108 @@ fn handleConnection(
             return;
         }
 
-        var req = parseRequest(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, prefill) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            error.RequestTooLarge => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    413,
-                    "Payload Too Large",
-                    "Request headers are too large.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            error.PayloadTooLarge => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    413,
-                    "Payload Too Large",
-                    "Request body exceeds configured limit.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            error.InvalidContentLength => {
-                try sendBadRequest(req_alloc, stream, "Invalid Content-Length header.");
-                return;
-            },
-            error.UnsupportedTransferEncoding => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    501,
-                    "Not Implemented",
-                    "Only plain Content-Length and chunked request bodies are supported.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            error.ExpectationFailed => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    417,
-                    "Expectation Failed",
-                    "Only Expect: 100-continue is supported.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            error.MalformedRequest => {
-                try sendBadRequest(req_alloc, stream, "Malformed request.");
-                return;
-            },
-            error.BadRequest => {
-                try sendBadRequest(req_alloc, stream, "Bad request.");
-                return;
-            },
-            error.MissingHostHeader => {
-                try sendBadRequest(req_alloc, stream, "Missing Host header.");
-                return;
-            },
-            error.UnsupportedHttpVersion => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    505,
-                    "HTTP Version Not Supported",
-                    "This process only serves HTTP/1.x requests directly. Configure TLS reverse proxy fronting for h2/h3 and set --h2-upstream for HTTP/2 cleartext passthrough.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            else => {
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    500,
-                    "Internal Server Error",
-                    "Internal server error while parsing request.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
+        var req = parseRequest(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, prefill) catch |err| {
+            if (err != error.ConnectionClosed) server_metrics.requestParseError();
+            switch (err) {
+                error.ConnectionClosed => return,
+                error.RequestTooLarge => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        413,
+                        "Payload Too Large",
+                        "Request headers are too large.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+                error.PayloadTooLarge => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        413,
+                        "Payload Too Large",
+                        "Request body exceeds configured limit.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+                error.InvalidContentLength => {
+                    try sendBadRequest(req_alloc, stream, "Invalid Content-Length header.");
+                    return;
+                },
+                error.UnsupportedTransferEncoding => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        501,
+                        "Not Implemented",
+                        "Only plain Content-Length and chunked request bodies are supported.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+                error.ExpectationFailed => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        417,
+                        "Expectation Failed",
+                        "Only Expect: 100-continue is supported.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+                error.MalformedRequest => {
+                    try sendBadRequest(req_alloc, stream, "Malformed request.");
+                    return;
+                },
+                error.BadRequest => {
+                    try sendBadRequest(req_alloc, stream, "Bad request.");
+                    return;
+                },
+                error.MissingHostHeader => {
+                    try sendBadRequest(req_alloc, stream, "Missing Host header.");
+                    return;
+                },
+                error.UnsupportedHttpVersion => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        505,
+                        "HTTP Version Not Supported",
+                        "This process only serves HTTP/1.x requests directly. Configure TLS reverse proxy fronting for h2/h3 and set --h2-upstream for HTTP/2 cleartext passthrough.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+                else => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        500,
+                        "Internal Server Error",
+                        "Internal server error while parsing request.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
+            }
         };
         handled_requests += 1;
+        server_metrics.requestStarted();
         if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
             req.close_connection = true;
         }
@@ -2467,7 +2725,10 @@ fn handleConnection(
         std.debug.print("{s} {s}\n", .{ req.method, req.path });
         routeRequest(io, stream, req_alloc, cfg, req) catch |err| switch (err) {
             error.CloseConnection => break,
-            else => return err,
+            else => {
+                server_metrics.routeError();
+                return err;
+            },
         };
 
         if (req.close_connection) break;
@@ -3022,6 +3283,7 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                             continue;
                         };
                         assembly.h3_response_sent = true;
+                        server_metrics.h3ResponseSent(packet_count);
                         std.debug.print("HTTP/3 served default page to {f} on stream {d} in {d} packet(s)\n", .{ msg.from, stream_id, packet_count });
                     }
                 }
@@ -3057,6 +3319,7 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                         continue;
                     };
                     assembly.h3_response_sent = true;
+                    server_metrics.h3ResponseSent(packet_count);
                     std.debug.print("HTTP/3 served default page to {f} on stream {d} in {d} packet(s)\n", .{ msg.from, stream_id, packet_count });
                 }
             }
@@ -3795,6 +4058,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         if (!concurrency.tryAcquire(cfg.max_concurrent_connections)) {
+            server_metrics.connectionRejected();
             std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{cfg.max_concurrent_connections});
             sendCoolError(
                 conn,
