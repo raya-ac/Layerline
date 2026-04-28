@@ -1,5 +1,6 @@
 const std = @import("std");
 const h3_native = @import("h3_native.zig");
+const h3_state = @import("h3_state.zig");
 const http_response = @import("http_response.zig");
 const quic_native = @import("quic_native.zig");
 const tls13_native = @import("tls13_native.zig");
@@ -26,6 +27,7 @@ const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
 const HTTP3_INITIAL_PADDING_BYTES = 600;
 const HTTP3_MAX_DATAGRAM_BYTES = 1200;
+const HTTP3_CONNECTION_TABLE_CAPACITY = 1024;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
 
@@ -2777,12 +2779,22 @@ const Http3InitialAssembly = struct {
     has_application_keys: bool = false,
     client_application_keys: quic_native.PacketKeys = undefined,
     server_application_keys: quic_native.PacketKeys = undefined,
-    next_server_handshake_packet_number: u64 = 1,
-    next_server_application_packet_number: u64 = 0,
+    server_handshake_packets: h3_state.PacketNumberSpace(16) = h3_state.PacketNumberSpace(16).init(),
+    server_application_packets: h3_state.PacketNumberSpace(64) = h3_state.PacketNumberSpace(64).init(),
     h3_response_sent: bool = false,
 
     fn matches(self: *const Http3InitialAssembly, scid: []const u8) bool {
         return self.has_scid and std.mem.eql(u8, self.scid.slice(), scid);
+    }
+
+    fn matchesServerCid(self: *const Http3InitialAssembly, dcid: []const u8) bool {
+        return self.has_server_cid and std.mem.eql(u8, self.server_cid.slice(), dcid);
+    }
+
+    fn deinit(self: *Http3InitialAssembly, allocator: std.mem.Allocator) void {
+        self.crypto.deinit(allocator);
+        self.client_handshake_crypto.deinit(allocator);
+        self.* = .{};
     }
 
     fn reset(self: *Http3InitialAssembly, allocator: std.mem.Allocator, original_dcid: []const u8, scid: []const u8) !void {
@@ -2797,8 +2809,8 @@ const Http3InitialAssembly = struct {
         self.has_handshake_keys = false;
         self.handshake_done = false;
         self.has_application_keys = false;
-        self.next_server_handshake_packet_number = 1;
-        self.next_server_application_packet_number = 0;
+        self.server_handshake_packets = h3_state.PacketNumberSpace(16).init();
+        self.server_application_packets = h3_state.PacketNumberSpace(64).init();
         self.h3_response_sent = false;
         _ = allocator;
     }
@@ -2806,6 +2818,70 @@ const Http3InitialAssembly = struct {
     fn rememberServerCid(self: *Http3InitialAssembly, server_cid: []const u8) !void {
         self.server_cid = try quic_native.ConnectionId.init(server_cid);
         self.has_server_cid = true;
+    }
+};
+
+const Http3ConnectionTable = struct {
+    allocator: std.mem.Allocator,
+    entries: []Http3InitialAssembly,
+    active: []bool,
+    active_count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) !Http3ConnectionTable {
+        const entries = try allocator.alloc(Http3InitialAssembly, capacity);
+        errdefer allocator.free(entries);
+        const active = try allocator.alloc(bool, capacity);
+        @memset(active, false);
+        return .{
+            .allocator = allocator,
+            .entries = entries,
+            .active = active,
+        };
+    }
+
+    fn deinit(self: *Http3ConnectionTable) void {
+        for (self.entries, self.active) |*entry, is_active| {
+            if (is_active) entry.deinit(self.allocator);
+        }
+        self.allocator.free(self.entries);
+        self.allocator.free(self.active);
+        self.* = undefined;
+    }
+
+    fn findByClientScid(self: *Http3ConnectionTable, scid: []const u8) ?*Http3InitialAssembly {
+        for (self.entries, self.active) |*entry, is_active| {
+            if (is_active and entry.matches(scid)) return entry;
+        }
+        return null;
+    }
+
+    fn findByServerCid(self: *Http3ConnectionTable, dcid: []const u8) ?*Http3InitialAssembly {
+        for (self.entries, self.active) |*entry, is_active| {
+            if (is_active and entry.matchesServerCid(dcid)) return entry;
+        }
+        return null;
+    }
+
+    fn findByShortPacketDcid(self: *Http3ConnectionTable, packet: []const u8) ?*Http3InitialAssembly {
+        if (packet.len <= 1) return null;
+        for (self.entries, self.active) |*entry, is_active| {
+            if (!is_active or !entry.has_server_cid) continue;
+            const cid = entry.server_cid.slice();
+            if (packet.len >= 1 + cid.len and std.mem.eql(u8, packet[1 .. 1 + cid.len], cid)) return entry;
+        }
+        return null;
+    }
+
+    fn acquire(self: *Http3ConnectionTable) !*Http3InitialAssembly {
+        for (self.active, 0..) |is_active, i| {
+            if (!is_active) {
+                self.entries[i] = .{};
+                self.active[i] = true;
+                self.active_count += 1;
+                return &self.entries[i];
+            }
+        }
+        return error.Http3ConnectionCapacityExceeded;
     }
 };
 
@@ -3060,14 +3136,14 @@ fn sendHttp3ShortPlaintext(
         packet_plaintext = buf;
     }
 
+    const packet_number = try assembly.server_application_packets.takeNext();
     const packet = try quic_native.buildProtectedShortPacket(std.heap.page_allocator, .{
         .dcid = assembly.scid.slice(),
-        .packet_number = assembly.next_server_application_packet_number,
+        .packet_number = packet_number,
         .keys = assembly.server_application_keys,
         .plaintext = packet_plaintext,
     });
     defer std.heap.page_allocator.free(packet);
-    assembly.next_server_application_packet_number += 1;
 
     try socket.send(activeIo(), peer, packet);
 }
@@ -3147,10 +3223,13 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
     std.debug.print("HTTP/3 native UDP listener on udp://{s}:{d}\n", .{ cfg.host, cfg.http3_port });
     std.debug.print("HTTP/3 status: native QUIC/TLS handshake and default-page response path active.\n", .{});
 
+    var connections = Http3ConnectionTable.init(std.heap.page_allocator, HTTP3_CONNECTION_TABLE_CAPACITY) catch |err| {
+        std.debug.print("HTTP/3 connection table allocation failed: {}\n", .{err});
+        return;
+    };
+    defer connections.deinit();
+
     var recv_buf: [4096]u8 = undefined;
-    var assembly = Http3InitialAssembly{};
-    defer assembly.crypto.deinit(std.heap.page_allocator);
-    defer assembly.client_handshake_crypto.deinit(std.heap.page_allocator);
 
     while (true) {
         const msg = socket.receive(activeIo(), &recv_buf) catch |err| {
@@ -3165,8 +3244,12 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                 std.debug.print("HTTP/3 ignored malformed long-header datagram from {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            const belongs_to_existing_http3 = assembly.has_server_cid and std.mem.eql(u8, long.dcid.slice(), assembly.server_cid.slice());
-            if (long.packet_type == .handshake or (belongs_to_existing_http3 and assembly.has_handshake_keys and assembly.server_flight_sent)) {
+            const assembly_opt = connections.findByServerCid(long.dcid.slice());
+            if (long.packet_type == .handshake or (assembly_opt != null and assembly_opt.?.has_handshake_keys and assembly_opt.?.server_flight_sent)) {
+                const assembly = assembly_opt orelse {
+                    std.debug.print("HTTP/3 ignored Handshake packet from {f}: unknown destination CID\n", .{msg.from});
+                    continue;
+                };
                 if (!assembly.has_handshake_keys) {
                     std.debug.print("HTTP/3 ignored early Handshake packet from {f}: no handshake keys yet\n", .{msg.from});
                     continue;
@@ -3254,11 +3337,15 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                     std.debug.print("HTTP/3 Handshake ACK padding build failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
+                const handshake_ack_packet_number = assembly.server_handshake_packets.takeNext() catch |err| {
+                    std.debug.print("HTTP/3 Handshake ACK packet number failed for {f}: {}\n", .{ msg.from, err });
+                    continue;
+                };
                 const ack_packet = quic_native.buildProtectedLongPacket(std.heap.page_allocator, .{
                     .packet_type = .handshake,
                     .dcid = assembly.scid.slice(),
                     .scid = assembly.server_cid.slice(),
-                    .packet_number = assembly.next_server_handshake_packet_number,
+                    .packet_number = handshake_ack_packet_number,
                     .keys = assembly.server_handshake_keys,
                     .plaintext = handshake_ack_plaintext.items,
                 }) catch |err| {
@@ -3266,7 +3353,6 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                     continue;
                 };
                 defer std.heap.page_allocator.free(ack_packet);
-                assembly.next_server_handshake_packet_number += 1;
                 socket.send(activeIo(), &msg.from, ack_packet) catch |err| {
                     std.debug.print("HTTP/3 Handshake ACK send failed for {f}: {}\n", .{ msg.from, err });
                     continue;
@@ -3294,7 +3380,7 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                         continue;
                     };
                     if (stream_id_opt) |stream_id| {
-                        const packet_count = sendHttp3ResponsePacket(socket, &msg.from, &assembly, short.packet_number, stream_id) catch |err| {
+                        const packet_count = sendHttp3ResponsePacket(socket, &msg.from, assembly, short.packet_number, stream_id) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
@@ -3306,6 +3392,10 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                 continue;
             }
         } else {
+            const assembly = connections.findByShortPacketDcid(msg.data) orelse {
+                std.debug.print("HTTP/3 ignored 1-RTT packet from {f}: unknown destination CID\n", .{msg.from});
+                continue;
+            };
             if (!assembly.has_application_keys) {
                 std.debug.print("HTTP/3 ignored 1-RTT packet from {f}: application keys not ready\n", .{msg.from});
                 continue;
@@ -3330,7 +3420,7 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
             };
             if (stream_id_opt) |stream_id| {
                 if (!assembly.h3_response_sent) {
-                    const packet_count = sendHttp3ResponsePacket(socket, &msg.from, &assembly, decrypted.packet_number, stream_id) catch |err| {
+                    const packet_count = sendHttp3ResponsePacket(socket, &msg.from, assembly, decrypted.packet_number, stream_id) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };
@@ -3365,13 +3455,32 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
         }
 
         var used_fresh_initial_keys = false;
-        const decrypted = if (assembly.has_original_dcid)
-            quic_native.decryptClientInitialWithOriginalDcid(
-                std.heap.page_allocator,
-                msg.data,
-                assembly.original_dcid.slice(),
-            ) catch |stored_err| fresh: {
-                const fresh_decrypted = quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch {
+        const existing_assembly = connections.findByClientScid(initial.long.scid.slice());
+        const decrypted = if (existing_assembly) |assembly|
+            if (assembly.has_original_dcid)
+                quic_native.decryptClientInitialWithOriginalDcid(
+                    std.heap.page_allocator,
+                    msg.data,
+                    assembly.original_dcid.slice(),
+                ) catch |stored_err| fresh: {
+                    const fresh_decrypted = quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch {
+                        std.debug.print(
+                            "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
+                            .{
+                                msg.from,
+                                initial.long.version,
+                                initial.long.dcid.len,
+                                initial.long.scid.len,
+                                stored_err,
+                            },
+                        );
+                        continue;
+                    };
+                    used_fresh_initial_keys = true;
+                    break :fresh fresh_decrypted;
+                }
+            else
+                quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
                     std.debug.print(
                         "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
                         .{
@@ -3379,16 +3488,14 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                             initial.long.version,
                             initial.long.dcid.len,
                             initial.long.scid.len,
-                            stored_err,
+                            err,
                         },
                     );
                     continue;
-                };
-                used_fresh_initial_keys = true;
-                break :fresh fresh_decrypted;
-            }
-        else
-            quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
+                }
+        else fresh: {
+            used_fresh_initial_keys = true;
+            break :fresh quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
                 std.debug.print(
                     "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
                     .{
@@ -3401,9 +3508,15 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                 );
                 continue;
             };
+        };
         defer std.heap.page_allocator.free(decrypted.plaintext);
 
-        if (!assembly.has_original_dcid or used_fresh_initial_keys or (!assembly.server_flight_sent and !assembly.matches(initial.long.scid.slice()))) {
+        const assembly = existing_assembly orelse (connections.acquire() catch |err| {
+            std.debug.print("HTTP/3 connection table is full; dropping Initial from {f}: {}\n", .{ msg.from, err });
+            continue;
+        });
+
+        if (existing_assembly == null or !assembly.has_original_dcid or used_fresh_initial_keys or (!assembly.server_flight_sent and !assembly.matches(initial.long.scid.slice()))) {
             assembly.reset(std.heap.page_allocator, initial.long.dcid.slice(), initial.long.scid.slice()) catch |err| {
                 std.debug.print("HTTP/3 state reset failed for {f}: {}\n", .{ msg.from, err });
                 continue;
@@ -3622,11 +3735,15 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
             };
             defer std.heap.page_allocator.free(handshake_crypto);
 
+            const server_handshake_packet_number = assembly.server_handshake_packets.takeNext() catch |err| {
+                std.debug.print("HTTP/3 server Handshake packet number failed for {f}: {}\n", .{ msg.from, err });
+                continue;
+            };
             const handshake_response = quic_native.buildProtectedLongPacket(std.heap.page_allocator, .{
                 .packet_type = .handshake,
                 .dcid = initial.long.scid.slice(),
                 .scid = &server_cid,
-                .packet_number = 0,
+                .packet_number = server_handshake_packet_number,
                 .keys = server_handshake_keys,
                 .plaintext = handshake_crypto,
             }) catch |err| {

@@ -218,17 +218,22 @@ run_h3_smoke() {
 
   log "HTTP/3 OpenSSL QUIC smoke against $host:$port"
   status=0
-  run_with_timeout "$H3_TIMEOUT" \
-    openssl s_client -quic -connect "${host}:${port}" -servername "$host" -alpn h3 -brief \
-    >"$output" 2>&1 </dev/null || status=$?
+  printf 'x' | run_with_timeout "$H3_TIMEOUT" \
+    openssl s_client -quic -connect "${host}:${port}" -servername "$host" -alpn h3 -quiet \
+    >"$output" 2>&1 || status=$?
 
-  if grep -Eiq 'ALPN.*h3|Protocol.*TLSv1\.3|CONNECTION ESTABLISHED' "$output"; then
-    ok "HTTP/3 OpenSSL smoke completed handshake/ALPN probe"
+  if grep -aq 'HTTP/3</h1>' "$output" && grep -aq 'Layerline' "$output"; then
+    ok "HTTP/3 OpenSSL smoke fetched the native default page"
     return
   fi
 
   if [[ $H3_REQUIRED == 1 ]]; then
     die "HTTP/3 OpenSSL smoke failed with status $status: $(body_snippet "$output")"
+  fi
+
+  if grep -Eiq 'ALPN.*h3|Protocol.*TLSv1\.3|CONNECTION ESTABLISHED|verify return:1' "$output"; then
+    warn "HTTP/3 OpenSSL smoke completed the handshake but did not see the default page; set LAYERLINE_H3_REQUIRED=1 to make this fatal: $(body_snippet "$output")"
+    return
   fi
 
   warn "HTTP/3 OpenSSL smoke did not complete; set LAYERLINE_H3_REQUIRED=1 to make this fatal: $(body_snippet "$output")"

@@ -101,6 +101,7 @@ This server is HTTP/1.x first, with a native HTTP/3 path built inside the Zig bi
 - HTTP/2 cleartext (`h2c`) passthrough using `--h2-upstream` / `h2_upstream`.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
 - The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, and sends the built-in Layerline page as HTTP/3 HEADERS + DATA.
+- HTTP/3 connection state is tracked per QUIC connection ID with a bounded in-process table, so concurrent handshakes no longer share one global assembly buffer.
 - Broader HTTP/3 routing is intentionally still narrow: the native path serves the default page first, while HTTP/1 keeps the full static/PHP/proxy surface.
 
 Run with:

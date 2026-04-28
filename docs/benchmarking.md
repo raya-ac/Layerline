@@ -44,9 +44,10 @@ request-count oriented.
 
 If OpenSSL exposes QUIC support through `openssl s_client -quic`, the harness
 also attempts a best-effort HTTP/3 smoke against `LAYERLINE_H3_URL`, defaulting
-to `https://127.0.0.1:8443/`. This checks the QUIC/TLS ALPN path, not a full
-HTTP/3 load test. If the local OpenSSL build does not support QUIC, the check is
-reported as skipped.
+to `https://127.0.0.1:8443/`. It writes a small stream payload and checks for
+Layerline's native default-page response. This is still not a full HTTP/3 load
+test. If the local OpenSSL build does not support QUIC, the check is reported as
+skipped.
 
 ## Useful Knobs
 
