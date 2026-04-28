@@ -676,10 +676,24 @@ pub fn buildStreamFrame(
     data: []const u8,
     fin: bool,
 ) ![]u8 {
+    return buildStreamFrameAt(allocator, stream_id, 0, data, fin);
+}
+
+pub fn buildStreamFrameAt(
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    stream_offset: u64,
+    data: []const u8,
+    fin: bool,
+) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try appendVarInt(allocator, &out, 0x08 | 0x02 | if (fin) @as(u64, 0x01) else @as(u64, 0));
+    const has_offset = stream_offset != 0;
+    try appendVarInt(allocator, &out, 0x08 | 0x02 | (if (has_offset) @as(u64, 0x04) else @as(u64, 0)) | if (fin) @as(u64, 0x01) else @as(u64, 0));
     try appendVarInt(allocator, &out, stream_id);
+    if (has_offset) {
+        try appendVarInt(allocator, &out, stream_offset);
+    }
     try appendVarInt(allocator, &out, data.len);
     try out.appendSlice(allocator, data);
     return out.toOwnedSlice(allocator);
@@ -1170,4 +1184,28 @@ test "build protected 1-RTT short packet with STREAM frame" {
     defer allocator.free(decrypted.plaintext);
     try std.testing.expectEqual(@as(u64, 9), decrypted.packet_number);
     try std.testing.expectEqualSlices(u8, stream, decrypted.plaintext);
+}
+
+test "build STREAM frame with explicit offset" {
+    const allocator = std.testing.allocator;
+    const frame = try buildStreamFrameAt(allocator, 0, 300, "abc", true);
+    defer allocator.free(frame);
+
+    var offset: usize = 0;
+    const frame_type = try h3.decodeVarInt(frame[offset..]);
+    offset += frame_type.len;
+    try std.testing.expectEqual(@as(u64, 0x0f), frame_type.value);
+
+    const stream_id = try h3.decodeVarInt(frame[offset..]);
+    offset += stream_id.len;
+    try std.testing.expectEqual(@as(u64, 0), stream_id.value);
+
+    const stream_offset = try h3.decodeVarInt(frame[offset..]);
+    offset += stream_offset.len;
+    try std.testing.expectEqual(@as(u64, 300), stream_offset.value);
+
+    const len = try h3.decodeVarInt(frame[offset..]);
+    offset += len.len;
+    try std.testing.expectEqual(@as(u64, 3), len.value);
+    try std.testing.expectEqualSlices(u8, "abc", frame[offset..]);
 }

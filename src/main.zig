@@ -24,6 +24,9 @@ const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
 const HTTP3_INITIAL_PADDING_BYTES = 600;
+const HTTP3_MAX_DATAGRAM_BYTES = 1200;
+const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
+const QUIC_AEAD_TAG_BYTES = 16;
 
 const SERVER_ICON_SVG =
     \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
@@ -1983,6 +1986,13 @@ fn routeRequest(
                 \\    line-height: .82;
                 \\    letter-spacing: 0;
                 \\  }
+                \\  .eyebrow {
+                \\    display: inline-flex;
+                \\    margin: 0 0 16px;
+                \\    color: #77786f;
+                \\    font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+                \\    text-transform: uppercase;
+                \\  }
                 \\  p {
                 \\    max-width: 46ch;
                 \\    margin: 24px 0 0;
@@ -2057,6 +2067,49 @@ fn routeRequest(
                 \\    background: repeating-linear-gradient(90deg, rgba(17,17,15,.5) 0 12px, transparent 12px 22px);
                 \\    transform: rotate(-9deg);
                 \\  }
+                \\  .packet {
+                \\    position: absolute;
+                \\    left: 14%;
+                \\    top: 45%;
+                \\    width: 54px;
+                \\    height: 28px;
+                \\    border: 1px solid rgba(17,17,15,.28);
+                \\    border-radius: 999px;
+                \\    background: #11110f;
+                \\    box-shadow: 0 18px 40px rgba(17,17,15,.2);
+                \\    animation: packet-run 4.8s ease-in-out infinite;
+                \\  }
+                \\  .h3mark {
+                \\    position: absolute;
+                \\    left: 34px;
+                \\    bottom: 118px;
+                \\    font-size: clamp(62px, 10vw, 116px);
+                \\    line-height: .82;
+                \\    letter-spacing: 0;
+                \\    color: rgba(17,17,15,.11);
+                \\  }
+                \\  .caps {
+                \\    position: absolute;
+                \\    left: 28px;
+                \\    right: 28px;
+                \\    top: 100px;
+                \\    display: grid;
+                \\    grid-template-columns: repeat(2, minmax(0, 1fr));
+                \\    gap: 10px;
+                \\  }
+                \\  .cap {
+                \\    min-height: 48px;
+                \\    padding: 10px 11px;
+                \\    border-top: 1px solid rgba(17,17,15,.14);
+                \\    background: rgba(251,250,246,.52);
+                \\    color: #11110f;
+                \\    font: 12px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+                \\    transition: background .18s ease, transform .18s ease;
+                \\  }
+                \\  .cap:hover {
+                \\    background: rgba(255,255,255,.76);
+                \\    transform: translateY(-2px);
+                \\  }
                 \\  .node {
                 \\    position: absolute;
                 \\    width: 12px;
@@ -2064,6 +2117,7 @@ fn routeRequest(
                 \\    border-radius: 999px;
                 \\    background: #11110f;
                 \\    box-shadow: 0 0 0 9px rgba(17,17,15,.08);
+                \\    animation: node-pulse 3.2s ease-in-out infinite;
                 \\  }
                 \\  .n1 { left: 18%; top: 34%; }
                 \\  .n2 { right: 22%; top: 44%; }
@@ -2094,10 +2148,22 @@ fn routeRequest(
                 \\    font-size: 48px;
                 \\    line-height: .9;
                 \\  }
+                \\  @keyframes packet-run {
+                \\    0%, 100% { transform: translateX(0) rotate(-9deg); opacity: .68; }
+                \\    50% { transform: translateX(230px) rotate(-9deg); opacity: 1; }
+                \\  }
+                \\  @keyframes node-pulse {
+                \\    0%, 100% { box-shadow: 0 0 0 8px rgba(17,17,15,.08); }
+                \\    50% { box-shadow: 0 0 0 15px rgba(17,17,15,.04); }
+                \\  }
                 \\  @media (max-width: 820px) {
                 \\    main { grid-template-columns: 1fr; padding: 24px; }
                 \\    h1 { font-size: clamp(64px, 22vw, 104px); }
-                \\    .surface { min-height: 360px; }
+                \\    .surface { min-height: 420px; }
+                \\    .route { top: 60%; }
+                \\    .packet { top: 56%; animation: none; transform: rotate(-9deg); }
+                \\    .h3mark { bottom: 138px; font-size: 70px; }
+                \\    .caps { grid-template-columns: 1fr 1fr; }
                 \\  }
                 \\</style>
                 \\</head>
@@ -2108,8 +2174,9 @@ fn routeRequest(
                 \\      <img src="/favicon.svg" alt="">
                 \\      <span><strong>Layerline</strong><small>Modern web server</small></span>
                 \\    </a>
+                \\    <div class="eyebrow">native QUIC path active</div>
                 \\    <h1>Layerline</h1>
-                \\    <p>A Zig web server with static files, PHP handoff, proxy fallback, native HTTP/3 groundwork, and guarded request limits.</p>
+                \\    <p>A Zig web server with HTTP/3 in the binary: QUIC v1, TLS 1.3, 1-RTT packet protection, QPACK headers, and bounded request handling.</p>
                 \\    <div class="actions">
                 \\      <a class="button primary" href="/health">Health</a>
                 \\      <a class="button" href="/time">Time</a>
@@ -2119,12 +2186,15 @@ fn routeRequest(
                 \\    </div>
                 \\  </section>
                 \\  <aside class="surface" aria-hidden="true">
-                \\    <div class="rail"><span>serving plane</span><span>HTTP/3</span></div>
+                \\    <div class="rail"><span>QUIC/TLS 1.3</span><span>HTTP/3</span></div>
+                \\    <div class="caps"><div class="cap">QUIC v1 Initial</div><div class="cap">TLS 1.3 Finished</div><div class="cap">1-RTT packets</div><div class="cap">QPACK response</div></div>
+                \\    <div class="h3mark">HTTP/3</div>
                 \\    <div class="route"></div>
+                \\    <div class="packet"></div>
                 \\    <div class="node n1"></div>
                 \\    <div class="node n2"></div>
                 \\    <div class="node n3"></div>
-                \\    <div class="footer"><div><strong>ready</strong><span>routes, files, and upstreams stay bounded</span></div><div class="status">200</div></div>
+                \\    <div class="footer"><div><strong>1-RTT ready</strong><span>native HTTP/3 default page path is live</span></div><div class="status">H3</div></div>
                 \\  </aside>
                 \\</main>
                 \\</body>
@@ -2626,14 +2696,18 @@ fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator) ![]u8 {
         \\<title>Layerline</title>
         \\<style>
         \\body{margin:0;min-height:100vh;background:linear-gradient(180deg,#f7f4ed,#e9e3d6);color:#11110f;font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-        \\main{min-height:100vh;display:grid;place-items:center;padding:48px}
-        \\section{max-width:760px}
-        \\h1{margin:0;font-size:clamp(64px,14vw,132px);line-height:.85;letter-spacing:0}
-        \\p{max-width:44ch;color:#5d5e58;font-size:20px}
-        \\code{font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
+        \\main{min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.7fr);gap:48px;align-items:center;padding:48px}
+        \\section{max-width:820px}
+        \\h1{margin:0;font-size:clamp(68px,14vw,148px);line-height:.82;letter-spacing:0}
+        \\p{max-width:48ch;color:#5d5e58;font-size:20px}
+        \\code,.tag{font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
+        \\.tag{display:inline-block;margin:0 0 18px;color:#77786f;text-transform:uppercase}
+        \\ul{display:grid;gap:12px;margin:0;padding:0;list-style:none}
+        \\li{border-top:1px solid rgba(17,17,15,.16);padding-top:12px;font:14px ui-monospace,SFMono-Regular,Menlo,monospace}
+        \\@media(max-width:760px){main{grid-template-columns:1fr;padding:28px}}
         \\</style>
         \\</head>
-        \\<body><main><section><h1>Layerline</h1><p>Served over native HTTP/3 from the Zig QUIC path.</p><code>HTTP/3 200</code></section></main></body>
+        \\<body><main><section><div class="tag">native QUIC response</div><h1>HTTP/3</h1><p>Served by Layerline from the Zig QUIC path after TLS 1.3 Finished, 1-RTT packet protection, QPACK headers, and an HTTP/3 DATA frame.</p><code>HTTP/3 200</code></section><ul><li>QUIC v1</li><li>TLS 1.3</li><li>1-RTT</li><li>QPACK</li></ul></main></body>
         \\</html>
     ;
 
@@ -2658,13 +2732,76 @@ fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn maxHttp3ShortPlaintextBytes(dcid_len: usize) !usize {
+    // Stay inside QUIC's conservative 1200-byte datagram floor until path MTU
+    // discovery exists. Bigger responses should split, not gamble on UDP.
+    const packet_overhead = 1 + dcid_len + QUIC_SHORT_PACKET_NUMBER_BYTES + QUIC_AEAD_TAG_BYTES;
+    if (HTTP3_MAX_DATAGRAM_BYTES <= packet_overhead + 16) return error.PacketBudgetTooSmall;
+    return HTTP3_MAX_DATAGRAM_BYTES - packet_overhead;
+}
+
+fn h3StreamFramePrefixLen(stream_id: u64, stream_offset: u64, data_len: usize) !usize {
+    const has_offset = stream_offset != 0;
+    const frame_type = 0x08 | 0x02 | (if (has_offset) @as(u64, 0x04) else @as(u64, 0));
+    return (try h3_native.varIntLen(frame_type)) +
+        (try h3_native.varIntLen(stream_id)) +
+        (if (has_offset) try h3_native.varIntLen(stream_offset) else 0) +
+        (try h3_native.varIntLen(@intCast(data_len)));
+}
+
+fn maxHttp3StreamChunkLen(available_plaintext: usize, stream_id: u64, stream_offset: u64, remaining: usize) !usize {
+    if (remaining == 0) return 0;
+
+    var chunk_len = @min(available_plaintext, remaining);
+    while (chunk_len > 0) {
+        const prefix_len = try h3StreamFramePrefixLen(stream_id, stream_offset, chunk_len);
+        if (prefix_len >= available_plaintext) return error.PacketBudgetTooSmall;
+
+        const next = @min(available_plaintext - prefix_len, remaining);
+        if (next == chunk_len) return chunk_len;
+        chunk_len = next;
+    }
+
+    return error.PacketBudgetTooSmall;
+}
+
+fn sendHttp3ShortPlaintext(
+    socket: anytype,
+    peer: *const std.Io.net.IpAddress,
+    assembly: *Http3InitialAssembly,
+    plaintext: []const u8,
+) !void {
+    var padded: ?[]u8 = null;
+    defer if (padded) |buf| std.heap.page_allocator.free(buf);
+
+    var packet_plaintext = plaintext;
+    if (packet_plaintext.len < 16) {
+        const buf = try std.heap.page_allocator.alloc(u8, 16);
+        @memcpy(buf[0..packet_plaintext.len], packet_plaintext);
+        @memset(buf[packet_plaintext.len..], 0);
+        padded = buf;
+        packet_plaintext = buf;
+    }
+
+    const packet = try quic_native.buildProtectedShortPacket(std.heap.page_allocator, .{
+        .dcid = assembly.scid.slice(),
+        .packet_number = assembly.next_server_application_packet_number,
+        .keys = assembly.server_application_keys,
+        .plaintext = packet_plaintext,
+    });
+    defer std.heap.page_allocator.free(packet);
+    assembly.next_server_application_packet_number += 1;
+
+    try socket.send(activeIo(), peer, packet);
+}
+
 fn sendHttp3ResponsePacket(
     socket: anytype,
     peer: *const std.Io.net.IpAddress,
     assembly: *Http3InitialAssembly,
     largest_client_packet_number: u64,
     request_stream_id: u64,
-) !void {
+) !usize {
     const ack_frame = try quic_native.buildAckFrame(std.heap.page_allocator, largest_client_packet_number, 0);
     defer std.heap.page_allocator.free(ack_frame);
     const control_data = try buildHttp3ControlStreamData(std.heap.page_allocator);
@@ -2673,25 +2810,48 @@ fn sendHttp3ResponsePacket(
     defer std.heap.page_allocator.free(control_stream);
     const response_data = try buildHttp3DefaultResponseData(std.heap.page_allocator);
     defer std.heap.page_allocator.free(response_data);
-    const response_stream = try quic_native.buildStreamFrame(std.heap.page_allocator, request_stream_id, response_data, true);
-    defer std.heap.page_allocator.free(response_stream);
 
-    var plaintext = std.ArrayListUnmanaged(u8).empty;
-    defer plaintext.deinit(std.heap.page_allocator);
-    try plaintext.appendSlice(std.heap.page_allocator, ack_frame);
-    try plaintext.appendSlice(std.heap.page_allocator, control_stream);
-    try plaintext.appendSlice(std.heap.page_allocator, response_stream);
+    const max_plaintext = try maxHttp3ShortPlaintextBytes(assembly.scid.slice().len);
+    var response_offset: usize = 0;
+    var include_control = true;
+    var packet_count: usize = 0;
 
-    const packet = try quic_native.buildProtectedShortPacket(std.heap.page_allocator, .{
-        .dcid = assembly.scid.slice(),
-        .packet_number = assembly.next_server_application_packet_number,
-        .keys = assembly.server_application_keys,
-        .plaintext = plaintext.items,
-    });
-    defer std.heap.page_allocator.free(packet);
-    assembly.next_server_application_packet_number += 1;
+    // STREAM offsets are byte offsets into the HTTP/3 stream. The client sees
+    // one ordered response even though we ship it as multiple QUIC packets.
+    while (include_control or response_offset < response_data.len) {
+        var plaintext = std.ArrayListUnmanaged(u8).empty;
+        defer plaintext.deinit(std.heap.page_allocator);
 
-    try socket.send(activeIo(), peer, packet);
+        if (include_control) {
+            try plaintext.appendSlice(std.heap.page_allocator, ack_frame);
+            try plaintext.appendSlice(std.heap.page_allocator, control_stream);
+            include_control = false;
+        }
+
+        if (plaintext.items.len > max_plaintext) return error.PacketBudgetTooSmall;
+
+        if (response_offset < response_data.len and plaintext.items.len < max_plaintext) {
+            const remaining = response_data.len - response_offset;
+            const available = max_plaintext - plaintext.items.len;
+            const chunk_len = try maxHttp3StreamChunkLen(available, request_stream_id, @intCast(response_offset), remaining);
+            const fin = chunk_len == remaining;
+            const response_stream = try quic_native.buildStreamFrameAt(
+                std.heap.page_allocator,
+                request_stream_id,
+                @intCast(response_offset),
+                response_data[response_offset .. response_offset + chunk_len],
+                fin,
+            );
+            defer std.heap.page_allocator.free(response_stream);
+            try plaintext.appendSlice(std.heap.page_allocator, response_stream);
+            response_offset += chunk_len;
+        }
+
+        try sendHttp3ShortPlaintext(socket, peer, assembly, plaintext.items);
+        packet_count += 1;
+    }
+
+    return packet_count;
 }
 
 fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
@@ -2857,12 +3017,12 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
                         continue;
                     };
                     if (stream_id_opt) |stream_id| {
-                        sendHttp3ResponsePacket(socket, &msg.from, &assembly, short.packet_number, stream_id) catch |err| {
+                        const packet_count = sendHttp3ResponsePacket(socket, &msg.from, &assembly, short.packet_number, stream_id) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
                         assembly.h3_response_sent = true;
-                        std.debug.print("HTTP/3 served default page to {f} on stream {d}\n", .{ msg.from, stream_id });
+                        std.debug.print("HTTP/3 served default page to {f} on stream {d} in {d} packet(s)\n", .{ msg.from, stream_id, packet_count });
                     }
                 }
                 continue;
@@ -2892,12 +3052,12 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
             };
             if (stream_id_opt) |stream_id| {
                 if (!assembly.h3_response_sent) {
-                    sendHttp3ResponsePacket(socket, &msg.from, &assembly, decrypted.packet_number, stream_id) catch |err| {
+                    const packet_count = sendHttp3ResponsePacket(socket, &msg.from, &assembly, decrypted.packet_number, stream_id) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };
                     assembly.h3_response_sent = true;
-                    std.debug.print("HTTP/3 served default page to {f} on stream {d}\n", .{ msg.from, stream_id });
+                    std.debug.print("HTTP/3 served default page to {f} on stream {d} in {d} packet(s)\n", .{ msg.from, stream_id, packet_count });
                 }
             }
             continue;
