@@ -202,7 +202,7 @@ Common host limits to revisit before aggressive load tests:
 
 ## Endpoints
 
-- `GET /` → small HTML welcome page.
+- `GET /` → HTML welcome page.
 - `GET /health` → plain health check.
 - `GET /time` → JSON with current epoch seconds.
 - `GET /api/echo?msg=hello` → JSON `{"msg":"hello"}`.

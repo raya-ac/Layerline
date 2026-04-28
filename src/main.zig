@@ -21,7 +21,7 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
 const SERVER_NAME = "Layerline";
-const SERVER_TAGLINE = "Local HTTP runtime";
+const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
 const HTTP3_INITIAL_PADDING_BYTES = 600;
 
@@ -2106,10 +2106,10 @@ fn routeRequest(
                 \\  <section>
                 \\    <a class="brand" href="/" aria-label="Layerline home">
                 \\      <img src="/favicon.svg" alt="">
-                \\      <span><strong>Layerline</strong><small>Local HTTP runtime</small></span>
+                \\      <span><strong>Layerline</strong><small>Modern web server</small></span>
                 \\    </a>
                 \\    <h1>Layerline</h1>
-                \\    <p>A small Zig origin server with static files, PHP handoff, proxy fallback, edge TLS notes, and guarded request limits.</p>
+                \\    <p>A Zig web server with static files, PHP handoff, proxy fallback, native HTTP/3 groundwork, and guarded request limits.</p>
                 \\    <div class="actions">
                 \\      <a class="button primary" href="/health">Health</a>
                 \\      <a class="button" href="/time">Time</a>
