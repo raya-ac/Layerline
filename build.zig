@@ -33,6 +33,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_h3_tests = b.addRunArtifact(h3_tests);
 
+    const http_response_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http_response.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_http_response_tests = b.addRunArtifact(http_response_tests);
+
+    const h3_state_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/h3_state.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_h3_state_tests = b.addRunArtifact(h3_state_tests);
+
     const quic_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/quic_native.zig"),
@@ -51,8 +69,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_tls13_tests = b.addRunArtifact(tls13_tests);
 
+    const reactor_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core/reactor.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_reactor_tests = b.addRunArtifact(reactor_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_h3_tests.step);
+    test_step.dependOn(&run_h3_state_tests.step);
+    test_step.dependOn(&run_http_response_tests.step);
     test_step.dependOn(&run_quic_tests.step);
+    test_step.dependOn(&run_reactor_tests.step);
     test_step.dependOn(&run_tls13_tests.step);
 }

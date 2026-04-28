@@ -1,5 +1,6 @@
 const std = @import("std");
 const h3_native = @import("h3_native.zig");
+const http_response = @import("http_response.zig");
 const quic_native = @import("quic_native.zig");
 const tls13_native = @import("tls13_native.zig");
 
@@ -722,14 +723,12 @@ const ServerMetrics = struct {
     fn responseSent(self: *ServerMetrics, status_code: u16, body_bytes: usize) void {
         ServerMetrics.inc(&self.responses_total);
         ServerMetrics.add(&self.response_body_bytes_total, body_bytes);
-        if (status_code >= 200 and status_code < 300) {
-            ServerMetrics.inc(&self.response_2xx_total);
-        } else if (status_code >= 300 and status_code < 400) {
-            ServerMetrics.inc(&self.response_3xx_total);
-        } else if (status_code >= 400 and status_code < 500) {
-            ServerMetrics.inc(&self.response_4xx_total);
-        } else if (status_code >= 500 and status_code < 600) {
-            ServerMetrics.inc(&self.response_5xx_total);
+        switch (http_response.statusClass(status_code)) {
+            2 => ServerMetrics.inc(&self.response_2xx_total),
+            3 => ServerMetrics.inc(&self.response_3xx_total),
+            4 => ServerMetrics.inc(&self.response_4xx_total),
+            5 => ServerMetrics.inc(&self.response_5xx_total),
+            else => {},
         }
     }
 
@@ -1049,15 +1048,16 @@ fn sendCoolErrorWithConnectionOnly(
 
 fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, extra_headers: ?[]const u8) !void {
     const body_len = body.len;
-    try streamWriteFmt(
-        stream,
-        "HTTP/1.1 {d} {s}\r\n" ++
-            "Server: {s}\r\n" ++
-            "Content-Type: {s}\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: {s}\r\n",
-        .{ status_code, status_text, SERVER_HEADER, content_type, body_len, if (close_connection) "close" else "keep-alive" },
-    );
+    var header_buffer: [4096]u8 = undefined;
+    const base_headers = try http_response.formatHttp1BaseHeaders(&header_buffer, .{
+        .status_code = status_code,
+        .status_text = status_text,
+        .server = SERVER_HEADER,
+        .content_type = content_type,
+        .content_length = body_len,
+        .close_connection = close_connection,
+    });
+    try streamWriteAll(stream, base_headers);
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
     }
@@ -1080,15 +1080,16 @@ fn sendResponseNoBody(stream: std.Io.net.Stream, status_code: u16, status_text: 
 }
 
 fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool, extra_headers: ?[]const u8) !void {
-    try streamWriteFmt(
-        stream,
-        "HTTP/1.1 {d} {s}\r\n" ++
-            "Server: {s}\r\n" ++
-            "Content-Type: {s}\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: {s}\r\n",
-        .{ status_code, status_text, SERVER_HEADER, content_type, body_len, if (close_connection) "close" else "keep-alive" },
-    );
+    var header_buffer: [4096]u8 = undefined;
+    const base_headers = try http_response.formatHttp1BaseHeaders(&header_buffer, .{
+        .status_code = status_code,
+        .status_text = status_text,
+        .server = SERVER_HEADER,
+        .content_type = content_type,
+        .content_length = body_len,
+        .close_connection = close_connection,
+    });
+    try streamWriteAll(stream, base_headers);
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
     }
@@ -1130,11 +1131,13 @@ fn sendNotImplemented(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
 }
 
 fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
-    if (is_head) {
-        try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, body.len, close_connection);
-    } else {
+    if (http_response.canSendBody(status_code, is_head)) {
         try sendResponseWithConnection(stream, status_code, status_text, content_type, body, close_connection);
+        return;
     }
+
+    const declared_len = if (is_head) body.len else 0;
+    try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, declared_len, close_connection);
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
@@ -2947,6 +2950,30 @@ fn buildHttp3ControlStreamData(allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn buildHttp3ResponseData(allocator: std.mem.Allocator, head: http_response.ResponseHead, body: []const u8) ![]u8 {
+    var status_buf: [8]u8 = undefined;
+    const status = try std.fmt.bufPrint(&status_buf, "{d}", .{head.status_code});
+    var length_buf: [32]u8 = undefined;
+    const content_length = try std.fmt.bufPrint(&length_buf, "{d}", .{head.content_length});
+    const headers = [_]h3_native.Header{
+        .{ .name = ":status", .value = status },
+        .{ .name = "server", .value = head.server },
+        .{ .name = "content-type", .value = head.content_type },
+        .{ .name = "content-length", .value = content_length },
+    };
+
+    const headers_frame = try h3_native.buildHeadersFrame(allocator, &headers);
+    defer allocator.free(headers_frame);
+    const data_frame = try h3_native.buildDataFrame(allocator, body);
+    defer allocator.free(data_frame);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, headers_frame);
+    try out.appendSlice(allocator, data_frame);
+    return out.toOwnedSlice(allocator);
+}
+
 fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator) ![]u8 {
     const body =
         \\<!doctype html>
@@ -2972,25 +2999,14 @@ fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator) ![]u8 {
         \\</html>
     ;
 
-    var length_buf: [32]u8 = undefined;
-    const content_length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
-    const headers = [_]h3_native.Header{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "server", .value = SERVER_HEADER },
-        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-        .{ .name = "content-length", .value = content_length },
-    };
-
-    const headers_frame = try h3_native.buildHeadersFrame(allocator, &headers);
-    defer allocator.free(headers_frame);
-    const data_frame = try h3_native.buildDataFrame(allocator, body);
-    defer allocator.free(data_frame);
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, headers_frame);
-    try out.appendSlice(allocator, data_frame);
-    return out.toOwnedSlice(allocator);
+    return buildHttp3ResponseData(allocator, .{
+        .status_code = 200,
+        .status_text = "OK",
+        .server = SERVER_HEADER,
+        .content_type = "text/html; charset=utf-8",
+        .content_length = body.len,
+        .close_connection = true,
+    }, body);
 }
 
 fn maxHttp3ShortPlaintextBytes(dcid_len: usize) !usize {
