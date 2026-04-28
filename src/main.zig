@@ -2119,7 +2119,7 @@ fn routeRequest(
                 \\    </div>
                 \\  </section>
                 \\  <aside class="surface" aria-hidden="true">
-                \\    <div class="rail"><span>origin surface</span><span>HTTP/1.1</span></div>
+                \\    <div class="rail"><span>serving plane</span><span>HTTP/3</span></div>
                 \\    <div class="route"></div>
                 \\    <div class="node n1"></div>
                 \\    <div class="node n2"></div>
