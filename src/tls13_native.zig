@@ -3,6 +3,7 @@ const std = @import("std");
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+pub const Ed25519 = std.crypto.sign.Ed25519;
 pub const X25519 = std.crypto.dh.X25519;
 
 pub const CipherSuite = enum(u16) {
@@ -71,6 +72,102 @@ pub fn buildServerHello(allocator: std.mem.Allocator, input: ServerHelloInput) !
     try appendHandshakeHeader(allocator, &out, 0x02, body.items.len);
     try out.appendSlice(allocator, body.items);
     return out.toOwnedSlice(allocator);
+}
+
+pub fn buildEncryptedExtensions(
+    allocator: std.mem.Allocator,
+    alpn: []const u8,
+    quic_transport_parameters: []const u8,
+) ![]u8 {
+    var extensions = std.ArrayListUnmanaged(u8).empty;
+    defer extensions.deinit(allocator);
+
+    var alpn_payload = std.ArrayListUnmanaged(u8).empty;
+    defer alpn_payload.deinit(allocator);
+    try appendU16(allocator, &alpn_payload, 1 + alpn.len);
+    try alpn_payload.append(allocator, @intCast(alpn.len));
+    try alpn_payload.appendSlice(allocator, alpn);
+    try appendExtension(allocator, &extensions, 0x0010, alpn_payload.items);
+
+    try appendExtension(allocator, &extensions, 0x0039, quic_transport_parameters);
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, extensions.items.len);
+    try body.appendSlice(allocator, extensions.items);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendHandshakeHeader(allocator, &out, 0x08, body.items.len);
+    try out.appendSlice(allocator, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn buildCertificate(allocator: std.mem.Allocator, cert_chain_der: []const []const u8) ![]u8 {
+    var certificate_list = std.ArrayListUnmanaged(u8).empty;
+    defer certificate_list.deinit(allocator);
+
+    for (cert_chain_der) |cert_der| {
+        try appendU24(allocator, &certificate_list, cert_der.len);
+        try certificate_list.appendSlice(allocator, cert_der);
+        try appendU16(allocator, &certificate_list, 0);
+    }
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0);
+    try appendU24(allocator, &body, certificate_list.items.len);
+    try body.appendSlice(allocator, certificate_list.items);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendHandshakeHeader(allocator, &out, 0x0b, body.items.len);
+    try out.appendSlice(allocator, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn buildCertificateVerify(allocator: std.mem.Allocator, scheme: SignatureScheme, signature: []const u8) ![]u8 {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, @intFromEnum(scheme));
+    try appendU16(allocator, &body, signature.len);
+    try body.appendSlice(allocator, signature);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendHandshakeHeader(allocator, &out, 0x0f, body.items.len);
+    try out.appendSlice(allocator, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn buildFinished(allocator: std.mem.Allocator, verify_data: [32]u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendHandshakeHeader(allocator, &out, 0x14, verify_data.len);
+    try out.appendSlice(allocator, &verify_data);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn certificateVerifySignatureInput(allocator: std.mem.Allocator, transcript_hash_value: [32]u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendNTimes(allocator, 0x20, 64);
+    try out.appendSlice(allocator, "TLS 1.3, server CertificateVerify");
+    try out.append(allocator, 0);
+    try out.appendSlice(allocator, &transcript_hash_value);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn signCertificateVerifyEd25519(key_pair: Ed25519.KeyPair, transcript_hash_value: [32]u8) ![Ed25519.Signature.encoded_length]u8 {
+    var input_buf: [64 + "TLS 1.3, server CertificateVerify".len + 1 + 32]u8 = undefined;
+    @memset(input_buf[0..64], 0x20);
+    const context = "TLS 1.3, server CertificateVerify";
+    @memcpy(input_buf[64..][0..context.len], context);
+    input_buf[64 + context.len] = 0;
+    @memcpy(input_buf[64 + context.len + 1 ..], &transcript_hash_value);
+
+    const signature = try key_pair.sign(&input_buf, null);
+    return signature.toBytes();
 }
 
 pub fn transcriptHash(messages: []const []const u8) [32]u8 {
@@ -146,9 +243,7 @@ fn hkdfExpandLabel(
 fn appendHandshakeHeader(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), kind: u8, len: usize) !void {
     if (len > 0x00ff_ffff) return error.HandshakeMessageTooLarge;
     try out.append(allocator, kind);
-    try out.append(allocator, @intCast((len >> 16) & 0xff));
-    try out.append(allocator, @intCast((len >> 8) & 0xff));
-    try out.append(allocator, @intCast(len & 0xff));
+    try appendU24Bytes(allocator, out, len);
 }
 
 fn appendExtension(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), extension_type: u16, payload: []const u8) !void {
@@ -164,6 +259,17 @@ fn appendU16(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), val
     try out.appendSlice(allocator, &buf);
 }
 
+fn appendU24(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: usize) !void {
+    if (value > 0x00ff_ffff) return error.IntegerTooLarge;
+    try appendU24Bytes(allocator, out, value);
+}
+
+fn appendU24Bytes(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: usize) !void {
+    try out.append(allocator, @intCast((value >> 16) & 0xff));
+    try out.append(allocator, @intCast((value >> 8) & 0xff));
+    try out.append(allocator, @intCast(value & 0xff));
+}
+
 test "builds TLS 1.3 ServerHello with X25519 key share" {
     const kp = try X25519.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
     const msg = try buildServerHello(std.testing.allocator, .{
@@ -176,6 +282,42 @@ test "builds TLS 1.3 ServerHello with X25519 key share" {
     try std.testing.expectEqual(@as(u8, 0x02), msg[0]);
     try std.testing.expect(std.mem.indexOf(u8, msg, &kp.public_key) != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "\x00\x2b\x00\x02\x03\x04") != null);
+}
+
+test "builds TLS 1.3 EncryptedExtensions for h3 over QUIC" {
+    const transport_params = "\x04\x04\x80\x10\x00\x00";
+    const msg = try buildEncryptedExtensions(std.testing.allocator, "h3", transport_params);
+    defer std.testing.allocator.free(msg);
+
+    try std.testing.expectEqual(@as(u8, 0x08), msg[0]);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\x00\x10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\x00\x39") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "h3") != null);
+}
+
+test "builds TLS 1.3 certificate, certificate verify, and finished messages" {
+    const cert = "fake der certificate bytes";
+    const certificate = try buildCertificate(std.testing.allocator, &.{cert});
+    defer std.testing.allocator.free(certificate);
+    try std.testing.expectEqual(@as(u8, 0x0b), certificate[0]);
+    try std.testing.expect(std.mem.indexOf(u8, certificate, cert) != null);
+
+    const kp = try Ed25519.KeyPair.generateDeterministic([_]u8{0x77} ** 32);
+    const transcript_hash_value = [_]u8{0x88} ** 32;
+    const signature = try signCertificateVerifyEd25519(kp, transcript_hash_value);
+    const signature_input = try certificateVerifySignatureInput(std.testing.allocator, transcript_hash_value);
+    defer std.testing.allocator.free(signature_input);
+    try Ed25519.Signature.fromBytes(signature).verify(signature_input, kp.public_key);
+
+    const certificate_verify = try buildCertificateVerify(std.testing.allocator, .ed25519, &signature);
+    defer std.testing.allocator.free(certificate_verify);
+    try std.testing.expectEqual(@as(u8, 0x0f), certificate_verify[0]);
+    try std.testing.expect(std.mem.indexOf(u8, certificate_verify, &signature) != null);
+
+    const finished = try buildFinished(std.testing.allocator, [_]u8{0x99} ** 32);
+    defer std.testing.allocator.free(finished);
+    try std.testing.expectEqual(@as(u8, 0x14), finished[0]);
+    try std.testing.expectEqual(@as(usize, 36), finished.len);
 }
 
 test "derives TLS and QUIC handshake keys from X25519 shared secret" {

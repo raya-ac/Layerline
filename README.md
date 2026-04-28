@@ -11,7 +11,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Static responses include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - HTTP/2 cleartext passthrough target support through `h2_upstream`.
-- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial parsing/decryption, UDP version negotiation, TLS ClientHello parsing, and TLS 1.3 ServerHello key-schedule primitives.
+- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial parsing/decryption, UDP version negotiation, TLS ClientHello parsing, and protected QUIC Initial/Handshake packet emission.
 - Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
@@ -97,8 +97,8 @@ This server is HTTP/1.x first, with native HTTP/3 being built inside the Zig bin
 
 - HTTP/2 cleartext (`h2c`) passthrough using `--h2-upstream` / `h2_upstream`.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
-- The current native HTTP/3 path decrypts QUIC v1 Initial packets, extracts TLS ClientHello data, checks ALPN/SNI/TLS capabilities, and prepares the TLS 1.3 ServerHello key material in-process.
-- Browser-compatible page serving still needs QUIC server-flight emission, client Finished handling, 1-RTT packet protection, stream frames, and HTTP/3 request/response wiring.
+- The current native HTTP/3 path decrypts QUIC v1 Initial packets, extracts TLS ClientHello data, checks ALPN/SNI/TLS capabilities, sends a protected server Initial containing ACK + ServerHello, and sends a protected Handshake packet containing EncryptedExtensions with ALPN `h3` and QUIC transport parameters.
+- Browser-compatible page serving still needs Certificate/CertificateVerify, Finished handling, 1-RTT packet protection, stream frames, and HTTP/3 request/response wiring.
 
 Run with:
 
