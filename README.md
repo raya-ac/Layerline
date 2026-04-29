@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools with round-robin target selection.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools with round-robin target selection and bounded retries.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -14,7 +14,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
-- Prometheus-style runtime metrics at `/metrics`, including static sendfile/buffered transfer counters and reverse-proxy upstream attempt/failure counters.
+- Prometheus-style runtime metrics at `/metrics`, including static sendfile/buffered transfer counters and reverse-proxy upstream attempt/failure/retry counters.
 - HTTP/2 cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
 - Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper upstream behavior: active health checks, retry budgets, circuit breakers, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper upstream behavior: active health checks, circuit breakers, richer balancing policies, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -88,6 +88,9 @@ php_info_page = false
 # Use off/false/no/0/none/null to disable it.
 proxy = off
 #proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
+# Retry failed pooled upstream targets before Layerline commits a proxy response.
+# Set to 0 to disable retry attempts.
+#upstream_retries = 1
 # Named route syntax: route = NAME /path-or-prefix/* static|php|proxy
 # Route-local settings inherit global values unless overridden.
 #route = assets /assets/* static
@@ -130,6 +133,7 @@ tls = false
 #idle_timeout_ms = 60000
 #write_timeout_ms = 30000
 #upstream_timeout_ms = 30000
+#upstream_retries = 1
 #graceful_shutdown_timeout_ms = 10000
 max_request_bytes = 16384
 max_body_bytes = 1048576
@@ -329,7 +333,7 @@ Common host limits to revisit before aggressive load tests:
 
 - `GET /` → HTML welcome page.
 - `GET /health` → plain health check.
-- `GET /metrics` → Prometheus-style counters for connections, requests, responses, static bytes, and native H3 packets.
+- `GET /metrics` → Prometheus-style counters for connections, requests, responses, static bytes, upstream proxy attempts, and native H3 packets.
 - `GET /time` → JSON with current epoch seconds.
 - `GET /api/echo?msg=hello` → JSON `{"msg":"hello"}`.
 - `POST /api/echo` → echoes the POST body as plain text.
@@ -376,6 +380,12 @@ You can pass an upstream base path:
 
 ```bash
 zig build run -- --proxy http://127.0.0.1:9000/service
+```
+
+For upstream pools, Layerline retries another target when a target fails before a proxy response is committed:
+
+```bash
+zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-retries 1
 ```
 
 You can also run only HTTP/2 cleartext passthrough:
