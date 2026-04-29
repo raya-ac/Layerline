@@ -52,6 +52,7 @@ const SERVER_ICON_SVG =
 ;
 
 threadlocal var current_io: ?std.Io = null;
+threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 
 // Zig 0.16 moved sockets behind std.Io, so detached worker threads need their
 // own bound handle before they touch a stream.
@@ -86,6 +87,12 @@ fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args: any
     var stack_buffer: [4096]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&stack_buffer, fmt, args);
     try streamWriteAll(stream, rendered);
+}
+
+fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
+    for (current_response_headers) |header| {
+        try streamWriteFmt(stream, "{s}: {s}\r\n", .{ header.name, header.value });
+    }
 }
 
 fn streamClose(stream: std.Io.net.Stream) void {
@@ -123,6 +130,18 @@ const UpstreamConfig = struct {
     https: bool,
 };
 
+const ResponseHeaderRule = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const RedirectRule = struct {
+    from: []const u8,
+    to: []const u8,
+    status_code: u16,
+    prefix_match: bool,
+};
+
 // All server behavior is described in this single config object.
 const ServerConfig = struct {
     host: []const u8,
@@ -145,6 +164,8 @@ const ServerConfig = struct {
     h2_upstream: ?UpstreamConfig,
     http3_enabled: bool,
     http3_port: u16,
+    response_headers: std.ArrayList(ResponseHeaderRule),
+    redirects: std.ArrayList(RedirectRule),
     max_request_bytes: usize,
     max_body_bytes: usize,
     max_static_file_bytes: usize,
@@ -784,6 +805,67 @@ fn disablesOptionalUrl(value: []const u8) bool {
     return false;
 }
 
+fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (c <= 32 or c >= 127 or c == ':' or c == '\r' or c == '\n') return false;
+    }
+    return true;
+}
+
+fn isSafeHeaderValue(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") == null;
+}
+
+fn parseResponseHeaderRule(allocator: std.mem.Allocator, raw: []const u8) !ResponseHeaderRule {
+    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return error.InvalidHeader;
+    const name = trimValue(raw[0..colon]);
+    const value = trimValue(raw[colon + 1 ..]);
+    if (!isValidHeaderName(name) or !isSafeHeaderValue(value)) return error.InvalidHeader;
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .value = try allocator.dupe(u8, value),
+    };
+}
+
+fn isSafeRedirectLocation(value: []const u8) bool {
+    return value.len > 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
+}
+
+fn parseRedirectRule(allocator: std.mem.Allocator, raw: []const u8) !RedirectRule {
+    var tokens = std.ArrayList([]const u8).empty;
+    defer tokens.deinit(allocator);
+
+    var it = std.mem.tokenizeAny(u8, raw, " \t");
+    while (it.next()) |token| {
+        if (std.mem.eql(u8, token, "->")) continue;
+        try tokens.append(allocator, token);
+    }
+
+    if (tokens.items.len < 2) return error.InvalidRedirect;
+
+    const from_raw = trimValue(tokens.items[0]);
+    const to = trimValue(tokens.items[1]);
+    if (from_raw.len == 0 or from_raw[0] != '/' or !isSafeRedirectLocation(to)) return error.InvalidRedirect;
+
+    const status_code = if (tokens.items.len >= 3)
+        std.fmt.parseInt(u16, tokens.items[2], 10) catch 308
+    else
+        308;
+    if (status_code != 301 and status_code != 302 and status_code != 303 and status_code != 307 and status_code != 308) return error.InvalidRedirect;
+
+    const prefix_match = std.mem.endsWith(u8, from_raw, "*");
+    const from = if (prefix_match) from_raw[0 .. from_raw.len - 1] else from_raw;
+    if (from.len == 0 or from[0] != '/') return error.InvalidRedirect;
+
+    return .{
+        .from = try allocator.dupe(u8, from),
+        .to = try allocator.dupe(u8, to),
+        .status_code = status_code,
+        .prefix_match = prefix_match,
+    };
+}
+
 // Map one config file line to fields; unknown values are ignored.
 fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     const k = std.mem.trim(u8, key, " \t\r\n");
@@ -845,6 +927,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.http3_enabled = parseBool(v) orelse cfg.http3_enabled;
     } else if (std.mem.eql(u8, k, "http3_port")) {
         cfg.http3_port = std.fmt.parseInt(u16, v, 10) catch cfg.http3_port;
+    } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
+        if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
+    } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
+        if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_request_bytes;
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -1082,6 +1168,7 @@ fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: 
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
     }
+    try streamWriteConfiguredResponseHeaders(stream);
     try streamWriteAll(stream, "\r\n");
 
     if (body_len > 0) try streamWriteAll(stream, body);
@@ -1114,6 +1201,7 @@ fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
     }
+    try streamWriteConfiguredResponseHeaders(stream);
     try streamWriteAll(stream, "\r\n");
     server_metrics.responseSent(status_code, 0);
 }
@@ -1159,6 +1247,58 @@ fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_tex
 
     const declared_len = if (is_head) body.len else 0;
     try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, declared_len, close_connection);
+}
+
+fn redirectStatusText(status_code: u16) []const u8 {
+    return switch (status_code) {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        else => "Permanent Redirect",
+    };
+}
+
+fn findRedirectRule(cfg: *const ServerConfig, path: []const u8) ?RedirectRule {
+    for (cfg.redirects.items) |rule| {
+        if (rule.prefix_match) {
+            if (std.mem.startsWith(u8, path, rule.from)) return rule;
+        } else if (std.mem.eql(u8, path, rule.from)) {
+            return rule;
+        }
+    }
+    return null;
+}
+
+fn buildRedirectLocation(allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest) ![]const u8 {
+    const suffix = if (rule.prefix_match and req.path.len >= rule.from.len) req.path[rule.from.len..] else "";
+    const should_preserve_query = req.query.len > 0 and std.mem.indexOfScalar(u8, rule.to, '?') == null;
+    const joiner: []const u8 = if (should_preserve_query) "?" else "";
+    const query: []const u8 = if (should_preserve_query) req.query else "";
+    return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ rule.to, suffix, joiner, query });
+}
+
+fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest, close_connection: bool, is_head: bool) !void {
+    const location = try buildRedirectLocation(allocator, rule, req);
+    defer allocator.free(location);
+
+    const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
+    defer allocator.free(extra_headers);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "Redirecting to {s}\n",
+        .{location},
+    );
+    defer allocator.free(body);
+
+    if (is_head) {
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, rule.status_code, redirectStatusText(rule.status_code), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
+        return;
+    }
+
+    try sendResponseWithConnectionAndHeaders(stream, rule.status_code, redirectStatusText(rule.status_code), "text/plain; charset=utf-8", body, close_connection, extra_headers);
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
@@ -2223,9 +2363,17 @@ fn routeRequest(
     req: HttpRequest,
 ) !void {
     // Route locally first, then fall back to proxying so known endpoints stay predictable.
+    current_response_headers = cfg.response_headers.items;
+    defer current_response_headers = &.{};
+
     const should_close = req.close_connection;
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
+
+    if (findRedirectRule(cfg, req.path)) |redirect| {
+        try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
+        return;
+    }
 
     if (std.mem.eql(u8, method, "GET") or is_head) {
         if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
@@ -3860,7 +4008,7 @@ fn usage() void {
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, proxy, h2_upstream, http3, http3_port, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
@@ -3924,6 +4072,8 @@ pub fn main(init: std.process.Init) !void {
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
+        .response_headers = .empty,
+        .redirects = .empty,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,

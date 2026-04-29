@@ -6,6 +6,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
 - Reverse-proxy fallback for anything the local server does not handle.
+- Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
@@ -26,7 +27,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - `public/hello.txt` – sample static file.
 - `public/index.php` – sample php endpoint (if PHP binary is installed and configured).
 - `server.conf` – sample config file.
-- `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort HTTP/3 ALPN checks.
+- `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - HTTP/2/HTTP/3 deployment notes in this README.
 
@@ -138,6 +139,22 @@ Argument precedence (highest wins):
 - Range requests use the original file representation so byte offsets stay predictable.
 - On Darwin targets, response bodies are transferred with `sendfile` when the socket and file descriptor support it; unsupported platforms or syscalls fall back to the bounded buffered path.
 - If no local static match is found, the reverse proxy (if configured) handles the request.
+
+## Header and Redirect Rules
+
+Repeat `header` lines in `server.conf` to add global headers to Layerline-generated responses:
+
+```conf
+header = X-Frame-Options: DENY
+header = X-Content-Type-Options: nosniff
+```
+
+Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
+
+```conf
+redirect = /old /new 308
+redirect = /docs/* /documentation/ 308
+```
 
 ## TLS options in config / CLI
 
