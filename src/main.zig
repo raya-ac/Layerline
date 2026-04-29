@@ -1023,6 +1023,8 @@ const ServerMetrics = struct {
     static_sendfile_responses_total: std.atomic.Value(usize),
     static_buffered_responses_total: std.atomic.Value(usize),
     static_body_bytes_total: std.atomic.Value(usize),
+    upstream_requests_total: std.atomic.Value(usize),
+    upstream_failures_total: std.atomic.Value(usize),
     h3_responses_total: std.atomic.Value(usize),
     h3_packets_sent_total: std.atomic.Value(usize),
 
@@ -1044,6 +1046,8 @@ const ServerMetrics = struct {
             .static_sendfile_responses_total = std.atomic.Value(usize).init(0),
             .static_buffered_responses_total = std.atomic.Value(usize).init(0),
             .static_body_bytes_total = std.atomic.Value(usize).init(0),
+            .upstream_requests_total = std.atomic.Value(usize).init(0),
+            .upstream_failures_total = std.atomic.Value(usize).init(0),
             .h3_responses_total = std.atomic.Value(usize).init(0),
             .h3_packets_sent_total = std.atomic.Value(usize).init(0),
         };
@@ -1105,6 +1109,14 @@ const ServerMetrics = struct {
             .buffered => ServerMetrics.inc(&self.static_buffered_responses_total),
         }
         ServerMetrics.add(&self.static_body_bytes_total, body_bytes);
+    }
+
+    fn upstreamRequestStarted(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_requests_total);
+    }
+
+    fn upstreamRequestFailed(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_failures_total);
     }
 
     fn h3ResponseSent(self: *ServerMetrics, packet_count: usize) void {
@@ -2176,6 +2188,12 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             "# HELP layerline_static_buffered_responses_total Static file responses transferred through the buffered fallback.\n" ++
             "# TYPE layerline_static_buffered_responses_total counter\n" ++
             "layerline_static_buffered_responses_total {d}\n" ++
+            "# HELP layerline_upstream_requests_total Reverse proxy upstream forwarding attempts.\n" ++
+            "# TYPE layerline_upstream_requests_total counter\n" ++
+            "layerline_upstream_requests_total {d}\n" ++
+            "# HELP layerline_upstream_failures_total Reverse proxy upstream attempts that returned an unexpected transport error.\n" ++
+            "# TYPE layerline_upstream_failures_total counter\n" ++
+            "layerline_upstream_failures_total {d}\n" ++
             "# HELP layerline_h3_responses_total Native HTTP/3 responses sent.\n" ++
             "# TYPE layerline_h3_responses_total counter\n" ++
             "layerline_h3_responses_total {d}\n" ++
@@ -2199,6 +2217,8 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.static_responses_total),
             ServerMetrics.load(&server_metrics.static_sendfile_responses_total),
             ServerMetrics.load(&server_metrics.static_buffered_responses_total),
+            ServerMetrics.load(&server_metrics.upstream_requests_total),
+            ServerMetrics.load(&server_metrics.upstream_failures_total),
             ServerMetrics.load(&server_metrics.h3_responses_total),
             ServerMetrics.load(&server_metrics.h3_packets_sent_total),
         },
@@ -3125,7 +3145,11 @@ fn forwardToUpstreamPool(stream: std.Io.net.Stream, allocator: std.mem.Allocator
         try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, false, null);
         return;
     };
-    try forwardToUpstream(stream, allocator, upstream, req, upstream_timeout_ms);
+    server_metrics.upstreamRequestStarted();
+    forwardToUpstream(stream, allocator, upstream, req, upstream_timeout_ms) catch |err| {
+        if (err != error.CloseConnection) server_metrics.upstreamRequestFailed();
+        return err;
+    };
 }
 
 fn handlePhp(
