@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted` policies, target weights, bounded retries, passive upstream ejection, and opt-in active health checks.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, and opt-in active health checks.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections and weighted balancing, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper upstream behavior: circuit breakers, slow start, consistent-hash or sticky balancing, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper upstream behavior: circuit breakers, slow start, sticky-session balancing, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -88,7 +88,7 @@ php_info_page = false
 # Use off/false/no/0/none/null to disable it.
 proxy = off
 #proxy = http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1
-# Pick the first target in a pool with round_robin, random, least_connections, or weighted.
+# Pick the first target in a pool with round_robin, random, least_connections, weighted, or consistent_hash.
 #upstream_policy = round_robin
 # Retry failed pooled upstream targets before Layerline commits a proxy response.
 # Set to 0 to disable retry attempts.
@@ -231,7 +231,7 @@ route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 route_upstream_policy.api = random
 ```
 
-Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random` when you want nginx-style per-scope balancing behavior. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random`, `least_connections`, `weighted`, or `consistent_hash` when you want nginx-style per-scope balancing behavior. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## Per-Domain Config Files
 

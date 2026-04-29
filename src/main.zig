@@ -215,6 +215,7 @@ const UpstreamPoolPolicy = enum {
     random,
     least_connections,
     weighted,
+    consistent_hash,
 };
 
 const UpstreamPoolConfig = struct {
@@ -1324,6 +1325,7 @@ fn upstreamPoolPolicyName(policy: UpstreamPoolPolicy) []const u8 {
         .random => "random",
         .least_connections => "least_connections",
         .weighted => "weighted",
+        .consistent_hash => "consistent_hash",
     };
 }
 
@@ -1351,6 +1353,14 @@ fn parseUpstreamPoolPolicy(value: []const u8) !UpstreamPoolPolicy {
         std.ascii.eqlIgnoreCase(value, "wrr"))
     {
         return .weighted;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "consistent_hash") or
+        std.ascii.eqlIgnoreCase(value, "consistent-hash") or
+        std.ascii.eqlIgnoreCase(value, "hash") or
+        std.ascii.eqlIgnoreCase(value, "uri_hash") or
+        std.ascii.eqlIgnoreCase(value, "uri-hash"))
+    {
+        return .consistent_hash;
     }
     return error.InvalidConfigValue;
 }
@@ -3391,18 +3401,91 @@ fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize {
     return ticket;
 }
 
-fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64) usize {
+const UPSTREAM_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const UPSTREAM_HASH_PRIME: u64 = 0x100000001b3;
+
+fn upstreamHashByte(seed: u64, value: u8) u64 {
+    return (seed ^ value) *% UPSTREAM_HASH_PRIME;
+}
+
+fn upstreamHashBytes(seed: u64, value: []const u8) u64 {
+    var hash = seed;
+    for (value) |byte| {
+        hash = upstreamHashByte(hash, byte);
+    }
+    return hash;
+}
+
+fn upstreamHashU16(seed: u64, value: u16) u64 {
+    var hash = seed;
+    hash = upstreamHashByte(hash, @intCast(value & 0xff));
+    hash = upstreamHashByte(hash, @intCast(value >> 8));
+    return hash;
+}
+
+fn firstForwardedValue(value: []const u8) []const u8 {
+    const first = if (std.mem.indexOfScalar(u8, value, ',')) |comma| value[0..comma] else value;
+    return std.mem.trim(u8, first, " \t\r\n");
+}
+
+fn upstreamConsistentHashKey(req: HttpRequest) u64 {
+    var hash = UPSTREAM_HASH_OFFSET;
+
+    if (findHeaderValue(req.headers, "X-Forwarded-For")) |forwarded| {
+        const first = firstForwardedValue(forwarded);
+        if (first.len > 0) return upstreamHashBytes(upstreamHashBytes(hash, "xff:"), first);
+    }
+    if (findHeaderValue(req.headers, "X-Real-IP")) |real_ip| {
+        const trimmed = trimValue(real_ip);
+        if (trimmed.len > 0) return upstreamHashBytes(upstreamHashBytes(hash, "xri:"), trimmed);
+    }
+    if (findHeaderValue(req.headers, "Host")) |host| {
+        hash = upstreamHashBytes(upstreamHashBytes(hash, "host:"), host);
+    }
+    hash = upstreamHashBytes(upstreamHashBytes(hash, "path:"), req.path);
+    if (req.query.len > 0) {
+        hash = upstreamHashBytes(upstreamHashBytes(hash, "?"), req.query);
+    }
+    return hash;
+}
+
+fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?HttpRequest, now_ms: i64) usize {
+    const target_count = pool.targets.items.len;
+    const fallback = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
+    if (target_count == 0) return fallback;
+
+    const key = if (req) |request| upstreamConsistentHashKey(request) else fallback;
+    var best_index: ?usize = null;
+    var best_score: u64 = 0;
+
+    for (pool.targets.items, 0..) |*upstream, index| {
+        if (upstreamIsEjected(upstream, now_ms)) continue;
+
+        var score = upstreamHashBytes(key, upstream.host);
+        score = upstreamHashU16(upstreamHashByte(score, 0), upstream.port);
+        score = upstreamHashBytes(upstreamHashByte(score, 0), upstream.base_path);
+        if (best_index == null or score > best_score) {
+            best_index = index;
+            best_score = score;
+        }
+    }
+
+    return best_index orelse @as(usize, @intCast(key % target_count));
+}
+
+fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64, req: ?HttpRequest) usize {
     return switch (policy) {
         .round_robin => upstream_round_robin_cursor.fetchAdd(1, .monotonic),
         .random => upstreamRandomTicket(),
         .least_connections => upstreamLeastConnectionsTicket(pool, now_ms),
         .weighted => upstreamWeightedTicket(pool, now_ms),
+        .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms),
     };
 }
 
 fn selectUpstream(pool: *UpstreamPoolConfig) ?*UpstreamConfig {
     if (pool.targets.items.len == 0) return null;
-    const ticket = upstreamStartTicket(pool, pool.policy, upstreamNowMs());
+    const ticket = upstreamStartTicket(pool, pool.policy, upstreamNowMs(), null);
     return &pool.targets.items[ticket % pool.targets.items.len];
 }
 
@@ -3822,7 +3905,7 @@ fn forwardToUpstreamPool(
 
     const attempt_limit = upstreamAttemptLimit(pool, upstream_retries);
     const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms);
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -4569,6 +4652,9 @@ test "upstream policy parser accepts configured policy names" {
     try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted"));
     try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted-round-robin"));
     try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("wrr"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent_hash"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent-hash"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("uri_hash"));
     try std.testing.expectEqual(@as(?UpstreamPoolPolicy, null), try parseOptionalUpstreamPoolPolicy("inherit"));
 }
 
@@ -4596,10 +4682,10 @@ test "least-connections policy chooses the quietest healthy upstream" {
     pool.targets.items[0].active_requests.store(5, .monotonic);
     pool.targets.items[1].active_requests.store(1, .monotonic);
     pool.targets.items[2].active_requests.store(3, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000, null));
 
     pool.targets.items[1].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000));
+    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000, null));
 }
 
 test "weighted policy honors target weights and passive ejection" {
@@ -4610,14 +4696,39 @@ test "weighted policy honors target weights and passive ejection" {
     var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1");
 
     upstream_round_robin_cursor.store(0, .monotonic);
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null));
 
     upstream_round_robin_cursor.store(0, .monotonic);
     pool.targets.items[0].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null));
+}
+
+test "consistent hash policy keeps a stable healthy target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
+    const req = HttpRequest{
+        .method = "GET",
+        .path = "/api/users",
+        .query = "page=1",
+        .headers = "Host: example.test\r\nX-Forwarded-For: 203.0.113.10, 10.0.0.1\r\n",
+        .version = "HTTP/1.1",
+        .body = "",
+        .close_connection = false,
+    };
+
+    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, req);
+    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, req));
+
+    pool.targets.items[first].ejected_until_ms.store(2_000, .monotonic);
+    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, req);
+    try std.testing.expect(replacement != first);
+    try std.testing.expect(replacement < pool.targets.items.len);
 }
 
 test "active health result transitions update upstream availability" {
@@ -6549,7 +6660,7 @@ fn usage() void {
             "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
-            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted] [--h2-upstream http://HOST:PORT[/path]] " ++
+            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
