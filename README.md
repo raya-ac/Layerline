@@ -36,6 +36,8 @@ The next roadmap slice is deeper upstream behavior: active health checks, retry 
 - `public/hello.txt` – sample static file.
 - `public/index.php` – sample php endpoint (if PHP binary is installed and configured).
 - `server.conf` – sample config file.
+- `domains-available/example.conf` – sample per-domain config file.
+- `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - HTTP/2/HTTP/3 deployment notes in this README.
@@ -96,18 +98,9 @@ proxy = off
 #route_php_bin.app = php-cgi
 #route = api /api/* proxy
 #route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
-# nginx-style domain/server config. Global settings remain the fallback.
-#server = main
-#server_name.main = example.com www.example.com
-#server_root.main = public
-#server_index.main = index.html
-#server_serve_static_root.main = true
-#server_route.main = app /app/* php
-#server_route_php_root.main.app = public
-#server_route_php_bin.main.app = php-cgi
-#server = wildcard
-#server_name.wildcard = *.example.net
-#server_proxy.wildcard = http://127.0.0.1:9000, http://127.0.0.1:9001
+# Nginx-style per-domain files live outside this main runtime config.
+# Put .conf files in domains-enabled/ and enable this:
+#domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
 tls = false
@@ -224,30 +217,39 @@ route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 
 Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool; target selection is round-robin. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
-## Domain Server Configs
+## Per-Domain Config Files
 
-Domain configs are Layerline's first virtual-host surface. They use named server blocks in the existing strict key/value config format, so one listener can serve different roots, PHP settings, redirects, routes, and proxy fallbacks by `Host` header.
+Keep `server.conf` for the actual web server runtime: listener, limits, global headers, default PHP binary, HTTP/3 port, ACME/Cloudflare, and other process-level behavior. Domain configs can live in separate files loaded from `domain_config_dir`, which is closer to nginx `sites-enabled`.
 
-```conf
-server = main
-server_name.main = example.com www.example.com
-server_root.main = public
-server_index.main = index.html
-server_serve_static_root.main = true
-
-server_route.main = assets /assets/* static
-server_route_dir.main.assets = public
-
-server_route.main = app /app/* php
-server_route_php_root.main.app = public
-server_route_php_bin.main.app = php-cgi
-
-server = api
-server_name.api = api.example.com
-server_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
+```text
+# server.conf
+host = 127.0.0.1
+port = 8080
+dir = public
+php_bin = /opt/homebrew/bin/php-cgi
+domain_config_dir = domains-enabled
 ```
 
-`server_name.NAME` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them.
+Each `*.conf` file in that directory defines one virtual host. The file name becomes the internal server name unless you set `name` or `server` inside the file.
+
+```conf
+# domains-enabled/example.conf
+server_name = example.com www.example.com
+root = public
+index = index.html
+serve_static_root = true
+
+route = assets /assets/* static
+route_dir.assets = public
+
+route = app /app/* php
+route_php_root.app = public
+route_php_bin.app = php-cgi
+
+proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
+```
+
+`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them. The older inline form (`server = main`, `server_name.main = ...`) still works, but domain files are the intended layout.
 
 ## TLS options in config / CLI
 

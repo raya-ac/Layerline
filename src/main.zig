@@ -311,6 +311,7 @@ const ServerConfig = struct {
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
     domains: std.ArrayList(DomainConfig),
+    domain_config_dir: ?[]const u8,
     max_request_bytes: usize,
     max_body_bytes: usize,
     max_static_file_bytes: usize,
@@ -1360,6 +1361,23 @@ fn findDomainConfigMutable(cfg: *ServerConfig, name: []const u8) ?*DomainConfig 
     return null;
 }
 
+fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainConfig {
+    if (!isDomainConfigNameValid(name)) return error.InvalidConfigValue;
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .server_names = .empty,
+        .static_dir = null,
+        .serve_static_root = null,
+        .index_file = null,
+        .php_root = null,
+        .php_binary = null,
+        .php_info_page = null,
+        .upstream = null,
+        .redirects = .empty,
+        .routes = .empty,
+    };
+}
+
 fn splitDomainRoutePropertyName(value: []const u8) ?struct { domain: []const u8, route: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return null;
     const domain = value[0..dot];
@@ -1384,19 +1402,7 @@ fn setDomainLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const 
     if (!isDomainConfigNameValid(name)) return error.InvalidConfigValue;
     if (findDomainConfigMutable(cfg, name) != null) return error.DuplicateConfigDomain;
 
-    try cfg.domains.append(allocator, .{
-        .name = try allocator.dupe(u8, name),
-        .server_names = .empty,
-        .static_dir = null,
-        .serve_static_root = null,
-        .index_file = null,
-        .php_root = null,
-        .php_binary = null,
-        .php_info_page = null,
-        .upstream = null,
-        .redirects = .empty,
-        .routes = .empty,
-    });
+    try cfg.domains.append(allocator, try initDomainConfig(allocator, name));
 }
 
 fn setDomainStringProperty(
@@ -1540,6 +1546,8 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
+    } else if (std.mem.eql(u8, k, "domain_config_dir") or std.mem.eql(u8, k, "domains_dir") or std.mem.eql(u8, k, "sites_enabled") or std.mem.eql(u8, k, "sites_dir")) {
+        cfg.domain_config_dir = if (v.len == 0) null else try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "server") or std.mem.eql(u8, k, "domain") or std.mem.eql(u8, k, "vhost")) {
         try setDomainLine(cfg, allocator, v);
     } else if (findRoutePropertyName(k, "server_name.")) |name| {
@@ -1742,6 +1750,177 @@ fn loadConfig(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, path
             std.debug.print("Config error in {s}:{d}: {s}: {}\n", .{ path, line_number, trimValue(key), err });
             return err;
         };
+    }
+}
+
+fn isDomainConfigFileName(name: []const u8) bool {
+    return name.len > 0 and name[0] != '.' and std.mem.endsWith(u8, name, ".conf");
+}
+
+fn domainConfigNameFromPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const slash = std.mem.lastIndexOfAny(u8, path, "/\\");
+    const base = if (slash) |pos| path[pos + 1 ..] else path;
+    const stem = if (std.mem.endsWith(u8, base, ".conf")) base[0 .. base.len - ".conf".len] else base;
+    if (stem.len == 0) return error.InvalidConfigValue;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (stem) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
+            try out.append(allocator, c);
+        } else {
+            try out.append(allocator, '-');
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
+fn setDomainStringPropertyDirect(allocator: std.mem.Allocator, domain: *DomainConfig, value: []const u8, field: DomainStringProperty) !void {
+    if (value.len == 0) return error.InvalidConfigValue;
+    const dupe_value = try allocator.dupe(u8, value);
+    switch (field) {
+        .static_dir => domain.static_dir = dupe_value,
+        .index_file => domain.index_file = dupe_value,
+        .php_root => domain.php_root = dupe_value,
+        .php_binary => domain.php_binary = dupe_value,
+    }
+}
+
+fn setDomainBoolPropertyDirect(domain: *DomainConfig, value: []const u8, field: DomainBoolProperty) !void {
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .serve_static_root => domain.serve_static_root = parsed,
+        .php_info_page => domain.php_info_page = parsed,
+    }
+}
+
+fn setDomainProxyPropertyDirect(allocator: std.mem.Allocator, domain: *DomainConfig, value: []const u8) !void {
+    if (disablesOptionalUrl(value)) {
+        domain.upstream = null;
+    } else {
+        domain.upstream = try parseUpstreamPool(allocator, value);
+    }
+}
+
+fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const k = std.mem.trim(u8, key, " \t\r\n");
+    const v = trimValue(value);
+
+    if (std.mem.eql(u8, k, "server") or std.mem.eql(u8, k, "domain") or std.mem.eql(u8, k, "vhost") or std.mem.eql(u8, k, "name")) {
+        if (!isDomainConfigNameValid(v)) return error.InvalidConfigValue;
+        domain.name = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "server_name") or std.mem.eql(u8, k, "server_names")) {
+        try appendServerNames(allocator, domain, v);
+    } else if (std.mem.eql(u8, k, "root") or std.mem.eql(u8, k, "dir") or std.mem.eql(u8, k, "static_dir") or std.mem.eql(u8, k, "server_root")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .static_dir);
+    } else if (std.mem.eql(u8, k, "index") or std.mem.eql(u8, k, "index_file") or std.mem.eql(u8, k, "server_index")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .index_file);
+    } else if (std.mem.eql(u8, k, "serve_static") or std.mem.eql(u8, k, "serve_static_root")) {
+        try setDomainBoolPropertyDirect(domain, v, .serve_static_root);
+    } else if (std.mem.eql(u8, k, "php_root")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .php_root);
+    } else if (std.mem.eql(u8, k, "php_binary") or std.mem.eql(u8, k, "php_bin")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .php_binary);
+    } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page")) {
+        try setDomainBoolPropertyDirect(domain, v, .php_info_page);
+    } else if (std.mem.eql(u8, k, "proxy") or std.mem.eql(u8, k, "upstream")) {
+        try setDomainProxyPropertyDirect(allocator, domain, v);
+    } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
+        if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
+    } else if (std.mem.eql(u8, k, "route")) {
+        try setRouteLineFor(&domain.routes, allocator, v);
+    } else if (findRoutePropertyName(k, "route_dir.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_static_dir.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_index.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "route_index_file.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "route_php_root.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .php_root);
+    } else if (findRoutePropertyName(k, "route_php_bin.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_binary.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_info_page.")) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_phpinfo_page.")) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_proxy.")) |name| {
+        try setRouteProxyProperty(&domain.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_upstream.")) |name| {
+        try setRouteProxyProperty(&domain.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .strip_prefix);
+    } else {
+        return error.UnknownConfigKey;
+    }
+}
+
+fn loadDomainConfigFile(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, path: []const u8) !void {
+    const default_name = try domainConfigNameFromPath(allocator, path);
+    var domain = try initDomainConfig(allocator, default_name);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_CONFIG_BYTES));
+    defer allocator.free(content);
+
+    var lines = std.mem.splitSequence(u8, content, "\n");
+    var line_number: usize = 0;
+    while (lines.next()) |raw_line| {
+        line_number += 1;
+        var line = trimValue(raw_line);
+        if (line.len == 0) continue;
+
+        if (std.mem.indexOfScalar(u8, line, '#')) |comment_start| {
+            if (comment_start == 0) continue;
+            line = trimValue(line[0..comment_start]);
+        }
+        if (line.len == 0) continue;
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+            std.debug.print("Domain config error in {s}:{d}: expected key = value\n", .{ path, line_number });
+            return error.MalformedConfigLine;
+        };
+        const key = line[0..eq];
+        const value = if (eq + 1 < line.len) line[eq + 1 ..] else "";
+        applyDomainConfigLine(&domain, allocator, key, value) catch |err| {
+            std.debug.print("Domain config error in {s}:{d}: {s}: {}\n", .{ path, line_number, trimValue(key), err });
+            return err;
+        };
+    }
+
+    if (findDomainConfigMutable(cfg, domain.name) != null) return error.DuplicateConfigDomain;
+    try cfg.domains.append(allocator, domain);
+}
+
+fn loadDomainConfigDir(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, dir_path: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var paths = std.ArrayList([]const u8).empty;
+    defer paths.deinit(allocator);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!isDomainConfigFileName(entry.name)) continue;
+        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        try paths.append(allocator, full_path);
+    }
+
+    std.sort.insertion([]const u8, paths.items, {}, stringLessThan);
+    for (paths.items) |path| {
+        try loadDomainConfigFile(io, allocator, cfg, path);
+    }
+}
+
+fn loadConfiguredDomainConfigs(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
+    if (cfg.domain_config_dir) |dir_path| {
+        try loadDomainConfigDir(io, allocator, cfg, dir_path);
     }
 }
 
@@ -3624,6 +3803,7 @@ test "named routes prefer exact and longest prefix matches" {
         .redirects = .empty,
         .routes = .empty,
         .domains = .empty,
+        .domain_config_dir = null,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
@@ -5501,6 +5681,7 @@ fn usage() void {
             "Usage:\n" ++
             "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
+            "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
@@ -5512,7 +5693,7 @@ fn usage() void {
             "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, graceful_shutdown_timeout_ms, " ++
@@ -5531,6 +5712,7 @@ fn usage() void {
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++
             "  zig build run -- --config server.conf\n" ++
+            "  zig build run -- --domain-config-dir domains-enabled --dump-routes\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
@@ -5590,6 +5772,7 @@ pub fn main(init: std.process.Init) !void {
         .redirects = .empty,
         .routes = .empty,
         .domains = .empty,
+        .domain_config_dir = null,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
@@ -5642,6 +5825,12 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, arg, "--config")) {
             _ = args.next();
+        } else if (std.mem.eql(u8, arg, "--domain-config-dir") or std.mem.eql(u8, arg, "--domains-dir") or std.mem.eql(u8, arg, "--sites-enabled")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.domain_config_dir = if (value.len == 0) null else value;
         } else if (std.mem.eql(u8, arg, "--validate-config") or std.mem.eql(u8, arg, "--check-config")) {
             validate_only = true;
         } else if (std.mem.eql(u8, arg, "--dump-routes") or std.mem.eql(u8, arg, "--routes")) {
@@ -5916,6 +6105,11 @@ pub fn main(init: std.process.Init) !void {
             return error.InvalidCommandLine;
         }
     }
+
+    loadConfiguredDomainConfigs(init.io, std.heap.page_allocator, &cfg) catch |err| {
+        std.debug.print("Failed to load domain config dir: {}\n", .{err});
+        return err;
+    };
 
     normalizeConfig(&cfg);
     validateConfig(&cfg) catch |err| {
