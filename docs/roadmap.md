@@ -42,7 +42,7 @@ Sources:
 
 ## Phase 3: Reverse Proxy and Load Balancing
 
-- Multiple upstreams per route with round-robin, random, least-connections, weighted, consistent-hash, and sticky-session policies. Initial comma/space-separated upstream pools with round-robin selection are implemented for global, domain, and route proxy settings.
+- Multiple upstreams per route with round-robin, random, least-connections, weighted, consistent-hash, and sticky-session policies. Initial comma/space-separated upstream pools with configurable round-robin/random selection are implemented for global, domain, and route proxy settings.
 - Active and passive health checks with slow start, outlier ejection, retry budgets, and circuit breakers. Initial upstream attempt/failure/retry metrics plus a bounded retry budget are implemented as the passive-observability base.
 - Upstream connection pools with keep-alive limits, per-host caps, DNS re-resolution, happy-eyeballs dialing, and Unix socket upstreams.
 - WebSocket and CONNECT tunneling.
@@ -108,7 +108,7 @@ Sources:
 1. Config validation and route gates.
 2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented. Host-based domain configs with per-domain routes and `domain_config_dir` file loading are implemented; route-local TLS/cache/security policy remains next.
 3. Timeouts and graceful shutdown.
-4. Reverse proxy upstream pools. Initial multi-target round-robin pools, upstream attempt/failure/retry metrics, and bounded retry budgets are implemented; active health checks and richer policies remain next.
+4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random policies, upstream attempt/failure/retry metrics, and bounded retry budgets are implemented; active health checks, least-connections, weighted pools, and keep-alive upstream sockets remain next.
 5. FastCGI and PHP front-controller.
 6. Native TLS termination.
 7. HTTP/2 server.

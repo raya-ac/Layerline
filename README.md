@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools with round-robin target selection and bounded retries.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random` policies, and bounded retries.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -25,7 +25,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries and configurable pool policy, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is deeper upstream behavior: active health checks, circuit breakers, richer balancing policies, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -88,6 +88,8 @@ php_info_page = false
 # Use off/false/no/0/none/null to disable it.
 proxy = off
 #proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
+# Pick the first target in a pool with round_robin or random.
+#upstream_policy = round_robin
 # Retry failed pooled upstream targets before Layerline commits a proxy response.
 # Set to 0 to disable retry attempts.
 #upstream_retries = 1
@@ -217,9 +219,10 @@ route_php_bin.app = php-cgi
 
 route = api /api/* proxy
 route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
+route_upstream_policy.api = random
 ```
 
-Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool; target selection is round-robin. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random` when you want nginx-style per-scope balancing behavior. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## Per-Domain Config Files
 
@@ -251,9 +254,10 @@ route_php_root.app = public
 route_php_bin.app = php-cgi
 
 proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
+upstream_policy = random
 ```
 
-`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them. The older inline form (`server = main`, `server_name.main = ...`) still works, but domain files are the intended layout.
+`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including upstream pool policy. The older inline form (`server = main`, `server_name.main = ...`) still works, but domain files are the intended layout.
 
 ## TLS options in config / CLI
 
@@ -386,6 +390,12 @@ For upstream pools, Layerline retries another target when a target fails before 
 
 ```bash
 zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-retries 1
+```
+
+Choose the first target with `round_robin` or `random`; retries still walk the remaining pool members once the first target is picked:
+
+```bash
+zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random
 ```
 
 You can also run only HTTP/2 cleartext passthrough:
