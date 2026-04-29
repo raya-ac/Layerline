@@ -3366,6 +3366,13 @@ const NativeTlsResult = struct {
     alpn: ?[]const u8,
 };
 
+const TlsSigningKeyKind = enum {
+    configured_ecdsa,
+    configured_rsa,
+    generated_ecdsa,
+    generated_ed25519,
+};
+
 fn selectedTlsAlpn(info: tls_client_hello.ClientHelloInfo) ?[]const u8 {
     if (info.offers_h2) return "h2";
     if (info.offers_http11) return "http/1.1";
@@ -3530,7 +3537,9 @@ fn establishNativeTls13(
 ) !NativeTlsResult {
     if (!info.supports_tls13) return error.UnsupportedTlsVersion;
     if (!info.offers_aes_128_gcm_sha256) return error.UnsupportedTlsCipherSuite;
-    if (!info.offers_ecdsa_secp256r1_sha256 and !info.offers_ed25519) return error.UnsupportedTlsSignatureScheme;
+    if (!info.offers_ecdsa_secp256r1_sha256 and !info.offers_rsa_pss_rsae_sha256 and !info.offers_ed25519) {
+        return error.UnsupportedTlsSignatureScheme;
+    }
     const client_x25519 = info.x25519_key_share orelse return error.MissingTlsKeyShare;
     const alpn = selectedTlsAlpn(info);
     if (info.alpn != null and alpn == null) return error.NoApplicationProtocol;
@@ -3559,39 +3568,62 @@ fn establishNativeTls13(
     defer allocator.free(encrypted_extensions);
 
     const cert_name = info.sni orelse "localhost";
-    const configured_material = if (info.offers_ecdsa_secp256r1_sha256) cfg.tls_material else null;
-    const use_configured_certificate = configured_material != null;
-    const use_ecdsa = use_configured_certificate or info.offers_ecdsa_secp256r1_sha256;
-    const ecdsa_key_pair = if (use_configured_certificate)
-        configured_material.?.ecdsa_key_pair
-    else if (use_ecdsa)
+    const signing_key_kind: TlsSigningKeyKind = if (cfg.tls_material) |material| switch (material.private_key) {
+        .ecdsa_p256 => if (info.offers_ecdsa_secp256r1_sha256) .configured_ecdsa else return error.UnsupportedTlsSignatureScheme,
+        .rsa => if (info.offers_rsa_pss_rsae_sha256) .configured_rsa else return error.UnsupportedTlsSignatureScheme,
+    } else if (info.offers_ecdsa_secp256r1_sha256)
+        .generated_ecdsa
+    else if (info.offers_ed25519)
+        .generated_ed25519
+    else
+        return error.UnsupportedTlsSignatureScheme;
+
+    const generated_ecdsa_key_pair = if (signing_key_kind == .generated_ecdsa)
         tls13_native.EcdsaP256Sha256.KeyPair.generate(io)
     else
         null;
-    const ed25519_key_pair = if (!use_ecdsa) tls13_native.Ed25519.KeyPair.generate(io) else null;
+    const generated_ed25519_key_pair = if (signing_key_kind == .generated_ed25519)
+        tls13_native.Ed25519.KeyPair.generate(io)
+    else
+        null;
     var generated_cert_der: ?[]u8 = null;
     defer if (generated_cert_der) |cert| allocator.free(cert);
 
-    const certificate = if (use_configured_certificate)
-        try tls13_native.buildCertificate(allocator, configured_material.?.certificate_chain)
-    else blk: {
-        generated_cert_der = if (use_ecdsa)
-            try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, ecdsa_key_pair.?, cert_name)
-        else
-            try tls13_native.buildSelfSignedEd25519Certificate(allocator, ed25519_key_pair.?, cert_name);
-        break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
+    const certificate = switch (signing_key_kind) {
+        .configured_ecdsa, .configured_rsa => try tls13_native.buildCertificate(allocator, cfg.tls_material.?.certificate_chain),
+        .generated_ecdsa => blk: {
+            generated_cert_der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, generated_ecdsa_key_pair.?, cert_name);
+            break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
+        },
+        .generated_ed25519 => blk: {
+            generated_cert_der = try tls13_native.buildSelfSignedEd25519Certificate(allocator, generated_ed25519_key_pair.?, cert_name);
+            break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
+        },
     };
     defer allocator.free(certificate);
 
     const cert_verify_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello, encrypted_extensions, certificate });
-    const cert_signature = if (use_ecdsa) blk: {
-        break :blk try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, ecdsa_key_pair.?, cert_verify_hash);
-    } else blk: {
-        const signature = try tls13_native.signCertificateVerifyEd25519(ed25519_key_pair.?, cert_verify_hash);
-        break :blk try allocator.dupe(u8, &signature);
+    const cert_signature = switch (signing_key_kind) {
+        .configured_ecdsa => blk: {
+            const key_pair = cfg.tls_material.?.private_key.ecdsa_p256;
+            break :blk try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, key_pair, cert_verify_hash);
+        },
+        .configured_rsa => blk: {
+            const key = cfg.tls_material.?.private_key.rsa;
+            break :blk try tls13_native.signCertificateVerifyRsaPssSha256(io, allocator, key, cert_verify_hash);
+        },
+        .generated_ecdsa => try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, generated_ecdsa_key_pair.?, cert_verify_hash),
+        .generated_ed25519 => blk: {
+            const signature = try tls13_native.signCertificateVerifyEd25519(generated_ed25519_key_pair.?, cert_verify_hash);
+            break :blk try allocator.dupe(u8, &signature);
+        },
     };
     defer allocator.free(cert_signature);
-    const signature_scheme: tls13_native.SignatureScheme = if (use_ecdsa) .ecdsa_secp256r1_sha256 else .ed25519;
+    const signature_scheme: tls13_native.SignatureScheme = switch (signing_key_kind) {
+        .configured_ecdsa, .generated_ecdsa => .ecdsa_secp256r1_sha256,
+        .configured_rsa => .rsa_pss_rsae_sha256,
+        .generated_ed25519 => .ed25519,
+    };
     const certificate_verify = try tls13_native.buildCertificateVerify(allocator, signature_scheme, cert_signature);
     defer allocator.free(certificate_verify);
 
@@ -3667,13 +3699,14 @@ fn handleTlsClientHelloProbe(
     defer info.deinit(allocator);
 
     std.debug.print(
-        "TLS ClientHello sni={s} alpn={s} tls13={} aes128gcm={} ecdsa_p256={} ed25519={} h2={} http11={} tls_configured={}\n",
+        "TLS ClientHello sni={s} alpn={s} tls13={} aes128gcm={} ecdsa_p256={} rsa_pss={} ed25519={} h2={} http11={} tls_configured={}\n",
         .{
             info.sni orelse "(none)",
             info.alpn orelse "(none)",
             info.supports_tls13,
             info.offers_aes_128_gcm_sha256,
             info.offers_ecdsa_secp256r1_sha256,
+            info.offers_rsa_pss_rsae_sha256,
             info.offers_ed25519,
             info.offers_h2,
             info.offers_http11,

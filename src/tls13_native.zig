@@ -3,6 +3,8 @@ const std = @import("std");
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const RsaModulus = std.crypto.ff.Modulus(4096);
+const RsaFieldElement = RsaModulus.Fe;
 pub const Ed25519 = std.crypto.sign.Ed25519;
 pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 pub const X25519 = std.crypto.dh.X25519;
@@ -17,7 +19,21 @@ pub const NamedGroup = enum(u16) {
 
 pub const SignatureScheme = enum(u16) {
     ecdsa_secp256r1_sha256 = 0x0403,
+    rsa_pss_rsae_sha256 = 0x0804,
     ed25519 = 0x0807,
+};
+
+pub const RsaPrivateKey = struct {
+    modulus: []const u8,
+    public_exponent: []const u8,
+    private_exponent: []const u8,
+
+    pub fn deinit(self: *RsaPrivateKey, allocator: std.mem.Allocator) void {
+        allocator.free(self.modulus);
+        allocator.free(self.public_exponent);
+        allocator.free(self.private_exponent);
+        self.* = undefined;
+    }
 };
 
 pub const ServerHelloInput = struct {
@@ -231,6 +247,17 @@ pub fn signCertificateVerifyEcdsaP256Sha256(
     const signature = try key_pair.sign(input, null);
     var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
     return allocator.dupe(u8, signature.toDer(&der_buf));
+}
+
+pub fn signCertificateVerifyRsaPssSha256(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    key: RsaPrivateKey,
+    transcript_hash_value: [32]u8,
+) ![]u8 {
+    const input = try certificateVerifySignatureInput(allocator, transcript_hash_value);
+    defer allocator.free(input);
+    return rsaPssSha256Sign(io, allocator, key, input);
 }
 
 pub fn buildSelfSignedEd25519Certificate(
@@ -479,6 +506,116 @@ pub fn finishedVerifyData(finished_key: [32]u8, transcript_hash_value: [32]u8) [
     var out: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&out, &transcript_hash_value, &finished_key);
     return out;
+}
+
+fn rsaPssSha256Sign(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    key: RsaPrivateKey,
+    message: []const u8,
+) ![]u8 {
+    const modulus = trimLeadingZeroes(key.modulus);
+    const private_exponent = trimLeadingZeroes(key.private_exponent);
+    if (modulus.len < 64 or modulus.len > 512) return error.UnsupportedRsaModulusLength;
+    if (private_exponent.len == 0 or private_exponent.len > modulus.len) return error.InvalidRsaPrivateExponent;
+
+    const modulus_bits = bitLength(modulus) orelse return error.InvalidRsaModulus;
+    const encoded = try rsaPssEncodeSha256(io, allocator, message, modulus_bits, modulus.len);
+    defer allocator.free(encoded);
+
+    const n = try RsaModulus.fromBytes(modulus, .big);
+    const m = try RsaFieldElement.fromBytes(n, encoded, .big);
+    const s = try n.powWithEncodedExponent(m, private_exponent, .big);
+
+    const out = try allocator.alloc(u8, modulus.len);
+    errdefer allocator.free(out);
+    try s.toBytes(out, .big);
+    return out;
+}
+
+fn rsaPssEncodeSha256(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    modulus_bits: usize,
+    modulus_len: usize,
+) ![]u8 {
+    if (modulus_bits < 2) return error.InvalidRsaModulus;
+    const em_bits = modulus_bits - 1;
+    const em_len = (em_bits + 7) / 8;
+    const hash_len = Sha256.digest_length;
+    const salt_len = Sha256.digest_length;
+    if (em_len < hash_len + salt_len + 2 or em_len > modulus_len) return error.RsaMessageTooLong;
+
+    var message_hash: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(message, &message_hash, .{});
+
+    var salt: [Sha256.digest_length]u8 = undefined;
+    io.random(&salt);
+
+    var m_prime: [8 + Sha256.digest_length + Sha256.digest_length]u8 = undefined;
+    @memset(m_prime[0..8], 0);
+    @memcpy(m_prime[8..][0..message_hash.len], &message_hash);
+    @memcpy(m_prime[8 + message_hash.len ..], &salt);
+
+    var h: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(&m_prime, &h, .{});
+
+    const encoded = try allocator.alloc(u8, modulus_len);
+    errdefer allocator.free(encoded);
+    @memset(encoded, 0);
+    const em = encoded[modulus_len - em_len ..];
+    const db_len = em_len - hash_len - 1;
+    const db = em[0..db_len];
+    @memset(db, 0);
+    const ps_len = db_len - salt_len - 1;
+    db[ps_len] = 0x01;
+    @memcpy(db[ps_len + 1 ..], &salt);
+
+    const db_mask = try allocator.alloc(u8, db_len);
+    defer allocator.free(db_mask);
+    mgf1Sha256(db_mask, &h);
+    for (db, db_mask) |*byte, mask| {
+        byte.* ^= mask;
+    }
+
+    const zero_bits = em_len * 8 - em_bits;
+    if (zero_bits > 0) {
+        db[0] &= @as(u8, 0xff) >> @intCast(zero_bits);
+    }
+
+    @memcpy(em[db_len..][0..hash_len], &h);
+    em[em.len - 1] = 0xbc;
+    return encoded;
+}
+
+fn mgf1Sha256(out: []u8, seed: *const [Sha256.digest_length]u8) void {
+    var counter: u32 = 0;
+    var offset: usize = 0;
+    var input: [Sha256.digest_length + 4]u8 = undefined;
+    @memcpy(input[0..Sha256.digest_length], seed);
+    while (offset < out.len) : (counter += 1) {
+        std.mem.writeInt(u32, input[Sha256.digest_length..][0..4], counter, .big);
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(&input, &digest, .{});
+        const n = @min(out.len - offset, digest.len);
+        @memcpy(out[offset..][0..n], digest[0..n]);
+        offset += n;
+    }
+}
+
+fn trimLeadingZeroes(bytes: []const u8) []const u8 {
+    var offset: usize = 0;
+    while (offset < bytes.len and bytes[offset] == 0) {
+        offset += 1;
+    }
+    return bytes[offset..];
+}
+
+fn bitLength(bytes: []const u8) ?usize {
+    const trimmed = trimLeadingZeroes(bytes);
+    if (trimmed.len == 0) return null;
+    return (trimmed.len - 1) * 8 + (8 - @clz(trimmed[0]));
 }
 
 fn tlsRecordNonce(iv: [12]u8, sequence_number: u64) [12]u8 {
@@ -818,4 +955,13 @@ test "signs TLS 1.3 CertificateVerify with ECDSA P-256" {
     const input = try certificateVerifySignatureInput(std.testing.allocator, transcript_hash_value);
     defer std.testing.allocator.free(input);
     try signature.verify(input, kp.public_key);
+}
+
+test "encodes RSA-PSS SHA-256 messages with TLS-compatible bounds" {
+    const encoded = try rsaPssEncodeSha256(std.testing.io, std.testing.allocator, "message", 1024, 128);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, 128), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0xbc), encoded[encoded.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0), encoded[0] & 0x80);
 }

@@ -17,6 +17,7 @@ pub const ClientHelloInfo = struct {
     supports_tls13: bool = false,
     offers_aes_128_gcm_sha256: bool = false,
     offers_ecdsa_secp256r1_sha256: bool = false,
+    offers_rsa_pss_rsae_sha256: bool = false,
     offers_ed25519: bool = false,
     offers_h2: bool = false,
     offers_http11: bool = false,
@@ -127,6 +128,7 @@ fn parseSignatureAlgorithms(payload: []const u8, info: *ClientHelloInfo) Error!v
     while (list_offset < list.len) {
         const scheme = try readU16(list, &list_offset);
         if (scheme == 0x0403) info.offers_ecdsa_secp256r1_sha256 = true;
+        if (scheme == 0x0804) info.offers_rsa_pss_rsae_sha256 = true;
         if (scheme == 0x0807) info.offers_ed25519 = true;
     }
 }
@@ -252,8 +254,9 @@ test "parses SNI ALPN and TLS 1.3 support from ClientHello" {
 
     var signature_algorithms = std.ArrayList(u8).empty;
     defer signature_algorithms.deinit(allocator);
-    try appendU16(allocator, &signature_algorithms, 4);
+    try appendU16(allocator, &signature_algorithms, 6);
     try appendU16(allocator, &signature_algorithms, 0x0403);
+    try appendU16(allocator, &signature_algorithms, 0x0804);
     try appendU16(allocator, &signature_algorithms, 0x0807);
     try appendExtension(allocator, &extensions, 0x000d, signature_algorithms.items);
 
@@ -299,6 +302,7 @@ test "parses SNI ALPN and TLS 1.3 support from ClientHello" {
     try std.testing.expect(info.supports_tls13);
     try std.testing.expect(info.offers_aes_128_gcm_sha256);
     try std.testing.expect(info.offers_ecdsa_secp256r1_sha256);
+    try std.testing.expect(info.offers_rsa_pss_rsae_sha256);
     try std.testing.expect(info.offers_ed25519);
     try std.testing.expectEqualSlices(u8, &client_key, &info.x25519_key_share.?);
     try std.testing.expect(info.offers_h2);

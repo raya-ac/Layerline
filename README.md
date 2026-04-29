@@ -161,7 +161,7 @@ max_concurrent_connections = 1000000
 
 This server now terminates native TLS 1.3 on the TCP listener and uses ALPN to route HTTP/1.1 or HTTP/2 on the same socket:
 
-- Native HTTPS supports TLS 1.3 with X25519, TLS_AES_128_GCM_SHA256, ECDSA P-256/SHA-256 certificates, and Ed25519 fallback.
+- Native HTTPS supports TLS 1.3 with X25519, TLS_AES_128_GCM_SHA256, ECDSA P-256/SHA-256 certificates, RSA-PSS/SHA-256 certificates, and Ed25519 fallback.
 - HTTP/2 is served directly over TLS when the client selects `h2`, and HTTP/1.1 stays on the existing router when the client selects `http/1.1` or sends no ALPN.
 - HTTP/2 cleartext (`h2c`) is still supported for local or upstream cleartext workflows.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
@@ -277,7 +277,7 @@ upstream_policy = random
 
 ## TLS options in config / CLI
 
-Set `tls = true` with `tls_cert` and `tls_key` to load a PEM certificate chain and ECDSA P-256 private key directly into Layerline. If TLS is enabled without a cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
+Set `tls = true` with `tls_cert` and `tls_key` to load a PEM certificate chain and private key directly into Layerline. If TLS is enabled without a cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
 
 ```ini
 tls = true
@@ -285,7 +285,7 @@ tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 ```
 
-The configured certificate path currently supports ECDSA P-256 private keys in SEC1 (`BEGIN EC PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form. RSA private keys are still on the roadmap.
+The configured certificate path supports ECDSA P-256 private keys in SEC1 (`BEGIN EC PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form, plus RSA private keys in PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form.
 
 ### Auto Let's Encrypt
 

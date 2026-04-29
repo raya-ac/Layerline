@@ -3,14 +3,29 @@ const tls13_native = @import("tls13_native.zig");
 
 const EC_PUBLIC_KEY_OID = "\x2a\x86\x48\xce\x3d\x02\x01";
 const PRIME256V1_OID = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
+const RSA_ENCRYPTION_OID = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+
+pub const ConfiguredPrivateKey = union(enum) {
+    ecdsa_p256: tls13_native.EcdsaP256Sha256.KeyPair,
+    rsa: tls13_native.RsaPrivateKey,
+
+    pub fn deinit(self: *ConfiguredPrivateKey, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ecdsa_p256 => {},
+            .rsa => |*key| key.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
 
 pub const ConfiguredTlsMaterial = struct {
     certificate_chain: []const []const u8,
-    ecdsa_key_pair: tls13_native.EcdsaP256Sha256.KeyPair,
+    private_key: ConfiguredPrivateKey,
 
     pub fn deinit(self: *ConfiguredTlsMaterial, allocator: std.mem.Allocator) void {
         for (self.certificate_chain) |cert| allocator.free(cert);
         allocator.free(self.certificate_chain);
+        self.private_key.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -83,19 +98,24 @@ pub fn decodeCertificateChainPem(allocator: std.mem.Allocator, pem: []const u8) 
     return chain.toOwnedSlice(allocator);
 }
 
-pub fn decodeEcdsaP256PrivateKeyPem(
+pub fn decodePrivateKeyPem(
     allocator: std.mem.Allocator,
     pem: []const u8,
-) !tls13_native.EcdsaP256Sha256.KeyPair {
+) !ConfiguredPrivateKey {
     if (findPemBlock(pem, "EC PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
         defer allocator.free(decoded);
-        return parseSec1EcPrivateKey(decoded);
+        return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(decoded) };
+    }
+    if (findPemBlock(pem, "RSA PRIVATE KEY", 0)) |block| {
+        const decoded = try decodeBase64PemBody(allocator, block.body);
+        defer allocator.free(decoded);
+        return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, decoded) };
     }
     if (findPemBlock(pem, "PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
         defer allocator.free(decoded);
-        return parsePkcs8PrivateKey(decoded);
+        return parsePkcs8PrivateKey(allocator, decoded);
     }
     return error.MissingPrivateKeyPemBlock;
 }
@@ -111,13 +131,21 @@ pub fn loadMaterialFromPem(
         allocator.free(chain);
     }
 
-    const key_pair = try decodeEcdsaP256PrivateKeyPem(allocator, key_pem);
-    const public_key_sec1 = key_pair.public_key.toUncompressedSec1();
-    if (std.mem.indexOf(u8, chain[0], &public_key_sec1) == null) return error.CertificateKeyMismatch;
+    var private_key = try decodePrivateKeyPem(allocator, key_pem);
+    errdefer private_key.deinit(allocator);
+    switch (private_key) {
+        .ecdsa_p256 => |key_pair| {
+            const public_key_sec1 = key_pair.public_key.toUncompressedSec1();
+            if (std.mem.indexOf(u8, chain[0], &public_key_sec1) == null) return error.CertificateKeyMismatch;
+        },
+        .rsa => |key| {
+            if (std.mem.indexOf(u8, chain[0], key.modulus) == null) return error.CertificateKeyMismatch;
+        },
+    }
 
     return .{
         .certificate_chain = chain,
-        .ecdsa_key_pair = key_pair,
+        .private_key = private_key,
     };
 }
 
@@ -164,7 +192,31 @@ fn parseSec1EcPrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair 
     return tls13_native.EcdsaP256Sha256.KeyPair.fromSecretKey(secret);
 }
 
-fn parsePkcs8PrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair {
+fn parsePkcs1RsaPrivateKey(allocator: std.mem.Allocator, der: []const u8) !tls13_native.RsaPrivateKey {
+    var reader = DerReader{ .bytes = der };
+    var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
+    if (!reader.done()) return error.TrailingDerData;
+
+    _ = try seq.readExpected(0x02);
+    const modulus = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    errdefer allocator.free(modulus);
+    const public_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    errdefer allocator.free(public_exponent);
+    const private_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    errdefer allocator.free(private_exponent);
+
+    if (modulus.len < 64 or modulus.len > 512) return error.UnsupportedRsaModulusLength;
+    if (private_exponent.len == 0 or private_exponent.len > modulus.len) return error.InvalidRsaPrivateExponent;
+    if (public_exponent.len == 0 or public_exponent.len > 4) return error.InvalidRsaPublicExponent;
+
+    return .{
+        .modulus = modulus,
+        .public_exponent = public_exponent,
+        .private_exponent = private_exponent,
+    };
+}
+
+fn parsePkcs8PrivateKey(allocator: std.mem.Allocator, der: []const u8) !ConfiguredPrivateKey {
     var reader = DerReader{ .bytes = der };
     var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
     if (!reader.done()) return error.TrailingDerData;
@@ -172,12 +224,27 @@ fn parsePkcs8PrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair {
     _ = try seq.readExpected(0x02);
     var algorithm = DerReader{ .bytes = try seq.readExpected(0x30) };
     const algorithm_oid = try algorithm.readExpected(0x06);
-    const curve_oid = try algorithm.readExpected(0x06);
-    if (!std.mem.eql(u8, algorithm_oid, EC_PUBLIC_KEY_OID)) return error.UnsupportedPrivateKeyAlgorithm;
-    if (!std.mem.eql(u8, curve_oid, PRIME256V1_OID)) return error.UnsupportedPrivateKeyCurve;
-
     const wrapped_private_key = try seq.readExpected(0x04);
-    return parseSec1EcPrivateKey(wrapped_private_key);
+
+    if (std.mem.eql(u8, algorithm_oid, EC_PUBLIC_KEY_OID)) {
+        const curve_oid = try algorithm.readExpected(0x06);
+        if (!std.mem.eql(u8, curve_oid, PRIME256V1_OID)) return error.UnsupportedPrivateKeyCurve;
+        return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(wrapped_private_key) };
+    }
+
+    if (std.mem.eql(u8, algorithm_oid, RSA_ENCRYPTION_OID)) {
+        return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, wrapped_private_key) };
+    }
+
+    return error.UnsupportedPrivateKeyAlgorithm;
+}
+
+fn trimDerInteger(value: []const u8) []const u8 {
+    var offset: usize = 0;
+    while (offset + 1 < value.len and value[offset] == 0) {
+        offset += 1;
+    }
+    return value[offset..];
 }
 
 fn appendDerLength(allocator: std.mem.Allocator, out: *std.ArrayList(u8), len: usize) !void {
@@ -238,4 +305,28 @@ test "parses SEC1 ECDSA P-256 private keys" {
 
     const parsed = try parseSec1EcPrivateKey(der.items);
     try std.testing.expectEqualSlices(u8, &kp.public_key.toUncompressedSec1(), &parsed.public_key.toUncompressedSec1());
+}
+
+test "parses PKCS1 RSA private keys" {
+    var modulus = [_]u8{0x55} ** 128;
+    modulus[0] = 0x7f;
+    var private_exponent = [_]u8{0x33} ** 128;
+    private_exponent[0] = 0x11;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try appendTlv(std.testing.allocator, &body, 0x02, "\x00");
+    try appendTlv(std.testing.allocator, &body, 0x02, &modulus);
+    try appendTlv(std.testing.allocator, &body, 0x02, "\x01\x00\x01");
+    try appendTlv(std.testing.allocator, &body, 0x02, &private_exponent);
+
+    var der = std.ArrayList(u8).empty;
+    defer der.deinit(std.testing.allocator);
+    try appendTlv(std.testing.allocator, &der, 0x30, body.items);
+
+    var parsed = try parsePkcs1RsaPrivateKey(std.testing.allocator, der.items);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &modulus, parsed.modulus);
+    try std.testing.expectEqualStrings("\x01\x00\x01", parsed.public_exponent);
+    try std.testing.expectEqualSlices(u8, &private_exponent, parsed.private_exponent);
 }
