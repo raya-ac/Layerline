@@ -27,6 +27,9 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
 const DEFAULT_UPSTREAM_RETRIES = 1;
 const DEFAULT_UPSTREAM_MAX_FAILURES = 2;
 const DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS = 10_000;
+const DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE = 16;
+const DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS = 100;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 1_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
@@ -198,6 +201,24 @@ const HttpRequest = struct {
     close_connection: bool,
 };
 
+const UpstreamIdleConnection = struct {
+    stream: std.Io.net.Stream,
+    expires_at_ms: i64,
+    requests_served: usize,
+};
+
+const UpstreamKeepAlivePool = struct {
+    mutex: std.Io.Mutex,
+    idle: std.ArrayList(UpstreamIdleConnection),
+
+    fn init() UpstreamKeepAlivePool {
+        return .{
+            .mutex = .init,
+            .idle = .empty,
+        };
+    }
+};
+
 // Parsed form of a configured upstream endpoint.
 const UpstreamConfig = struct {
     host: []const u8,
@@ -205,6 +226,7 @@ const UpstreamConfig = struct {
     base_path: []const u8,
     https: bool,
     weight: usize,
+    keepalive_pool: UpstreamKeepAlivePool,
     active_requests: std.atomic.Value(usize),
     passive_failures: std.atomic.Value(usize),
     ejected_until_ms: std.atomic.Value(i64),
@@ -343,6 +365,10 @@ const ServerConfig = struct {
     upstream_retries: usize,
     upstream_max_failures: usize,
     upstream_fail_timeout_ms: u32,
+    upstream_keepalive_enabled: bool,
+    upstream_keepalive_max_idle: usize,
+    upstream_keepalive_idle_timeout_ms: u32,
+    upstream_keepalive_max_requests: usize,
     upstream_health_check_enabled: bool,
     upstream_health_check_path: []const u8,
     upstream_health_check_interval_ms: u32,
@@ -1053,6 +1079,10 @@ const ServerMetrics = struct {
     upstream_retries_total: std.atomic.Value(usize),
     upstream_ejections_total: std.atomic.Value(usize),
     upstream_ejected_skips_total: std.atomic.Value(usize),
+    upstream_connections_opened_total: std.atomic.Value(usize),
+    upstream_connections_reused_total: std.atomic.Value(usize),
+    upstream_connections_pooled_total: std.atomic.Value(usize),
+    upstream_connections_discarded_total: std.atomic.Value(usize),
     upstream_health_checks_total: std.atomic.Value(usize),
     upstream_health_check_failures_total: std.atomic.Value(usize),
     upstream_health_check_recoveries_total: std.atomic.Value(usize),
@@ -1082,6 +1112,10 @@ const ServerMetrics = struct {
             .upstream_retries_total = std.atomic.Value(usize).init(0),
             .upstream_ejections_total = std.atomic.Value(usize).init(0),
             .upstream_ejected_skips_total = std.atomic.Value(usize).init(0),
+            .upstream_connections_opened_total = std.atomic.Value(usize).init(0),
+            .upstream_connections_reused_total = std.atomic.Value(usize).init(0),
+            .upstream_connections_pooled_total = std.atomic.Value(usize).init(0),
+            .upstream_connections_discarded_total = std.atomic.Value(usize).init(0),
             .upstream_health_checks_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_failures_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_recoveries_total = std.atomic.Value(usize).init(0),
@@ -1166,6 +1200,22 @@ const ServerMetrics = struct {
 
     fn upstreamEjectedSkip(self: *ServerMetrics) void {
         ServerMetrics.inc(&self.upstream_ejected_skips_total);
+    }
+
+    fn upstreamConnectionOpened(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_connections_opened_total);
+    }
+
+    fn upstreamConnectionReused(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_connections_reused_total);
+    }
+
+    fn upstreamConnectionPooled(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_connections_pooled_total);
+    }
+
+    fn upstreamConnectionDiscarded(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_connections_discarded_total);
     }
 
     fn upstreamHealthCheckRan(self: *ServerMetrics) void {
@@ -1822,6 +1872,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.upstream_max_failures = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "upstream_fail_timeout_ms") or std.mem.eql(u8, k, "proxy_fail_timeout_ms")) {
         cfg.upstream_fail_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_keepalive") or std.mem.eql(u8, k, "proxy_keepalive")) {
+        cfg.upstream_keepalive_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "upstream_keepalive_max_idle") or std.mem.eql(u8, k, "proxy_keepalive_max_idle")) {
+        cfg.upstream_keepalive_max_idle = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "upstream_keepalive_idle_timeout_ms") or std.mem.eql(u8, k, "proxy_keepalive_idle_timeout_ms")) {
+        cfg.upstream_keepalive_idle_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_keepalive_max_requests") or std.mem.eql(u8, k, "proxy_keepalive_max_requests")) {
+        cfg.upstream_keepalive_max_requests = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "upstream_health_check") or std.mem.eql(u8, k, "upstream_health_check_enabled") or std.mem.eql(u8, k, "active_health_check") or std.mem.eql(u8, k, "proxy_health_check")) {
         cfg.upstream_health_check_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "upstream_health_check_path") or std.mem.eql(u8, k, "proxy_health_check_path")) {
@@ -2114,6 +2172,12 @@ fn normalizeConfig(cfg: *ServerConfig) void {
     }
     if (cfg.max_php_output_bytes == 0) {
         cfg.max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES;
+    }
+    if (cfg.upstream_keepalive_max_requests == 0) {
+        cfg.upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS;
+    }
+    if (cfg.upstream_keepalive_idle_timeout_ms == 0) {
+        cfg.upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS;
     }
     if (cfg.worker_stack_size < 16 * 1024) {
         cfg.worker_stack_size = 16 * 1024;
@@ -2569,6 +2633,18 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             "# HELP layerline_upstream_ejected_skips_total Proxy attempts skipped because a target is in passive-health cooldown.\n" ++
             "# TYPE layerline_upstream_ejected_skips_total counter\n" ++
             "layerline_upstream_ejected_skips_total {d}\n" ++
+            "# HELP layerline_upstream_connections_opened_total New TCP connections opened to upstream targets.\n" ++
+            "# TYPE layerline_upstream_connections_opened_total counter\n" ++
+            "layerline_upstream_connections_opened_total {d}\n" ++
+            "# HELP layerline_upstream_connections_reused_total Idle upstream TCP connections reused from a keep-alive pool.\n" ++
+            "# TYPE layerline_upstream_connections_reused_total counter\n" ++
+            "layerline_upstream_connections_reused_total {d}\n" ++
+            "# HELP layerline_upstream_connections_pooled_total Upstream TCP connections returned to an idle keep-alive pool.\n" ++
+            "# TYPE layerline_upstream_connections_pooled_total counter\n" ++
+            "layerline_upstream_connections_pooled_total {d}\n" ++
+            "# HELP layerline_upstream_connections_discarded_total Upstream TCP connections closed instead of pooled or reused.\n" ++
+            "# TYPE layerline_upstream_connections_discarded_total counter\n" ++
+            "layerline_upstream_connections_discarded_total {d}\n" ++
             "# HELP layerline_upstream_health_checks_total Active upstream health probes run.\n" ++
             "# TYPE layerline_upstream_health_checks_total counter\n" ++
             "layerline_upstream_health_checks_total {d}\n" ++
@@ -2606,6 +2682,10 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.upstream_retries_total),
             ServerMetrics.load(&server_metrics.upstream_ejections_total),
             ServerMetrics.load(&server_metrics.upstream_ejected_skips_total),
+            ServerMetrics.load(&server_metrics.upstream_connections_opened_total),
+            ServerMetrics.load(&server_metrics.upstream_connections_reused_total),
+            ServerMetrics.load(&server_metrics.upstream_connections_pooled_total),
+            ServerMetrics.load(&server_metrics.upstream_connections_discarded_total),
             ServerMetrics.load(&server_metrics.upstream_health_checks_total),
             ServerMetrics.load(&server_metrics.upstream_health_check_failures_total),
             ServerMetrics.load(&server_metrics.upstream_health_check_recoveries_total),
@@ -3289,6 +3369,7 @@ fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig 
         .base_path = dupe_path,
         .https = scheme_https,
         .weight = 1,
+        .keepalive_pool = UpstreamKeepAlivePool.init(),
         .active_requests = std.atomic.Value(usize).init(0),
         .passive_failures = std.atomic.Value(usize).init(0),
         .ejected_until_ms = std.atomic.Value(i64).init(0),
@@ -3612,8 +3693,6 @@ fn isSkippedProxyHeader(name: []const u8) bool {
 }
 
 fn isSkippedProxyResponseHeader(name: []const u8) bool {
-    // The proxy closes the client connection after each upstream response, so
-    // forwarding an upstream "keep-alive" promise would be a lie.
     return std.ascii.eqlIgnoreCase(name, "Connection") or
         std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
         std.ascii.eqlIgnoreCase(name, "Proxy-Authenticate") or
@@ -3623,7 +3702,277 @@ fn isSkippedProxyResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Upgrade");
 }
 
-fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream) !void {
+const UpstreamConnectionLease = struct {
+    stream: std.Io.net.Stream,
+    requests_served: usize,
+};
+
+const UpstreamResponseForwardResult = struct {
+    reusable: bool,
+};
+
+const UpstreamResponseFraming = struct {
+    status_code: ?u16,
+    content_length: ?usize,
+    transfer_chunked: bool,
+    connection_close: bool,
+};
+
+const ChunkScanState = enum {
+    size,
+    size_lf,
+    data,
+    data_cr,
+    data_lf,
+    trailer,
+    trailer_lf,
+    done,
+};
+
+const ChunkedBodyScanner = struct {
+    state: ChunkScanState = .size,
+    chunk_size: usize = 0,
+    remaining: usize = 0,
+    saw_size_digit: bool = false,
+    in_extension: bool = false,
+    trailer_line_start: bool = true,
+
+    fn resetSize(self: *ChunkedBodyScanner) void {
+        self.chunk_size = 0;
+        self.saw_size_digit = false;
+        self.in_extension = false;
+    }
+
+    fn consume(self: *ChunkedBodyScanner, byte: u8) !bool {
+        switch (self.state) {
+            .size => {
+                if (byte == ';') {
+                    if (!self.saw_size_digit) return error.BadGateway;
+                    self.in_extension = true;
+                    return false;
+                }
+                if (byte == '\r') {
+                    if (!self.saw_size_digit) return error.BadGateway;
+                    self.state = .size_lf;
+                    return false;
+                }
+                if (self.in_extension) return false;
+
+                const digit = std.fmt.charToDigit(byte, 16) catch return error.BadGateway;
+                self.saw_size_digit = true;
+                self.chunk_size = std.math.mul(usize, self.chunk_size, 16) catch return error.BadGateway;
+                self.chunk_size = std.math.add(usize, self.chunk_size, digit) catch return error.BadGateway;
+                return false;
+            },
+            .size_lf => {
+                if (byte != '\n') return error.BadGateway;
+                if (self.chunk_size == 0) {
+                    self.trailer_line_start = true;
+                    self.state = .trailer;
+                } else {
+                    self.remaining = self.chunk_size;
+                    self.state = .data;
+                }
+                self.resetSize();
+                return false;
+            },
+            .data => {
+                self.remaining -= 1;
+                if (self.remaining == 0) self.state = .data_cr;
+                return false;
+            },
+            .data_cr => {
+                if (byte != '\r') return error.BadGateway;
+                self.state = .data_lf;
+                return false;
+            },
+            .data_lf => {
+                if (byte != '\n') return error.BadGateway;
+                self.state = .size;
+                return false;
+            },
+            .trailer => {
+                if (byte == '\r') {
+                    self.state = .trailer_lf;
+                } else {
+                    self.trailer_line_start = false;
+                }
+                return false;
+            },
+            .trailer_lf => {
+                if (byte != '\n') return error.BadGateway;
+                if (self.trailer_line_start) {
+                    self.state = .done;
+                    return true;
+                }
+                self.trailer_line_start = true;
+                self.state = .trailer;
+                return false;
+            },
+            .done => return true,
+        }
+    }
+};
+
+fn upstreamKeepaliveConfigured(cfg: *const ServerConfig) bool {
+    return cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0;
+}
+
+fn closeIdleUpstreamConnection(conn: UpstreamIdleConnection) void {
+    streamClose(conn.stream);
+    server_metrics.upstreamConnectionDiscarded();
+}
+
+fn upstreamAcquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, now_ms: i64) !UpstreamConnectionLease {
+    if (upstreamKeepaliveConfigured(cfg) and !upstream.https) {
+        const io = activeIo();
+        upstream.keepalive_pool.mutex.lockUncancelable(io);
+        defer upstream.keepalive_pool.mutex.unlock(io);
+
+        while (upstream.keepalive_pool.idle.pop()) |conn| {
+            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests) {
+                closeIdleUpstreamConnection(conn);
+                continue;
+            }
+
+            server_metrics.upstreamConnectionReused();
+            return .{
+                .stream = conn.stream,
+                .requests_served = conn.requests_served,
+            };
+        }
+    }
+
+    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
+    try setStreamTimeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
+    server_metrics.upstreamConnectionOpened();
+    return .{
+        .stream = upstream_conn,
+        .requests_served = 0,
+    };
+}
+
+fn upstreamReleaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease: UpstreamConnectionLease, reusable: bool, now_ms: i64) void {
+    if (!reusable or !upstreamKeepaliveConfigured(cfg) or upstream.https) {
+        streamClose(lease.stream);
+        server_metrics.upstreamConnectionDiscarded();
+        return;
+    }
+
+    const served = lease.requests_served + 1;
+    if (served >= cfg.upstream_keepalive_max_requests) {
+        streamClose(lease.stream);
+        server_metrics.upstreamConnectionDiscarded();
+        return;
+    }
+
+    const idle_conn = UpstreamIdleConnection{
+        .stream = lease.stream,
+        .expires_at_ms = now_ms + @as(i64, @intCast(cfg.upstream_keepalive_idle_timeout_ms)),
+        .requests_served = served,
+    };
+
+    const io = activeIo();
+    upstream.keepalive_pool.mutex.lockUncancelable(io);
+    defer upstream.keepalive_pool.mutex.unlock(io);
+
+    while (upstream.keepalive_pool.idle.items.len >= cfg.upstream_keepalive_max_idle) {
+        closeIdleUpstreamConnection(upstream.keepalive_pool.idle.orderedRemove(0));
+    }
+
+    upstream.keepalive_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
+        streamClose(idle_conn.stream);
+        server_metrics.upstreamConnectionDiscarded();
+        return;
+    };
+    server_metrics.upstreamConnectionPooled();
+}
+
+fn parseOptionalContentLength(headers: []const u8) !?usize {
+    if (findHeaderValue(headers, "Content-Length")) |raw| {
+        const value = trimValue(raw);
+        if (value.len == 0) return error.BadGateway;
+        return std.fmt.parseInt(usize, value, 10) catch return error.BadGateway;
+    }
+    return null;
+}
+
+fn parseUpstreamResponseFraming(header_bytes: []const u8, response_headers: []const u8) !UpstreamResponseFraming {
+    const connection = findHeaderValue(response_headers, "Connection") orelse "";
+    const transfer_encoding = findHeaderValue(response_headers, "Transfer-Encoding") orelse "";
+    return .{
+        .status_code = parseHttpStatusCode(header_bytes),
+        .content_length = try parseOptionalContentLength(response_headers),
+        .transfer_chunked = hasConnectionToken(transfer_encoding, "chunked"),
+        .connection_close = hasConnectionToken(connection, "close"),
+    };
+}
+
+fn responseHasNoBody(method: []const u8, status_code: ?u16) bool {
+    if (std.ascii.eqlIgnoreCase(method, "HEAD")) return true;
+    const code = status_code orelse return false;
+    return (code >= 100 and code < 200) or code == 204 or code == 304;
+}
+
+fn forwardFixedUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, content_length: usize) !bool {
+    const initial = @min(body_tail.len, content_length);
+    if (initial > 0) streamWriteAll(stream, body_tail[0..initial]) catch return error.CloseConnection;
+    if (body_tail.len > content_length) return false;
+
+    var remaining = content_length - initial;
+    var buf: [8192]u8 = undefined;
+    while (remaining > 0) {
+        const max_read = @min(remaining, buf.len);
+        const n = try streamRead(upstream_conn, buf[0..max_read]);
+        if (n == 0) return error.BadGateway;
+        remaining -= n;
+        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
+    }
+    return true;
+}
+
+fn forwardChunkedUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8) !void {
+    var scanner = ChunkedBodyScanner{};
+
+    if (body_tail.len > 0) {
+        var consumed: usize = 0;
+        while (consumed < body_tail.len) : (consumed += 1) {
+            if (try scanner.consume(body_tail[consumed])) {
+                streamWriteAll(stream, body_tail[0 .. consumed + 1]) catch return error.CloseConnection;
+                return;
+            }
+        }
+        streamWriteAll(stream, body_tail) catch return error.CloseConnection;
+    }
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try streamRead(upstream_conn, &buf);
+        if (n == 0) return error.BadGateway;
+
+        var consumed: usize = 0;
+        while (consumed < n) : (consumed += 1) {
+            if (try scanner.consume(buf[consumed])) {
+                streamWriteAll(stream, buf[0 .. consumed + 1]) catch return error.CloseConnection;
+                return;
+            }
+        }
+        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
+    }
+}
+
+fn forwardUnknownLengthUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8) !void {
+    if (body_tail.len > 0) streamWriteAll(stream, body_tail) catch return error.CloseConnection;
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try streamRead(upstream_conn, &buf);
+        if (n == 0) break;
+        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
+    }
+}
+
+fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest) !UpstreamResponseForwardResult {
     var response_buffer: [DEFAULT_MAX_REQUEST_BYTES]u8 = undefined;
     var used: usize = 0;
 
@@ -3643,13 +3992,13 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
 
     const headers_start = status_line_end + 2;
     const headers_end = header_end - 4;
-    var response_started = false;
+    const response_headers = header_bytes[headers_start..headers_end];
+    const framing = try parseUpstreamResponseFraming(header_bytes, response_headers);
 
     streamWriteAll(stream, header_bytes[0..status_line_end]) catch return error.CloseConnection;
-    response_started = true;
     streamWriteAll(stream, "\r\n") catch return error.CloseConnection;
 
-    var headers = std.mem.splitSequence(u8, header_bytes[headers_start..headers_end], "\r\n");
+    var headers = std.mem.splitSequence(u8, response_headers, "\r\n");
     while (headers.next()) |line| {
         const trimmed = trimValue(line);
         if (trimmed.len == 0) continue;
@@ -3662,27 +4011,36 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
     }
 
     streamWriteAll(stream, "Connection: close\r\n\r\n") catch return error.CloseConnection;
-    if (body_tail.len > 0) streamWriteAll(stream, body_tail) catch return error.CloseConnection;
 
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = streamRead(upstream_conn, &buf) catch |err| {
-            if (response_started) return error.CloseConnection;
-            return err;
-        };
-        if (n == 0) break;
-        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
+    if (responseHasNoBody(req.method, framing.status_code)) {
+        return .{ .reusable = !framing.connection_close and body_tail.len == 0 };
     }
+    if (framing.content_length) |content_length| {
+        const completed = try forwardFixedUpstreamBody(stream, upstream_conn, body_tail, content_length);
+        return .{ .reusable = completed and !framing.connection_close };
+    }
+    if (framing.transfer_chunked) {
+        try forwardChunkedUpstreamBody(stream, upstream_conn, body_tail);
+        return .{ .reusable = !framing.connection_close };
+    }
+
+    try forwardUnknownLengthUpstreamBody(stream, upstream_conn, body_tail);
+    return .{ .reusable = false };
 }
 
-fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *const UpstreamConfig, req: HttpRequest, upstream_timeout_ms: u32) !void {
+fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig) !void {
     if (upstream.https) {
         return error.UnsupportedUpstreamScheme;
     }
 
-    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
-    defer streamClose(upstream_conn);
-    try setStreamTimeouts(upstream_conn, upstream_timeout_ms, upstream_timeout_ms);
+    const keepalive_enabled = upstreamKeepaliveConfigured(cfg);
+    const lease = try upstreamAcquireConnection(allocator, upstream, cfg, upstreamNowMs());
+    var lease_released = false;
+    defer if (!lease_released) {
+        streamClose(lease.stream);
+        server_metrics.upstreamConnectionDiscarded();
+    };
+    try setStreamTimeouts(lease.stream, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
 
     const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
     defer allocator.free(proxy_path);
@@ -3694,11 +4052,12 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     // Content-Length here caused duplicate lengths and strict backends rejected it.
     try out.print(
         allocator,
-        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n",
+        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: {s}\r\n",
         .{
             req.method,
             proxy_path,
             upstream.host,
+            if (keepalive_enabled) "keep-alive" else "close",
         },
     );
 
@@ -3723,14 +4082,14 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     const request_line = try out.toOwnedSlice(allocator);
     defer allocator.free(request_line);
 
-    streamWriteAll(upstream_conn, request_line) catch |err| switch (err) {
+    streamWriteAll(lease.stream, request_line) catch |err| switch (err) {
         error.RequestTimeout => {
             return err;
         },
         else => |e| return e,
     };
     if (req.body.len > 0) {
-        streamWriteAll(upstream_conn, req.body) catch |err| switch (err) {
+        streamWriteAll(lease.stream, req.body) catch |err| switch (err) {
             error.RequestTimeout => {
                 return err;
             },
@@ -3738,12 +4097,14 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         };
     }
 
-    forwardUpstreamResponse(stream, upstream_conn) catch |err| switch (err) {
+    const result = forwardUpstreamResponse(stream, lease.stream, req) catch |err| switch (err) {
         error.RequestTimeout => {
             return err;
         },
         else => |e| return e,
     };
+    upstreamReleaseConnection(upstream, cfg, lease, result.reusable, upstreamNowMs());
+    lease_released = true;
 
     return error.CloseConnection;
 }
@@ -3893,17 +4254,14 @@ fn forwardToUpstreamPool(
     pool: *UpstreamPoolConfig,
     policy: UpstreamPoolPolicy,
     req: HttpRequest,
-    upstream_timeout_ms: u32,
-    upstream_retries: usize,
-    upstream_max_failures: usize,
-    upstream_fail_timeout_ms: u32,
+    cfg: *const ServerConfig,
 ) !void {
     if (pool.targets.items.len == 0) {
         try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, false, null);
         return;
     }
 
-    const attempt_limit = upstreamAttemptLimit(pool, upstream_retries);
+    const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
     const now_ms = upstreamNowMs();
     const start_ticket = upstreamStartTicket(pool, policy, now_ms, req);
     var considered: usize = 0;
@@ -3923,7 +4281,7 @@ fn forwardToUpstreamPool(
         attempts += 1;
         server_metrics.upstreamRequestStarted();
         upstreamBeginAttempt(upstream);
-        forwardToUpstream(stream, allocator, upstream, req, upstream_timeout_ms) catch |err| switch (err) {
+        forwardToUpstream(stream, allocator, upstream, req, cfg) catch |err| switch (err) {
             error.CloseConnection => {
                 upstreamEndAttempt(upstream);
                 upstreamRecordSuccess(upstream);
@@ -3937,7 +4295,7 @@ fn forwardToUpstreamPool(
                 upstreamEndAttempt(upstream);
                 last_error = err;
                 server_metrics.upstreamRequestFailed();
-                if (upstreamRecordFailure(upstream, now_ms, upstream_max_failures, upstream_fail_timeout_ms)) {
+                if (upstreamRecordFailure(upstream, now_ms, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
                     server_metrics.upstreamEjected();
                 }
                 continue :attempt_loop;
@@ -4473,7 +4831,7 @@ fn handleNamedRoute(
                     try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
                     return;
                 };
-            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg);
             return;
         },
     }
@@ -4526,6 +4884,10 @@ test "named routes prefer exact and longest prefix matches" {
         .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
         .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
         .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,
+        .upstream_keepalive_enabled = true,
+        .upstream_keepalive_max_idle = DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE,
+        .upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS,
         .upstream_health_check_enabled = false,
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
@@ -4551,6 +4913,10 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_policy", "random");
     try applyConfigLine(&cfg, allocator, "upstream_max_failures", "3");
     try applyConfigLine(&cfg, allocator, "upstream_fail_timeout_ms", "1500");
+    try applyConfigLine(&cfg, allocator, "upstream_keepalive", "true");
+    try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_idle", "24");
+    try applyConfigLine(&cfg, allocator, "upstream_keepalive_idle_timeout_ms", "45000");
+    try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_requests", "250");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -4564,6 +4930,10 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(UpstreamPoolPolicy.random, cfg.upstream_policy);
     try std.testing.expectEqual(@as(usize, 3), cfg.upstream_max_failures);
     try std.testing.expectEqual(@as(u32, 1500), cfg.upstream_fail_timeout_ms);
+    try std.testing.expect(cfg.upstream_keepalive_enabled);
+    try std.testing.expectEqual(@as(usize, 24), cfg.upstream_keepalive_max_idle);
+    try std.testing.expectEqual(@as(u32, 45000), cfg.upstream_keepalive_idle_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 250), cfg.upstream_keepalive_max_requests);
     try std.testing.expect(cfg.upstream_health_check_enabled);
     try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
     try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
@@ -4750,6 +5120,29 @@ test "health check status parser accepts normal HTTP status lines" {
     try std.testing.expectEqual(@as(?u16, 200), parseHttpStatusCode("HTTP/1.1 200 OK\r\nServer: test\r\n\r\n"));
     try std.testing.expectEqual(@as(?u16, 503), parseHttpStatusCode("HTTP/1.0 503 Service Unavailable\r\n\r\n"));
     try std.testing.expectEqual(@as(?u16, null), parseHttpStatusCode("not-http\r\n\r\n"));
+}
+
+test "chunked upstream body scanner detects trailers and terminator" {
+    var scanner = ChunkedBodyScanner{};
+    var completed = false;
+    for ("4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Upstream: yes\r\n\r\n") |byte| {
+        completed = try scanner.consume(byte);
+    }
+    try std.testing.expect(completed);
+}
+
+test "upstream response framing parser keeps keep-alive candidates explicit" {
+    const head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Length: 12\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "\r\n";
+    const headers = head["HTTP/1.1 200 OK\r\n".len .. head.len - 4];
+    const framing = try parseUpstreamResponseFraming(head, headers);
+    try std.testing.expectEqual(@as(?u16, 200), framing.status_code);
+    try std.testing.expectEqual(@as(?usize, 12), framing.content_length);
+    try std.testing.expect(!framing.connection_close);
+    try std.testing.expect(!framing.transfer_chunked);
 }
 
 test "passive upstream health ejects and recovers targets" {
@@ -5266,7 +5659,7 @@ fn routeRequest(
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
             return;
         }
 
@@ -5292,7 +5685,7 @@ fn routeRequest(
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
             return;
         }
 
@@ -5310,7 +5703,7 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
             return;
         }
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
@@ -6669,13 +7062,14 @@ fn usage() void {
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N] [--read-header-timeout-ms N] " ++
             "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] [--upstream-retries N] [--upstream-max-failures N] [--upstream-fail-timeout-ms N] " ++
+            "[--upstream-keepalive true|false] [--upstream-keepalive-max-idle N] [--upstream-keepalive-idle-timeout-ms N] [--upstream-keepalive-max-requests N] " ++
             "[--upstream-health-check true|false] [--upstream-health-path /health] [--upstream-health-interval-ms N] [--upstream-health-timeout-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
-            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, graceful_shutdown_timeout_ms, " ++
+            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
@@ -6694,15 +7088,16 @@ fn usage() void {
             "  zig build run -- --domain-config-dir domains-enabled --dump-routes\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random\n" ++
+            "  zig build run -- --proxy http://127.0.0.1:9000 --upstream-keepalive true --upstream-keepalive-max-idle 32\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-health-check true\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
             "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
             "Notes:\n" ++
-            "  This is a thread-per-connection model for now. For very high fan-in (large counts of\n" ++
-            "  open keep-alive sockets), place this server behind a TLS/HTTP proxy with strict\n" ++
-            "  timeout and connection management policies.\n" ++
+            "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
+            "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
+            "  and connection management policies.\n" ++
             "  Native HTTP/3 currently covers the local default-page path, with broader routing\n" ++
             "  and certificate trust/automation still kept separate from the HTTP/1 surface.\n",
         .{},
@@ -6769,6 +7164,10 @@ pub fn main(init: std.process.Init) !void {
         .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
         .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
         .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,
+        .upstream_keepalive_enabled = true,
+        .upstream_keepalive_max_idle = DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE,
+        .upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS,
         .upstream_health_check_enabled = false,
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
@@ -7045,6 +7444,30 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.upstream_fail_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_fail_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-keepalive") or std.mem.eql(u8, arg, "--proxy-keepalive")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_keepalive_enabled = parseBool(value) orelse cfg.upstream_keepalive_enabled;
+        } else if (std.mem.eql(u8, arg, "--upstream-keepalive-max-idle") or std.mem.eql(u8, arg, "--proxy-keepalive-max-idle")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_keepalive_max_idle = std.fmt.parseInt(usize, value, 10) catch cfg.upstream_keepalive_max_idle;
+        } else if (std.mem.eql(u8, arg, "--upstream-keepalive-idle-timeout-ms") or std.mem.eql(u8, arg, "--proxy-keepalive-idle-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_keepalive_idle_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_keepalive_idle_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-keepalive-max-requests") or std.mem.eql(u8, arg, "--proxy-keepalive-max-requests")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_keepalive_max_requests = std.fmt.parseInt(usize, value, 10) catch cfg.upstream_keepalive_max_requests;
         } else if (std.mem.eql(u8, arg, "--upstream-health-check") or std.mem.eql(u8, arg, "--proxy-health-check")) {
             const value = args.next() orelse {
                 usage();
@@ -7209,7 +7632,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
     if (cfg.upstream != null) {
         const pool = cfg.upstream.?;
-        std.debug.print("Reverse proxy pool: {s} over {d} target(s), retries={d}, max_failures={d}, fail_timeout={d}ms\n", .{ upstreamPoolPolicyName(cfg.upstream_policy), upstreamPoolTargetCount(pool), cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms });
+        std.debug.print("Reverse proxy pool: {s} over {d} target(s), retries={d}, max_failures={d}, fail_timeout={d}ms, keepalive={s} max_idle={d}\n", .{ upstreamPoolPolicyName(cfg.upstream_policy), upstreamPoolTargetCount(pool), cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms, if (upstreamKeepaliveConfigured(&cfg)) "on" else "off", cfg.upstream_keepalive_max_idle });
     }
     if (cfg.h2_upstream != null) {
         const hup = cfg.h2_upstream.?;

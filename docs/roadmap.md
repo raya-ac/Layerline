@@ -43,8 +43,8 @@ Sources:
 ## Phase 3: Reverse Proxy and Load Balancing
 
 - Multiple upstreams per route with round-robin, random, least-connections, weighted, consistent-hash, and sticky-session policies. Initial comma/space-separated upstream pools with configurable round-robin/random/least-connections/weighted/consistent-hash selection and per-target `weight=N` options are implemented for global, domain, and route proxy settings.
-- Active and passive health checks with slow start, outlier ejection, retry budgets, and circuit breakers. Initial upstream attempt/failure/retry/ejection metrics, bounded retry budgets, config-owned health state, passive target cooldown, and opt-in active HTTP probes are implemented; slow start remains next.
-- Upstream connection pools with keep-alive limits, per-host caps, DNS re-resolution, happy-eyeballs dialing, and Unix socket upstreams.
+- Active and passive health checks with slow start, outlier ejection, retry budgets, and circuit breakers. Initial upstream attempt/failure/retry/ejection metrics, bounded retry budgets, config-owned health state, passive target cooldown, and opt-in active HTTP probes are implemented; circuit breakers and slow start remain next.
+- Upstream connection pools with keep-alive limits, per-host caps, DNS re-resolution, happy-eyeballs dialing, and Unix socket upstreams. Initial per-target HTTP/1 upstream keep-alive pooling with idle caps, idle expiry, max-use rotation, framed fixed/chunked response handling, and connection-pool metrics is implemented.
 - WebSocket and CONNECT tunneling.
 - Header rewrite rules: set, append, delete, regex map, forwarded headers, trusted proxy CIDRs, and host/SNI override.
 - Response interception: status/header matchers, custom error fallback, maintenance responses, and retry-on conditions.
@@ -108,7 +108,7 @@ Sources:
 1. Config validation and route gates.
 2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented. Host-based domain configs with per-domain routes and `domain_config_dir` file loading are implemented; route-local TLS/cache/security policy remains next.
 3. Timeouts and graceful shutdown.
-4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection metrics, bounded retry budgets, passive cooldown, and opt-in active HTTP probes are implemented; keep-alive upstream sockets remain next.
+4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection/connect-reuse metrics, bounded retry budgets, passive cooldown, opt-in active HTTP probes, and upstream keep-alive sockets are implemented; circuit breakers and slow start remain next.
 5. FastCGI and PHP front-controller.
 6. Native TLS termination.
 7. HTTP/2 server.
@@ -116,4 +116,4 @@ Sources:
 9. Cache and compression.
 10. Admin API and hot reload.
 
-The next engineering milestone should be a config parser and route table refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
+The next engineering milestone should be circuit breakers plus slow start for upstreams, then a config parser and route table refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
