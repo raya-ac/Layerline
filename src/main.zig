@@ -201,6 +201,7 @@ const UpstreamConfig = struct {
     port: u16,
     base_path: []const u8,
     https: bool,
+    weight: usize,
     active_requests: std.atomic.Value(usize),
     passive_failures: std.atomic.Value(usize),
     ejected_until_ms: std.atomic.Value(i64),
@@ -210,6 +211,7 @@ const UpstreamPoolPolicy = enum {
     round_robin,
     random,
     least_connections,
+    weighted,
 };
 
 const UpstreamPoolConfig = struct {
@@ -1296,6 +1298,7 @@ fn upstreamPoolPolicyName(policy: UpstreamPoolPolicy) []const u8 {
         .round_robin => "round_robin",
         .random => "random",
         .least_connections => "least_connections",
+        .weighted => "weighted",
     };
 }
 
@@ -1316,6 +1319,13 @@ fn parseUpstreamPoolPolicy(value: []const u8) !UpstreamPoolPolicy {
         std.ascii.eqlIgnoreCase(value, "leastconn"))
     {
         return .least_connections;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "weighted") or
+        std.ascii.eqlIgnoreCase(value, "weighted_round_robin") or
+        std.ascii.eqlIgnoreCase(value, "weighted-round-robin") or
+        std.ascii.eqlIgnoreCase(value, "wrr"))
+    {
+        return .weighted;
     }
     return error.InvalidConfigValue;
 }
@@ -3218,10 +3228,30 @@ fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig 
         .port = port,
         .base_path = dupe_path,
         .https = scheme_https,
+        .weight = 1,
         .active_requests = std.atomic.Value(usize).init(0),
         .passive_failures = std.atomic.Value(usize).init(0),
         .ejected_until_ms = std.atomic.Value(i64).init(0),
     };
+}
+
+fn applyUpstreamOption(upstream: *UpstreamConfig, raw: []const u8) !bool {
+    const token = std.mem.trim(u8, raw, " \t\r\n;");
+    const eq = std.mem.indexOfScalar(u8, token, '=') orelse return false;
+    const key = token[0..eq];
+    const value = token[eq + 1 ..];
+
+    if (std.ascii.eqlIgnoreCase(key, "weight") or std.ascii.eqlIgnoreCase(key, "w")) {
+        const weight = std.fmt.parseInt(usize, value, 10) catch return error.InvalidUpstream;
+        if (weight == 0 or weight > 1_000_000) return error.InvalidUpstream;
+        upstream.weight = weight;
+        return true;
+    }
+
+    if (!std.mem.startsWith(u8, token, "http://") and !std.mem.startsWith(u8, token, "https://")) {
+        return error.InvalidUpstream;
+    }
+    return false;
 }
 
 fn parseUpstreamPool(allocator: std.mem.Allocator, raw: []const u8) !UpstreamPoolConfig {
@@ -3234,6 +3264,16 @@ fn parseUpstreamPool(allocator: std.mem.Allocator, raw: []const u8) !UpstreamPoo
     while (parts.next()) |part| {
         const value = trimValue(part);
         if (value.len == 0) continue;
+
+        if (pool.targets.items.len > 0) {
+            if (try applyUpstreamOption(&pool.targets.items[pool.targets.items.len - 1], value)) continue;
+        } else if (std.mem.indexOfScalar(u8, value, '=') != null and
+            !std.mem.startsWith(u8, value, "http://") and
+            !std.mem.startsWith(u8, value, "https://"))
+        {
+            return error.InvalidUpstream;
+        }
+
         try pool.targets.append(allocator, try parseUpstream(allocator, value));
     }
 
@@ -3279,11 +3319,34 @@ fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize 
     return best_index orelse tie_ticket;
 }
 
+fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize {
+    const target_count = pool.targets.items.len;
+    const ticket = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
+    if (target_count == 0) return ticket;
+
+    var total_weight: usize = 0;
+    for (pool.targets.items) |*upstream| {
+        if (upstreamIsEjected(upstream, now_ms)) continue;
+        total_weight += upstream.weight;
+    }
+    if (total_weight == 0) return ticket;
+
+    var remaining = ticket % total_weight;
+    for (pool.targets.items, 0..) |*upstream, index| {
+        if (upstreamIsEjected(upstream, now_ms)) continue;
+        if (remaining < upstream.weight) return index;
+        remaining -= upstream.weight;
+    }
+
+    return ticket;
+}
+
 fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64) usize {
     return switch (policy) {
         .round_robin => upstream_round_robin_cursor.fetchAdd(1, .monotonic),
         .random => upstreamRandomTicket(),
         .least_connections => upstreamLeastConnectionsTicket(pool, now_ms),
+        .weighted => upstreamWeightedTicket(pool, now_ms),
     };
 }
 
@@ -3350,6 +3413,7 @@ fn printUpstreamPool(policy: UpstreamPoolPolicy, pool: UpstreamPoolConfig) void 
     for (pool.targets.items, 0..) |up, i| {
         if (i > 0) std.debug.print(",", .{});
         std.debug.print("{s}:{d}{s}", .{ up.host, up.port, up.base_path });
+        if (up.weight != 1) std.debug.print(" weight={d}", .{up.weight});
     }
     std.debug.print("]", .{});
 }
@@ -4225,7 +4289,24 @@ test "upstream policy parser accepts configured policy names" {
     try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least_connections"));
     try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least-connections"));
     try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("leastconn"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted-round-robin"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("wrr"));
     try std.testing.expectEqual(@as(?UpstreamPoolPolicy, null), try parseOptionalUpstreamPoolPolicy("inherit"));
+}
+
+test "upstream pools parse target weights" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 w=1");
+
+    try std.testing.expectEqual(@as(usize, 2), pool.targets.items.len);
+    try std.testing.expectEqual(@as(usize, 3), pool.targets.items[0].weight);
+    try std.testing.expectEqual(@as(usize, 1), pool.targets.items[1].weight);
+    try std.testing.expectError(error.InvalidUpstream, parseUpstreamPool(allocator, "weight=3 http://127.0.0.1:9000"));
+    try std.testing.expectError(error.InvalidUpstream, parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=0"));
 }
 
 test "least-connections policy chooses the quietest healthy upstream" {
@@ -4242,6 +4323,24 @@ test "least-connections policy chooses the quietest healthy upstream" {
 
     pool.targets.items[1].ejected_until_ms.store(2_000, .monotonic);
     try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000));
+}
+
+test "weighted policy honors target weights and passive ejection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1");
+
+    upstream_round_robin_cursor.store(0, .monotonic);
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000));
+
+    upstream_round_robin_cursor.store(0, .monotonic);
+    pool.targets.items[0].ejected_until_ms.store(2_000, .monotonic);
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000));
 }
 
 test "passive upstream health ejects and recovers targets" {
