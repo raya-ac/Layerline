@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const h3_native = @import("h3_native.zig");
 const h3_state = @import("h3_state.zig");
 const http_response = @import("http_response.zig");
@@ -30,6 +31,11 @@ const HTTP3_MAX_DATAGRAM_BYTES = 1200;
 const HTTP3_CONNECTION_TABLE_CAPACITY = 1024;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
+
+const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+    else => false,
+};
 
 const SERVER_ICON_SVG =
     \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
@@ -660,6 +666,8 @@ const ServerMetrics = struct {
     response_5xx_total: std.atomic.Value(usize),
     response_body_bytes_total: std.atomic.Value(usize),
     static_responses_total: std.atomic.Value(usize),
+    static_sendfile_responses_total: std.atomic.Value(usize),
+    static_buffered_responses_total: std.atomic.Value(usize),
     static_body_bytes_total: std.atomic.Value(usize),
     h3_responses_total: std.atomic.Value(usize),
     h3_packets_sent_total: std.atomic.Value(usize),
@@ -679,6 +687,8 @@ const ServerMetrics = struct {
             .response_5xx_total = std.atomic.Value(usize).init(0),
             .response_body_bytes_total = std.atomic.Value(usize).init(0),
             .static_responses_total = std.atomic.Value(usize).init(0),
+            .static_sendfile_responses_total = std.atomic.Value(usize).init(0),
+            .static_buffered_responses_total = std.atomic.Value(usize).init(0),
             .static_body_bytes_total = std.atomic.Value(usize).init(0),
             .h3_responses_total = std.atomic.Value(usize).init(0),
             .h3_packets_sent_total = std.atomic.Value(usize).init(0),
@@ -734,8 +744,12 @@ const ServerMetrics = struct {
         }
     }
 
-    fn staticBodySent(self: *ServerMetrics, body_bytes: usize) void {
+    fn staticBodySent(self: *ServerMetrics, body_bytes: usize, transfer_mode: StaticTransferMode) void {
         ServerMetrics.inc(&self.static_responses_total);
+        switch (transfer_mode) {
+            .sendfile => ServerMetrics.inc(&self.static_sendfile_responses_total),
+            .buffered => ServerMetrics.inc(&self.static_buffered_responses_total),
+        }
         ServerMetrics.add(&self.static_body_bytes_total, body_bytes);
     }
 
@@ -746,6 +760,11 @@ const ServerMetrics = struct {
 };
 
 var server_metrics = ServerMetrics.init();
+
+const StaticTransferMode = enum {
+    sendfile,
+    buffered,
+};
 
 // Parse CLI/config booleans without crashing on odd values.
 fn parseBool(value: []const u8) ?bool {
@@ -1183,6 +1202,12 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             "# HELP layerline_static_responses_total Static file responses streamed from disk.\n" ++
             "# TYPE layerline_static_responses_total counter\n" ++
             "layerline_static_responses_total {d}\n" ++
+            "# HELP layerline_static_sendfile_responses_total Static file responses transferred with kernel sendfile.\n" ++
+            "# TYPE layerline_static_sendfile_responses_total counter\n" ++
+            "layerline_static_sendfile_responses_total {d}\n" ++
+            "# HELP layerline_static_buffered_responses_total Static file responses transferred through the buffered fallback.\n" ++
+            "# TYPE layerline_static_buffered_responses_total counter\n" ++
+            "layerline_static_buffered_responses_total {d}\n" ++
             "# HELP layerline_h3_responses_total Native HTTP/3 responses sent.\n" ++
             "# TYPE layerline_h3_responses_total counter\n" ++
             "layerline_h3_responses_total {d}\n" ++
@@ -1204,6 +1229,8 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.response_body_bytes_total),
             ServerMetrics.load(&server_metrics.static_body_bytes_total),
             ServerMetrics.load(&server_metrics.static_responses_total),
+            ServerMetrics.load(&server_metrics.static_sendfile_responses_total),
+            ServerMetrics.load(&server_metrics.static_buffered_responses_total),
             ServerMetrics.load(&server_metrics.h3_responses_total),
             ServerMetrics.load(&server_metrics.h3_packets_sent_total),
         },
@@ -1324,6 +1351,41 @@ fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
     return stat;
 }
 
+fn trySendfileStaticRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, body_len: usize) !bool {
+    if (comptime !HAS_DARWIN_SENDFILE) return false;
+    if (body_len == 0) return true;
+
+    var offset = std.math.cast(std.c.off_t, start) orelse return error.FileTooBig;
+    var remaining = body_len;
+    var sent_total: usize = 0;
+
+    while (remaining > 0) {
+        const chunk = @min(remaining, @as(usize, @intCast(std.math.maxInt(i32))));
+        var len: std.c.off_t = @intCast(chunk);
+        switch (std.c.errno(std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0))) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => {
+                if (len == 0) continue;
+            },
+            .OPNOTSUPP, .NOTSOCK, .NOSYS => {
+                if (sent_total == 0) return false;
+                return error.Unexpected;
+            },
+            .PIPE, .NOTCONN => return error.BrokenPipe,
+            .IO => return error.InputOutput,
+            else => return error.Unexpected,
+        }
+
+        if (len <= 0) return error.WriteZero;
+        const sent: usize = @intCast(len);
+        remaining -= sent;
+        sent_total += sent;
+        offset += len;
+    }
+
+    return true;
+}
+
 fn streamStaticFileRangeBody(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -1333,6 +1395,11 @@ fn streamStaticFileRangeBody(
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
     defer file.close(io);
+
+    if (try trySendfileStaticRange(stream, file, start, body_len)) {
+        server_metrics.staticBodySent(body_len, .sendfile);
+        return;
+    }
 
     var buffer: [8 * 1024]u8 = undefined;
     var sent: usize = 0;
@@ -1345,7 +1412,7 @@ fn streamStaticFileRangeBody(
         sent += read_n;
     }
 
-    server_metrics.staticBodySent(body_len);
+    server_metrics.staticBodySent(body_len, .buffered);
 }
 
 fn serveStatic(
