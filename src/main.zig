@@ -151,6 +151,7 @@ const ServerConfig = struct {
     index_file: []const u8,
     php_root: []const u8,
     php_binary: []const u8,
+    php_info_page: bool,
     upstream: ?UpstreamConfig,
     tls_enabled: bool,
     tls_cert: ?[]const u8,
@@ -1063,6 +1064,8 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.php_root = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "php_binary") or std.mem.eql(u8, k, "php_bin")) {
         cfg.php_binary = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page") or std.mem.eql(u8, k, "enable_php_info_page")) {
+        cfg.php_info_page = parseBool(v) orelse cfg.php_info_page;
     } else if (std.mem.eql(u8, k, "proxy")) {
         if (disablesOptionalUrl(v)) {
             cfg.upstream = null;
@@ -2949,6 +2952,11 @@ fn routeRequest(
             return;
         }
 
+        if (std.mem.eql(u8, req.path, "/test.php") and !cfg.php_info_page) {
+            try sendNotFoundWithConnection(allocator, stream, should_close);
+            return;
+        }
+
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
             try handlePhp(io, stream, allocator, cfg, req, should_close, is_head, process_env);
             return;
@@ -2996,6 +3004,11 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "POST")) {
+        if (std.mem.eql(u8, req.path, "/test.php") and !cfg.php_info_page) {
+            try sendNotFoundWithConnection(allocator, stream, should_close);
+            return;
+        }
+
         if (std.mem.endsWith(u8, req.path, ".php")) {
             try handlePhp(io, stream, allocator, cfg, req, should_close, false, process_env);
             return;
@@ -4242,7 +4255,7 @@ fn usage() void {
         "Layerline HTTP server\\n\\n" ++
             "Usage:\\n" ++
             "  zig build run -- [--config server.conf] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
-            "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] " ++
+            "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
             "[--proxy http://HOST:PORT[/path]] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
@@ -4252,7 +4265,7 @@ fn usage() void {
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
@@ -4292,6 +4305,7 @@ pub fn main(init: std.process.Init) !void {
         .index_file = "index.html",
         .php_root = "public",
         .php_binary = "php-cgi",
+        .php_info_page = false,
         .tls_enabled = false,
         .tls_auto = false,
         .letsencrypt_email = null,
@@ -4453,6 +4467,12 @@ pub fn main(init: std.process.Init) !void {
                 usage();
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--php-info-page") or std.mem.eql(u8, arg, "--phpinfo-page")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.php_info_page = parseBool(value) orelse cfg.php_info_page;
         } else if (std.mem.eql(u8, arg, "--proxy") or std.mem.eql(u8, arg, "-x")) {
             const value = args.next() orelse {
                 usage();

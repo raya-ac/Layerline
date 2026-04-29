@@ -62,6 +62,8 @@ serve_static_root = true
 index_file = index.html
 php_root = public
 php_bin = php-cgi
+# /test.php renders phpinfo(); keep disabled outside local diagnostics.
+php_info_page = false
 # Set proxy to an upstream URL to forward unknown local routes.
 # Use off/false/no/0/none/null to disable it.
 proxy = off
@@ -292,6 +294,12 @@ zig build run -- --php-bin /usr/bin/php-cgi --php-root public
 ```
 
 If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
+
+The bundled `/test.php` phpinfo page is disabled by default because it exposes runtime details. Enable it only when you need diagnostics:
+
+```text
+php_info_page = true
+```
 
 Example PHP file:
 
