@@ -25,7 +25,7 @@ Sources:
 ## Phase 1: Core Server Correctness
 
 - Harden HTTP/1 parsing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, and strict keep-alive semantics.
-- Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout.
+- Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config and SIGINT/SIGTERM drain are implemented; route-local timeout policy remains next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation and `--validate-config` are implemented; route-local schema validation is still needed.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and local admin command.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields.

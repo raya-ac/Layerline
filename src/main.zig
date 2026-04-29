@@ -19,6 +19,12 @@ const DEFAULT_MAX_CONCURRENT_CONNECTIONS = 1_000_000;
 const DEFAULT_WORKER_STACK_BYTES = 64 * 1024;
 // PHP can be noisy. Treat child output as untrusted input too.
 const DEFAULT_MAX_PHP_OUTPUT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_READ_HEADER_TIMEOUT_MS = 10_000;
+const DEFAULT_READ_BODY_TIMEOUT_MS = 30_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_WRITE_TIMEOUT_MS = 30_000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
 const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
@@ -53,6 +59,8 @@ const SERVER_ICON_SVG =
 
 threadlocal var current_io: ?std.Io = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
+var shutdown_requested = std.atomic.Value(bool).init(false);
+var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
 
 // Zig 0.16 moved sockets behind std.Io, so detached worker threads need their
 // own bound handle before they touch a stream.
@@ -64,10 +72,17 @@ fn activeIo() std.Io {
     return current_io orelse @panic("network stream used before std.Io was bound to this thread");
 }
 
+fn normalizeSocketIoError(err: anyerror) anyerror {
+    return switch (err) {
+        error.WouldBlock, error.TimedOut, error.ConnectionTimedOut, error.Unexpected => error.RequestTimeout,
+        else => err,
+    };
+}
+
 fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     const io = activeIo();
     var data: [1][]u8 = .{out};
-    return io.vtable.netRead(io.userdata, stream.socket.handle, &data);
+    return io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
 }
 
 fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
@@ -77,7 +92,7 @@ fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
         // netWrite expects a real scatter list here. Passing an empty one
         // looked tidy, then crashed in the vtable path.
         const empty: [1][]const u8 = .{""};
-        const n = try io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0);
+        const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| return normalizeSocketIoError(err);
         if (n == 0) return error.WriteZero;
         written += n;
     }
@@ -87,6 +102,61 @@ fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args: any
     var stack_buffer: [4096]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&stack_buffer, fmt, args);
     try streamWriteAll(stream, rendered);
+}
+
+fn timeoutMsToTimeval(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+}
+
+fn setStreamReadTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
+    if (builtin.os.tag == .windows) return;
+    var tv = timeoutMsToTimeval(timeout_ms);
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+}
+
+fn setStreamWriteTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
+    if (builtin.os.tag == .windows) return;
+    var tv = timeoutMsToTimeval(timeout_ms);
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+}
+
+fn setStreamTimeouts(stream: std.Io.net.Stream, read_timeout_ms: u32, write_timeout_ms: u32) !void {
+    try setStreamReadTimeout(stream, read_timeout_ms);
+    try setStreamWriteTimeout(stream, write_timeout_ms);
+}
+
+fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installShutdownSignalHandlers() void {
+    if (std.posix.Sigaction == void) return;
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &action, null);
+    std.posix.sigaction(.TERM, &action, null);
+}
+
+const ShutdownWatcherContext = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+};
+
+fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
+    bindThreadIo(ctx.io);
+    while (!shutdown_requested.load(.acquire)) {
+        ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
+    }
+
+    if (!listener_closed_by_shutdown.swap(true, .acq_rel)) {
+        ctx.server.socket.close(ctx.io);
+    }
 }
 
 fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
@@ -211,6 +281,12 @@ const ServerConfig = struct {
     max_requests_per_connection: usize,
     max_concurrent_connections: usize,
     worker_stack_size: usize,
+    read_header_timeout_ms: u32,
+    read_body_timeout_ms: u32,
+    idle_timeout_ms: u32,
+    write_timeout_ms: u32,
+    upstream_timeout_ms: u32,
+    graceful_shutdown_timeout_ms: u32,
     cloudflare_auto_deploy: bool,
     max_php_output_bytes: usize,
     cloudflare_api_base: []const u8,
@@ -888,6 +964,10 @@ const ConcurrencyState = struct {
         _ = self.active_connections.fetchSub(1, .acq_rel);
         server_metrics.connectionClosed();
     }
+
+    fn active(self: *ConcurrencyState) usize {
+        return self.active_connections.load(.acquire);
+    }
 };
 
 const ServerMetrics = struct {
@@ -1330,6 +1410,18 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.max_concurrent_connections = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "worker_stack_size")) {
         cfg.worker_stack_size = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "read_header_timeout_ms")) {
+        cfg.read_header_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "read_body_timeout_ms")) {
+        cfg.read_body_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "idle_timeout_ms")) {
+        cfg.idle_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "write_timeout_ms")) {
+        cfg.write_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_timeout_ms")) {
+        cfg.upstream_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "graceful_shutdown_timeout_ms")) {
+        cfg.graceful_shutdown_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "max_php_output_bytes")) {
         cfg.max_php_output_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "cf_auto_deploy")) {
@@ -1448,6 +1540,11 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_concurrent_connections == 0) return error.InvalidConfigValue;
     if (cfg.worker_stack_size < 16 * 1024) return error.InvalidConfigValue;
+    if (cfg.read_header_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.read_body_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.idle_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.write_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.upstream_timeout_ms == 0) return error.InvalidConfigValue;
 
     if (cfg.tls_auto and (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0)) {
         return error.InvalidConfigValue;
@@ -2369,6 +2466,7 @@ fn parseRequest(
     allocator: std.mem.Allocator,
     max_request_bytes: usize,
     max_body_bytes: usize,
+    read_body_timeout_ms: u32,
     prefill: []const u8,
 ) !HttpRequest {
     const request_buffer = try allocator.alloc(u8, max_request_bytes);
@@ -2420,6 +2518,7 @@ fn parseRequest(
     }
 
     // Parse body only after headers are validated, and enforce limits immediately.
+    try setStreamReadTimeout(stream, read_body_timeout_ms);
     const body_read = try readBody(stream, allocator, headers, body_tail, max_body_bytes);
     const close_connection = parseConnectionClose(version, headers) or body_read.discarded_pipeline_bytes;
 
@@ -2466,6 +2565,7 @@ fn handleHttp2Preface(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
 
     const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
     defer streamClose(upstream_conn);
+    try setStreamTimeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
 
     // Preserve any bytes already read (including partial preface/frame data)
     // and bridge both directions.
@@ -2621,7 +2721,7 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
     }
 }
 
-fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *const UpstreamConfig, req: HttpRequest) !void {
+fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *const UpstreamConfig, req: HttpRequest, upstream_timeout_ms: u32) !void {
     if (upstream.https) {
         try sendCoolErrorWithConnection(
             stream,
@@ -2638,6 +2738,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
 
     const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
     defer streamClose(upstream_conn);
+    try setStreamTimeouts(upstream_conn, upstream_timeout_ms, upstream_timeout_ms);
 
     const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
     defer allocator.free(proxy_path);
@@ -2678,10 +2779,30 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     const request_line = try out.toOwnedSlice(allocator);
     defer allocator.free(request_line);
 
-    try streamWriteAll(upstream_conn, request_line);
-    if (req.body.len > 0) try streamWriteAll(upstream_conn, req.body);
+    streamWriteAll(upstream_conn, request_line) catch |err| switch (err) {
+        error.RequestTimeout => {
+            try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "Timed out writing to upstream.", true, false, null);
+            return;
+        },
+        else => |e| return e,
+    };
+    if (req.body.len > 0) {
+        streamWriteAll(upstream_conn, req.body) catch |err| switch (err) {
+            error.RequestTimeout => {
+                try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "Timed out writing request body to upstream.", true, false, null);
+                return;
+            },
+            else => |e| return e,
+        };
+    }
 
-    try forwardUpstreamResponse(stream, upstream_conn);
+    forwardUpstreamResponse(stream, upstream_conn) catch |err| switch (err) {
+        error.RequestTimeout => {
+            try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "Timed out waiting for upstream response.", true, false, null);
+            return;
+        },
+        else => |e| return e,
+    };
 
     return error.CloseConnection;
 }
@@ -2983,7 +3104,7 @@ fn handleNamedRoute(
                 try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
                 return;
             };
-            try forwardToUpstream(stream, allocator, &upstream, req);
+            try forwardToUpstream(stream, allocator, &upstream, req, cfg.upstream_timeout_ms);
             return;
         },
     }
@@ -3025,6 +3146,12 @@ test "named routes prefer exact and longest prefix matches" {
         .max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION,
         .max_concurrent_connections = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
         .worker_stack_size = DEFAULT_WORKER_STACK_BYTES,
+        .read_header_timeout_ms = DEFAULT_READ_HEADER_TIMEOUT_MS,
+        .read_body_timeout_ms = DEFAULT_READ_BODY_TIMEOUT_MS,
+        .idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS,
+        .write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS,
+        .upstream_timeout_ms = DEFAULT_UPSTREAM_TIMEOUT_MS,
+        .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .cloudflare_auto_deploy = false,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
         .cloudflare_api_base = "https://api.cloudflare.com/client/v4",
@@ -3453,7 +3580,7 @@ fn routeRequest(
         }
 
         if (cfg.upstream) |up| {
-            try forwardToUpstream(stream, allocator, &up, req);
+            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
 
@@ -3478,7 +3605,7 @@ fn routeRequest(
         }
 
         if (cfg.upstream) |up| {
-            try forwardToUpstream(stream, allocator, &up, req);
+            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
 
@@ -3496,7 +3623,7 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
         if (cfg.upstream) |up| {
-            try forwardToUpstream(stream, allocator, &up, req);
+            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
@@ -3516,6 +3643,9 @@ fn handleConnection(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var handled_requests: usize = 0;
+    setStreamWriteTimeout(stream, cfg.write_timeout_ms) catch |err| {
+        std.debug.print("Socket write timeout setup failed: {}\n", .{err});
+    };
 
     // Keep one connection worker alive across keep-alive requests.
     // Each request still gets a hard cap before the socket is closed.
@@ -3526,8 +3656,28 @@ fn handleConnection(
 
         _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
+        const next_read_timeout = if (handled_requests == 0) cfg.read_header_timeout_ms else cfg.idle_timeout_ms;
+        setStreamReadTimeout(stream, next_read_timeout) catch |err| {
+            std.debug.print("Socket read timeout setup failed: {}\n", .{err});
+        };
         var prefill_buf: [64]u8 = undefined;
-        const prefill_len = try streamRead(stream, &prefill_buf);
+        const prefill_len = streamRead(stream, &prefill_buf) catch |err| switch (err) {
+            error.RequestTimeout => {
+                if (handled_requests > 0) return;
+                try sendCoolErrorWithConnection(
+                    stream,
+                    req_alloc,
+                    408,
+                    "Request Timeout",
+                    "No request bytes arrived before the header timeout.",
+                    true,
+                    false,
+                    null,
+                );
+                return;
+            },
+            else => |e| return e,
+        };
         if (prefill_len == 0) return;
         const prefill = prefill_buf[0..prefill_len];
 
@@ -3550,10 +3700,26 @@ fn handleConnection(
             return;
         }
 
-        var req = parseRequest(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, prefill) catch |err| {
+        setStreamReadTimeout(stream, cfg.read_header_timeout_ms) catch |err| {
+            std.debug.print("Socket header timeout setup failed: {}\n", .{err});
+        };
+        var req = parseRequest(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, cfg.read_body_timeout_ms, prefill) catch |err| {
             if (err != error.ConnectionClosed) server_metrics.requestParseError();
             switch (err) {
                 error.ConnectionClosed => return,
+                error.RequestTimeout => {
+                    try sendCoolErrorWithConnection(
+                        stream,
+                        req_alloc,
+                        408,
+                        "Request Timeout",
+                        "The request took too long to read.",
+                        true,
+                        false,
+                        null,
+                    );
+                    return;
+                },
                 error.RequestTooLarge => {
                     try sendCoolErrorWithConnection(
                         stream,
@@ -4740,6 +4906,22 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
     }
 }
 
+fn waitForConnectionDrain(io: std.Io, state: *ConcurrencyState, timeout_ms: u32) void {
+    var waited_ms: u32 = 0;
+    while (state.active() > 0 and waited_ms < timeout_ms) {
+        const step_ms: u32 = @min(@as(u32, 25), timeout_ms - waited_ms);
+        io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
+        waited_ms += step_ms;
+    }
+
+    const remaining = state.active();
+    if (remaining == 0) {
+        std.debug.print("Graceful shutdown complete: all connections drained.\n", .{});
+    } else {
+        std.debug.print("Graceful shutdown timeout reached with {d} active connection(s).\n", .{remaining});
+    }
+}
+
 // Emit current runtime usage, flags, and sample invocations.
 fn usage() void {
     std.debug.print(
@@ -4754,11 +4936,14 @@ fn usage() void {
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
             "[--cf-record-type A|AAAA|CNAME|TXT] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
-            "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\n" ++
+            "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N] [--read-header-timeout-ms N] " ++
+            "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] " ++
+            "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
+            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_strip_prefix.NAME\n" ++
@@ -4790,6 +4975,9 @@ fn usage() void {
 // Bootstraps config/CLI, optional cert automation, then starts the accept loop.
 pub fn main(init: std.process.Init) !void {
     bindThreadIo(init.io);
+    installShutdownSignalHandlers();
+    shutdown_requested.store(false, .release);
+    listener_closed_by_shutdown.store(false, .release);
 
     var cfg = ServerConfig{
         .host = "127.0.0.1",
@@ -4833,6 +5021,12 @@ pub fn main(init: std.process.Init) !void {
         .max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION,
         .max_concurrent_connections = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
         .worker_stack_size = DEFAULT_WORKER_STACK_BYTES,
+        .read_header_timeout_ms = DEFAULT_READ_HEADER_TIMEOUT_MS,
+        .read_body_timeout_ms = DEFAULT_READ_BODY_TIMEOUT_MS,
+        .idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS,
+        .write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS,
+        .upstream_timeout_ms = DEFAULT_UPSTREAM_TIMEOUT_MS,
+        .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
     };
 
@@ -5041,6 +5235,42 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.worker_stack_size = std.fmt.parseInt(usize, value, 10) catch cfg.worker_stack_size;
+        } else if (std.mem.eql(u8, arg, "--read-header-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.read_header_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.read_header_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--read-body-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.read_body_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.read_body_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--idle-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.idle_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--write-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.write_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.write_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--graceful-shutdown-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.graceful_shutdown_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.graceful_shutdown_timeout_ms;
         } else if (std.mem.eql(u8, arg, "--max-concurrent-connections")) {
             const value = args.next() orelse {
                 usage();
@@ -5152,7 +5382,20 @@ pub fn main(init: std.process.Init) !void {
 
     var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try address.listen(init.io, .{ .reuse_address = true });
-    defer server.deinit(init.io);
+    defer {
+        if (!listener_closed_by_shutdown.load(.acquire)) {
+            server.deinit(init.io);
+        }
+    }
+    const shutdown_watcher = std.Thread.spawn(
+        .{},
+        shutdownWatcherTask,
+        .{ShutdownWatcherContext{ .io = init.io, .server = &server }},
+    ) catch |err| {
+        std.debug.print("Failed to start shutdown watcher: {}\n", .{err});
+        return;
+    };
+    shutdown_watcher.detach();
 
     std.debug.print("Serving on http://{s}:{d}\n", .{ cfg.host, cfg.port });
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
@@ -5164,6 +5407,17 @@ pub fn main(init: std.process.Init) !void {
         const hup = cfg.h2_upstream.?;
         std.debug.print("HTTP/2 cleartext passthrough to: {s}:{d} (base {s})\n", .{ hup.host, hup.port, hup.base_path });
     }
+    std.debug.print(
+        "Timeouts: header={d}ms body={d}ms idle={d}ms write={d}ms upstream={d}ms graceful_shutdown={d}ms\n",
+        .{
+            cfg.read_header_timeout_ms,
+            cfg.read_body_timeout_ms,
+            cfg.idle_timeout_ms,
+            cfg.write_timeout_ms,
+            cfg.upstream_timeout_ms,
+            cfg.graceful_shutdown_timeout_ms,
+        },
+    );
     if (cfg.http3_enabled) {
         const h3_worker = std.Thread.spawn(.{}, serveHttp3ProbeTask, .{ init.io, &cfg }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
@@ -5172,8 +5426,9 @@ pub fn main(init: std.process.Init) !void {
         h3_worker.detach();
     }
 
-    while (true) {
+    while (!shutdown_requested.load(.acquire)) {
         const conn = server.accept(init.io) catch |err| {
+            if (shutdown_requested.load(.acquire)) break;
             std.debug.print("Accept failed: {}. Continuing to accept.\n", .{err});
             init.io.sleep(.fromMilliseconds(25), .awake) catch {};
             continue;
@@ -5214,4 +5469,7 @@ pub fn main(init: std.process.Init) !void {
         };
         worker.detach();
     }
+
+    std.debug.print("Shutdown requested; draining active connections for up to {d}ms.\n", .{cfg.graceful_shutdown_timeout_ms});
+    waitForConnectionDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
 }

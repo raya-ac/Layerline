@@ -11,6 +11,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
+- Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - Prometheus-style runtime metrics at `/metrics`, including static sendfile vs buffered transfer counters.
 - HTTP/2 cleartext passthrough target support through `h2_upstream`.
@@ -111,6 +112,12 @@ tls = false
 #max_requests_per_connection = 256
 #worker_stack_size = 65536
 #max_php_output_bytes = 2097152
+#read_header_timeout_ms = 10000
+#read_body_timeout_ms = 30000
+#idle_timeout_ms = 60000
+#write_timeout_ms = 30000
+#upstream_timeout_ms = 30000
+#graceful_shutdown_timeout_ms = 10000
 max_request_bytes = 16384
 max_body_bytes = 1048576
 max_static_file_bytes = 10485760
@@ -252,13 +259,19 @@ zig build run -- \
   --max-requests-per-connection 256 \
   --worker-stack-size 65536 \
   --max-php-output-bytes 2097152 \
+  --read-header-timeout-ms 10000 \
+  --read-body-timeout-ms 30000 \
+  --idle-timeout-ms 60000 \
+  --write-timeout-ms 30000 \
+  --upstream-timeout-ms 30000 \
   --max-request-bytes 16384 \
   --max-body-bytes 1048576 \
   --max-static-bytes 10485760
 ```
 
 When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
-This process still uses one worker thread per accepted socket, so for very high live-connection counts it should sit behind HAProxy/Nginx/Caddy with strict timeouts and strict reuse policies.
+This process still uses one worker thread per accepted socket, so for very high live-connection counts it should sit behind HAProxy/Nginx/Caddy or another edge balancer while native evented IO is built out.
+`SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for active handlers to drain.
 Common host limits to revisit before aggressive load tests:
 
 - Linux/macOS: increase open file limit (`ulimit -n 2000000`).
