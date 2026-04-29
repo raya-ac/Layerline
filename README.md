@@ -50,6 +50,14 @@ zig build run -- --port 8080 --dir public
 Use `--config` to load a base config, then override values with CLI flags.
 From the project root, `server.conf` loads automatically when present unless you pass a custom `--config`.
 With `serve_static_root` enabled, unknown paths are checked against local static files first, then forwarded upstream.
+Validate a config without opening sockets:
+
+```bash
+zig build run -- --validate-config
+zig build run -- --config server.conf --validate-config
+```
+
+Config files are strict: unknown keys, malformed lines, invalid booleans, invalid numbers, invalid headers, and invalid redirects fail with a line-numbered error.
 
 Example `server.conf`:
 

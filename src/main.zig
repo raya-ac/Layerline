@@ -977,6 +977,29 @@ fn parseBool(value: []const u8) ?bool {
     return null;
 }
 
+fn parseConfigBool(value: []const u8) !bool {
+    return parseBool(value) orelse error.InvalidConfigValue;
+}
+
+fn parseConfigU16(value: []const u8) !u16 {
+    return std.fmt.parseInt(u16, value, 10) catch error.InvalidConfigValue;
+}
+
+fn parseConfigU32(value: []const u8) !u32 {
+    return std.fmt.parseInt(u32, value, 10) catch error.InvalidConfigValue;
+}
+
+fn parseConfigUsize(value: []const u8) !usize {
+    return std.fmt.parseInt(usize, value, 10) catch error.InvalidConfigValue;
+}
+
+fn isSupportedCloudflareRecordType(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "A") or
+        std.ascii.eqlIgnoreCase(value, "AAAA") or
+        std.ascii.eqlIgnoreCase(value, "CNAME") or
+        std.ascii.eqlIgnoreCase(value, "TXT");
+}
+
 fn disablesOptionalUrl(value: []const u8) bool {
     if (value.len == 0) return true;
     if (parseBool(value)) |enabled| return !enabled;
@@ -1045,27 +1068,33 @@ fn parseRedirectRule(allocator: std.mem.Allocator, raw: []const u8) !RedirectRul
     };
 }
 
-// Map one config file line to fields; unknown values are ignored.
+// Map one config file line to fields. Config files are strict so typos do not
+// silently change server behavior.
 fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     const k = std.mem.trim(u8, key, " \t\r\n");
     const v = trimValue(value);
 
     if (std.mem.eql(u8, k, "host")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.host = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "port")) {
-        cfg.port = std.fmt.parseInt(u16, v, 10) catch cfg.port;
+        cfg.port = try parseConfigU16(v);
     } else if (std.mem.eql(u8, k, "static_dir") or std.mem.eql(u8, k, "dir")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.static_dir = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "serve_static_root")) {
-        cfg.serve_static_root = parseBool(v) orelse cfg.serve_static_root;
+        cfg.serve_static_root = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "index_file") or std.mem.eql(u8, k, "index")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.index_file = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "php_root")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.php_root = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "php_binary") or std.mem.eql(u8, k, "php_bin")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.php_binary = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page") or std.mem.eql(u8, k, "enable_php_info_page")) {
-        cfg.php_info_page = parseBool(v) orelse cfg.php_info_page;
+        cfg.php_info_page = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "proxy")) {
         if (disablesOptionalUrl(v)) {
             cfg.upstream = null;
@@ -1073,13 +1102,15 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
             cfg.upstream = try parseUpstream(allocator, v);
         }
     } else if (std.mem.eql(u8, k, "tls")) {
-        cfg.tls_enabled = parseBool(v) orelse cfg.tls_enabled;
+        cfg.tls_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "tls_cert")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.tls_cert = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "tls_key")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.tls_key = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "tls_auto")) {
-        cfg.tls_auto = parseBool(v) orelse cfg.tls_auto;
+        cfg.tls_auto = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "letsencrypt_email")) {
         if (v.len == 0) {
             cfg.letsencrypt_email = null;
@@ -1095,9 +1126,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
     } else if (std.mem.eql(u8, k, "letsencrypt_webroot")) {
         cfg.letsencrypt_webroot = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "letsencrypt_certbot")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.letsencrypt_certbot = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "letsencrypt_staging")) {
-        cfg.letsencrypt_staging = parseBool(v) orelse cfg.letsencrypt_staging;
+        cfg.letsencrypt_staging = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "h2_upstream") or std.mem.eql(u8, k, "http2_upstream")) {
         if (disablesOptionalUrl(v)) {
             cfg.h2_upstream = null;
@@ -1105,30 +1137,31 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
             cfg.h2_upstream = try parseUpstream(allocator, v);
         }
     } else if (std.mem.eql(u8, k, "http3")) {
-        cfg.http3_enabled = parseBool(v) orelse cfg.http3_enabled;
+        cfg.http3_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "http3_port")) {
-        cfg.http3_port = std.fmt.parseInt(u16, v, 10) catch cfg.http3_port;
+        cfg.http3_port = try parseConfigU16(v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
-        cfg.max_request_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_request_bytes;
+        cfg.max_request_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
-        cfg.max_body_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_body_bytes;
+        cfg.max_body_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_static_file_bytes")) {
-        cfg.max_static_file_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_static_file_bytes;
+        cfg.max_static_file_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_requests_per_connection")) {
-        cfg.max_requests_per_connection = std.fmt.parseInt(usize, v, 10) catch cfg.max_requests_per_connection;
+        cfg.max_requests_per_connection = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_concurrent_connections")) {
-        cfg.max_concurrent_connections = std.fmt.parseInt(usize, v, 10) catch cfg.max_concurrent_connections;
+        cfg.max_concurrent_connections = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "worker_stack_size")) {
-        cfg.worker_stack_size = std.fmt.parseInt(usize, v, 10) catch cfg.worker_stack_size;
+        cfg.worker_stack_size = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_php_output_bytes")) {
-        cfg.max_php_output_bytes = std.fmt.parseInt(usize, v, 10) catch cfg.max_php_output_bytes;
+        cfg.max_php_output_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "cf_auto_deploy")) {
-        cfg.cloudflare_auto_deploy = parseBool(v) orelse cfg.cloudflare_auto_deploy;
+        cfg.cloudflare_auto_deploy = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "cf_api_base")) {
+        if (v.len == 0) return error.InvalidConfigValue;
         cfg.cloudflare_api_base = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "cf_token")) {
         if (v.len == 0) {
@@ -1158,6 +1191,7 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         if (v.len == 0) {
             cfg.cloudflare_record_type = "A";
         } else {
+            if (!isSupportedCloudflareRecordType(v)) return error.InvalidConfigValue;
             cfg.cloudflare_record_type = try allocator.dupe(u8, v);
         }
     } else if (std.mem.eql(u8, k, "cf_record_content")) {
@@ -1167,15 +1201,17 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
             cfg.cloudflare_record_content = try allocator.dupe(u8, v);
         }
     } else if (std.mem.eql(u8, k, "cf_record_ttl")) {
-        cfg.cloudflare_record_ttl = std.fmt.parseInt(u32, v, 10) catch cfg.cloudflare_record_ttl;
+        cfg.cloudflare_record_ttl = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "cf_record_proxied")) {
-        cfg.cloudflare_record_proxied = parseBool(v) orelse cfg.cloudflare_record_proxied;
+        cfg.cloudflare_record_proxied = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "cf_record_comment")) {
         if (v.len == 0) {
             cfg.cloudflare_record_comment = null;
         } else {
             cfg.cloudflare_record_comment = try allocator.dupe(u8, v);
         }
+    } else {
+        return error.UnknownConfigKey;
     }
 }
 
@@ -1185,7 +1221,9 @@ fn loadConfig(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, path
     defer allocator.free(content);
 
     var lines = std.mem.splitSequence(u8, content, "\n");
+    var line_number: usize = 0;
     while (lines.next()) |raw_line| {
+        line_number += 1;
         var line = trimValue(raw_line);
         if (line.len == 0) continue;
 
@@ -1195,10 +1233,56 @@ fn loadConfig(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, path
         }
         if (line.len == 0) continue;
 
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+            std.debug.print("Config error in {s}:{d}: expected key = value\n", .{ path, line_number });
+            return error.MalformedConfigLine;
+        };
         const key = line[0..eq];
         const value = if (eq + 1 < line.len) line[eq + 1 ..] else "";
-        try applyConfigLine(cfg, allocator, key, value);
+        applyConfigLine(cfg, allocator, key, value) catch |err| {
+            std.debug.print("Config error in {s}:{d}: {s}: {}\n", .{ path, line_number, trimValue(key), err });
+            return err;
+        };
+    }
+}
+
+fn normalizeConfig(cfg: *ServerConfig) void {
+    if (cfg.max_concurrent_connections == 0) {
+        cfg.max_concurrent_connections = 1024;
+    }
+    if (cfg.max_requests_per_connection == 0) {
+        cfg.max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION;
+    }
+    if (cfg.max_php_output_bytes == 0) {
+        cfg.max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES;
+    }
+    if (cfg.worker_stack_size < 16 * 1024) {
+        cfg.worker_stack_size = 16 * 1024;
+    }
+}
+
+fn validateConfig(cfg: *const ServerConfig) !void {
+    if (cfg.host.len == 0) return error.InvalidConfigValue;
+    if (cfg.port == 0) return error.InvalidConfigValue;
+    if (cfg.static_dir.len == 0) return error.InvalidConfigValue;
+    if (cfg.index_file.len == 0) return error.InvalidConfigValue;
+    if (cfg.php_root.len == 0) return error.InvalidConfigValue;
+    if (cfg.php_binary.len == 0) return error.InvalidConfigValue;
+    if (cfg.http3_enabled and cfg.http3_port == 0) return error.InvalidConfigValue;
+    if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
+    if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
+    if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
+    if (cfg.max_concurrent_connections == 0) return error.InvalidConfigValue;
+    if (cfg.worker_stack_size < 16 * 1024) return error.InvalidConfigValue;
+
+    if (cfg.tls_auto and (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0)) {
+        return error.InvalidConfigValue;
+    }
+    if (cfg.cloudflare_auto_deploy) {
+        if (cfg.cloudflare_token == null or cfg.cloudflare_token.?.len == 0) return error.InvalidConfigValue;
+        if ((cfg.cloudflare_zone_id == null or cfg.cloudflare_zone_id.?.len == 0) and (cfg.cloudflare_zone_name == null or cfg.cloudflare_zone_name.?.len == 0)) return error.InvalidConfigValue;
+        if (cfg.cloudflare_record_name == null or cfg.cloudflare_record_name.?.len == 0) return error.InvalidConfigValue;
+        if (cfg.cloudflare_record_content == null or cfg.cloudflare_record_content.?.len == 0) return error.InvalidConfigValue;
     }
 }
 
@@ -4252,43 +4336,44 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
 // Emit current runtime usage, flags, and sample invocations.
 fn usage() void {
     std.debug.print(
-        "Layerline HTTP server\\n\\n" ++
-            "Usage:\\n" ++
-            "  zig build run -- [--config server.conf] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+        "Layerline HTTP server\n\n" ++
+            "Usage:\n" ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
             "[--proxy http://HOST:PORT[/path]] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
-            "[--cf-record-type A|AAAA|CNAME] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
+            "[--cf-record-type A|AAAA|CNAME|TXT] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
-            "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\\n" ++
+            "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, h2_upstream, http3, http3_port, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
-            "cf_record_ttl, cf_record_proxied, cf_record_comment\\n" ++
+            "cf_record_ttl, cf_record_proxied, cf_record_comment\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\\n\\n" ++
-            "Examples:\\n" ++
-            "  zig build run\\n" ++
-            "  zig build run -- --port 4000\\n" ++
-            "  zig build run -- --index index.php --serve-static true\\n" ++
-            "  zig build run -- --php-root public --php-bin php-cgi\\n" ++
-            "  zig build run -- --config server.conf\\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000\\n" ++
-            "  zig build run -- --proxy off\\n" ++
-            "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\\n" ++
-            "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\\n" ++
-            "  zig build run -- --h2-upstream http://127.0.0.1:9001\\n\\n" ++
-            "Notes:\\n" ++
-            "  This is a thread-per-connection model for now. For very high fan-in (large counts of\\n" ++
-            "  open keep-alive sockets), place this server behind a TLS/HTTP proxy with strict\\n" ++
-            "  timeout and connection management policies.\\n" ++
-            "  Native HTTP/3 currently covers the local default-page path, with broader routing\\n" ++
-            "  and certificate trust/automation still kept separate from the HTTP/1 surface.\\n",
+            "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
+            "Examples:\n" ++
+            "  zig build run\n" ++
+            "  zig build run -- --validate-config\n" ++
+            "  zig build run -- --port 4000\n" ++
+            "  zig build run -- --index index.php --serve-static true\n" ++
+            "  zig build run -- --php-root public --php-bin php-cgi\n" ++
+            "  zig build run -- --config server.conf\n" ++
+            "  zig build run -- --proxy http://127.0.0.1:9000\n" ++
+            "  zig build run -- --proxy off\n" ++
+            "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
+            "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
+            "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
+            "Notes:\n" ++
+            "  This is a thread-per-connection model for now. For very high fan-in (large counts of\n" ++
+            "  open keep-alive sockets), place this server behind a TLS/HTTP proxy with strict\n" ++
+            "  timeout and connection management policies.\n" ++
+            "  Native HTTP/3 currently covers the local default-page path, with broader routing\n" ++
+            "  and certificate trust/automation still kept separate from the HTTP/1 surface.\n",
         .{},
     );
 }
@@ -4348,9 +4433,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--config")) {
             config_explicitly_set = true;
             if (args_for_config.next()) |path| {
-                loadConfig(init.io, std.heap.page_allocator, &cfg, path) catch {
+                loadConfig(init.io, std.heap.page_allocator, &cfg, path) catch |err| {
                     std.debug.print("Failed to load config file: {s}\n", .{path});
-                    return;
+                    return err;
                 };
             } else {
                 usage();
@@ -4361,21 +4446,24 @@ pub fn main(init: std.process.Init) !void {
 
     if (!config_explicitly_set) {
         if (std.Io.Dir.cwd().statFile(init.io, DEFAULT_CONFIG_PATH, .{})) |_| {
-            loadConfig(init.io, std.heap.page_allocator, &cfg, DEFAULT_CONFIG_PATH) catch {
+            loadConfig(init.io, std.heap.page_allocator, &cfg, DEFAULT_CONFIG_PATH) catch |err| {
                 std.debug.print("Failed to load default config file: {s}\n", .{DEFAULT_CONFIG_PATH});
-                return;
+                return err;
             };
         } else |_| {}
     }
 
     var args = std.process.Args.iterate(init.minimal.args);
     _ = args.next();
+    var validate_only = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
             return;
         } else if (std.mem.eql(u8, arg, "--config")) {
             _ = args.next();
+        } else if (std.mem.eql(u8, arg, "--validate-config") or std.mem.eql(u8, arg, "--check-config")) {
+            validate_only = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
             if (args.next()) |value| {
                 cfg.tls_enabled = parseBool(value) orelse cfg.tls_enabled;
@@ -4604,7 +4692,22 @@ pub fn main(init: std.process.Init) !void {
                 usage();
                 return;
             };
+        } else {
+            std.debug.print("Unknown argument: {s}\n", .{arg});
+            usage();
+            return error.InvalidCommandLine;
         }
+    }
+
+    normalizeConfig(&cfg);
+    validateConfig(&cfg) catch |err| {
+        std.debug.print("Invalid Layerline configuration: {}\n", .{err});
+        return err;
+    };
+
+    if (validate_only) {
+        std.debug.print("Layerline config OK: {s}:{d}\n", .{ cfg.host, cfg.port });
+        return;
     }
 
     if (cfg.tls_auto) {
@@ -4618,19 +4721,6 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Cloudflare deployment failed: {}\n", .{err});
         return;
     };
-
-    if (cfg.max_concurrent_connections == 0) {
-        cfg.max_concurrent_connections = 1024;
-    }
-    if (cfg.max_requests_per_connection == 0) {
-        cfg.max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION;
-    }
-    if (cfg.max_php_output_bytes == 0) {
-        cfg.max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES;
-    }
-    if (cfg.worker_stack_size < 16 * 1024) {
-        cfg.worker_stack_size = 16 * 1024;
-    }
 
     var concurrency = ConcurrencyState.init();
 
