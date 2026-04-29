@@ -6,6 +6,7 @@ const h3_state = @import("h3_state.zig");
 const http_response = @import("http_response.zig");
 const quic_native = @import("quic_native.zig");
 const tls13_native = @import("tls13_native.zig");
+const tls_client_hello = @import("tls_client_hello.zig");
 
 // Boring defaults on purpose: enough room for local dev, with caps before
 // anything can turn into an accidental memory sink.
@@ -200,6 +201,7 @@ const HttpRequest = struct {
     version: []const u8,
     body: []const u8,
     close_connection: bool,
+    h2c_upgrade_tail: []const u8 = "",
 };
 
 const UpstreamIdleConnection = struct {
@@ -473,6 +475,42 @@ fn findHeaderValue(headers: []const u8, target_name: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+fn http2SettingsDecodedLength(value: []const u8) ?usize {
+    var len: usize = 0;
+    for (value) |byte| {
+        const valid = (byte >= 'A' and byte <= 'Z') or
+            (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '-' or
+            byte == '_';
+        if (!valid) return null;
+        len += 1;
+    }
+
+    const rem = len % 4;
+    if (rem == 1) return null;
+    return (len / 4) * 3 + switch (rem) {
+        0 => @as(usize, 0),
+        2 => @as(usize, 1),
+        3 => @as(usize, 2),
+        else => unreachable,
+    };
+}
+
+fn isValidHttp2SettingsHeader(value: []const u8) bool {
+    const decoded_len = http2SettingsDecodedLength(trimValue(value)) orelse return false;
+    return decoded_len % 6 == 0;
+}
+
+fn isH2cUpgradeHeaders(headers: []const u8) bool {
+    const upgrade = findHeaderValue(headers, "Upgrade") orelse return false;
+    const settings = findHeaderValue(headers, "HTTP2-Settings") orelse return false;
+    return hasConnectionToken(upgrade, "h2c") and
+        hasHeaderToken(headers, "Connection", "Upgrade") and
+        hasHeaderToken(headers, "Connection", "HTTP2-Settings") and
+        isValidHttp2SettingsHeader(settings);
 }
 
 fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
@@ -3222,6 +3260,71 @@ fn isHttp3OverTcpProbe(bytes: []const u8) bool {
     return bytes[0] == 0x00;
 }
 
+fn readTlsClientHelloRecord(stream: std.Io.net.Stream, allocator: std.mem.Allocator, prefill: []const u8) ![]u8 {
+    var header: [5]u8 = undefined;
+    const copied_header: usize = @min(prefill.len, header.len);
+    if (copied_header > 0) @memcpy(header[0..copied_header], prefill[0..copied_header]);
+    var header_used: usize = copied_header;
+    while (header_used < header.len) {
+        const n = try streamRead(stream, header[header_used..]);
+        if (n == 0) return error.ConnectionClosed;
+        header_used += n;
+    }
+
+    const record_len = try tls_client_hello.recordLength(&header);
+    if (record_len > 5 + 16 * 1024) return error.RequestTooLarge;
+    const record = try allocator.alloc(u8, record_len);
+    @memcpy(record[0..header.len], &header);
+    const copied_body: usize = if (prefill.len > header.len) @min(prefill.len - header.len, record_len - header.len) else 0;
+    if (copied_body > 0) {
+        @memcpy(record[header.len .. header.len + copied_body], prefill[header.len .. header.len + copied_body]);
+    }
+
+    var used = header.len + copied_body;
+    while (used < record.len) {
+        const n = try streamRead(stream, record[used..]);
+        if (n == 0) return error.ConnectionClosed;
+        used += n;
+    }
+    return record;
+}
+
+fn sendTlsFatalAlert(stream: std.Io.net.Stream, description: u8) !void {
+    const alert = [_]u8{
+        0x15,
+        0x03,
+        0x03,
+        0x00,
+        0x02,
+        0x02,
+        description,
+    };
+    try streamWriteAll(stream, &alert);
+}
+
+fn handleTlsClientHelloProbe(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, prefill: []const u8) !void {
+    const record = try readTlsClientHelloRecord(stream, allocator, prefill);
+    var info = tls_client_hello.parse(allocator, record) catch |err| {
+        std.debug.print("TLS ClientHello parse failed before native TLS termination: {}\n", .{err});
+        try sendTlsFatalAlert(stream, 40);
+        return;
+    };
+    defer info.deinit(allocator);
+
+    std.debug.print(
+        "TLS ClientHello sni={s} alpn={s} tls13={} h2={} http11={} tls_configured={}\n",
+        .{
+            info.sni orelse "(none)",
+            info.alpn orelse "(none)",
+            info.supports_tls13,
+            info.offers_h2,
+            info.offers_http11,
+            cfg.tls_enabled,
+        },
+    );
+    try sendTlsFatalAlert(stream, 120);
+}
+
 // Read the whole request envelope while the backing buffer is still alive.
 // Method/path/header slices all point into it.
 fn parseRequest(
@@ -3273,6 +3376,19 @@ fn parseRequest(
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
     if (std.mem.startsWith(u8, version, "HTTP/1.1") and findHeaderValue(headers, "Host") == null) {
         return error.MissingHostHeader;
+    }
+
+    if (isH2cUpgradeHeaders(headers)) {
+        return HttpRequest{
+            .method = method,
+            .path = path,
+            .query = query,
+            .headers = headers,
+            .version = version,
+            .body = "",
+            .close_connection = true,
+            .h2c_upgrade_tail = body_tail,
+        };
     }
 
     if (findHeaderValue(headers, "Expect")) |expect| {
@@ -3823,6 +3939,12 @@ fn sendHttp2Rst(stream: std.Io.net.Stream, stream_id: u32, code: u32) !void {
     try sendHttp2Frame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload);
 }
 
+fn readHttp2ClientPreface(reader: *H2PendingReader) !void {
+    var preface_buf: [HTTP2_PREFACE_MAGIC.len]u8 = undefined;
+    try reader.readExact(&preface_buf);
+    if (!std.mem.eql(u8, &preface_buf, HTTP2_PREFACE_MAGIC)) return error.BadRequest;
+}
+
 fn handleHttp2HeadersFrame(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -3881,32 +4003,14 @@ fn handleHttp2HeadersFrame(
     try sendHttp2Response(stream, allocator, frame.header.stream_id, response, std.mem.eql(u8, req.method, "HEAD"));
 }
 
-fn handleHttp2Preface(
+fn runHttp2FrameLoop(
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     cfg: *ServerConfig,
-    prefill: []const u8,
+    reader: *H2PendingReader,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    var preface_buf: [HTTP2_PREFACE_MAGIC.len]u8 = undefined;
-    const copied = @min(prefill.len, HTTP2_PREFACE_MAGIC.len);
-    if (copied > 0) @memcpy(preface_buf[0..copied], prefill[0..copied]);
-    var reader = H2PendingReader{
-        .stream = stream,
-        .pending = if (prefill.len > copied) prefill[copied..] else "",
-    };
-    if (copied < HTTP2_PREFACE_MAGIC.len) {
-        try reader.readExact(preface_buf[copied..]);
-    }
-    if (!std.mem.eql(u8, &preface_buf, HTTP2_PREFACE_MAGIC)) {
-        try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", "Invalid HTTP/2 connection preface.", true, false, null);
-        return;
-    }
-
-    try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
-    std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
-
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var hpack_decoder = h2_native.HpackDecoder.init(allocator);
@@ -3915,7 +4019,7 @@ fn handleHttp2Preface(
     while (true) {
         _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
-        const frame = readHttp2Frame(&reader, req_alloc, @max(cfg.max_request_bytes, cfg.max_body_bytes)) catch |err| switch (err) {
+        const frame = readHttp2Frame(reader, req_alloc, @max(cfg.max_request_bytes, cfg.max_body_bytes)) catch |err| switch (err) {
             error.ConnectionClosed => return,
             error.RequestTimeout => return,
             else => return err,
@@ -3943,6 +4047,69 @@ fn handleHttp2Preface(
             else => {},
         }
     }
+}
+
+fn handleHttp2Preface(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    prefill: []const u8,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    var reader = H2PendingReader{
+        .stream = stream,
+        .pending = prefill,
+    };
+    readHttp2ClientPreface(&reader) catch {
+        try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", "Invalid HTTP/2 connection preface.", true, false, null);
+        return;
+    };
+
+    try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
+    std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
+    try runHttp2FrameLoop(io, stream, allocator, cfg, &reader, process_env);
+}
+
+fn handleHttp2Upgrade(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    req: HttpRequest,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    try streamWriteAll(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Upgrade: h2c\r\n" ++
+            "\r\n",
+    );
+    server_metrics.responseSent(101, 0);
+
+    try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
+
+    var reader = H2PendingReader{
+        .stream = stream,
+        .pending = req.h2c_upgrade_tail,
+    };
+    readHttp2ClientPreface(&reader) catch {
+        try sendHttp2Frame(stream, h2_native.FRAME_GOAWAY, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x01");
+        return;
+    };
+
+    var h2_req = req;
+    h2_req.version = "HTTP/2.0";
+    h2_req.close_connection = true;
+    std.debug.print("HTTP/2 h2c upgrade {s} {s}\n", .{ h2_req.method, h2_req.path });
+    const response = buildHttp2ResponseForRequest(io, allocator, cfg, h2_req, process_env) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try h2CoolErrorResponse(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 upgrade request."),
+    };
+    try sendHttp2Response(stream, allocator, 1, response, std.mem.eql(u8, h2_req.method, "HEAD"));
+    try runHttp2FrameLoop(io, stream, allocator, cfg, &reader, process_env);
 }
 
 // Parse scheme/host/port/path strings from a proxy URL into normalized fields.
@@ -6406,6 +6573,11 @@ fn handleConnection(
             return;
         }
 
+        if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
+            try handleTlsClientHelloProbe(stream, req_alloc, cfg, prefill);
+            return;
+        }
+
         if (isHttp3OverTcpProbe(prefill)) {
             try sendCoolErrorWithConnection(
                 stream,
@@ -6538,6 +6710,12 @@ fn handleConnection(
         };
         handled_requests += 1;
         server_metrics.requestStarted();
+
+        if (req.h2c_upgrade_tail.len > 0 or isH2cUpgradeHeaders(req.headers)) {
+            try handleHttp2Upgrade(io, stream, req_alloc, cfg, req, process_env);
+            return;
+        }
+
         if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
             req.close_connection = true;
         }
