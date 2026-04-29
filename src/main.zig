@@ -4057,8 +4057,8 @@ fn routeRequest(
                 \\  }
                 \\  h1 {
                 \\    margin: 0;
-                \\    max-width: 8.5ch;
-                \\    font-size: clamp(72px, 11vw, 156px);
+                \\    max-width: 9ch;
+                \\    font-size: clamp(68px, 9vw, 132px);
                 \\    line-height: .82;
                 \\    letter-spacing: 0;
                 \\  }
@@ -4100,9 +4100,9 @@ fn routeRequest(
                 \\  }
                 \\  .surface {
                 \\    position: relative;
-                \\    min-height: 470px;
+                \\    min-height: 560px;
                 \\    border: 1px solid rgba(17,17,15,.16);
-                \\    border-radius: 28px;
+                \\    border-radius: 10px;
                 \\    overflow: hidden;
                 \\    background: rgba(251,250,246,.72);
                 \\    box-shadow: 0 44px 110px rgba(38,34,24,.14);
@@ -4112,13 +4112,77 @@ fn routeRequest(
                 \\    content: "";
                 \\    position: absolute;
                 \\    inset: 0;
+                \\    z-index: 0;
+                \\    pointer-events: none;
                 \\    background:
                 \\      linear-gradient(rgba(17,17,15,.08) 1px, transparent 1px),
                 \\      linear-gradient(90deg, rgba(17,17,15,.08) 1px, transparent 1px);
                 \\    background-size: 44px 44px;
                 \\  }
+                \\  .mascot-wrap {
+                \\    position: absolute;
+                \\    left: 90px;
+                \\    right: 30px;
+                \\    top: 70px;
+                \\    bottom: 74px;
+                \\    z-index: 2;
+                \\    display: flex;
+                \\    align-items: flex-end;
+                \\    justify-content: center;
+                \\    pointer-events: auto;
+                \\  }
+                \\  .mascot-wrap::after {
+                \\    content: "";
+                \\    position: absolute;
+                \\    left: 50%;
+                \\    bottom: 0;
+                \\    width: min(58%, 280px);
+                \\    height: 26px;
+                \\    border-radius: 999px;
+                \\    background: rgba(17,17,15,.13);
+                \\    filter: blur(14px);
+                \\    transform: translateX(-50%);
+                \\    animation: mascot-shadow 5.4s ease-in-out infinite;
+                \\  }
+                \\  .mascot {
+                \\    position: relative;
+                \\    z-index: 2;
+                \\    display: block;
+                \\    width: auto;
+                \\    height: min(100%, 500px);
+                \\    max-width: 100%;
+                \\    border-radius: 8px;
+                \\    object-fit: contain;
+                \\    filter: drop-shadow(0 30px 42px rgba(17,17,15,.18));
+                \\    animation: mascot-float 5.4s ease-in-out infinite;
+                \\  }
+                \\  .mascot-wrap:focus-visible {
+                \\    outline: 2px solid #1c8c74;
+                \\    outline-offset: -8px;
+                \\  }
+                \\  .mascot-wrap:hover .mascot,
+                \\  .mascot-wrap:focus-within .mascot {
+                \\    animation-duration: 3.8s;
+                \\  }
+                \\  .mascot-name {
+                \\    position: absolute;
+                \\    z-index: 5;
+                \\    left: 28px;
+                \\    bottom: 106px;
+                \\    color: #11110f;
+                \\    font: 700 13px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace;
+                \\    text-transform: uppercase;
+                \\  }
+                \\  .mascot-name span {
+                \\    display: block;
+                \\    margin-top: 4px;
+                \\    color: #5f6f68;
+                \\    font-weight: 500;
+                \\    text-transform: none;
+                \\  }
                 \\  .rail {
                 \\    position: absolute;
+                \\    z-index: 5;
                 \\    left: 28px;
                 \\    right: 28px;
                 \\    top: 28px;
@@ -4131,20 +4195,22 @@ fn routeRequest(
                 \\    background: rgba(251,250,246,.86);
                 \\    color: #8b8c84;
                 \\    font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
-                \\    letter-spacing: .08em;
+                \\    letter-spacing: 0;
                 \\    text-transform: uppercase;
                 \\  }
                 \\  .route {
                 \\    position: absolute;
+                \\    z-index: 1;
                 \\    left: 18%;
                 \\    right: 18%;
-                \\    top: 48%;
+                \\    top: 51%;
                 \\    height: 2px;
                 \\    background: repeating-linear-gradient(90deg, rgba(17,17,15,.5) 0 12px, transparent 12px 22px);
                 \\    transform: rotate(-9deg);
                 \\  }
                 \\  .packet {
                 \\    position: absolute;
+                \\    z-index: 3;
                 \\    left: 14%;
                 \\    top: 45%;
                 \\    width: 54px;
@@ -4157,8 +4223,9 @@ fn routeRequest(
                 \\  }
                 \\  .h3mark {
                 \\    position: absolute;
+                \\    z-index: 1;
                 \\    left: 34px;
-                \\    bottom: 118px;
+                \\    bottom: 128px;
                 \\    font-size: clamp(62px, 10vw, 116px);
                 \\    line-height: .82;
                 \\    letter-spacing: 0;
@@ -4168,7 +4235,7 @@ fn routeRequest(
                 \\    position: absolute;
                 \\    left: 28px;
                 \\    right: 28px;
-                \\    top: 100px;
+                \\    top: 88px;
                 \\    display: grid;
                 \\    grid-template-columns: repeat(2, minmax(0, 1fr));
                 \\    gap: 10px;
@@ -4188,6 +4255,7 @@ fn routeRequest(
                 \\  }
                 \\  .node {
                 \\    position: absolute;
+                \\    z-index: 4;
                 \\    width: 12px;
                 \\    height: 12px;
                 \\    border-radius: 999px;
@@ -4200,6 +4268,7 @@ fn routeRequest(
                 \\  .n3 { left: 46%; bottom: 24%; }
                 \\  .footer {
                 \\    position: absolute;
+                \\    z-index: 5;
                 \\    left: 28px;
                 \\    right: 28px;
                 \\    bottom: 28px;
@@ -4228,6 +4297,14 @@ fn routeRequest(
                 \\    0%, 100% { transform: translateX(0) rotate(-9deg); opacity: .68; }
                 \\    50% { transform: translateX(230px) rotate(-9deg); opacity: 1; }
                 \\  }
+                \\  @keyframes mascot-float {
+                \\    0%, 100% { transform: translateY(0) rotate(-.8deg); }
+                \\    50% { transform: translateY(-12px) rotate(.8deg); }
+                \\  }
+                \\  @keyframes mascot-shadow {
+                \\    0%, 100% { transform: translateX(-50%) scaleX(.92); opacity: .72; }
+                \\    50% { transform: translateX(-50%) scaleX(1.06); opacity: .46; }
+                \\  }
                 \\  @keyframes node-pulse {
                 \\    0%, 100% { box-shadow: 0 0 0 8px rgba(17,17,15,.08); }
                 \\    50% { box-shadow: 0 0 0 15px rgba(17,17,15,.04); }
@@ -4235,10 +4312,13 @@ fn routeRequest(
                 \\  @media (max-width: 820px) {
                 \\    main { grid-template-columns: 1fr; padding: 24px; }
                 \\    h1 { font-size: clamp(64px, 22vw, 104px); }
-                \\    .surface { min-height: 420px; }
-                \\    .route { top: 60%; }
-                \\    .packet { top: 56%; animation: none; transform: rotate(-9deg); }
-                \\    .h3mark { bottom: 138px; font-size: 70px; }
+                \\    .surface { min-height: 560px; }
+                \\    .mascot-wrap { left: 62px; right: 8px; top: 76px; bottom: 114px; }
+                \\    .mascot { height: min(100%, 430px); }
+                \\    .mascot-name { bottom: 104px; }
+                \\    .route { top: 57%; }
+                \\    .packet { top: 54%; animation: none; transform: rotate(-9deg); }
+                \\    .h3mark { bottom: 148px; font-size: 70px; }
                 \\    .caps { grid-template-columns: 1fr 1fr; }
                 \\  }
                 \\</style>
@@ -4261,12 +4341,15 @@ fn routeRequest(
                 \\      <a class="button" href="/favicon.svg">Icon</a>
                 \\    </div>
                 \\  </section>
-                \\  <aside class="surface" aria-hidden="true">
-                \\    <div class="rail"><span>QUIC/TLS 1.3</span><span>HTTP/3</span></div>
-                \\    <div class="caps"><div class="cap">QUIC v1 Initial</div><div class="cap">TLS 1.3 Finished</div><div class="cap">1-RTT packets</div><div class="cap">QPACK response</div></div>
+                \\  <aside class="surface" aria-labelledby="laina-heading laina-role">
+                \\    <div class="rail"><span>Laina // route operator</span><span>HTTP/3</span></div>
                 \\    <div class="h3mark">HTTP/3</div>
                 \\    <div class="route"></div>
                 \\    <div class="packet"></div>
+                \\    <div class="mascot-wrap" tabindex="0">
+                \\      <img class="mascot" src="/static/laina.png?v=hands" alt="Laina, Layerline's anime route operator mascot">
+                \\    </div>
+                \\    <div class="mascot-name" id="laina-heading">Laina<span id="laina-role">packet-route mascot</span></div>
                 \\    <div class="node n1"></div>
                 \\    <div class="node n2"></div>
                 \\    <div class="node n3"></div>
