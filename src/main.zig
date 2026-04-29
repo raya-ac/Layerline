@@ -27,6 +27,9 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
 const DEFAULT_UPSTREAM_RETRIES = 1;
 const DEFAULT_UPSTREAM_MAX_FAILURES = 2;
 const DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS = 10_000;
+const DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 5_000;
+const DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 1_000;
+const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
 const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -339,6 +342,10 @@ const ServerConfig = struct {
     upstream_retries: usize,
     upstream_max_failures: usize,
     upstream_fail_timeout_ms: u32,
+    upstream_health_check_enabled: bool,
+    upstream_health_check_path: []const u8,
+    upstream_health_check_interval_ms: u32,
+    upstream_health_check_timeout_ms: u32,
     graceful_shutdown_timeout_ms: u32,
     cloudflare_auto_deploy: bool,
     max_php_output_bytes: usize,
@@ -1045,6 +1052,9 @@ const ServerMetrics = struct {
     upstream_retries_total: std.atomic.Value(usize),
     upstream_ejections_total: std.atomic.Value(usize),
     upstream_ejected_skips_total: std.atomic.Value(usize),
+    upstream_health_checks_total: std.atomic.Value(usize),
+    upstream_health_check_failures_total: std.atomic.Value(usize),
+    upstream_health_check_recoveries_total: std.atomic.Value(usize),
     h3_responses_total: std.atomic.Value(usize),
     h3_packets_sent_total: std.atomic.Value(usize),
 
@@ -1071,6 +1081,9 @@ const ServerMetrics = struct {
             .upstream_retries_total = std.atomic.Value(usize).init(0),
             .upstream_ejections_total = std.atomic.Value(usize).init(0),
             .upstream_ejected_skips_total = std.atomic.Value(usize).init(0),
+            .upstream_health_checks_total = std.atomic.Value(usize).init(0),
+            .upstream_health_check_failures_total = std.atomic.Value(usize).init(0),
+            .upstream_health_check_recoveries_total = std.atomic.Value(usize).init(0),
             .h3_responses_total = std.atomic.Value(usize).init(0),
             .h3_packets_sent_total = std.atomic.Value(usize).init(0),
         };
@@ -1152,6 +1165,18 @@ const ServerMetrics = struct {
 
     fn upstreamEjectedSkip(self: *ServerMetrics) void {
         ServerMetrics.inc(&self.upstream_ejected_skips_total);
+    }
+
+    fn upstreamHealthCheckRan(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_health_checks_total);
+    }
+
+    fn upstreamHealthCheckFailed(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_health_check_failures_total);
+    }
+
+    fn upstreamHealthCheckRecovered(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.upstream_health_check_recoveries_total);
     }
 
     fn h3ResponseSent(self: *ServerMetrics, packet_count: usize) void {
@@ -1787,6 +1812,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.upstream_max_failures = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "upstream_fail_timeout_ms") or std.mem.eql(u8, k, "proxy_fail_timeout_ms")) {
         cfg.upstream_fail_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_health_check") or std.mem.eql(u8, k, "upstream_health_check_enabled") or std.mem.eql(u8, k, "active_health_check") or std.mem.eql(u8, k, "proxy_health_check")) {
+        cfg.upstream_health_check_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_path") or std.mem.eql(u8, k, "proxy_health_check_path")) {
+        cfg.upstream_health_check_path = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_interval_ms") or std.mem.eql(u8, k, "proxy_health_check_interval_ms")) {
+        cfg.upstream_health_check_interval_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_timeout_ms") or std.mem.eql(u8, k, "proxy_health_check_timeout_ms")) {
+        cfg.upstream_health_check_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "graceful_shutdown_timeout_ms")) {
         cfg.graceful_shutdown_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "max_php_output_bytes")) {
@@ -2128,6 +2161,11 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.write_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.upstream_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.upstream_max_failures > 0 and cfg.upstream_fail_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.upstream_health_check_enabled) {
+        if (cfg.upstream_health_check_path.len == 0 or cfg.upstream_health_check_path[0] != '/') return error.InvalidConfigValue;
+        if (cfg.upstream_health_check_interval_ms == 0) return error.InvalidConfigValue;
+        if (cfg.upstream_health_check_timeout_ms == 0) return error.InvalidConfigValue;
+    }
     if (cfg.upstream) |pool| {
         try validateUpstreamPool(pool);
     }
@@ -2521,6 +2559,15 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             "# HELP layerline_upstream_ejected_skips_total Proxy attempts skipped because a target is in passive-health cooldown.\n" ++
             "# TYPE layerline_upstream_ejected_skips_total counter\n" ++
             "layerline_upstream_ejected_skips_total {d}\n" ++
+            "# HELP layerline_upstream_health_checks_total Active upstream health probes run.\n" ++
+            "# TYPE layerline_upstream_health_checks_total counter\n" ++
+            "layerline_upstream_health_checks_total {d}\n" ++
+            "# HELP layerline_upstream_health_check_failures_total Active upstream health probes that failed or returned unhealthy status.\n" ++
+            "# TYPE layerline_upstream_health_check_failures_total counter\n" ++
+            "layerline_upstream_health_check_failures_total {d}\n" ++
+            "# HELP layerline_upstream_health_check_recoveries_total Active upstream health probes that restored an unavailable target.\n" ++
+            "# TYPE layerline_upstream_health_check_recoveries_total counter\n" ++
+            "layerline_upstream_health_check_recoveries_total {d}\n" ++
             "# HELP layerline_h3_responses_total Native HTTP/3 responses sent.\n" ++
             "# TYPE layerline_h3_responses_total counter\n" ++
             "layerline_h3_responses_total {d}\n" ++
@@ -2549,6 +2596,9 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.upstream_retries_total),
             ServerMetrics.load(&server_metrics.upstream_ejections_total),
             ServerMetrics.load(&server_metrics.upstream_ejected_skips_total),
+            ServerMetrics.load(&server_metrics.upstream_health_checks_total),
+            ServerMetrics.load(&server_metrics.upstream_health_check_failures_total),
+            ServerMetrics.load(&server_metrics.upstream_health_check_recoveries_total),
             ServerMetrics.load(&server_metrics.h3_responses_total),
             ServerMetrics.load(&server_metrics.h3_packets_sent_total),
         },
@@ -3615,6 +3665,145 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     return error.CloseConnection;
 }
 
+fn parseHttpStatusCode(response_head: []const u8) ?u16 {
+    const first_line_end = std.mem.indexOf(u8, response_head, "\r\n") orelse response_head.len;
+    const first_line = response_head[0..first_line_end];
+    if (!std.mem.startsWith(u8, first_line, "HTTP/")) return null;
+
+    var parts = std.mem.tokenizeAny(u8, first_line, " \t");
+    _ = parts.next() orelse return null;
+    const code_raw = parts.next() orelse return null;
+    if (code_raw.len != 3) return null;
+    return std.fmt.parseInt(u16, code_raw, 10) catch null;
+}
+
+fn readUpstreamHealthStatus(upstream_conn: std.Io.net.Stream) !u16 {
+    var buffer: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const n = streamRead(upstream_conn, buffer[used..]) catch |err| switch (err) {
+            error.RequestTimeout => return err,
+            else => |e| return e,
+        };
+        if (n == 0) break;
+        used += n;
+        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n") != null) break;
+    }
+
+    if (used == 0) return error.InvalidUpstream;
+    return parseHttpStatusCode(buffer[0..used]) orelse error.InvalidUpstream;
+}
+
+fn checkUpstreamHealth(allocator: std.mem.Allocator, upstream: *const UpstreamConfig, health_path: []const u8, timeout_ms: u32) !bool {
+    if (upstream.https) return error.UnsupportedUpstreamScheme;
+
+    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
+    defer streamClose(upstream_conn);
+    try setStreamTimeouts(upstream_conn, timeout_ms, timeout_ms);
+
+    const probe_path = try buildProxyPath(allocator, upstream.base_path, health_path, "");
+    defer allocator.free(probe_path);
+
+    var request_buffer: [1024]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buffer,
+        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: Layerline-healthcheck\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        .{ probe_path, upstream.host },
+    );
+    try streamWriteAll(upstream_conn, request);
+
+    const status_code = try readUpstreamHealthStatus(upstream_conn);
+    return status_code >= 200 and status_code < 400;
+}
+
+const UpstreamHealthTransition = enum {
+    unchanged,
+    ejected,
+    recovered,
+};
+
+fn upstreamRecordActiveHealthResult(upstream: *UpstreamConfig, healthy: bool, now_ms: i64, cooldown_ms: u32) UpstreamHealthTransition {
+    if (healthy) {
+        const was_unavailable = upstream.ejected_until_ms.load(.monotonic) != 0 or upstream.passive_failures.load(.monotonic) != 0;
+        upstreamRecordSuccess(upstream);
+        return if (was_unavailable) .recovered else .unchanged;
+    }
+
+    const was_available = !upstreamIsEjected(upstream, now_ms);
+    upstream.passive_failures.store(1, .monotonic);
+    upstream.ejected_until_ms.store(now_ms + @as(i64, @intCast(cooldown_ms)), .monotonic);
+    return if (was_available) .ejected else .unchanged;
+}
+
+fn activeHealthCooldownMs(cfg: *const ServerConfig) u32 {
+    const doubled_interval = cfg.upstream_health_check_interval_ms *| 2;
+    return @max(doubled_interval, cfg.upstream_health_check_timeout_ms);
+}
+
+fn recordActiveHealthMetrics(transition: UpstreamHealthTransition, healthy: bool) void {
+    server_metrics.upstreamHealthCheckRan();
+    if (!healthy) server_metrics.upstreamHealthCheckFailed();
+    switch (transition) {
+        .ejected => server_metrics.upstreamEjected(),
+        .recovered => server_metrics.upstreamHealthCheckRecovered(),
+        .unchanged => {},
+    }
+}
+
+fn runActiveHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, cfg: *const ServerConfig) void {
+    const cooldown_ms = activeHealthCooldownMs(cfg);
+    for (pool.targets.items) |*upstream| {
+        if (shutdown_requested.load(.acquire)) return;
+
+        const healthy = checkUpstreamHealth(allocator, upstream, cfg.upstream_health_check_path, cfg.upstream_health_check_timeout_ms) catch false;
+        const transition = upstreamRecordActiveHealthResult(upstream, healthy, upstreamNowMs(), cooldown_ms);
+        recordActiveHealthMetrics(transition, healthy);
+    }
+}
+
+fn runActiveHealthCheckCycle(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
+    if (cfg.upstream) |*pool| {
+        runActiveHealthCheckForPool(allocator, pool, cfg);
+    }
+    for (cfg.routes.items) |*route| {
+        if (route.upstream) |*pool| {
+            runActiveHealthCheckForPool(allocator, pool, cfg);
+        }
+    }
+    for (cfg.domains.items) |*domain| {
+        if (domain.upstream) |*pool| {
+            runActiveHealthCheckForPool(allocator, pool, cfg);
+        }
+        for (domain.routes.items) |*route| {
+            if (route.upstream) |*pool| {
+                runActiveHealthCheckForPool(allocator, pool, cfg);
+            }
+        }
+    }
+}
+
+const UpstreamHealthCheckContext = struct {
+    io: std.Io,
+    cfg: *ServerConfig,
+};
+
+fn sleepUpstreamHealthInterval(io: std.Io, interval_ms: u32) void {
+    var remaining = interval_ms;
+    while (remaining > 0 and !shutdown_requested.load(.acquire)) {
+        const chunk = @min(remaining, 250);
+        io.sleep(.fromMilliseconds(chunk), .awake) catch {};
+        remaining -= chunk;
+    }
+}
+
+fn upstreamHealthCheckTask(ctx: UpstreamHealthCheckContext) void {
+    bindThreadIo(ctx.io);
+    while (!shutdown_requested.load(.acquire)) {
+        runActiveHealthCheckCycle(std.heap.page_allocator, ctx.cfg);
+        sleepUpstreamHealthInterval(ctx.io, ctx.cfg.upstream_health_check_interval_ms);
+    }
+}
+
 fn forwardToUpstreamPool(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
@@ -4196,6 +4385,10 @@ test "named routes prefer exact and longest prefix matches" {
         .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
         .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
         .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,
+        .upstream_health_check_enabled = false,
+        .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
+        .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
+        .upstream_health_check_timeout_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS,
         .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .cloudflare_auto_deploy = false,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
@@ -4217,6 +4410,10 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_policy", "random");
     try applyConfigLine(&cfg, allocator, "upstream_max_failures", "3");
     try applyConfigLine(&cfg, allocator, "upstream_fail_timeout_ms", "1500");
+    try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
+    try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
+    try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
+    try applyConfigLine(&cfg, allocator, "upstream_health_check_timeout_ms", "750");
     try applyConfigLine(&cfg, allocator, "route_proxy_policy.health", "round-robin");
 
     try std.testing.expectEqualStrings("health", findNamedRoute(&cfg, "/health").?.name);
@@ -4226,6 +4423,10 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(UpstreamPoolPolicy.random, cfg.upstream_policy);
     try std.testing.expectEqual(@as(usize, 3), cfg.upstream_max_failures);
     try std.testing.expectEqual(@as(u32, 1500), cfg.upstream_fail_timeout_ms);
+    try std.testing.expect(cfg.upstream_health_check_enabled);
+    try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
+    try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
+    try std.testing.expectEqual(@as(u32, 750), cfg.upstream_health_check_timeout_ms);
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
 
     const rel = try routeFileRelativePath(allocator, findNamedRoute(&cfg, "/assets/hello.txt").?, "/assets/hello.txt", "index.html");
@@ -4341,6 +4542,27 @@ test "weighted policy honors target weights and passive ejection" {
     upstream_round_robin_cursor.store(0, .monotonic);
     pool.targets.items[0].ejected_until_ms.store(2_000, .monotonic);
     try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000));
+}
+
+test "active health result transitions update upstream availability" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var upstream = try parseUpstream(allocator, "http://127.0.0.1:9000");
+
+    try std.testing.expectEqual(UpstreamHealthTransition.ejected, upstreamRecordActiveHealthResult(&upstream, false, 1_000, 500));
+    try std.testing.expect(upstreamIsEjected(&upstream, 1_250));
+    try std.testing.expectEqual(@as(i64, 1_500), upstream.ejected_until_ms.load(.monotonic));
+    try std.testing.expectEqual(UpstreamHealthTransition.unchanged, upstreamRecordActiveHealthResult(&upstream, false, 1_300, 500));
+    try std.testing.expectEqual(UpstreamHealthTransition.recovered, upstreamRecordActiveHealthResult(&upstream, true, 1_350, 500));
+    try std.testing.expect(!upstreamIsEjected(&upstream, 1_351));
+}
+
+test "health check status parser accepts normal HTTP status lines" {
+    try std.testing.expectEqual(@as(?u16, 200), parseHttpStatusCode("HTTP/1.1 200 OK\r\nServer: test\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 503), parseHttpStatusCode("HTTP/1.0 503 Service Unavailable\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, null), parseHttpStatusCode("not-http\r\n\r\n"));
 }
 
 test "passive upstream health ejects and recovers targets" {
@@ -6254,7 +6476,7 @@ fn usage() void {
             "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
-            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random] [--h2-upstream http://HOST:PORT[/path]] " ++
+            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
@@ -6263,12 +6485,13 @@ fn usage() void {
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N] [--read-header-timeout-ms N] " ++
             "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] [--upstream-retries N] [--upstream-max-failures N] [--upstream-fail-timeout-ms N] " ++
+            "[--upstream-health-check true|false] [--upstream-health-path /health] [--upstream-health-interval-ms N] [--upstream-health-timeout-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
-            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, graceful_shutdown_timeout_ms, " ++
+            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
@@ -6287,6 +6510,7 @@ fn usage() void {
             "  zig build run -- --domain-config-dir domains-enabled --dump-routes\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random\n" ++
+            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-health-check true\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
@@ -6361,6 +6585,10 @@ pub fn main(init: std.process.Init) !void {
         .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
         .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
         .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,
+        .upstream_health_check_enabled = false,
+        .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
+        .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
+        .upstream_health_check_timeout_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS,
         .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
     };
@@ -6633,6 +6861,29 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.upstream_fail_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_fail_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-health-check") or std.mem.eql(u8, arg, "--proxy-health-check")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_health_check_enabled = parseBool(value) orelse cfg.upstream_health_check_enabled;
+        } else if (std.mem.eql(u8, arg, "--upstream-health-path") or std.mem.eql(u8, arg, "--upstream-health-check-path") or std.mem.eql(u8, arg, "--proxy-health-path")) {
+            cfg.upstream_health_check_path = args.next() orelse {
+                usage();
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--upstream-health-interval-ms") or std.mem.eql(u8, arg, "--upstream-health-check-interval-ms") or std.mem.eql(u8, arg, "--proxy-health-interval-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_health_check_interval_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_health_check_interval_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-health-timeout-ms") or std.mem.eql(u8, arg, "--upstream-health-check-timeout-ms") or std.mem.eql(u8, arg, "--proxy-health-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_health_check_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_health_check_timeout_ms;
         } else if (std.mem.eql(u8, arg, "--graceful-shutdown-timeout-ms")) {
             const value = args.next() orelse {
                 usage();
@@ -6792,6 +7043,14 @@ pub fn main(init: std.process.Init) !void {
             cfg.graceful_shutdown_timeout_ms,
         },
     );
+    if (cfg.upstream_health_check_enabled) {
+        const health_worker = std.Thread.spawn(.{}, upstreamHealthCheckTask, .{UpstreamHealthCheckContext{ .io = init.io, .cfg = &cfg }}) catch |err| {
+            std.debug.print("Failed to start upstream health checker: {}\n", .{err});
+            return;
+        };
+        health_worker.detach();
+        std.debug.print("Active upstream health checks: path={s} interval={d}ms timeout={d}ms\n", .{ cfg.upstream_health_check_path, cfg.upstream_health_check_interval_ms, cfg.upstream_health_check_timeout_ms });
+    }
     if (cfg.http3_enabled) {
         const h3_worker = std.Thread.spawn(.{}, serveHttp3ProbeTask, .{ init.io, &cfg }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});

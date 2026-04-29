@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted` policies, target weights, bounded retries, and passive upstream ejection.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted` policies, target weights, bounded retries, passive upstream ejection, and opt-in active health checks.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections and weighted balancing, passive upstream ejection, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections and weighted balancing, passive and active upstream health, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper upstream behavior: active health checks, circuit breakers, richer balancing policies, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper upstream behavior: circuit breakers, slow start, consistent-hash or sticky balancing, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -97,6 +97,11 @@ proxy = off
 # Set upstream_max_failures = 0 to disable passive ejection.
 #upstream_max_failures = 2
 #upstream_fail_timeout_ms = 10000
+# Active health checks are opt-in and mark unhealthy targets before user traffic hits them.
+#upstream_health_check = false
+#upstream_health_check_path = /health
+#upstream_health_check_interval_ms = 5000
+#upstream_health_check_timeout_ms = 1000
 # Named route syntax: route = NAME /path-or-prefix/* static|php|proxy
 # Route-local settings inherit global values unless overridden.
 #route = assets /assets/* static
