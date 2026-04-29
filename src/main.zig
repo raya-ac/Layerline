@@ -4048,6 +4048,17 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
+    const forwarded_host = if (findHeaderValue(req.headers, "Host")) |host|
+        trimValue(host)
+    else
+        upstream.host;
+    const forwarded_proto = if (findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
+        trimValue(proto)
+    else if (cfg.tls_enabled)
+        "https"
+    else
+        "http";
+
     // Rebuild framing headers from parsed state. Copying the client's
     // Content-Length here caused duplicate lengths and strict backends rejected it.
     try out.print(
@@ -4056,11 +4067,13 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         .{
             req.method,
             proxy_path,
-            upstream.host,
+            forwarded_host,
             if (keepalive_enabled) "keep-alive" else "close",
         },
     );
 
+    var saw_forwarded_host = false;
+    var saw_forwarded_proto = false;
     var headers = std.mem.splitSequence(u8, req.headers, "\r\n");
     while (headers.next()) |line| {
         const trimmed = trimValue(line);
@@ -4070,9 +4083,16 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
             if (isSkippedProxyHeader(name)) continue;
             const value = trimValue(trimmed[colon + 1 ..]);
             if (value.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
+            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
             try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
         }
     }
+
+    // App frameworks commonly build absolute URLs from these. Keep caller-provided
+    // values when a trusted frontend has already set them.
+    if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{forwarded_host});
+    if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
 
     try out.print(
         allocator,
@@ -5199,6 +5219,21 @@ fn routeRequest(
         return;
     }
 
+    if ((std.mem.eql(u8, method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
+        const token = req.path["/.well-known/acme-challenge/".len..];
+        try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, should_close, is_head);
+        return;
+    }
+
+    // A domain-level proxy is the virtual host's fallback owner. Keep the
+    // built-in Layerline pages for direct/default hosts, not for proxied apps.
+    if (domain != null) {
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+            return;
+        }
+    }
+
     if (std.mem.eql(u8, method, "GET") or is_head) {
         if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
             try sendServerIcon(stream, should_close, is_head);
@@ -5594,12 +5629,6 @@ fn routeRequest(
             var ts_buf: [64]u8 = undefined;
             const ts = try std.fmt.bufPrint(&ts_buf, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()});
             try sendResponseForMethod(stream, 200, "OK", "application/json; charset=utf-8", ts, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
-            const token = req.path["/.well-known/acme-challenge/".len..];
-            try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, should_close, is_head);
             return;
         }
 
