@@ -23,6 +23,12 @@ This is a practical build that blends local serving with edge-style deployment:
 - High-load knobs (`--max-requests-per-connection`, `--max-php-output-bytes`, `--worker-stack-size`) to tune behavior under sustained pressure.
 - Branded HTML error responses for common 4xx/5xx paths, including HEAD-safe behavior.
 
+## Current status
+
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+
+The next roadmap slice is reverse-proxy depth: multiple upstreams per route, load-balancing policy, health state, retry behavior, and cleaner upstream diagnostics. That work should build on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+
 ## Files
 
 - `src/main.zig` – server implementation.
