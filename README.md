@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, upstream keep-alive pooling, and opt-in active health checks.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, circuit breaker half-open probes, slow start, upstream keep-alive pooling, and opt-in active health checks.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper upstream behavior: circuit breakers, slow start, sticky-session balancing, and per-route upstream pool policy. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI/PHP front-controller handling, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -94,9 +94,13 @@ proxy = off
 # Set to 0 to disable retry attempts.
 #upstream_retries = 1
 # Passive health ejects a target after repeated failed attempts.
+# Circuit breaker recovery allows a small half-open probe window after cooldown.
 # Set upstream_max_failures = 0 to disable passive ejection.
 #upstream_max_failures = 2
 #upstream_fail_timeout_ms = 10000
+#upstream_circuit_breaker = true
+#upstream_circuit_half_open_max = 1
+#upstream_slow_start_ms = 10000
 # Reuse backend TCP sockets after framed upstream responses.
 #upstream_keepalive = true
 #upstream_keepalive_max_idle = 16
@@ -423,10 +427,10 @@ Choose the first target with `round_robin` or `random`; retries still walk the r
 zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random
 ```
 
-Passive health marks a target as unavailable after repeated failed attempts and skips it until the cooldown expires:
+Passive health marks a target as unavailable after repeated failed attempts. After the cooldown, the circuit breaker only allows a small half-open probe window; successful recovery starts the target at reduced weighted capacity before it receives full traffic again.
 
 ```bash
-zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-max-failures 2 --upstream-fail-timeout-ms 10000
+zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-max-failures 2 --upstream-fail-timeout-ms 10000 --upstream-circuit-half-open-max 1 --upstream-slow-start-ms 10000
 ```
 
 You can also run only HTTP/2 cleartext passthrough:

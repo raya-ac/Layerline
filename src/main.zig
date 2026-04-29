@@ -36,6 +36,8 @@ const DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS = 100;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 1_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
+const DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX = 1;
+const DEFAULT_UPSTREAM_SLOW_START_MS = 10_000;
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
 const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -259,8 +261,10 @@ const UpstreamConfig = struct {
     weight: usize,
     keepalive_pool: UpstreamKeepAlivePool,
     active_requests: std.atomic.Value(usize),
+    half_open_requests: std.atomic.Value(usize),
     passive_failures: std.atomic.Value(usize),
     ejected_until_ms: std.atomic.Value(i64),
+    recovered_at_ms: std.atomic.Value(i64),
 };
 
 const UpstreamPoolPolicy = enum {
@@ -410,6 +414,9 @@ const ServerConfig = struct {
     upstream_health_check_path: []const u8,
     upstream_health_check_interval_ms: u32,
     upstream_health_check_timeout_ms: u32,
+    upstream_circuit_breaker_enabled: bool,
+    upstream_circuit_half_open_max: usize,
+    upstream_slow_start_ms: u32,
     graceful_shutdown_timeout_ms: u32,
     cloudflare_auto_deploy: bool,
     max_php_output_bytes: usize,
@@ -2012,6 +2019,12 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.upstream_health_check_interval_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "upstream_health_check_timeout_ms") or std.mem.eql(u8, k, "proxy_health_check_timeout_ms")) {
         cfg.upstream_health_check_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "upstream_circuit_breaker") or std.mem.eql(u8, k, "upstream_circuit_breaker_enabled") or std.mem.eql(u8, k, "proxy_circuit_breaker")) {
+        cfg.upstream_circuit_breaker_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "upstream_circuit_half_open_max") or std.mem.eql(u8, k, "proxy_circuit_half_open_max")) {
+        cfg.upstream_circuit_half_open_max = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "upstream_slow_start_ms") or std.mem.eql(u8, k, "proxy_slow_start_ms")) {
+        cfg.upstream_slow_start_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "graceful_shutdown_timeout_ms")) {
         cfg.graceful_shutdown_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "max_php_output_bytes")) {
@@ -2370,6 +2383,7 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if (cfg.upstream_health_check_interval_ms == 0) return error.InvalidConfigValue;
         if (cfg.upstream_health_check_timeout_ms == 0) return error.InvalidConfigValue;
     }
+    if (cfg.upstream_circuit_breaker_enabled and cfg.upstream_circuit_half_open_max == 0) return error.InvalidConfigValue;
     if (cfg.upstream) |pool| {
         try validateUpstreamPool(pool);
     }
@@ -4242,7 +4256,7 @@ fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamP
 
     const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
     const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req);
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req, cfg);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -4250,31 +4264,31 @@ fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamP
 
     while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
         const upstream = upstreamAtAttempt(pool, start_ticket, considered);
-        if (upstreamIsEjected(upstream, now_ms)) {
+        const lease = upstreamBeginAttempt(upstream, now_ms, cfg) orelse {
             skipped_ejected += 1;
             server_metrics.upstreamEjectedSkip();
             continue;
-        }
+        };
+
         if (attempts > 0) server_metrics.upstreamRetried();
         attempts += 1;
         server_metrics.upstreamRequestStarted();
-        upstreamBeginAttempt(upstream);
         const response = fetchHttp2UpstreamResponse(allocator, upstream, req, cfg) catch |err| {
-            upstreamEndAttempt(upstream);
+            upstreamEndAttempt(upstream, lease);
             last_error = err;
             server_metrics.upstreamRequestFailed();
-            if (upstreamRecordFailure(upstream, now_ms, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
+            if (upstreamRecordFailure(upstream, upstreamNowMs(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
                 server_metrics.upstreamEjected();
             }
             continue;
         };
-        upstreamEndAttempt(upstream);
-        upstreamRecordSuccess(upstream);
+        upstreamEndAttempt(upstream, lease);
+        upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
         return response;
     }
 
     if (attempts == 0 and skipped_ejected > 0) {
-        return h2CoolErrorResponse(allocator, 503, "Service Unavailable", "All configured upstream targets are in passive-health cooldown.");
+        return h2CoolErrorResponse(allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.");
     }
     if (last_error) |err| switch (err) {
         error.RequestTimeout => return h2CoolErrorResponse(allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out."),
@@ -4627,8 +4641,10 @@ fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig 
         .weight = 1,
         .keepalive_pool = UpstreamKeepAlivePool.init(),
         .active_requests = std.atomic.Value(usize).init(0),
+        .half_open_requests = std.atomic.Value(usize).init(0),
         .passive_failures = std.atomic.Value(usize).init(0),
         .ejected_until_ms = std.atomic.Value(i64).init(0),
+        .recovered_at_ms = std.atomic.Value(i64).init(0),
     };
 }
 
@@ -4693,7 +4709,53 @@ fn upstreamRandomTicket() usize {
     return @truncate(z ^ (z >> 31));
 }
 
-fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize {
+fn upstreamInSlowStart(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) bool {
+    const slow_start_ms = if (cfg) |config| config.upstream_slow_start_ms else 0;
+    if (slow_start_ms == 0) return false;
+    const recovered_at = upstream.recovered_at_ms.load(.monotonic);
+    if (recovered_at == 0) return false;
+    if (now_ms <= recovered_at) return true;
+    if (now_ms - recovered_at < @as(i64, @intCast(slow_start_ms))) return true;
+    upstream.recovered_at_ms.store(0, .monotonic);
+    return false;
+}
+
+fn upstreamEffectiveWeight(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
+    const base_weight = upstream.weight;
+    if (base_weight <= 1) return base_weight;
+    const config = cfg orelse return base_weight;
+    if (config.upstream_slow_start_ms == 0) return base_weight;
+
+    const recovered_at = upstream.recovered_at_ms.load(.monotonic);
+    if (recovered_at == 0) return base_weight;
+    if (now_ms <= recovered_at) return 1;
+
+    const elapsed_ms = now_ms - recovered_at;
+    const slow_start_ms = @as(i64, @intCast(config.upstream_slow_start_ms));
+    if (elapsed_ms >= slow_start_ms) {
+        upstream.recovered_at_ms.store(0, .monotonic);
+        return base_weight;
+    }
+
+    const scaled = (@as(u128, base_weight) * @as(u128, @intCast(elapsed_ms))) / @as(u128, @intCast(slow_start_ms));
+    return @max(@as(usize, 1), @min(base_weight, @as(usize, @intCast(scaled))));
+}
+
+fn upstreamInHalfOpen(upstream: *UpstreamConfig, now_ms: i64) bool {
+    const until_ms = upstream.ejected_until_ms.load(.monotonic);
+    return until_ms != 0 and now_ms >= until_ms;
+}
+
+fn upstreamIsSelectable(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) bool {
+    if (upstreamIsEjected(upstream, now_ms)) return false;
+    const config = cfg orelse return true;
+    if (!config.upstream_circuit_breaker_enabled) return true;
+    if (!upstreamInHalfOpen(upstream, now_ms)) return true;
+    if (config.upstream_circuit_half_open_max == 0) return false;
+    return upstream.half_open_requests.load(.monotonic) < config.upstream_circuit_half_open_max;
+}
+
+fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
     const target_count = pool.targets.items.len;
     const tie_ticket = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return tie_ticket;
@@ -4704,9 +4766,10 @@ fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize 
     while (offset < target_count) : (offset += 1) {
         const index = (tie_ticket + offset) % target_count;
         const upstream = &pool.targets.items[index];
-        if (upstreamIsEjected(upstream, now_ms)) continue;
+        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
 
-        const active = upstream.active_requests.load(.monotonic);
+        var active = upstream.active_requests.load(.monotonic);
+        if (upstreamInSlowStart(upstream, now_ms, cfg)) active += 1;
         if (best_index == null or active < best_active) {
             best_index = index;
             best_active = active;
@@ -4716,23 +4779,24 @@ fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize 
     return best_index orelse tie_ticket;
 }
 
-fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize {
+fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
     const target_count = pool.targets.items.len;
     const ticket = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return ticket;
 
     var total_weight: usize = 0;
     for (pool.targets.items) |*upstream| {
-        if (upstreamIsEjected(upstream, now_ms)) continue;
-        total_weight += upstream.weight;
+        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
+        total_weight += upstreamEffectiveWeight(upstream, now_ms, cfg);
     }
     if (total_weight == 0) return ticket;
 
     var remaining = ticket % total_weight;
     for (pool.targets.items, 0..) |*upstream, index| {
-        if (upstreamIsEjected(upstream, now_ms)) continue;
-        if (remaining < upstream.weight) return index;
-        remaining -= upstream.weight;
+        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
+        const weight = upstreamEffectiveWeight(upstream, now_ms, cfg);
+        if (remaining < weight) return index;
+        remaining -= weight;
     }
 
     return ticket;
@@ -4786,7 +4850,7 @@ fn upstreamConsistentHashKey(req: HttpRequest) u64 {
     return hash;
 }
 
-fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?HttpRequest, now_ms: i64) usize {
+fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?HttpRequest, now_ms: i64, cfg: ?*const ServerConfig) usize {
     const target_count = pool.targets.items.len;
     const fallback = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return fallback;
@@ -4796,7 +4860,7 @@ fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?HttpRequest, no
     var best_score: u64 = 0;
 
     for (pool.targets.items, 0..) |*upstream, index| {
-        if (upstreamIsEjected(upstream, now_ms)) continue;
+        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
 
         var score = upstreamHashBytes(key, upstream.host);
         score = upstreamHashU16(upstreamHashByte(score, 0), upstream.port);
@@ -4810,54 +4874,76 @@ fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?HttpRequest, no
     return best_index orelse @as(usize, @intCast(key % target_count));
 }
 
-fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64, req: ?HttpRequest) usize {
+fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64, req: ?HttpRequest, cfg: ?*const ServerConfig) usize {
     return switch (policy) {
         .round_robin => upstream_round_robin_cursor.fetchAdd(1, .monotonic),
         .random => upstreamRandomTicket(),
-        .least_connections => upstreamLeastConnectionsTicket(pool, now_ms),
-        .weighted => upstreamWeightedTicket(pool, now_ms),
-        .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms),
+        .least_connections => upstreamLeastConnectionsTicket(pool, now_ms, cfg),
+        .weighted => upstreamWeightedTicket(pool, now_ms, cfg),
+        .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms, cfg),
     };
 }
 
 fn selectUpstream(pool: *UpstreamPoolConfig) ?*UpstreamConfig {
     if (pool.targets.items.len == 0) return null;
-    const ticket = upstreamStartTicket(pool, pool.policy, upstreamNowMs(), null);
+    const ticket = upstreamStartTicket(pool, pool.policy, upstreamNowMs(), null, null);
     return &pool.targets.items[ticket % pool.targets.items.len];
 }
 
 fn upstreamIsEjected(upstream: *UpstreamConfig, now_ms: i64) bool {
     const until_ms = upstream.ejected_until_ms.load(.monotonic);
     if (until_ms == 0) return false;
-    if (now_ms < until_ms) return true;
-
-    upstream.ejected_until_ms.store(0, .monotonic);
-    upstream.passive_failures.store(0, .monotonic);
-    return false;
+    return now_ms < until_ms;
 }
 
-fn upstreamRecordSuccess(upstream: *UpstreamConfig) void {
+fn upstreamRecordSuccess(upstream: *UpstreamConfig, now_ms: i64, slow_start_ms: u32) void {
+    const was_recovering = upstream.ejected_until_ms.load(.monotonic) != 0 or upstream.passive_failures.load(.monotonic) != 0;
     upstream.passive_failures.store(0, .monotonic);
     upstream.ejected_until_ms.store(0, .monotonic);
+    if (was_recovering and slow_start_ms > 0) {
+        upstream.recovered_at_ms.store(now_ms, .monotonic);
+    }
 }
 
 fn upstreamRecordFailure(upstream: *UpstreamConfig, now_ms: i64, max_failures: usize, fail_timeout_ms: u32) bool {
     if (max_failures == 0 or fail_timeout_ms == 0) return false;
 
+    const half_open = upstreamInHalfOpen(upstream, now_ms);
     const failures = upstream.passive_failures.fetchAdd(1, .monotonic) + 1;
-    if (failures < max_failures) return false;
+    if (!half_open and failures < max_failures) return false;
 
+    const previous_until = upstream.ejected_until_ms.load(.monotonic);
     const cooldown_until = now_ms + @as(i64, @intCast(fail_timeout_ms));
     upstream.ejected_until_ms.store(cooldown_until, .monotonic);
-    return true;
+    upstream.recovered_at_ms.store(0, .monotonic);
+    return previous_until == 0 or previous_until <= now_ms;
 }
 
-fn upstreamBeginAttempt(upstream: *UpstreamConfig) void {
+const UpstreamAttemptLease = struct {
+    half_open: bool,
+};
+
+fn upstreamBeginAttempt(upstream: *UpstreamConfig, now_ms: i64, cfg: *const ServerConfig) ?UpstreamAttemptLease {
+    if (upstreamIsEjected(upstream, now_ms)) return null;
+
+    var half_open = false;
+    if (cfg.upstream_circuit_breaker_enabled and upstreamInHalfOpen(upstream, now_ms)) {
+        if (cfg.upstream_circuit_half_open_max == 0) return null;
+        const active_half_open = upstream.half_open_requests.fetchAdd(1, .monotonic);
+        if (active_half_open >= cfg.upstream_circuit_half_open_max) {
+            _ = upstream.half_open_requests.fetchSub(1, .monotonic);
+            return null;
+        }
+        half_open = true;
+    }
+
     _ = upstream.active_requests.fetchAdd(1, .monotonic);
+    return .{ .half_open = half_open };
 }
 
-fn upstreamEndAttempt(upstream: *UpstreamConfig) void {
+fn upstreamEndAttempt(upstream: *UpstreamConfig, lease: UpstreamAttemptLease) void {
     _ = upstream.active_requests.fetchSub(1, .monotonic);
+    if (lease.half_open) _ = upstream.half_open_requests.fetchSub(1, .monotonic);
 }
 
 fn upstreamAttemptLimit(pool: *const UpstreamPoolConfig, retry_budget: usize) usize {
@@ -5442,10 +5528,10 @@ const UpstreamHealthTransition = enum {
     recovered,
 };
 
-fn upstreamRecordActiveHealthResult(upstream: *UpstreamConfig, healthy: bool, now_ms: i64, cooldown_ms: u32) UpstreamHealthTransition {
+fn upstreamRecordActiveHealthResult(upstream: *UpstreamConfig, healthy: bool, now_ms: i64, cooldown_ms: u32, slow_start_ms: u32) UpstreamHealthTransition {
     if (healthy) {
         const was_unavailable = upstream.ejected_until_ms.load(.monotonic) != 0 or upstream.passive_failures.load(.monotonic) != 0;
-        upstreamRecordSuccess(upstream);
+        upstreamRecordSuccess(upstream, now_ms, slow_start_ms);
         return if (was_unavailable) .recovered else .unchanged;
     }
 
@@ -5476,7 +5562,7 @@ fn runActiveHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPool
         if (shutdown_requested.load(.acquire)) return;
 
         const healthy = checkUpstreamHealth(allocator, upstream, cfg.upstream_health_check_path, cfg.upstream_health_check_timeout_ms) catch false;
-        const transition = upstreamRecordActiveHealthResult(upstream, healthy, upstreamNowMs(), cooldown_ms);
+        const transition = upstreamRecordActiveHealthResult(upstream, healthy, upstreamNowMs(), cooldown_ms, cfg.upstream_slow_start_ms);
         recordActiveHealthMetrics(transition, healthy);
     }
 }
@@ -5539,7 +5625,7 @@ fn forwardToUpstreamPool(
 
     const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
     const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req);
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req, cfg);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -5547,43 +5633,42 @@ fn forwardToUpstreamPool(
 
     attempt_loop: while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
         const upstream = upstreamAtAttempt(pool, start_ticket, considered);
-        if (upstreamIsEjected(upstream, now_ms)) {
+        const lease = upstreamBeginAttempt(upstream, now_ms, cfg) orelse {
             skipped_ejected += 1;
             server_metrics.upstreamEjectedSkip();
             continue :attempt_loop;
-        }
+        };
 
         if (attempts > 0) server_metrics.upstreamRetried();
         attempts += 1;
         server_metrics.upstreamRequestStarted();
-        upstreamBeginAttempt(upstream);
         forwardToUpstream(stream, allocator, upstream, req, cfg) catch |err| switch (err) {
             error.CloseConnection => {
-                upstreamEndAttempt(upstream);
-                upstreamRecordSuccess(upstream);
+                upstreamEndAttempt(upstream, lease);
+                upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
                 return err;
             },
             error.OutOfMemory => {
-                upstreamEndAttempt(upstream);
+                upstreamEndAttempt(upstream, lease);
                 return err;
             },
             else => {
-                upstreamEndAttempt(upstream);
+                upstreamEndAttempt(upstream, lease);
                 last_error = err;
                 server_metrics.upstreamRequestFailed();
-                if (upstreamRecordFailure(upstream, now_ms, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
+                if (upstreamRecordFailure(upstream, upstreamNowMs(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
                     server_metrics.upstreamEjected();
                 }
                 continue :attempt_loop;
             },
         };
-        upstreamEndAttempt(upstream);
-        upstreamRecordSuccess(upstream);
+        upstreamEndAttempt(upstream, lease);
+        upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
         return;
     }
 
     if (attempts == 0 and skipped_ejected > 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 503, "Service Unavailable", "All configured upstream targets are in passive-health cooldown.", true, false, null);
+        try sendCoolErrorWithConnection(stream, allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.", true, false, null);
         return;
     }
 
@@ -6169,6 +6254,9 @@ test "named routes prefer exact and longest prefix matches" {
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
         .upstream_health_check_timeout_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS,
+        .upstream_circuit_breaker_enabled = true,
+        .upstream_circuit_half_open_max = DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX,
+        .upstream_slow_start_ms = DEFAULT_UPSTREAM_SLOW_START_MS,
         .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .cloudflare_auto_deploy = false,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
@@ -6198,6 +6286,8 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_timeout_ms", "750");
+    try applyConfigLine(&cfg, allocator, "upstream_circuit_half_open_max", "2");
+    try applyConfigLine(&cfg, allocator, "upstream_slow_start_ms", "6000");
     try applyConfigLine(&cfg, allocator, "route_proxy_policy.health", "round-robin");
 
     try std.testing.expectEqualStrings("health", findNamedRoute(&cfg, "/health").?.name);
@@ -6215,12 +6305,33 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
     try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
     try std.testing.expectEqual(@as(u32, 750), cfg.upstream_health_check_timeout_ms);
+    try std.testing.expect(cfg.upstream_circuit_breaker_enabled);
+    try std.testing.expectEqual(@as(usize, 2), cfg.upstream_circuit_half_open_max);
+    try std.testing.expectEqual(@as(u32, 6000), cfg.upstream_slow_start_ms);
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
 
     cfg.upstream = try parseUpstreamPool(allocator, "http://127.0.0.1:9100");
     const fallback_pool = domainUpstreamMutable(&cfg, null).?;
     try std.testing.expect(!upstreamRecordFailure(&fallback_pool.targets.items[0], 1_000, 2, 500));
     try std.testing.expectEqual(@as(usize, 1), domainUpstreamMutable(&cfg, null).?.targets.items[0].passive_failures.load(.monotonic));
+
+    var breaker_target = try parseUpstream(allocator, "http://127.0.0.1:9200");
+    breaker_target.weight = 5;
+    try std.testing.expect(upstreamRecordFailure(&breaker_target, 10_000, 1, 500));
+    try std.testing.expect(upstreamIsEjected(&breaker_target, 10_250));
+    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_250, &cfg) == null);
+    const half_open_1 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
+    const half_open_2 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(half_open_1.half_open);
+    try std.testing.expect(half_open_2.half_open);
+    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_500, &cfg) == null);
+    upstreamEndAttempt(&breaker_target, half_open_2);
+    upstreamEndAttempt(&breaker_target, half_open_1);
+    upstreamRecordSuccess(&breaker_target, 10_550, cfg.upstream_slow_start_ms);
+    try std.testing.expect(!upstreamIsEjected(&breaker_target, 10_551));
+    try std.testing.expect(upstreamInSlowStart(&breaker_target, 10_551, &cfg));
+    try std.testing.expectEqual(@as(usize, 1), upstreamEffectiveWeight(&breaker_target, 10_551, &cfg));
+    try std.testing.expectEqual(@as(usize, 5), upstreamEffectiveWeight(&breaker_target, 16_550, &cfg));
 
     try applyConfigLine(&cfg, allocator, "route_proxy.health", "http://127.0.0.1:9101");
     const health_route = findNamedRouteMutable(&cfg, "/health").?;
@@ -6339,10 +6450,10 @@ test "least-connections policy chooses the quietest healthy upstream" {
     pool.targets.items[0].active_requests.store(5, .monotonic);
     pool.targets.items[1].active_requests.store(1, .monotonic);
     pool.targets.items[2].active_requests.store(3, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000, null, null));
 
     pool.targets.items[1].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000, null, null));
 }
 
 test "weighted policy honors target weights and passive ejection" {
@@ -6353,14 +6464,14 @@ test "weighted policy honors target weights and passive ejection" {
     var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1");
 
     upstream_round_robin_cursor.store(0, .monotonic);
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null));
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
 
     upstream_round_robin_cursor.store(0, .monotonic);
     pool.targets.items[0].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null));
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
 }
 
 test "consistent hash policy keeps a stable healthy target" {
@@ -6379,11 +6490,11 @@ test "consistent hash policy keeps a stable healthy target" {
         .close_connection = false,
     };
 
-    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, req);
-    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, req));
+    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, req, null);
+    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, req, null));
 
     pool.targets.items[first].ejected_until_ms.store(2_000, .monotonic);
-    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, req);
+    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, req, null);
     try std.testing.expect(replacement != first);
     try std.testing.expect(replacement < pool.targets.items.len);
 }
@@ -6395,11 +6506,11 @@ test "active health result transitions update upstream availability" {
 
     var upstream = try parseUpstream(allocator, "http://127.0.0.1:9000");
 
-    try std.testing.expectEqual(UpstreamHealthTransition.ejected, upstreamRecordActiveHealthResult(&upstream, false, 1_000, 500));
+    try std.testing.expectEqual(UpstreamHealthTransition.ejected, upstreamRecordActiveHealthResult(&upstream, false, 1_000, 500, 0));
     try std.testing.expect(upstreamIsEjected(&upstream, 1_250));
     try std.testing.expectEqual(@as(i64, 1_500), upstream.ejected_until_ms.load(.monotonic));
-    try std.testing.expectEqual(UpstreamHealthTransition.unchanged, upstreamRecordActiveHealthResult(&upstream, false, 1_300, 500));
-    try std.testing.expectEqual(UpstreamHealthTransition.recovered, upstreamRecordActiveHealthResult(&upstream, true, 1_350, 500));
+    try std.testing.expectEqual(UpstreamHealthTransition.unchanged, upstreamRecordActiveHealthResult(&upstream, false, 1_300, 500, 0));
+    try std.testing.expectEqual(UpstreamHealthTransition.recovered, upstreamRecordActiveHealthResult(&upstream, true, 1_350, 500, 0));
     try std.testing.expect(!upstreamIsEjected(&upstream, 1_351));
 }
 
@@ -6443,6 +6554,8 @@ test "passive upstream health ejects and recovers targets" {
     try std.testing.expect(upstreamRecordFailure(&upstream, 1_010, 2, 250));
     try std.testing.expect(upstreamIsEjected(&upstream, 1_100));
     try std.testing.expect(!upstreamIsEjected(&upstream, 1_300));
+    try std.testing.expectEqual(@as(usize, 2), upstream.passive_failures.load(.monotonic));
+    upstreamRecordSuccess(&upstream, 1_301, 0);
     try std.testing.expectEqual(@as(usize, 0), upstream.passive_failures.load(.monotonic));
 
     try std.testing.expect(!upstreamRecordFailure(&upstream, 1_400, 0, 250));
@@ -8371,12 +8484,13 @@ fn usage() void {
             "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] [--upstream-retries N] [--upstream-max-failures N] [--upstream-fail-timeout-ms N] " ++
             "[--upstream-keepalive true|false] [--upstream-keepalive-max-idle N] [--upstream-keepalive-idle-timeout-ms N] [--upstream-keepalive-max-requests N] " ++
             "[--upstream-health-check true|false] [--upstream-health-path /health] [--upstream-health-interval-ms N] [--upstream-health-timeout-ms N] " ++
+            "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
-            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, graceful_shutdown_timeout_ms, " ++
+            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
@@ -8397,6 +8511,7 @@ fn usage() void {
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000 --upstream-keepalive true --upstream-keepalive-max-idle 32\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-health-check true\n" ++
+            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-circuit-breaker true --upstream-slow-start-ms 10000\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
@@ -8480,6 +8595,9 @@ pub fn main(init: std.process.Init) !void {
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
         .upstream_health_check_timeout_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS,
+        .upstream_circuit_breaker_enabled = true,
+        .upstream_circuit_half_open_max = DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX,
+        .upstream_slow_start_ms = DEFAULT_UPSTREAM_SLOW_START_MS,
         .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
         .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
     };
@@ -8799,6 +8917,24 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.upstream_health_check_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_health_check_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--upstream-circuit-breaker") or std.mem.eql(u8, arg, "--proxy-circuit-breaker")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_circuit_breaker_enabled = parseBool(value) orelse cfg.upstream_circuit_breaker_enabled;
+        } else if (std.mem.eql(u8, arg, "--upstream-circuit-half-open-max") or std.mem.eql(u8, arg, "--proxy-circuit-half-open-max")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_circuit_half_open_max = std.fmt.parseInt(usize, value, 10) catch cfg.upstream_circuit_half_open_max;
+        } else if (std.mem.eql(u8, arg, "--upstream-slow-start-ms") or std.mem.eql(u8, arg, "--proxy-slow-start-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.upstream_slow_start_ms = std.fmt.parseInt(u32, value, 10) catch cfg.upstream_slow_start_ms;
         } else if (std.mem.eql(u8, arg, "--graceful-shutdown-timeout-ms")) {
             const value = args.next() orelse {
                 usage();
@@ -8940,7 +9076,21 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
     if (cfg.upstream != null) {
         const pool = cfg.upstream.?;
-        std.debug.print("Reverse proxy pool: {s} over {d} target(s), retries={d}, max_failures={d}, fail_timeout={d}ms, keepalive={s} max_idle={d}\n", .{ upstreamPoolPolicyName(cfg.upstream_policy), upstreamPoolTargetCount(pool), cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms, if (upstreamKeepaliveConfigured(&cfg)) "on" else "off", cfg.upstream_keepalive_max_idle });
+        std.debug.print(
+            "Reverse proxy pool: {s} over {d} target(s), retries={d}, max_failures={d}, fail_timeout={d}ms, circuit={s} half_open={d}, slow_start={d}ms, keepalive={s} max_idle={d}\n",
+            .{
+                upstreamPoolPolicyName(cfg.upstream_policy),
+                upstreamPoolTargetCount(pool),
+                cfg.upstream_retries,
+                cfg.upstream_max_failures,
+                cfg.upstream_fail_timeout_ms,
+                if (cfg.upstream_circuit_breaker_enabled) "on" else "off",
+                cfg.upstream_circuit_half_open_max,
+                cfg.upstream_slow_start_ms,
+                if (upstreamKeepaliveConfigured(&cfg)) "on" else "off",
+                cfg.upstream_keepalive_max_idle,
+            },
+        );
     }
     if (cfg.h2_upstream != null) {
         const hup = cfg.h2_upstream.?;
