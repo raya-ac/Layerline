@@ -261,6 +261,8 @@ server_name = example.com www.example.com
 root = public
 index = index.html
 serve_static_root = true
+tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
+tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 
 route = assets /assets/* static
 route_dir.assets = public
@@ -273,11 +275,11 @@ proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
 upstream_policy = random
 ```
 
-`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including upstream pool policy. The older inline form (`server = main`, `server_name.main = ...`) still works, but domain files are the intended layout.
+`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including upstream pool policy and TLS material. Domain-local `tls_cert`/`tls_key` pairs are selected by SNI before Layerline falls back to the global certificate. The older inline form (`server = main`, `server_name.main = ...`, `server_tls_cert.main = ...`) still works, but domain files are the intended layout.
 
 ## TLS options in config / CLI
 
-Set `tls = true` with `tls_cert` and `tls_key` to load a PEM certificate chain and private key directly into Layerline. If TLS is enabled without a cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
+Set `tls = true` with global `tls_cert` and `tls_key` to load a fallback PEM certificate chain and private key directly into Layerline. Put `tls_cert` and `tls_key` in a domain config file when a virtual host needs its own certificate. Layerline selects the matching domain certificate from the ClientHello SNI name, then falls back to the global pair. If TLS is enabled without any cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
 
 ```ini
 tls = true

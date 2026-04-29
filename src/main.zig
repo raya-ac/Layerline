@@ -316,6 +316,8 @@ const DomainStringProperty = enum {
     index_file,
     php_root,
     php_binary,
+    tls_cert,
+    tls_key,
 };
 
 const DomainBoolProperty = enum {
@@ -347,6 +349,9 @@ const DomainConfig = struct {
     php_root: ?[]const u8,
     php_binary: ?[]const u8,
     php_info_page: ?bool,
+    tls_cert: ?[]const u8,
+    tls_key: ?[]const u8,
+    tls_material: ?tls_pem.ConfiguredTlsMaterial,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
     redirects: std.ArrayList(RedirectRule),
@@ -1103,6 +1108,35 @@ fn loadConfiguredTlsMaterial(
     return tls_pem.loadMaterialFromPem(allocator, cert_pem, key_pem);
 }
 
+fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
+    if (cfg.tls_enabled) {
+        if (cfg.tls_cert == null and cfg.tls_key == null) {
+            std.debug.print("TLS enabled without cert/key; native TLS will use an ephemeral self-signed certificate.\n", .{});
+        } else if (cfg.tls_cert == null or cfg.tls_key == null) {
+            return error.InvalidTlsConfig;
+        } else {
+            cfg.tls_material = try loadConfiguredTlsMaterial(io, allocator, cfg.tls_cert.?, cfg.tls_key.?);
+            std.debug.print("Native TLS certificate loaded from {s}\n", .{cfg.tls_cert.?});
+        }
+    }
+
+    for (cfg.domains.items) |*domain| {
+        if (domain.tls_cert == null and domain.tls_key == null) continue;
+        if (domain.tls_cert == null or domain.tls_key == null) return error.InvalidTlsConfig;
+        domain.tls_material = try loadConfiguredTlsMaterial(io, allocator, domain.tls_cert.?, domain.tls_key.?);
+        std.debug.print("Native TLS certificate loaded for {s} from {s}\n", .{ domain.name, domain.tls_cert.? });
+    }
+}
+
+fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
+    if (cfg.tls_material) |*material| material.deinit(allocator);
+    cfg.tls_material = null;
+    for (cfg.domains.items) |*domain| {
+        if (domain.tls_material) |*material| material.deinit(allocator);
+        domain.tls_material = null;
+    }
+}
+
 fn isLikelyHttp2Preface(bytes: []const u8) bool {
     if (bytes.len < 7) return false;
     if (std.mem.startsWith(u8, bytes, HTTP2_PREFACE_MAGIC)) return true;
@@ -1626,6 +1660,9 @@ fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainConfi
         .php_root = null,
         .php_binary = null,
         .php_info_page = null,
+        .tls_cert = null,
+        .tls_key = null,
+        .tls_material = null,
         .upstream = null,
         .upstream_policy = null,
         .redirects = .empty,
@@ -1675,6 +1712,8 @@ fn setDomainStringProperty(
         .index_file => domain.index_file = dupe_value,
         .php_root => domain.php_root = dupe_value,
         .php_binary => domain.php_binary = dupe_value,
+        .tls_cert => domain.tls_cert = dupe_value,
+        .tls_key => domain.tls_key = dupe_value,
     }
 }
 
@@ -1844,6 +1883,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "server_php_binary.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_tls_cert.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .tls_cert);
+    } else if (findRoutePropertyName(k, "server_tls_key.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .tls_key);
     } else if (findRoutePropertyName(k, "server_php_info_page.")) |name| {
         try setDomainBoolProperty(cfg, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "server_phpinfo_page.")) |name| {
@@ -2095,6 +2138,8 @@ fn setDomainStringPropertyDirect(allocator: std.mem.Allocator, domain: *DomainCo
         .index_file => domain.index_file = dupe_value,
         .php_root => domain.php_root = dupe_value,
         .php_binary => domain.php_binary = dupe_value,
+        .tls_cert => domain.tls_cert = dupe_value,
+        .tls_key => domain.tls_key = dupe_value,
     }
 }
 
@@ -2139,6 +2184,10 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setDomainStringPropertyDirect(allocator, domain, v, .php_binary);
     } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page")) {
         try setDomainBoolPropertyDirect(domain, v, .php_info_page);
+    } else if (std.mem.eql(u8, k, "tls_cert") or std.mem.eql(u8, k, "ssl_certificate")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .tls_cert);
+    } else if (std.mem.eql(u8, k, "tls_key") or std.mem.eql(u8, k, "ssl_certificate_key")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .tls_key);
     } else if (std.mem.eql(u8, k, "proxy") or std.mem.eql(u8, k, "upstream")) {
         try setDomainProxyPropertyDirect(allocator, domain, v);
     } else if (std.mem.eql(u8, k, "upstream_policy") or std.mem.eql(u8, k, "proxy_policy") or std.mem.eql(u8, k, "load_balance")) {
@@ -2357,6 +2406,7 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if (domain.php_binary) |php_binary| {
             if (php_binary.len == 0) return error.InvalidConfigValue;
         }
+        if ((domain.tls_cert == null) != (domain.tls_key == null)) return error.InvalidConfigValue;
         if (domain.upstream) |pool| {
             try validateUpstreamPool(pool);
         }
@@ -3379,6 +3429,15 @@ fn selectedTlsAlpn(info: tls_client_hello.ClientHelloInfo) ?[]const u8 {
     return null;
 }
 
+fn selectedTlsMaterialForClientHello(cfg: *const ServerConfig, info: tls_client_hello.ClientHelloInfo) ?tls_pem.ConfiguredTlsMaterial {
+    if (info.sni) |server_name| {
+        if (findDomainForHost(cfg, server_name)) |domain| {
+            if (domain.tls_material) |material| return material;
+        }
+    }
+    return cfg.tls_material;
+}
+
 fn tlsClientHelloHandshakeMessage(record: []const u8) ![]const u8 {
     if (record.len < 5) return error.Truncated;
     const record_len = (@as(usize, record[3]) << 8) | record[4];
@@ -3568,7 +3627,8 @@ fn establishNativeTls13(
     defer allocator.free(encrypted_extensions);
 
     const cert_name = info.sni orelse "localhost";
-    const signing_key_kind: TlsSigningKeyKind = if (cfg.tls_material) |material| switch (material.private_key) {
+    const selected_material = selectedTlsMaterialForClientHello(cfg, info);
+    const signing_key_kind: TlsSigningKeyKind = if (selected_material) |material| switch (material.private_key) {
         .ecdsa_p256 => if (info.offers_ecdsa_secp256r1_sha256) .configured_ecdsa else return error.UnsupportedTlsSignatureScheme,
         .rsa => if (info.offers_rsa_pss_rsae_sha256) .configured_rsa else return error.UnsupportedTlsSignatureScheme,
     } else if (info.offers_ecdsa_secp256r1_sha256)
@@ -3590,7 +3650,7 @@ fn establishNativeTls13(
     defer if (generated_cert_der) |cert| allocator.free(cert);
 
     const certificate = switch (signing_key_kind) {
-        .configured_ecdsa, .configured_rsa => try tls13_native.buildCertificate(allocator, cfg.tls_material.?.certificate_chain),
+        .configured_ecdsa, .configured_rsa => try tls13_native.buildCertificate(allocator, selected_material.?.certificate_chain),
         .generated_ecdsa => blk: {
             generated_cert_der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, generated_ecdsa_key_pair.?, cert_name);
             break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
@@ -3605,11 +3665,11 @@ fn establishNativeTls13(
     const cert_verify_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello, encrypted_extensions, certificate });
     const cert_signature = switch (signing_key_kind) {
         .configured_ecdsa => blk: {
-            const key_pair = cfg.tls_material.?.private_key.ecdsa_p256;
+            const key_pair = selected_material.?.private_key.ecdsa_p256;
             break :blk try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, key_pair, cert_verify_hash);
         },
         .configured_rsa => blk: {
-            const key = cfg.tls_material.?.private_key.rsa;
+            const key = selected_material.?.private_key.rsa;
             break :blk try tls13_native.signCertificateVerifyRsaPssSha256(io, allocator, key, cert_verify_hash);
         },
         .generated_ecdsa => try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, generated_ecdsa_key_pair.?, cert_verify_hash),
@@ -6180,6 +6240,8 @@ test "named routes prefer exact and longest prefix matches" {
 
     try setDomainLine(&cfg, allocator, "site");
     try appendServerNames(allocator, findDomainConfigMutable(&cfg, "site").?, "example.test *.example.test");
+    try applyConfigLine(&cfg, allocator, "server_tls_cert.site", "/certs/site/fullchain.pem");
+    try applyConfigLine(&cfg, allocator, "server_tls_key.site", "/certs/site/privkey.pem");
     try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
     try setDomainRouteLine(&cfg, allocator, "site", "site-api /api/* proxy");
     try applyConfigLine(&cfg, allocator, "server_proxy_policy.site", "random");
@@ -6191,9 +6253,17 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "example.test:8080").?.name);
     try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "www.example.test").?.name);
     try std.testing.expectEqualStrings("fallback", findDomainForHost(&cfg, "other.test").?.name);
+    try std.testing.expectEqualStrings("/certs/site/fullchain.pem", findDomainForHost(&cfg, "example.test").?.tls_cert.?);
+    try std.testing.expectEqualStrings("/certs/site/privkey.pem", findDomainForHost(&cfg, "example.test").?.tls_key.?);
     try std.testing.expectEqualStrings("site-assets", findDomainRoute(findDomainForHost(&cfg, "example.test"), "/assets/domain.txt").?.name);
     try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/global.txt").?.name);
     try std.testing.expectEqual(UpstreamPoolPolicy.random, routeUpstreamPolicy(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
+
+    var file_domain = try initDomainConfig(allocator, "file-site");
+    try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate", "/certs/file/fullchain.pem");
+    try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate_key", "/certs/file/privkey.pem");
+    try std.testing.expectEqualStrings("/certs/file/fullchain.pem", file_domain.tls_cert.?);
+    try std.testing.expectEqualStrings("/certs/file/privkey.pem", file_domain.tls_key.?);
 }
 
 test "upstream pools parse multiple targets and rotate selection" {
@@ -8311,7 +8381,7 @@ fn usage() void {
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE\n" ++
+            "server_upstream_policy.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
@@ -8839,19 +8909,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    if (cfg.tls_enabled) {
-        if (cfg.tls_cert == null or cfg.tls_key == null) {
-            std.debug.print("TLS enabled without cert/key; native TLS will use an ephemeral self-signed certificate.\n", .{});
-        } else {
-            cfg.tls_material = loadConfiguredTlsMaterial(init.io, std.heap.page_allocator, cfg.tls_cert.?, cfg.tls_key.?) catch |err| {
-                std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
-                return err;
-            };
-            std.debug.print("Native TLS certificate loaded from {s}\n", .{cfg.tls_cert.?});
-        }
-    }
+    loadAllConfiguredTlsMaterials(init.io, std.heap.page_allocator, &cfg) catch |err| {
+        std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
+        return err;
+    };
     defer {
-        if (cfg.tls_material) |*material| material.deinit(std.heap.page_allocator);
+        deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
 
     var concurrency = ConcurrencyState.init();
