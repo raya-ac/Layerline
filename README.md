@@ -159,9 +159,11 @@ max_concurrent_connections = 1000000
 
 ## HTTP/2 and HTTP/3
 
-This server is HTTP/1.x first, with a native HTTP/3 path built inside the Zig binary:
+This server now terminates native TLS 1.3 on the TCP listener and uses ALPN to route HTTP/1.1 or HTTP/2 on the same socket:
 
-- HTTP/2 cleartext (`h2c`) passthrough using `--h2-upstream` / `h2_upstream`.
+- Native HTTPS supports TLS 1.3 with X25519, TLS_AES_128_GCM_SHA256, ECDSA P-256/SHA-256 certificates, and Ed25519 fallback.
+- HTTP/2 is served directly over TLS when the client selects `h2`, and HTTP/1.1 stays on the existing router when the client selects `http/1.1` or sends no ALPN.
+- HTTP/2 cleartext (`h2c`) is still supported for local or upstream cleartext workflows.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
 - The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, and sends the built-in Layerline page as HTTP/3 HEADERS + DATA.
 - HTTP/3 connection state is tracked per QUIC connection ID with a bounded in-process table, so concurrent handshakes no longer share one global assembly buffer.
@@ -275,8 +277,15 @@ upstream_policy = random
 
 ## TLS options in config / CLI
 
-Config supports `tls`, `tls_cert`, and `tls_key` for deployment tracking, while this app socket stays plain HTTP.
-Terminate TLS at a reverse proxy in front.
+Set `tls = true` with `tls_cert` and `tls_key` to load a PEM certificate chain and ECDSA P-256 private key directly into Layerline. If TLS is enabled without a cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
+
+```ini
+tls = true
+tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
+tls_key = /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+The configured certificate path currently supports ECDSA P-256 private keys in SEC1 (`BEGIN EC PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form. RSA private keys are still on the roadmap.
 
 ### Auto Let's Encrypt
 
@@ -458,8 +467,16 @@ curl http://127.0.0.1:8080/index.php
 
 ## SSL/TLS
 
-This server currently supports HTTP on the app socket.
-Run it behind a TLS reverse proxy for HTTPS:
+Layerline can terminate HTTPS itself:
+
+```bash
+zig build run -- \
+  --tls true \
+  --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
+  --tls-key /etc/letsencrypt/live/example.com/privkey.pem
+```
+
+The same listener can serve plain HTTP and native HTTPS. HTTPS clients negotiate TLS 1.3, then ALPN dispatches to HTTP/2 or HTTP/1.1. Keeping a reverse proxy in front is still possible during migration, but it is no longer required for the basic HTTPS path.
 
 ### Caddy sample
 

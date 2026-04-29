@@ -4,6 +4,7 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Ed25519 = std.crypto.sign.Ed25519;
+pub const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 pub const X25519 = std.crypto.dh.X25519;
 
 pub const CipherSuite = enum(u16) {
@@ -15,6 +16,7 @@ pub const NamedGroup = enum(u16) {
 };
 
 pub const SignatureScheme = enum(u16) {
+    ecdsa_secp256r1_sha256 = 0x0403,
     ed25519 = 0x0807,
 };
 
@@ -42,6 +44,21 @@ pub const QuicPacketKeys = struct {
     key: [16]u8,
     iv: [12]u8,
     hp: [16]u8,
+};
+
+pub const TlsRecordKeys = struct {
+    key: [Aes128Gcm.key_length]u8,
+    iv: [12]u8,
+};
+
+pub const DecryptedRecord = struct {
+    content_type: u8,
+    payload: []u8,
+
+    pub fn deinit(self: *DecryptedRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = .{ .content_type = 0, .payload = &.{} };
+    }
 };
 
 pub fn buildServerHello(allocator: std.mem.Allocator, input: ServerHelloInput) ![]u8 {
@@ -76,6 +93,34 @@ pub fn buildServerHello(allocator: std.mem.Allocator, input: ServerHelloInput) !
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try appendHandshakeHeader(allocator, &out, 0x02, body.items.len);
+    try out.appendSlice(allocator, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn buildTcpEncryptedExtensions(
+    allocator: std.mem.Allocator,
+    alpn: ?[]const u8,
+) ![]u8 {
+    var extensions = std.ArrayListUnmanaged(u8).empty;
+    defer extensions.deinit(allocator);
+
+    if (alpn) |protocol| {
+        var alpn_payload = std.ArrayListUnmanaged(u8).empty;
+        defer alpn_payload.deinit(allocator);
+        try appendU16(allocator, &alpn_payload, 1 + protocol.len);
+        try alpn_payload.append(allocator, @intCast(protocol.len));
+        try alpn_payload.appendSlice(allocator, protocol);
+        try appendExtension(allocator, &extensions, 0x0010, alpn_payload.items);
+    }
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, extensions.items.len);
+    try body.appendSlice(allocator, extensions.items);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendHandshakeHeader(allocator, &out, 0x08, body.items.len);
     try out.appendSlice(allocator, body.items);
     return out.toOwnedSlice(allocator);
 }
@@ -176,6 +221,18 @@ pub fn signCertificateVerifyEd25519(key_pair: Ed25519.KeyPair, transcript_hash_v
     return signature.toBytes();
 }
 
+pub fn signCertificateVerifyEcdsaP256Sha256(
+    allocator: std.mem.Allocator,
+    key_pair: EcdsaP256Sha256.KeyPair,
+    transcript_hash_value: [32]u8,
+) ![]u8 {
+    const input = try certificateVerifySignatureInput(allocator, transcript_hash_value);
+    defer allocator.free(input);
+    const signature = try key_pair.sign(input, null);
+    var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    return allocator.dupe(u8, signature.toDer(&der_buf));
+}
+
 pub fn buildSelfSignedEd25519Certificate(
     allocator: std.mem.Allocator,
     key_pair: Ed25519.KeyPair,
@@ -234,6 +291,73 @@ pub fn buildSelfSignedEd25519Certificate(
     return derSequenceFromParts(allocator, &.{ tbs, algorithm, signature_value });
 }
 
+pub fn buildSelfSignedEcdsaP256Sha256Certificate(
+    allocator: std.mem.Allocator,
+    key_pair: EcdsaP256Sha256.KeyPair,
+    common_name: []const u8,
+) ![]u8 {
+    const signature_oid = try derOid(allocator, "\x2a\x86\x48\xce\x3d\x04\x03\x02");
+    defer allocator.free(signature_oid);
+    const signature_algorithm = try derSequenceFromParts(allocator, &.{signature_oid});
+    defer allocator.free(signature_algorithm);
+
+    const ec_public_key_oid = try derOid(allocator, "\x2a\x86\x48\xce\x3d\x02\x01");
+    defer allocator.free(ec_public_key_oid);
+    const prime256v1_oid = try derOid(allocator, "\x2a\x86\x48\xce\x3d\x03\x01\x07");
+    defer allocator.free(prime256v1_oid);
+    const public_key_algorithm = try derSequenceFromParts(allocator, &.{ ec_public_key_oid, prime256v1_oid });
+    defer allocator.free(public_key_algorithm);
+
+    const version_integer = try derInteger(allocator, "\x02");
+    defer allocator.free(version_integer);
+    const version = try derExplicit(allocator, 0, version_integer);
+    defer allocator.free(version);
+
+    const serial = try derInteger(allocator, "\x01\x33\x7b");
+    defer allocator.free(serial);
+
+    const name = try derNameCommonName(allocator, common_name);
+    defer allocator.free(name);
+
+    const not_before = try derUtcTime(allocator, "260101000000Z");
+    defer allocator.free(not_before);
+    const not_after = try derUtcTime(allocator, "360101000000Z");
+    defer allocator.free(not_after);
+    const validity = try derSequenceFromParts(allocator, &.{ not_before, not_after });
+    defer allocator.free(validity);
+
+    const public_key_sec1 = key_pair.public_key.toUncompressedSec1();
+    const subject_public_key = try derBitString(allocator, &public_key_sec1);
+    defer allocator.free(subject_public_key);
+    const spki = try derSequenceFromParts(allocator, &.{ public_key_algorithm, subject_public_key });
+    defer allocator.free(spki);
+
+    const extension_sequence = try buildCertificateExtensions(allocator);
+    defer allocator.free(extension_sequence);
+    const extensions = try derExplicit(allocator, 3, extension_sequence);
+    defer allocator.free(extensions);
+
+    const tbs = try derSequenceFromParts(allocator, &.{
+        version,
+        serial,
+        signature_algorithm,
+        name,
+        validity,
+        name,
+        spki,
+        extensions,
+    });
+    defer allocator.free(tbs);
+
+    const signature = try key_pair.sign(tbs, null);
+    var der_signature_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const der_signature = signature.toDer(&der_signature_buf);
+    const signature_value = try derBitString(allocator, der_signature);
+    defer allocator.free(signature_value);
+
+    return derSequenceFromParts(allocator, &.{ tbs, signature_algorithm, signature_value });
+}
+
 pub fn transcriptHash(messages: []const []const u8) [32]u8 {
     var hasher = Sha256.init(.{});
     for (messages) |message| {
@@ -278,10 +402,93 @@ pub fn deriveQuicPacketKeys(traffic_secret: [32]u8) QuicPacketKeys {
     };
 }
 
+pub fn deriveTlsRecordKeys(traffic_secret: [32]u8) TlsRecordKeys {
+    return .{
+        .key = hkdfExpandLabel(traffic_secret, "key", "", Aes128Gcm.key_length),
+        .iv = hkdfExpandLabel(traffic_secret, "iv", "", 12),
+    };
+}
+
+pub fn encryptTlsRecord(
+    allocator: std.mem.Allocator,
+    keys: TlsRecordKeys,
+    sequence_number: u64,
+    inner_content_type: u8,
+    plaintext: []const u8,
+) ![]u8 {
+    if (plaintext.len + 1 > 16 * 1024) return error.TlsPlaintextTooLarge;
+
+    var inner = std.ArrayListUnmanaged(u8).empty;
+    defer inner.deinit(allocator);
+    try inner.appendSlice(allocator, plaintext);
+    try inner.append(allocator, inner_content_type);
+
+    const encrypted_len = inner.items.len + Aes128Gcm.tag_length;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, 0x17);
+    try out.append(allocator, 0x03);
+    try out.append(allocator, 0x03);
+    try appendU16(allocator, &out, encrypted_len);
+    try out.resize(allocator, out.items.len + encrypted_len);
+
+    const ciphertext = out.items[5 .. 5 + inner.items.len];
+    const tag = out.items[5 + inner.items.len ..][0..Aes128Gcm.tag_length];
+    const nonce = tlsRecordNonce(keys.iv, sequence_number);
+    Aes128Gcm.encrypt(ciphertext, tag, inner.items, out.items[0..5], nonce, keys.key);
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn decryptTlsRecord(
+    allocator: std.mem.Allocator,
+    keys: TlsRecordKeys,
+    sequence_number: u64,
+    record: []const u8,
+) !DecryptedRecord {
+    if (record.len < 5) return error.TruncatedTlsRecord;
+    if (record[0] != 0x17) return error.UnexpectedTlsRecordType;
+    if (record[1] != 0x03 or record[2] != 0x03) return error.UnsupportedTlsRecordVersion;
+    const encrypted_len = (@as(usize, record[3]) << 8) | record[4];
+    if (record.len != 5 + encrypted_len) return error.TruncatedTlsRecord;
+    if (encrypted_len < Aes128Gcm.tag_length + 1) return error.BadTlsRecord;
+
+    const ciphertext_len = encrypted_len - Aes128Gcm.tag_length;
+    const ciphertext = record[5 .. 5 + ciphertext_len];
+    const tag: [Aes128Gcm.tag_length]u8 = record[5 + ciphertext_len ..][0..Aes128Gcm.tag_length].*;
+    var inner = try allocator.alloc(u8, ciphertext.len);
+    defer allocator.free(inner);
+
+    const nonce = tlsRecordNonce(keys.iv, sequence_number);
+    try Aes128Gcm.decrypt(inner, ciphertext, tag, record[0..5], nonce, keys.key);
+
+    var end = inner.len;
+    while (end > 0 and inner[end - 1] == 0) {
+        end -= 1;
+    }
+    if (end == 0) return error.BadTlsInnerPlaintext;
+
+    const content_type = inner[end - 1];
+    const payload = try allocator.dupe(u8, inner[0 .. end - 1]);
+    return .{
+        .content_type = content_type,
+        .payload = payload,
+    };
+}
+
 pub fn finishedVerifyData(finished_key: [32]u8, transcript_hash_value: [32]u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&out, &transcript_hash_value, &finished_key);
     return out;
+}
+
+fn tlsRecordNonce(iv: [12]u8, sequence_number: u64) [12]u8 {
+    var nonce = iv;
+    var seq: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seq, sequence_number, .big);
+    for (seq, 0..) |byte, i| {
+        nonce[nonce.len - seq.len + i] ^= byte;
+    }
+    return nonce;
 }
 
 fn hashBytes(bytes: []const u8) [32]u8 {
@@ -510,6 +717,16 @@ test "builds TLS 1.3 EncryptedExtensions for h3 over QUIC" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "h3") != null);
 }
 
+test "builds TLS 1.3 EncryptedExtensions for TCP ALPN" {
+    const msg = try buildTcpEncryptedExtensions(std.testing.allocator, "h2");
+    defer std.testing.allocator.free(msg);
+
+    try std.testing.expectEqual(@as(u8, 0x08), msg[0]);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\x00\x10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\x00\x39") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "h2") != null);
+}
+
 test "builds TLS 1.3 certificate, certificate verify, and finished messages" {
     const cert = "fake der certificate bytes";
     const certificate = try buildCertificate(std.testing.allocator, &.{cert});
@@ -546,6 +763,19 @@ test "builds a self-signed Ed25519 certificate matching its key" {
     try std.testing.expect(std.mem.indexOf(u8, cert, "\x2b\x65\x70") != null);
 }
 
+test "builds a self-signed ECDSA P-256 certificate matching its key" {
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x43} ** 32);
+    const cert = try buildSelfSignedEcdsaP256Sha256Certificate(std.testing.allocator, kp, "localhost");
+    defer std.testing.allocator.free(cert);
+
+    const public_key_sec1 = kp.public_key.toUncompressedSec1();
+    try std.testing.expectEqual(@as(u8, 0x30), cert[0]);
+    try std.testing.expect(std.mem.indexOf(u8, cert, "localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cert, &public_key_sec1) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cert, "\x2a\x86\x48\xce\x3d\x04\x03\x02") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cert, "\x2a\x86\x48\xce\x3d\x03\x01\x07") != null);
+}
+
 test "derives TLS and QUIC handshake keys from X25519 shared secret" {
     const client = try X25519.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
     const server = try X25519.KeyPair.generateDeterministic([_]u8{0x44} ** 32);
@@ -562,4 +792,30 @@ test "derives TLS and QUIC handshake keys from X25519 shared secret" {
     try std.testing.expect(!std.mem.allEqual(u8, &packet_keys.iv, 0));
     try std.testing.expect(!std.mem.allEqual(u8, &packet_keys.hp, 0));
     try std.testing.expect(!std.mem.allEqual(u8, &verify_data, 0));
+}
+
+test "encrypts and decrypts TLS 1.3 TCP records" {
+    const keys = deriveTlsRecordKeys([_]u8{0x66} ** 32);
+    const record = try encryptTlsRecord(std.testing.allocator, keys, 0, 0x17, "hello");
+    defer std.testing.allocator.free(record);
+
+    try std.testing.expectEqual(@as(u8, 0x17), record[0]);
+    try std.testing.expectEqual(@as(u8, 0x03), record[1]);
+    try std.testing.expectEqual(@as(u8, 0x03), record[2]);
+
+    var decrypted = try decryptTlsRecord(std.testing.allocator, keys, 0, record);
+    defer decrypted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0x17), decrypted.content_type);
+    try std.testing.expectEqualStrings("hello", decrypted.payload);
+}
+
+test "signs TLS 1.3 CertificateVerify with ECDSA P-256" {
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x68} ** 32);
+    const transcript_hash_value = [_]u8{0x81} ** 32;
+    const signature_der = try signCertificateVerifyEcdsaP256Sha256(std.testing.allocator, kp, transcript_hash_value);
+    defer std.testing.allocator.free(signature_der);
+    const signature = try EcdsaP256Sha256.Signature.fromDer(signature_der);
+    const input = try certificateVerifySignatureInput(std.testing.allocator, transcript_hash_value);
+    defer std.testing.allocator.free(input);
+    try signature.verify(input, kp.public_key);
 }

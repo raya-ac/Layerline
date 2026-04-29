@@ -12,13 +12,19 @@ pub const Error = error{
 pub const ClientHelloInfo = struct {
     sni: ?[]const u8 = null,
     alpn: ?[]const u8 = null,
+    legacy_session_id: ?[]const u8 = null,
+    x25519_key_share: ?[32]u8 = null,
     supports_tls13: bool = false,
+    offers_aes_128_gcm_sha256: bool = false,
+    offers_ecdsa_secp256r1_sha256: bool = false,
+    offers_ed25519: bool = false,
     offers_h2: bool = false,
     offers_http11: bool = false,
 
     pub fn deinit(self: *ClientHelloInfo, allocator: std.mem.Allocator) void {
         if (self.sni) |value| allocator.free(value);
         if (self.alpn) |value| allocator.free(value);
+        if (self.legacy_session_id) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -112,6 +118,34 @@ fn parseSupportedVersions(payload: []const u8, info: *ClientHelloInfo) Error!voi
     }
 }
 
+fn parseSignatureAlgorithms(payload: []const u8, info: *ClientHelloInfo) Error!void {
+    var offset: usize = 0;
+    const list_len = try readU16(payload, &offset);
+    const list = try take(payload, &offset, list_len);
+    if (list.len % 2 != 0) return error.BadClientHello;
+    var list_offset: usize = 0;
+    while (list_offset < list.len) {
+        const scheme = try readU16(list, &list_offset);
+        if (scheme == 0x0403) info.offers_ecdsa_secp256r1_sha256 = true;
+        if (scheme == 0x0807) info.offers_ed25519 = true;
+    }
+}
+
+fn parseKeyShare(payload: []const u8, info: *ClientHelloInfo) Error!void {
+    var offset: usize = 0;
+    const shares_len = try readU16(payload, &offset);
+    const shares = try take(payload, &offset, shares_len);
+    var shares_offset: usize = 0;
+    while (shares_offset < shares.len) {
+        const group = try readU16(shares, &shares_offset);
+        const key_len = try readU16(shares, &shares_offset);
+        const key = try take(shares, &shares_offset, key_len);
+        if (group == 0x001d and key.len == 32 and info.x25519_key_share == null) {
+            info.x25519_key_share = key[0..32].*;
+        }
+    }
+}
+
 fn parseExtensions(allocator: std.mem.Allocator, extensions: []const u8, info: *ClientHelloInfo) Error!void {
     var offset: usize = 0;
     while (offset < extensions.len) {
@@ -120,10 +154,21 @@ fn parseExtensions(allocator: std.mem.Allocator, extensions: []const u8, info: *
         const payload = try take(extensions, &offset, ext_len);
         switch (ext_type) {
             0x0000 => try parseServerName(allocator, payload, info),
+            0x000d => try parseSignatureAlgorithms(payload, info),
             0x0010 => try parseAlpn(allocator, payload, info),
             0x002b => try parseSupportedVersions(payload, info),
+            0x0033 => try parseKeyShare(payload, info),
             else => {},
         }
+    }
+}
+
+fn parseCipherSuites(cipher_suites: []const u8, info: *ClientHelloInfo) Error!void {
+    if (cipher_suites.len % 2 != 0) return error.BadClientHello;
+    var offset: usize = 0;
+    while (offset < cipher_suites.len) {
+        const suite = try readU16(cipher_suites, &offset);
+        if (suite == 0x1301) info.offers_aes_128_gcm_sha256 = true;
     }
 }
 
@@ -142,15 +187,16 @@ pub fn parse(allocator: std.mem.Allocator, record: []const u8) Error!ClientHello
     _ = try readU16(body, &body_offset);
     _ = try take(body, &body_offset, 32);
     const session_id_len = (try take(body, &body_offset, 1))[0];
-    _ = try take(body, &body_offset, session_id_len);
+    const session_id = try take(body, &body_offset, session_id_len);
     const cipher_suites_len = try readU16(body, &body_offset);
-    if (cipher_suites_len % 2 != 0) return error.BadClientHello;
-    _ = try take(body, &body_offset, cipher_suites_len);
+    const cipher_suites = try take(body, &body_offset, cipher_suites_len);
     const compression_methods_len = (try take(body, &body_offset, 1))[0];
     _ = try take(body, &body_offset, compression_methods_len);
 
     var info = ClientHelloInfo{};
     errdefer info.deinit(allocator);
+    if (session_id.len > 0) info.legacy_session_id = try allocator.dupe(u8, session_id);
+    try parseCipherSuites(cipher_suites, &info);
 
     if (body_offset < body.len) {
         const extensions_len = try readU16(body, &body_offset);
@@ -204,11 +250,28 @@ test "parses SNI ALPN and TLS 1.3 support from ClientHello" {
     const supported_versions = [_]u8{ 0x02, 0x03, 0x04 };
     try appendExtension(allocator, &extensions, 0x002b, &supported_versions);
 
+    var signature_algorithms = std.ArrayList(u8).empty;
+    defer signature_algorithms.deinit(allocator);
+    try appendU16(allocator, &signature_algorithms, 4);
+    try appendU16(allocator, &signature_algorithms, 0x0403);
+    try appendU16(allocator, &signature_algorithms, 0x0807);
+    try appendExtension(allocator, &extensions, 0x000d, signature_algorithms.items);
+
+    var key_share = std.ArrayList(u8).empty;
+    defer key_share.deinit(allocator);
+    const client_key = [_]u8{0x55} ** 32;
+    try appendU16(allocator, &key_share, 2 + 2 + client_key.len);
+    try appendU16(allocator, &key_share, 0x001d);
+    try appendU16(allocator, &key_share, client_key.len);
+    try key_share.appendSlice(allocator, &client_key);
+    try appendExtension(allocator, &extensions, 0x0033, key_share.items);
+
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     try appendU16(allocator, &body, 0x0303);
     try body.appendNTimes(allocator, 0x42, 32);
-    try body.append(allocator, 0);
+    try body.append(allocator, 3);
+    try body.appendSlice(allocator, "sid");
     try appendU16(allocator, &body, 2);
     try appendU16(allocator, &body, 0x1301);
     try body.append(allocator, 1);
@@ -232,7 +295,12 @@ test "parses SNI ALPN and TLS 1.3 support from ClientHello" {
     defer info.deinit(allocator);
     try std.testing.expectEqualStrings("layerline.dev", info.sni.?);
     try std.testing.expectEqualStrings("h2,http/1.1", info.alpn.?);
+    try std.testing.expectEqualStrings("sid", info.legacy_session_id.?);
     try std.testing.expect(info.supports_tls13);
+    try std.testing.expect(info.offers_aes_128_gcm_sha256);
+    try std.testing.expect(info.offers_ecdsa_secp256r1_sha256);
+    try std.testing.expect(info.offers_ed25519);
+    try std.testing.expectEqualSlices(u8, &client_key, &info.x25519_key_share.?);
     try std.testing.expect(info.offers_h2);
     try std.testing.expect(info.offers_http11);
 }

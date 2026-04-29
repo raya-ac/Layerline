@@ -87,6 +87,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_tls_client_hello_tests = b.addRunArtifact(tls_client_hello_tests);
 
+    const tls_pem_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls_pem.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_tls_pem_tests = b.addRunArtifact(tls_pem_tests);
+
     const reactor_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/core/reactor.zig"),
@@ -105,4 +114,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_reactor_tests.step);
     test_step.dependOn(&run_tls_client_hello_tests.step);
     test_step.dependOn(&run_tls13_tests.step);
+    test_step.dependOn(&run_tls_pem_tests.step);
 }

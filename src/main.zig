@@ -7,6 +7,7 @@ const http_response = @import("http_response.zig");
 const quic_native = @import("quic_native.zig");
 const tls13_native = @import("tls13_native.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
+const tls_pem = @import("tls_pem.zig");
 
 // Boring defaults on purpose: enough room for local dev, with caps before
 // anything can turn into an accidental memory sink.
@@ -48,6 +49,14 @@ const HTTP3_MAX_DATAGRAM_BYTES = 1200;
 const HTTP3_CONNECTION_TABLE_CAPACITY = 1024;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
+const TLS_MAX_INNER_PLAINTEXT_BYTES = 16 * 1024;
+const TLS_MAX_RECORD_BYTES = 5 + TLS_MAX_INNER_PLAINTEXT_BYTES + 256;
+const TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
+const TLS_CONTENT_TYPE_ALERT: u8 = 0x15;
+const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
+const TLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+const TLS_ALERT_HANDSHAKE_FAILURE: u8 = 40;
+const TLS_ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
 const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
@@ -69,6 +78,7 @@ const SERVER_ICON_SVG =
 ;
 
 threadlocal var current_io: ?std.Io = null;
+threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
@@ -90,13 +100,22 @@ fn normalizeSocketIoError(err: anyerror) anyerror {
     };
 }
 
-fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
+fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     const io = activeIo();
     var data: [1][]u8 = .{out};
     return io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
 }
 
-fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
+    if (current_tls_channel) |channel| {
+        if (stream.socket.handle == channel.stream.socket.handle) {
+            return tlsReadApplicationData(channel, out);
+        }
+    }
+    return rawStreamRead(stream, out);
+}
+
+fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
     const io = activeIo();
     var written: usize = 0;
     while (written < bytes.len) {
@@ -107,6 +126,15 @@ fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
         if (n == 0) return error.WriteZero;
         written += n;
     }
+}
+
+fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    if (current_tls_channel) |channel| {
+        if (stream.socket.handle == channel.stream.socket.handle) {
+            return tlsWriteApplicationData(channel, bytes);
+        }
+    }
+    return rawStreamWriteAll(stream, bytes);
 }
 
 fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args: anytype) !void {
@@ -340,6 +368,7 @@ const ServerConfig = struct {
     tls_enabled: bool,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
+    tls_material: ?tls_pem.ConfiguredTlsMaterial,
     tls_auto: bool,
     letsencrypt_email: ?[]const u8,
     letsencrypt_domains: ?[]const u8,
@@ -1059,6 +1088,19 @@ fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Server
 
     std.debug.print("Running Let's Encrypt setup for {d} domain(s) via {s}\n", .{ domains.items.len, cfg.letsencrypt_certbot });
     try runCommand(io, allocator, cfg.letsencrypt_certbot, cert_args.items);
+}
+
+fn loadConfiguredTlsMaterial(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cert_path: []const u8,
+    key_path: []const u8,
+) !tls_pem.ConfiguredTlsMaterial {
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cert_path, allocator, .limited(512 * 1024));
+    defer allocator.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(128 * 1024));
+    defer allocator.free(key_pem);
+    return tls_pem.loadMaterialFromPem(allocator, cert_pem, key_pem);
 }
 
 fn isLikelyHttp2Preface(bytes: []const u8) bool {
@@ -3266,7 +3308,7 @@ fn readTlsClientHelloRecord(stream: std.Io.net.Stream, allocator: std.mem.Alloca
     if (copied_header > 0) @memcpy(header[0..copied_header], prefill[0..copied_header]);
     var header_used: usize = copied_header;
     while (header_used < header.len) {
-        const n = try streamRead(stream, header[header_used..]);
+        const n = try rawStreamRead(stream, header[header_used..]);
         if (n == 0) return error.ConnectionClosed;
         header_used += n;
     }
@@ -3282,7 +3324,7 @@ fn readTlsClientHelloRecord(stream: std.Io.net.Stream, allocator: std.mem.Alloca
 
     var used = header.len + copied_body;
     while (used < record.len) {
-        const n = try streamRead(stream, record[used..]);
+        const n = try rawStreamRead(stream, record[used..]);
         if (n == 0) return error.ConnectionClosed;
         used += n;
     }
@@ -3299,30 +3341,373 @@ fn sendTlsFatalAlert(stream: std.Io.net.Stream, description: u8) !void {
         0x02,
         description,
     };
-    try streamWriteAll(stream, &alert);
+    try rawStreamWriteAll(stream, &alert);
 }
 
-fn handleTlsClientHelloProbe(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, prefill: []const u8) !void {
+const TlsChannel = struct {
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    client_application_keys: tls13_native.TlsRecordKeys,
+    server_application_keys: tls13_native.TlsRecordKeys,
+    client_sequence: u64 = 0,
+    server_sequence: u64 = 0,
+    pending_plaintext: ?[]u8 = null,
+    pending_offset: usize = 0,
+
+    fn deinit(self: *TlsChannel) void {
+        if (self.pending_plaintext) |pending| self.allocator.free(pending);
+        self.pending_plaintext = null;
+        self.pending_offset = 0;
+    }
+};
+
+const NativeTlsResult = struct {
+    channel: TlsChannel,
+    alpn: ?[]const u8,
+};
+
+fn selectedTlsAlpn(info: tls_client_hello.ClientHelloInfo) ?[]const u8 {
+    if (info.offers_h2) return "h2";
+    if (info.offers_http11) return "http/1.1";
+    return null;
+}
+
+fn tlsClientHelloHandshakeMessage(record: []const u8) ![]const u8 {
+    if (record.len < 5) return error.Truncated;
+    const record_len = (@as(usize, record[3]) << 8) | record[4];
+    if (record.len < 5 + record_len) return error.Truncated;
+    return record[5 .. 5 + record_len];
+}
+
+fn readTlsRecordRaw(stream: std.Io.net.Stream, allocator: std.mem.Allocator) ![]u8 {
+    var header: [5]u8 = undefined;
+    var used: usize = 0;
+    while (used < header.len) {
+        const n = try rawStreamRead(stream, header[used..]);
+        if (n == 0) return error.ConnectionClosed;
+        used += n;
+    }
+
+    const payload_len = (@as(usize, header[3]) << 8) | header[4];
+    if (payload_len > TLS_MAX_RECORD_BYTES - 5) return error.RequestTooLarge;
+    const record = try allocator.alloc(u8, 5 + payload_len);
+    @memcpy(record[0..5], &header);
+    used = 5;
+    while (used < record.len) {
+        const n = try rawStreamRead(stream, record[used..]);
+        if (n == 0) return error.ConnectionClosed;
+        used += n;
+    }
+    return record;
+}
+
+fn sendTlsPlainRecord(stream: std.Io.net.Stream, content_type: u8, payload: []const u8) !void {
+    if (payload.len > TLS_MAX_INNER_PLAINTEXT_BYTES) return error.TlsPlaintextTooLarge;
+    var header: [5]u8 = .{ content_type, 0x03, 0x03, 0, 0 };
+    std.mem.writeInt(u16, header[3..5], @intCast(payload.len), .big);
+    try rawStreamWriteAll(stream, &header);
+    if (payload.len > 0) try rawStreamWriteAll(stream, payload);
+}
+
+fn sendTlsEncryptedRecord(
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    keys: tls13_native.TlsRecordKeys,
+    sequence: *u64,
+    inner_content_type: u8,
+    payload: []const u8,
+) !void {
+    if (sequence.* == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
+    const record = try tls13_native.encryptTlsRecord(allocator, keys, sequence.*, inner_content_type, payload);
+    defer allocator.free(record);
+    try rawStreamWriteAll(stream, record);
+    sequence.* += 1;
+}
+
+fn tlsReadApplicationData(channel: *TlsChannel, out: []u8) !usize {
+    if (out.len == 0) return 0;
+
+    while (true) {
+        if (channel.pending_plaintext) |pending| {
+            const available = pending[channel.pending_offset..];
+            const copied = @min(out.len, available.len);
+            if (copied > 0) {
+                @memcpy(out[0..copied], available[0..copied]);
+                channel.pending_offset += copied;
+                if (channel.pending_offset >= pending.len) {
+                    channel.allocator.free(pending);
+                    channel.pending_plaintext = null;
+                    channel.pending_offset = 0;
+                }
+                return copied;
+            }
+
+            channel.allocator.free(pending);
+            channel.pending_plaintext = null;
+            channel.pending_offset = 0;
+        }
+
+        const record = try readTlsRecordRaw(channel.stream, channel.allocator);
+        defer channel.allocator.free(record);
+
+        switch (record[0]) {
+            TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC => continue,
+            TLS_CONTENT_TYPE_ALERT => return 0,
+            TLS_CONTENT_TYPE_APPLICATION_DATA => {},
+            else => return error.UnexpectedTlsRecordType,
+        }
+
+        if (channel.client_sequence == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
+        var decrypted = try tls13_native.decryptTlsRecord(
+            channel.allocator,
+            channel.client_application_keys,
+            channel.client_sequence,
+            record,
+        );
+        channel.client_sequence += 1;
+
+        switch (decrypted.content_type) {
+            TLS_CONTENT_TYPE_APPLICATION_DATA => {
+                if (decrypted.payload.len == 0) {
+                    decrypted.deinit(channel.allocator);
+                    continue;
+                }
+                channel.pending_plaintext = decrypted.payload;
+                channel.pending_offset = 0;
+            },
+            TLS_CONTENT_TYPE_ALERT => {
+                decrypted.deinit(channel.allocator);
+                return 0;
+            },
+            TLS_CONTENT_TYPE_HANDSHAKE => {
+                decrypted.deinit(channel.allocator);
+                continue;
+            },
+            else => {
+                decrypted.deinit(channel.allocator);
+                return error.UnexpectedTlsInnerContentType;
+            },
+        }
+    }
+}
+
+fn tlsWriteApplicationData(channel: *TlsChannel, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const chunk_len = @min(bytes.len - offset, TLS_MAX_INNER_PLAINTEXT_BYTES - 1);
+        try sendTlsEncryptedRecord(
+            channel.stream,
+            channel.allocator,
+            channel.server_application_keys,
+            &channel.server_sequence,
+            TLS_CONTENT_TYPE_APPLICATION_DATA,
+            bytes[offset .. offset + chunk_len],
+        );
+        offset += chunk_len;
+    }
+}
+
+fn verifyClientFinished(plain: tls13_native.DecryptedRecord, expected_verify_data: [32]u8) !void {
+    if (plain.content_type != TLS_CONTENT_TYPE_HANDSHAKE) return error.BadTlsFinished;
+    if (plain.payload.len != 4 + expected_verify_data.len) return error.BadTlsFinished;
+    if (plain.payload[0] != 0x14) return error.BadTlsFinished;
+    const finished_len = (@as(usize, plain.payload[1]) << 16) |
+        (@as(usize, plain.payload[2]) << 8) |
+        @as(usize, plain.payload[3]);
+    if (finished_len != expected_verify_data.len) return error.BadTlsFinished;
+    const client_verify_data: [32]u8 = plain.payload[4..][0..32].*;
+    if (!std.crypto.timing_safe.eql([32]u8, expected_verify_data, client_verify_data)) {
+        return error.BadTlsFinishedVerifyData;
+    }
+}
+
+fn establishNativeTls13(
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    client_hello_record: []const u8,
+    info: tls_client_hello.ClientHelloInfo,
+) !NativeTlsResult {
+    if (!info.supports_tls13) return error.UnsupportedTlsVersion;
+    if (!info.offers_aes_128_gcm_sha256) return error.UnsupportedTlsCipherSuite;
+    if (!info.offers_ecdsa_secp256r1_sha256 and !info.offers_ed25519) return error.UnsupportedTlsSignatureScheme;
+    const client_x25519 = info.x25519_key_share orelse return error.MissingTlsKeyShare;
+    const alpn = selectedTlsAlpn(info);
+    if (info.alpn != null and alpn == null) return error.NoApplicationProtocol;
+
+    const io = activeIo();
+    var server_random: [32]u8 = undefined;
+    io.random(&server_random);
+    const server_key_pair = tls13_native.X25519.KeyPair.generate(io);
+    const shared_secret = try tls13_native.X25519.scalarmult(server_key_pair.secret_key, client_x25519);
+
+    const legacy_session_id = info.legacy_session_id orelse "";
+    const server_hello = try tls13_native.buildServerHello(allocator, .{
+        .legacy_session_id = legacy_session_id,
+        .random = server_random,
+        .x25519_public_key = server_key_pair.public_key,
+    });
+    defer allocator.free(server_hello);
+
+    const client_hello = try tlsClientHelloHandshakeMessage(client_hello_record);
+    const hello_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello });
+    const traffic = tls13_native.deriveTrafficSecrets(shared_secret, hello_hash);
+    const client_handshake_keys = tls13_native.deriveTlsRecordKeys(traffic.client_handshake_traffic_secret);
+    const server_handshake_keys = tls13_native.deriveTlsRecordKeys(traffic.server_handshake_traffic_secret);
+
+    const encrypted_extensions = try tls13_native.buildTcpEncryptedExtensions(allocator, alpn);
+    defer allocator.free(encrypted_extensions);
+
+    const cert_name = info.sni orelse "localhost";
+    const configured_material = if (info.offers_ecdsa_secp256r1_sha256) cfg.tls_material else null;
+    const use_configured_certificate = configured_material != null;
+    const use_ecdsa = use_configured_certificate or info.offers_ecdsa_secp256r1_sha256;
+    const ecdsa_key_pair = if (use_configured_certificate)
+        configured_material.?.ecdsa_key_pair
+    else if (use_ecdsa)
+        tls13_native.EcdsaP256Sha256.KeyPair.generate(io)
+    else
+        null;
+    const ed25519_key_pair = if (!use_ecdsa) tls13_native.Ed25519.KeyPair.generate(io) else null;
+    var generated_cert_der: ?[]u8 = null;
+    defer if (generated_cert_der) |cert| allocator.free(cert);
+
+    const certificate = if (use_configured_certificate)
+        try tls13_native.buildCertificate(allocator, configured_material.?.certificate_chain)
+    else blk: {
+        generated_cert_der = if (use_ecdsa)
+            try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, ecdsa_key_pair.?, cert_name)
+        else
+            try tls13_native.buildSelfSignedEd25519Certificate(allocator, ed25519_key_pair.?, cert_name);
+        break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
+    };
+    defer allocator.free(certificate);
+
+    const cert_verify_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello, encrypted_extensions, certificate });
+    const cert_signature = if (use_ecdsa) blk: {
+        break :blk try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, ecdsa_key_pair.?, cert_verify_hash);
+    } else blk: {
+        const signature = try tls13_native.signCertificateVerifyEd25519(ed25519_key_pair.?, cert_verify_hash);
+        break :blk try allocator.dupe(u8, &signature);
+    };
+    defer allocator.free(cert_signature);
+    const signature_scheme: tls13_native.SignatureScheme = if (use_ecdsa) .ecdsa_secp256r1_sha256 else .ed25519;
+    const certificate_verify = try tls13_native.buildCertificateVerify(allocator, signature_scheme, cert_signature);
+    defer allocator.free(certificate_verify);
+
+    const finished_hash = tls13_native.transcriptHash(&.{
+        client_hello,
+        server_hello,
+        encrypted_extensions,
+        certificate,
+        certificate_verify,
+    });
+    const server_verify_data = tls13_native.finishedVerifyData(traffic.server_finished_key, finished_hash);
+    const server_finished = try tls13_native.buildFinished(allocator, server_verify_data);
+    defer allocator.free(server_finished);
+
+    const application_hash = tls13_native.transcriptHash(&.{
+        client_hello,
+        server_hello,
+        encrypted_extensions,
+        certificate,
+        certificate_verify,
+        server_finished,
+    });
+
+    try sendTlsPlainRecord(stream, TLS_CONTENT_TYPE_HANDSHAKE, server_hello);
+    var server_handshake_sequence: u64 = 0;
+    try sendTlsEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, TLS_CONTENT_TYPE_HANDSHAKE, encrypted_extensions);
+    try sendTlsEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, TLS_CONTENT_TYPE_HANDSHAKE, certificate);
+    try sendTlsEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, TLS_CONTENT_TYPE_HANDSHAKE, certificate_verify);
+    try sendTlsEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, TLS_CONTENT_TYPE_HANDSHAKE, server_finished);
+
+    var client_handshake_sequence: u64 = 0;
+    while (true) {
+        const client_record = try readTlsRecordRaw(stream, allocator);
+        defer allocator.free(client_record);
+        if (client_record[0] == TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC) continue;
+        if (client_record[0] != TLS_CONTENT_TYPE_APPLICATION_DATA) return error.UnexpectedTlsRecordType;
+
+        var client_finished = try tls13_native.decryptTlsRecord(allocator, client_handshake_keys, client_handshake_sequence, client_record);
+        defer client_finished.deinit(allocator);
+        client_handshake_sequence += 1;
+        const expected_client_verify_data = tls13_native.finishedVerifyData(traffic.client_finished_key, application_hash);
+        try verifyClientFinished(client_finished, expected_client_verify_data);
+        break;
+    }
+
+    const app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
+    return .{
+        .channel = .{
+            .stream = stream,
+            .allocator = allocator,
+            .client_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.client_application_traffic_secret),
+            .server_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.server_application_traffic_secret),
+        },
+        .alpn = alpn,
+    };
+}
+
+fn handleTlsClientHelloProbe(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    prefill: []const u8,
+    process_env: *const std.process.Environ.Map,
+) anyerror!void {
     const record = try readTlsClientHelloRecord(stream, allocator, prefill);
+    defer allocator.free(record);
     var info = tls_client_hello.parse(allocator, record) catch |err| {
         std.debug.print("TLS ClientHello parse failed before native TLS termination: {}\n", .{err});
-        try sendTlsFatalAlert(stream, 40);
+        try sendTlsFatalAlert(stream, TLS_ALERT_HANDSHAKE_FAILURE);
         return;
     };
     defer info.deinit(allocator);
 
     std.debug.print(
-        "TLS ClientHello sni={s} alpn={s} tls13={} h2={} http11={} tls_configured={}\n",
+        "TLS ClientHello sni={s} alpn={s} tls13={} aes128gcm={} ecdsa_p256={} ed25519={} h2={} http11={} tls_configured={}\n",
         .{
             info.sni orelse "(none)",
             info.alpn orelse "(none)",
             info.supports_tls13,
+            info.offers_aes_128_gcm_sha256,
+            info.offers_ecdsa_secp256r1_sha256,
+            info.offers_ed25519,
             info.offers_h2,
             info.offers_http11,
             cfg.tls_enabled,
         },
     );
-    try sendTlsFatalAlert(stream, 120);
+
+    var established = establishNativeTls13(stream, allocator, cfg, record, info) catch |err| {
+        std.debug.print("Native TLS 1.3 handshake failed: {}\n", .{err});
+        const alert = switch (err) {
+            error.NoApplicationProtocol => TLS_ALERT_NO_APPLICATION_PROTOCOL,
+            else => TLS_ALERT_HANDSHAKE_FAILURE,
+        };
+        try sendTlsFatalAlert(stream, alert);
+        return;
+    };
+    defer established.channel.deinit();
+
+    current_tls_channel = &established.channel;
+    defer current_tls_channel = null;
+
+    std.debug.print(
+        "TLS 1.3 native connection accepted sni={s} alpn={s}\n",
+        .{ info.sni orelse "(none)", established.alpn orelse "(none)" },
+    );
+
+    if (established.alpn) |alpn| {
+        if (std.mem.eql(u8, alpn, "h2")) {
+            try handleHttp2Preface(io, stream, allocator, cfg, "", process_env);
+            return;
+        }
+    }
+
+    try handleConnection(io, stream, cfg, allocator, process_env);
 }
 
 // Read the whole request envelope while the backing buffer is still alive.
@@ -5654,6 +6039,7 @@ test "named routes prefer exact and longest prefix matches" {
         .tls_enabled = false,
         .tls_cert = null,
         .tls_key = null,
+        .tls_material = null,
         .tls_auto = false,
         .letsencrypt_email = null,
         .letsencrypt_domains = null,
@@ -6574,7 +6960,7 @@ fn handleConnection(
         }
 
         if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
-            try handleTlsClientHelloProbe(stream, req_alloc, cfg, prefill);
+            try handleTlsClientHelloProbe(io, stream, allocator, cfg, prefill, process_env);
             return;
         }
 
@@ -7960,6 +8346,7 @@ pub fn main(init: std.process.Init) !void {
         .upstream_policy = .round_robin,
         .tls_cert = null,
         .tls_key = null,
+        .tls_material = null,
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
@@ -8419,15 +8806,22 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    var concurrency = ConcurrencyState.init();
-
     if (cfg.tls_enabled) {
         if (cfg.tls_cert == null or cfg.tls_key == null) {
-            std.debug.print("TLS hint: tls=true was set, but cert/key were not both provided. Keep TLS at the reverse proxy layer.\n", .{});
+            std.debug.print("TLS enabled without cert/key; native TLS will use an ephemeral self-signed certificate.\n", .{});
         } else {
-            std.debug.print("TLS hint: cert/key were provided, but this version currently requires TLS termination in front of this process.\n", .{});
+            cfg.tls_material = loadConfiguredTlsMaterial(init.io, std.heap.page_allocator, cfg.tls_cert.?, cfg.tls_key.?) catch |err| {
+                std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
+                return err;
+            };
+            std.debug.print("Native TLS certificate loaded from {s}\n", .{cfg.tls_cert.?});
         }
     }
+    defer {
+        if (cfg.tls_material) |*material| material.deinit(std.heap.page_allocator);
+    }
+
+    var concurrency = ConcurrencyState.init();
 
     var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try address.listen(init.io, .{ .reuse_address = true });

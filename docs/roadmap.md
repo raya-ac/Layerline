@@ -60,7 +60,7 @@ Sources:
 
 ## Phase 5: TLS, ACME, and Protocols
 
-- Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth.
+- Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 configured certificate loading, and self-signed local fallback; RSA keys, session resumption, OCSP, SNI certificate selection, and mTLS remain next.
 - ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs.
 - HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade.
 - HTTP/3 full routing: route all app responses over QUIC, not just the default page; QPACK dynamic table policy; stream lifecycle; connection migration stance; anti-amplification limits.
@@ -110,8 +110,8 @@ Sources:
 3. Timeouts and graceful shutdown.
 4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection/connect-reuse metrics, bounded retry budgets, passive cooldown, opt-in active HTTP probes, and upstream keep-alive sockets are implemented; circuit breakers and slow start remain next.
 5. FastCGI and PHP front-controller.
-6. Native TLS termination.
-7. HTTP/2 server.
+6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA certificate loading, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
+7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented; flow control, GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
 9. Cache and compression.
 10. Admin API and hot reload.
