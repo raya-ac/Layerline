@@ -7,6 +7,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
 - Reverse-proxy fallback for anything the local server does not handle.
 - Named route config for route-local static, PHP, and proxy behavior.
+- Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
@@ -88,6 +89,18 @@ proxy = off
 #route_php_bin.app = php-cgi
 #route = api /api/* proxy
 #route_proxy.api = http://127.0.0.1:9000
+# nginx-style domain/server config. Global settings remain the fallback.
+#server = main
+#server_name.main = example.com www.example.com
+#server_root.main = public
+#server_index.main = index.html
+#server_serve_static_root.main = true
+#server_route.main = app /app/* php
+#server_route_php_root.main.app = public
+#server_route_php_bin.main.app = php-cgi
+#server = wildcard
+#server_name.wildcard = *.example.net
+#server_proxy.wildcard = http://127.0.0.1:9000
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
 tls = false
@@ -203,6 +216,31 @@ route_proxy.api = http://127.0.0.1:9000
 ```
 
 Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+
+## Domain Server Configs
+
+Domain configs are Layerline's first virtual-host surface. They use named server blocks in the existing strict key/value config format, so one listener can serve different roots, PHP settings, redirects, routes, and proxy fallbacks by `Host` header.
+
+```conf
+server = main
+server_name.main = example.com www.example.com
+server_root.main = public
+server_index.main = index.html
+server_serve_static_root.main = true
+
+server_route.main = assets /assets/* static
+server_route_dir.main.assets = public
+
+server_route.main = app /app/* php
+server_route_php_root.main.app = public
+server_route_php_bin.main.app = php-cgi
+
+server = api
+server_name.api = api.example.com
+server_proxy.api = http://127.0.0.1:9000
+```
+
+`server_name.NAME` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them.
 
 ## TLS options in config / CLI
 

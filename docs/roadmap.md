@@ -26,7 +26,7 @@ Sources:
 
 - Harden HTTP/1 parsing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, and strict keep-alive semantics.
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config and SIGINT/SIGTERM drain are implemented; route-local timeout policy remains next.
-- Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation and `--validate-config` are implemented; route-local schema validation is still needed.
+- Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and local admin command.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
@@ -87,7 +87,7 @@ Sources:
 
 - Local admin API over Unix socket by default: status, config validate, reload, metrics, route dump, upstream health, and cert status.
 - CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`.
-- Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter.
+- Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based `server`/`server_name` domain configs are implemented.
 - Prometheus metrics plus optional OpenTelemetry traces.
 - Systemd/launchd templates, Docker image, Homebrew tap, and reproducible release builds.
 - Crash reporting primitives: panic log, build info, runtime profile, and redacted support bundle.
@@ -106,7 +106,7 @@ Sources:
 ## Immediate Build Order
 
 1. Config validation and route gates.
-2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented; route-local TLS/cache/security policy remains next.
+2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented. Host-based domain configs with per-domain routes are implemented; route-local TLS/cache/security policy remains next.
 3. Timeouts and graceful shutdown.
 4. Reverse proxy upstream pools.
 5. FastCGI and PHP front-controller.

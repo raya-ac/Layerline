@@ -235,6 +235,18 @@ const RouteBoolProperty = enum {
     strip_prefix,
 };
 
+const DomainStringProperty = enum {
+    static_dir,
+    index_file,
+    php_root,
+    php_binary,
+};
+
+const DomainBoolProperty = enum {
+    serve_static_root,
+    php_info_page,
+};
+
 const RouteConfig = struct {
     name: []const u8,
     pattern: []const u8,
@@ -247,6 +259,20 @@ const RouteConfig = struct {
     php_binary: ?[]const u8,
     php_info_page: ?bool,
     upstream: ?UpstreamConfig,
+};
+
+const DomainConfig = struct {
+    name: []const u8,
+    server_names: std.ArrayList([]const u8),
+    static_dir: ?[]const u8,
+    serve_static_root: ?bool,
+    index_file: ?[]const u8,
+    php_root: ?[]const u8,
+    php_binary: ?[]const u8,
+    php_info_page: ?bool,
+    upstream: ?UpstreamConfig,
+    redirects: std.ArrayList(RedirectRule),
+    routes: std.ArrayList(RouteConfig),
 };
 
 // All server behavior is described in this single config object.
@@ -275,6 +301,7 @@ const ServerConfig = struct {
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
+    domains: std.ArrayList(DomainConfig),
     max_request_bytes: usize,
     max_body_bytes: usize,
     max_static_file_bytes: usize,
@@ -1217,8 +1244,8 @@ fn isRouteNameValid(name: []const u8) bool {
     return true;
 }
 
-fn findRouteConfigMutable(cfg: *ServerConfig, name: []const u8) ?*RouteConfig {
-    for (cfg.routes.items) |*route| {
+fn findRouteConfigMutable(routes: *std.ArrayList(RouteConfig), name: []const u8) ?*RouteConfig {
+    for (routes.items) |*route| {
         if (std.mem.eql(u8, route.name, name)) return route;
     }
     return null;
@@ -1231,21 +1258,21 @@ fn findRoutePropertyName(key: []const u8, prefix: []const u8) ?[]const u8 {
     return name;
 }
 
-fn setRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const u8) !void {
+fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, raw: []const u8) !void {
     var parts = std.mem.tokenizeAny(u8, raw, " \t");
     const name = parts.next() orelse return error.InvalidConfigValue;
     const pattern_raw = parts.next() orelse return error.InvalidConfigValue;
     const handler_raw = parts.next() orelse return error.InvalidConfigValue;
     if (parts.next() != null) return error.InvalidConfigValue;
     if (!isRouteNameValid(name)) return error.InvalidConfigValue;
-    if (findRouteConfigMutable(cfg, name) != null) return error.DuplicateConfigRoute;
+    if (findRouteConfigMutable(routes, name) != null) return error.DuplicateConfigRoute;
     if (pattern_raw.len == 0 or pattern_raw[0] != '/') return error.InvalidConfigValue;
 
     const match_kind: RouteMatchKind = if (std.mem.endsWith(u8, pattern_raw, "*")) .prefix else .exact;
     const pattern_without_star = if (match_kind == .prefix) pattern_raw[0 .. pattern_raw.len - 1] else pattern_raw;
     const normalized_pattern = if (pattern_without_star.len == 0) "/" else pattern_without_star;
 
-    try cfg.routes.append(allocator, .{
+    try routes.append(allocator, .{
         .name = try allocator.dupe(u8, name),
         .pattern = try allocator.dupe(u8, normalized_pattern),
         .match_kind = match_kind,
@@ -1260,15 +1287,19 @@ fn setRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const u
     });
 }
 
+fn setRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const u8) !void {
+    try setRouteLineFor(&cfg.routes, allocator, raw);
+}
+
 fn setRouteStringProperty(
-    cfg: *ServerConfig,
+    routes: *std.ArrayList(RouteConfig),
     allocator: std.mem.Allocator,
     route_name: []const u8,
     value: []const u8,
     field: RouteStringProperty,
 ) !void {
     if (value.len == 0) return error.InvalidConfigValue;
-    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     const dupe_value = try allocator.dupe(u8, value);
     switch (field) {
         .static_dir => route.static_dir = dupe_value,
@@ -1278,8 +1309,8 @@ fn setRouteStringProperty(
     }
 }
 
-fn setRouteProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, route_name: []const u8, value: []const u8) !void {
-    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+fn setRouteProxyProperty(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, route_name: []const u8, value: []const u8) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     if (disablesOptionalUrl(value)) {
         route.upstream = null;
     } else {
@@ -1287,13 +1318,128 @@ fn setRouteProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, route
     }
 }
 
-fn setRouteBoolProperty(cfg: *ServerConfig, route_name: []const u8, value: []const u8, field: RouteBoolProperty) !void {
-    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: RouteBoolProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     const parsed = try parseConfigBool(value);
     switch (field) {
         .php_info_page => route.php_info_page = parsed,
         .strip_prefix => route.strip_prefix = parsed,
     }
+}
+
+fn isDomainConfigNameValid(name: []const u8) bool {
+    return isRouteNameValid(name);
+}
+
+fn findDomainConfigMutable(cfg: *ServerConfig, name: []const u8) ?*DomainConfig {
+    for (cfg.domains.items) |*domain| {
+        if (std.mem.eql(u8, domain.name, name)) return domain;
+    }
+    return null;
+}
+
+fn splitDomainRoutePropertyName(value: []const u8) ?struct { domain: []const u8, route: []const u8 } {
+    const dot = std.mem.indexOfScalar(u8, value, '.') orelse return null;
+    const domain = value[0..dot];
+    const route = value[dot + 1 ..];
+    if (domain.len == 0 or route.len == 0) return null;
+    return .{ .domain = domain, .route = route };
+}
+
+fn appendServerNames(allocator: std.mem.Allocator, domain: *DomainConfig, value: []const u8) !void {
+    var parts = std.mem.tokenizeAny(u8, value, " \t,");
+    var added = false;
+    while (parts.next()) |name| {
+        if (name.len == 0) continue;
+        try domain.server_names.append(allocator, try allocator.dupe(u8, name));
+        added = true;
+    }
+    if (!added) return error.InvalidConfigValue;
+}
+
+fn setDomainLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const u8) !void {
+    const name = trimValue(raw);
+    if (!isDomainConfigNameValid(name)) return error.InvalidConfigValue;
+    if (findDomainConfigMutable(cfg, name) != null) return error.DuplicateConfigDomain;
+
+    try cfg.domains.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .server_names = .empty,
+        .static_dir = null,
+        .serve_static_root = null,
+        .index_file = null,
+        .php_root = null,
+        .php_binary = null,
+        .php_info_page = null,
+        .upstream = null,
+        .redirects = .empty,
+        .routes = .empty,
+    });
+}
+
+fn setDomainStringProperty(
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    domain_name: []const u8,
+    value: []const u8,
+    field: DomainStringProperty,
+) !void {
+    if (value.len == 0) return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const dupe_value = try allocator.dupe(u8, value);
+    switch (field) {
+        .static_dir => domain.static_dir = dupe_value,
+        .index_file => domain.index_file = dupe_value,
+        .php_root => domain.php_root = dupe_value,
+        .php_binary => domain.php_binary = dupe_value,
+    }
+}
+
+fn setDomainBoolProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: DomainBoolProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .serve_static_root => domain.serve_static_root = parsed,
+        .php_info_page => domain.php_info_page = parsed,
+    }
+}
+
+fn setDomainProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    if (disablesOptionalUrl(value)) {
+        domain.upstream = null;
+    } else {
+        domain.upstream = try parseUpstream(allocator, value);
+    }
+}
+
+fn setDomainRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    try setRouteLineFor(&domain.routes, allocator, value);
+}
+
+fn setDomainRouteStringProperty(
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    property_name: []const u8,
+    value: []const u8,
+    field: RouteStringProperty,
+) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteStringProperty(&domain.routes, allocator, split.route, value, field);
+}
+
+fn setDomainRouteBoolProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: RouteBoolProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteBoolProperty(&domain.routes, split.route, value, field);
+}
+
+fn setDomainRouteProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, property_name: []const u8, value: []const u8) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteProxyProperty(&domain.routes, allocator, split.route, value);
 }
 
 // Map one config file line to fields. Config files are strict so typos do not
@@ -1372,32 +1518,97 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
+    } else if (std.mem.eql(u8, k, "server") or std.mem.eql(u8, k, "domain") or std.mem.eql(u8, k, "vhost")) {
+        try setDomainLine(cfg, allocator, v);
+    } else if (findRoutePropertyName(k, "server_name.")) |name| {
+        const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
+        try appendServerNames(allocator, domain, v);
+    } else if (findRoutePropertyName(k, "server_names.")) |name| {
+        const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
+        try appendServerNames(allocator, domain, v);
+    } else if (findRoutePropertyName(k, "server_root.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_dir.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_static_dir.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_index.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "server_index_file.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "server_serve_static.")) |name| {
+        try setDomainBoolProperty(cfg, name, v, .serve_static_root);
+    } else if (findRoutePropertyName(k, "server_serve_static_root.")) |name| {
+        try setDomainBoolProperty(cfg, name, v, .serve_static_root);
+    } else if (findRoutePropertyName(k, "server_php_root.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .php_root);
+    } else if (findRoutePropertyName(k, "server_php_bin.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_php_binary.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_php_info_page.")) |name| {
+        try setDomainBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_phpinfo_page.")) |name| {
+        try setDomainBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_proxy.")) |name| {
+        try setDomainProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_upstream.")) |name| {
+        try setDomainProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_redirect.")) |name| {
+        const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
+        if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
+    } else if (findRoutePropertyName(k, "server_route.")) |name| {
+        try setDomainRouteLine(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_route_dir.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_route_static_dir.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_route_index.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "server_route_index_file.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "server_route_php_root.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .php_root);
+    } else if (findRoutePropertyName(k, "server_route_php_bin.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_route_php_binary.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_route_php_info_page.")) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_route_phpinfo_page.")) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_route_proxy.")) |name| {
+        try setDomainRouteProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_route_upstream.")) |name| {
+        try setDomainRouteProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_route_strip_prefix.")) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .strip_prefix);
     } else if (std.mem.eql(u8, k, "route")) {
         try setRouteLine(cfg, allocator, v);
     } else if (findRoutePropertyName(k, "route_dir.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .static_dir);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "route_static_dir.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .static_dir);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "route_index.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .index_file);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "route_index_file.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .index_file);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "route_php_root.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .php_root);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_root);
     } else if (findRoutePropertyName(k, "route_php_bin.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .php_binary);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "route_php_binary.")) |name| {
-        try setRouteStringProperty(cfg, allocator, name, v, .php_binary);
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "route_php_info_page.")) |name| {
-        try setRouteBoolProperty(cfg, name, v, .php_info_page);
+        try setRouteBoolProperty(&cfg.routes, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "route_phpinfo_page.")) |name| {
-        try setRouteBoolProperty(cfg, name, v, .php_info_page);
+        try setRouteBoolProperty(&cfg.routes, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "route_proxy.")) |name| {
-        try setRouteProxyProperty(cfg, allocator, name, v);
+        try setRouteProxyProperty(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_upstream.")) |name| {
-        try setRouteProxyProperty(cfg, allocator, name, v);
+        try setRouteProxyProperty(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
-        try setRouteBoolProperty(cfg, name, v, .strip_prefix);
+        try setRouteBoolProperty(&cfg.routes, name, v, .strip_prefix);
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -1527,6 +1738,26 @@ fn normalizeConfig(cfg: *ServerConfig) void {
     }
 }
 
+fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamConfig) !void {
+    if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
+    if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
+    if (route.static_dir) |static_dir| {
+        if (static_dir.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.index_file) |index_file| {
+        if (index_file.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.php_root) |php_root| {
+        if (php_root.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.php_binary) |php_binary| {
+        if (php_binary.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.handler == .proxy and route.upstream == null and fallback_upstream == null) {
+        return error.InvalidConfigValue;
+    }
+}
+
 fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.host.len == 0) return error.InvalidConfigValue;
     if (cfg.port == 0) return error.InvalidConfigValue;
@@ -1556,23 +1787,32 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if (cfg.cloudflare_record_content == null or cfg.cloudflare_record_content.?.len == 0) return error.InvalidConfigValue;
     }
 
-    for (cfg.routes.items) |route| {
-        if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
-        if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
-        if (route.static_dir) |static_dir| {
+    for (cfg.routes.items) |*route| {
+        try validateRouteConfig(route, cfg.upstream);
+    }
+
+    for (cfg.domains.items) |*domain| {
+        if (!isDomainConfigNameValid(domain.name)) return error.InvalidConfigValue;
+        if (domain.server_names.items.len == 0) return error.InvalidConfigValue;
+        for (domain.server_names.items) |name| {
+            if (std.mem.trim(u8, name, " \t\r\n").len == 0) return error.InvalidConfigValue;
+        }
+        if (domain.static_dir) |static_dir| {
             if (static_dir.len == 0) return error.InvalidConfigValue;
         }
-        if (route.index_file) |index_file| {
+        if (domain.index_file) |index_file| {
             if (index_file.len == 0) return error.InvalidConfigValue;
         }
-        if (route.php_root) |php_root| {
+        if (domain.php_root) |php_root| {
             if (php_root.len == 0) return error.InvalidConfigValue;
         }
-        if (route.php_binary) |php_binary| {
+        if (domain.php_binary) |php_binary| {
             if (php_binary.len == 0) return error.InvalidConfigValue;
         }
-        if (route.handler == .proxy and route.upstream == null and cfg.upstream == null) {
-            return error.InvalidConfigValue;
+
+        const fallback_upstream = if (domain.upstream) |upstream| upstream else cfg.upstream;
+        for (domain.routes.items) |*route| {
+            try validateRouteConfig(route, fallback_upstream);
         }
     }
 }
@@ -1816,8 +2056,8 @@ fn redirectStatusText(status_code: u16) []const u8 {
     };
 }
 
-fn findRedirectRule(cfg: *const ServerConfig, path: []const u8) ?RedirectRule {
-    for (cfg.redirects.items) |rule| {
+fn findRedirectRuleIn(rules: []const RedirectRule, path: []const u8) ?RedirectRule {
+    for (rules) |rule| {
         if (rule.prefix_match) {
             if (std.mem.startsWith(u8, path, rule.from)) return rule;
         } else if (std.mem.eql(u8, path, rule.from)) {
@@ -1825,6 +2065,10 @@ fn findRedirectRule(cfg: *const ServerConfig, path: []const u8) ?RedirectRule {
         }
     }
     return null;
+}
+
+fn findRedirectRule(cfg: *const ServerConfig, path: []const u8) ?RedirectRule {
+    return findRedirectRuleIn(cfg.redirects.items, path);
 }
 
 fn buildRedirectLocation(allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest) ![]const u8 {
@@ -3023,9 +3267,13 @@ fn routeMatches(route: *const RouteConfig, path: []const u8) bool {
 }
 
 fn findNamedRoute(cfg: *const ServerConfig, path: []const u8) ?*const RouteConfig {
+    return findNamedRouteIn(cfg.routes.items, path);
+}
+
+fn findNamedRouteIn(routes: []const RouteConfig, path: []const u8) ?*const RouteConfig {
     var best: ?*const RouteConfig = null;
     var best_len: usize = 0;
-    for (cfg.routes.items) |*route| {
+    for (routes) |*route| {
         if (!routeMatches(route, path)) continue;
         if (route.match_kind == .exact) return route;
         if (route.pattern.len >= best_len) {
@@ -3034,6 +3282,139 @@ fn findNamedRoute(cfg: *const ServerConfig, path: []const u8) ?*const RouteConfi
         }
     }
     return best;
+}
+
+fn stripHostPort(raw_host: []const u8) []const u8 {
+    const host = std.mem.trim(u8, raw_host, " \t\r\n");
+    if (host.len == 0) return host;
+
+    if (host[0] == '[') {
+        if (std.mem.indexOfScalar(u8, host, ']')) |close| {
+            return host[0 .. close + 1];
+        }
+        return host;
+    }
+
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, host[0..colon], ':') == null) {
+            return host[0..colon];
+        }
+    }
+
+    return host;
+}
+
+fn asciiEndsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    if (suffix.len > value.len) return false;
+    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
+}
+
+fn serverNameMatchScore(server_name: []const u8, host: []const u8) usize {
+    const pattern = std.mem.trim(u8, server_name, " \t\r\n");
+    if (pattern.len == 0 or host.len == 0) return 0;
+
+    if (std.mem.eql(u8, pattern, "_") or std.ascii.eqlIgnoreCase(pattern, "default")) {
+        return 1;
+    }
+
+    if (std.ascii.eqlIgnoreCase(pattern, host)) {
+        return 1_000_000 + pattern.len;
+    }
+
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..];
+        if (host.len > suffix.len and asciiEndsWithIgnoreCase(host, suffix)) {
+            return 1000 + suffix.len;
+        }
+    }
+
+    return 0;
+}
+
+fn findDomainForHost(cfg: *const ServerConfig, raw_host: []const u8) ?*const DomainConfig {
+    const host = stripHostPort(raw_host);
+    var best: ?*const DomainConfig = null;
+    var best_score: usize = 0;
+
+    for (cfg.domains.items) |*domain| {
+        for (domain.server_names.items) |server_name| {
+            const score = serverNameMatchScore(server_name, host);
+            if (score > best_score) {
+                best = domain;
+                best_score = score;
+            }
+        }
+    }
+
+    return best;
+}
+
+fn findDomainForRequest(cfg: *const ServerConfig, headers: []const u8) ?*const DomainConfig {
+    const host = findHeaderValue(headers, "Host") orelse return null;
+    return findDomainForHost(cfg, host);
+}
+
+fn domainStaticDir(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
+    if (domain) |d| {
+        if (d.static_dir) |value| return value;
+    }
+    return cfg.static_dir;
+}
+
+fn domainServeStaticRoot(cfg: *const ServerConfig, domain: ?*const DomainConfig) bool {
+    if (domain) |d| {
+        if (d.serve_static_root) |value| return value;
+    }
+    return cfg.serve_static_root;
+}
+
+fn domainIndexFile(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
+    if (domain) |d| {
+        if (d.index_file) |value| return value;
+    }
+    return cfg.index_file;
+}
+
+fn domainPhpRoot(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
+    if (domain) |d| {
+        if (d.php_root) |value| return value;
+    }
+    return cfg.php_root;
+}
+
+fn domainPhpBinary(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
+    if (domain) |d| {
+        if (d.php_binary) |value| return value;
+    }
+    return cfg.php_binary;
+}
+
+fn domainPhpInfoPage(cfg: *const ServerConfig, domain: ?*const DomainConfig) bool {
+    if (domain) |d| {
+        if (d.php_info_page) |value| return value;
+    }
+    return cfg.php_info_page;
+}
+
+fn domainUpstream(cfg: *const ServerConfig, domain: ?*const DomainConfig) ?UpstreamConfig {
+    if (domain) |d| {
+        if (d.upstream) |value| return value;
+    }
+    return cfg.upstream;
+}
+
+fn findDomainRedirectRule(domain: ?*const DomainConfig, path: []const u8) ?RedirectRule {
+    if (domain) |d| {
+        if (findRedirectRuleIn(d.redirects.items, path)) |rule| return rule;
+    }
+    return null;
+}
+
+fn findDomainRoute(domain: ?*const DomainConfig, path: []const u8) ?*const RouteConfig {
+    if (domain) |d| {
+        return findNamedRouteIn(d.routes.items, path);
+    }
+    return null;
 }
 
 fn routeFileRelativePath(allocator: std.mem.Allocator, route: *const RouteConfig, request_path: []const u8, index_file: []const u8) ![]const u8 {
@@ -3055,6 +3436,7 @@ fn handleNamedRoute(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
     route: *const RouteConfig,
     req: HttpRequest,
     close_connection: bool,
@@ -3079,27 +3461,27 @@ fn handleNamedRoute(
                 try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection);
                 return;
             }
-            const static_dir = route.static_dir orelse cfg.static_dir;
-            const index_file = route.index_file orelse cfg.index_file;
+            const static_dir = route.static_dir orelse domainStaticDir(cfg, domain);
+            const index_file = route.index_file orelse domainIndexFile(cfg, domain);
             const rel = try routeFileRelativePath(allocator, route, req.path, index_file);
             defer allocator.free(rel);
             try serveStatic(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes);
             return;
         },
         .php => {
-            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse cfg.php_info_page)) {
+            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
                 try sendNotFoundWithConnection(allocator, stream, close_connection);
                 return;
             }
-            const php_root = route.php_root orelse cfg.php_root;
-            const php_binary = route.php_binary orelse cfg.php_binary;
-            const script_rel = try routeFileRelativePath(allocator, route, req.path, cfg.index_file);
+            const php_root = route.php_root orelse domainPhpRoot(cfg, domain);
+            const php_binary = route.php_binary orelse domainPhpBinary(cfg, domain);
+            const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
             defer allocator.free(script_rel);
             try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, script_rel, close_connection, is_head, process_env);
             return;
         },
         .proxy => {
-            const maybe_upstream = if (route.upstream) |up| up else cfg.upstream;
+            const maybe_upstream = if (route.upstream) |up| up else domainUpstream(cfg, domain);
             const upstream = maybe_upstream orelse {
                 try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
                 return;
@@ -3140,6 +3522,7 @@ test "named routes prefer exact and longest prefix matches" {
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
+        .domains = .empty,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
@@ -3177,6 +3560,19 @@ test "named routes prefer exact and longest prefix matches" {
 
     const rel = try routeFileRelativePath(allocator, findNamedRoute(&cfg, "/assets/hello.txt").?, "/assets/hello.txt", "index.html");
     try std.testing.expectEqualStrings("hello.txt", rel);
+
+    try setDomainLine(&cfg, allocator, "site");
+    try appendServerNames(allocator, findDomainConfigMutable(&cfg, "site").?, "example.test *.example.test");
+    try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
+
+    try setDomainLine(&cfg, allocator, "fallback");
+    try appendServerNames(allocator, findDomainConfigMutable(&cfg, "fallback").?, "_");
+
+    try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "example.test:8080").?.name);
+    try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "www.example.test").?.name);
+    try std.testing.expectEqualStrings("fallback", findDomainForHost(&cfg, "other.test").?.name);
+    try std.testing.expectEqualStrings("site-assets", findDomainRoute(findDomainForHost(&cfg, "example.test"), "/assets/domain.txt").?.name);
+    try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/global.txt").?.name);
 }
 
 fn routeRequest(
@@ -3194,14 +3590,25 @@ fn routeRequest(
     const should_close = req.close_connection;
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
+    const domain = findDomainForRequest(cfg, req.headers);
+
+    if (findDomainRedirectRule(domain, req.path)) |redirect| {
+        try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
+        return;
+    }
 
     if (findRedirectRule(cfg, req.path)) |redirect| {
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
         return;
     }
 
+    if (findDomainRoute(domain, req.path)) |route| {
+        try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
+        return;
+    }
+
     if (findNamedRoute(cfg, req.path)) |route| {
-        try handleNamedRoute(io, stream, allocator, cfg, route, req, should_close, is_head, process_env);
+        try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
         return;
     }
 
@@ -3537,33 +3944,35 @@ fn routeRequest(
             return;
         }
 
-        if (std.mem.eql(u8, req.path, "/test.php") and !cfg.php_info_page) {
+        if (std.mem.eql(u8, req.path, "/test.php") and !domainPhpInfoPage(cfg, domain)) {
             try sendNotFoundWithConnection(allocator, stream, should_close);
             return;
         }
 
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
-            try handlePhp(io, stream, allocator, cfg, req, should_close, is_head, process_env);
+            const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, should_close, is_head, process_env);
             return;
         }
 
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             const rel = req.path["/static/".len..];
-            try serveStatic(io, stream, allocator, cfg.static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
+            try serveStatic(io, stream, allocator, domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
             return;
         }
 
-        if (cfg.serve_static_root and
+        if (domainServeStaticRoot(cfg, domain) and
             !std.mem.startsWith(u8, req.path, "/api/") and
             !std.mem.startsWith(u8, req.path, "/php/") and
             !std.mem.eql(u8, req.path, "/health") and
             !std.mem.eql(u8, req.path, "/time") and
             !std.mem.eql(u8, req.path, "/"))
         {
-            const rel = try makeStaticPathFromRequest(allocator, req.path, cfg.index_file);
+            const static_dir = domainStaticDir(cfg, domain);
+            const rel = try makeStaticPathFromRequest(allocator, req.path, domainIndexFile(cfg, domain));
             defer allocator.free(rel);
 
-            const candidate_path = try std.fs.path.join(allocator, &.{ cfg.static_dir, rel });
+            const candidate_path = try std.fs.path.join(allocator, &.{ static_dir, rel });
             defer allocator.free(candidate_path);
 
             var file_exists = false;
@@ -3574,12 +3983,12 @@ fn routeRequest(
             } else |_| {}
 
             if (file_exists) {
-                try serveStatic(io, stream, allocator, cfg.static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
+                try serveStatic(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
                 return;
             }
         }
 
-        if (cfg.upstream) |up| {
+        if (domainUpstream(cfg, domain)) |up| {
             try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
@@ -3589,13 +3998,14 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "POST")) {
-        if (std.mem.eql(u8, req.path, "/test.php") and !cfg.php_info_page) {
+        if (std.mem.eql(u8, req.path, "/test.php") and !domainPhpInfoPage(cfg, domain)) {
             try sendNotFoundWithConnection(allocator, stream, should_close);
             return;
         }
 
         if (std.mem.endsWith(u8, req.path, ".php")) {
-            try handlePhp(io, stream, allocator, cfg, req, should_close, false, process_env);
+            const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, should_close, false, process_env);
             return;
         }
 
@@ -3604,7 +4014,7 @@ fn routeRequest(
             return;
         }
 
-        if (cfg.upstream) |up| {
+        if (domainUpstream(cfg, domain)) |up| {
             try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
@@ -3622,7 +4032,7 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
-        if (cfg.upstream) |up| {
+        if (domainUpstream(cfg, domain)) |up| {
             try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
             return;
         }
@@ -4874,12 +5284,16 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
 }
 
 fn dumpRoutes(cfg: *const ServerConfig) void {
-    if (cfg.routes.items.len == 0) {
+    if (cfg.routes.items.len == 0 and cfg.domains.items.len == 0) {
         std.debug.print("Layerline routes: no named routes configured; built-in routes remain active.\n", .{});
         return;
     }
 
-    std.debug.print("Layerline routes ({d}):\n", .{cfg.routes.items.len});
+    if (cfg.routes.items.len == 0) {
+        std.debug.print("Layerline routes: no global named routes configured.\n", .{});
+    } else {
+        std.debug.print("Layerline routes ({d}):\n", .{cfg.routes.items.len});
+    }
     for (cfg.routes.items) |route| {
         std.debug.print(
             "  {s}: {s} {s} -> {s}",
@@ -4903,6 +5317,45 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
         }
         if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
         std.debug.print("\n", .{});
+    }
+
+    if (cfg.domains.items.len > 0) {
+        std.debug.print("Layerline domains ({d}):\n", .{cfg.domains.items.len});
+    }
+    for (cfg.domains.items) |*domain| {
+        std.debug.print("  server {s}: server_name", .{domain.name});
+        for (domain.server_names.items) |server_name| {
+            std.debug.print(" {s}", .{server_name});
+        }
+        std.debug.print(" root={s} index={s}", .{ domainStaticDir(cfg, domain), domainIndexFile(cfg, domain) });
+        if (domainServeStaticRoot(cfg, domain)) std.debug.print(" serve_static_root=true", .{});
+        if (domain.upstream) |up| std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+        std.debug.print("\n", .{});
+
+        for (domain.routes.items) |route| {
+            std.debug.print(
+                "    {s}: {s} {s} -> {s}",
+                .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) },
+            );
+            switch (route.handler) {
+                .static => {
+                    std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse domainStaticDir(cfg, domain), route.index_file orelse domainIndexFile(cfg, domain) });
+                },
+                .php => {
+                    std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain) });
+                },
+                .proxy => {
+                    const maybe_upstream = if (route.upstream) |up| up else domainUpstream(cfg, domain);
+                    if (maybe_upstream) |up| {
+                        std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+                    } else {
+                        std.debug.print(" upstream=<unset>", .{});
+                    }
+                },
+            }
+            if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
+            std.debug.print("\n", .{});
+        }
     }
 }
 
@@ -4946,7 +5399,9 @@ fn usage() void {
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_strip_prefix.NAME\n" ++
+            "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
+            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_proxy.NAME, " ++
+            "server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
@@ -5015,6 +5470,7 @@ pub fn main(init: std.process.Init) !void {
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
+        .domains = .empty,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
