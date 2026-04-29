@@ -201,6 +201,7 @@ const UpstreamConfig = struct {
     port: u16,
     base_path: []const u8,
     https: bool,
+    active_requests: std.atomic.Value(usize),
     passive_failures: std.atomic.Value(usize),
     ejected_until_ms: std.atomic.Value(i64),
 };
@@ -208,6 +209,7 @@ const UpstreamConfig = struct {
 const UpstreamPoolPolicy = enum {
     round_robin,
     random,
+    least_connections,
 };
 
 const UpstreamPoolConfig = struct {
@@ -1293,6 +1295,7 @@ fn upstreamPoolPolicyName(policy: UpstreamPoolPolicy) []const u8 {
     return switch (policy) {
         .round_robin => "round_robin",
         .random => "random",
+        .least_connections => "least_connections",
     };
 }
 
@@ -1306,6 +1309,13 @@ fn parseUpstreamPoolPolicy(value: []const u8) !UpstreamPoolPolicy {
     }
     if (std.ascii.eqlIgnoreCase(value, "random") or std.ascii.eqlIgnoreCase(value, "rand")) {
         return .random;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "least_connections") or
+        std.ascii.eqlIgnoreCase(value, "least-connections") or
+        std.ascii.eqlIgnoreCase(value, "least_conn") or
+        std.ascii.eqlIgnoreCase(value, "leastconn"))
+    {
+        return .least_connections;
     }
     return error.InvalidConfigValue;
 }
@@ -3208,6 +3218,7 @@ fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig 
         .port = port,
         .base_path = dupe_path,
         .https = scheme_https,
+        .active_requests = std.atomic.Value(usize).init(0),
         .passive_failures = std.atomic.Value(usize).init(0),
         .ejected_until_ms = std.atomic.Value(i64).init(0),
     };
@@ -3245,16 +3256,40 @@ fn upstreamRandomTicket() usize {
     return @truncate(z ^ (z >> 31));
 }
 
-fn upstreamStartTicket(policy: UpstreamPoolPolicy) usize {
+fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64) usize {
+    const target_count = pool.targets.items.len;
+    const tie_ticket = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
+    if (target_count == 0) return tie_ticket;
+
+    var best_index: ?usize = null;
+    var best_active: usize = std.math.maxInt(usize);
+    var offset: usize = 0;
+    while (offset < target_count) : (offset += 1) {
+        const index = (tie_ticket + offset) % target_count;
+        const upstream = &pool.targets.items[index];
+        if (upstreamIsEjected(upstream, now_ms)) continue;
+
+        const active = upstream.active_requests.load(.monotonic);
+        if (best_index == null or active < best_active) {
+            best_index = index;
+            best_active = active;
+        }
+    }
+
+    return best_index orelse tie_ticket;
+}
+
+fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64) usize {
     return switch (policy) {
         .round_robin => upstream_round_robin_cursor.fetchAdd(1, .monotonic),
         .random => upstreamRandomTicket(),
+        .least_connections => upstreamLeastConnectionsTicket(pool, now_ms),
     };
 }
 
-fn selectUpstream(pool: *const UpstreamPoolConfig) ?*const UpstreamConfig {
+fn selectUpstream(pool: *UpstreamPoolConfig) ?*UpstreamConfig {
     if (pool.targets.items.len == 0) return null;
-    const ticket = upstreamStartTicket(pool.policy);
+    const ticket = upstreamStartTicket(pool, pool.policy, upstreamNowMs());
     return &pool.targets.items[ticket % pool.targets.items.len];
 }
 
@@ -3282,6 +3317,14 @@ fn upstreamRecordFailure(upstream: *UpstreamConfig, now_ms: i64, max_failures: u
     const cooldown_until = now_ms + @as(i64, @intCast(fail_timeout_ms));
     upstream.ejected_until_ms.store(cooldown_until, .monotonic);
     return true;
+}
+
+fn upstreamBeginAttempt(upstream: *UpstreamConfig) void {
+    _ = upstream.active_requests.fetchAdd(1, .monotonic);
+}
+
+fn upstreamEndAttempt(upstream: *UpstreamConfig) void {
+    _ = upstream.active_requests.fetchSub(1, .monotonic);
 }
 
 fn upstreamAttemptLimit(pool: *const UpstreamPoolConfig, retry_budget: usize) usize {
@@ -3525,8 +3568,8 @@ fn forwardToUpstreamPool(
     }
 
     const attempt_limit = upstreamAttemptLimit(pool, upstream_retries);
-    const start_ticket = upstreamStartTicket(policy);
     const now_ms = upstreamNowMs();
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -3543,13 +3586,19 @@ fn forwardToUpstreamPool(
         if (attempts > 0) server_metrics.upstreamRetried();
         attempts += 1;
         server_metrics.upstreamRequestStarted();
+        upstreamBeginAttempt(upstream);
         forwardToUpstream(stream, allocator, upstream, req, upstream_timeout_ms) catch |err| switch (err) {
             error.CloseConnection => {
+                upstreamEndAttempt(upstream);
                 upstreamRecordSuccess(upstream);
                 return err;
             },
-            error.OutOfMemory => return err,
+            error.OutOfMemory => {
+                upstreamEndAttempt(upstream);
+                return err;
+            },
             else => {
+                upstreamEndAttempt(upstream);
                 last_error = err;
                 server_metrics.upstreamRequestFailed();
                 if (upstreamRecordFailure(upstream, now_ms, upstream_max_failures, upstream_fail_timeout_ms)) {
@@ -3558,6 +3607,7 @@ fn forwardToUpstreamPool(
                 continue :attempt_loop;
             },
         };
+        upstreamEndAttempt(upstream);
         upstreamRecordSuccess(upstream);
         return;
     }
@@ -4140,7 +4190,7 @@ test "upstream pools parse multiple targets and rotate selection" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000/api, http://127.0.0.1:9001");
+    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000/api, http://127.0.0.1:9001");
 
     try std.testing.expectEqual(@as(usize, 2), pool.targets.items.len);
     try std.testing.expectEqualStrings("127.0.0.1", pool.targets.items[0].host);
@@ -4172,7 +4222,26 @@ test "upstream policy parser accepts configured policy names" {
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, try parseUpstreamPoolPolicy("round_robin"));
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, try parseUpstreamPoolPolicy("round-robin"));
     try std.testing.expectEqual(UpstreamPoolPolicy.random, try parseUpstreamPoolPolicy("random"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least_connections"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least-connections"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("leastconn"));
     try std.testing.expectEqual(@as(?UpstreamPoolPolicy, null), try parseOptionalUpstreamPoolPolicy("inherit"));
+}
+
+test "least-connections policy chooses the quietest healthy upstream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
+
+    pool.targets.items[0].active_requests.store(5, .monotonic);
+    pool.targets.items[1].active_requests.store(1, .monotonic);
+    pool.targets.items[2].active_requests.store(3, .monotonic);
+    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000));
+
+    pool.targets.items[1].ejected_until_ms.store(2_000, .monotonic);
+    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000));
 }
 
 test "passive upstream health ejects and recovers targets" {

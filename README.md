@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random` policies, bounded retries, and passive upstream ejection.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections` policies, bounded retries, and passive upstream ejection.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -25,7 +25,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, and passive upstream ejection, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections balancing, passive upstream ejection, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is deeper upstream behavior: active health checks, circuit breakers, richer balancing policies, and keep-alive upstream pools. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -88,7 +88,7 @@ php_info_page = false
 # Use off/false/no/0/none/null to disable it.
 proxy = off
 #proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
-# Pick the first target in a pool with round_robin or random.
+# Pick the first target in a pool with round_robin, random, or least_connections.
 #upstream_policy = round_robin
 # Retry failed pooled upstream targets before Layerline commits a proxy response.
 # Set to 0 to disable retry attempts.
