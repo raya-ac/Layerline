@@ -200,6 +200,15 @@ const UpstreamConfig = struct {
     https: bool,
 };
 
+const UpstreamPoolPolicy = enum {
+    round_robin,
+};
+
+const UpstreamPoolConfig = struct {
+    targets: std.ArrayList(UpstreamConfig),
+    policy: UpstreamPoolPolicy,
+};
+
 const ResponseHeaderRule = struct {
     name: []const u8,
     value: []const u8,
@@ -258,7 +267,7 @@ const RouteConfig = struct {
     php_root: ?[]const u8,
     php_binary: ?[]const u8,
     php_info_page: ?bool,
-    upstream: ?UpstreamConfig,
+    upstream: ?UpstreamPoolConfig,
 };
 
 const DomainConfig = struct {
@@ -270,7 +279,7 @@ const DomainConfig = struct {
     php_root: ?[]const u8,
     php_binary: ?[]const u8,
     php_info_page: ?bool,
-    upstream: ?UpstreamConfig,
+    upstream: ?UpstreamPoolConfig,
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
 };
@@ -285,7 +294,7 @@ const ServerConfig = struct {
     php_root: []const u8,
     php_binary: []const u8,
     php_info_page: bool,
-    upstream: ?UpstreamConfig,
+    upstream: ?UpstreamPoolConfig,
     tls_enabled: bool,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
@@ -1105,6 +1114,7 @@ const ServerMetrics = struct {
 };
 
 var server_metrics = ServerMetrics.init();
+var upstream_round_robin_cursor = std.atomic.Value(usize).init(0);
 
 const StaticTransferMode = enum {
     sendfile,
@@ -1314,7 +1324,7 @@ fn setRouteProxyProperty(routes: *std.ArrayList(RouteConfig), allocator: std.mem
     if (disablesOptionalUrl(value)) {
         route.upstream = null;
     } else {
-        route.upstream = try parseUpstream(allocator, value);
+        route.upstream = try parseUpstreamPool(allocator, value);
     }
 }
 
@@ -1409,7 +1419,7 @@ fn setDomainProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, doma
     if (disablesOptionalUrl(value)) {
         domain.upstream = null;
     } else {
-        domain.upstream = try parseUpstream(allocator, value);
+        domain.upstream = try parseUpstreamPool(allocator, value);
     }
 }
 
@@ -1473,7 +1483,7 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         if (disablesOptionalUrl(v)) {
             cfg.upstream = null;
         } else {
-            cfg.upstream = try parseUpstream(allocator, v);
+            cfg.upstream = try parseUpstreamPool(allocator, v);
         }
     } else if (std.mem.eql(u8, k, "tls")) {
         cfg.tls_enabled = try parseConfigBool(v);
@@ -1738,7 +1748,16 @@ fn normalizeConfig(cfg: *ServerConfig) void {
     }
 }
 
-fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamConfig) !void {
+fn validateUpstreamPool(pool: UpstreamPoolConfig) !void {
+    if (pool.targets.items.len == 0) return error.InvalidConfigValue;
+    for (pool.targets.items) |target| {
+        if (target.host.len == 0) return error.InvalidConfigValue;
+        if (target.port == 0) return error.InvalidConfigValue;
+        if (target.base_path.len == 0 or target.base_path[0] != '/') return error.InvalidConfigValue;
+    }
+}
+
+fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPoolConfig) !void {
     if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
     if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
     if (route.static_dir) |static_dir| {
@@ -1752,6 +1771,9 @@ fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamCo
     }
     if (route.php_binary) |php_binary| {
         if (php_binary.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.upstream) |pool| {
+        try validateUpstreamPool(pool);
     }
     if (route.handler == .proxy and route.upstream == null and fallback_upstream == null) {
         return error.InvalidConfigValue;
@@ -1776,6 +1798,9 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.idle_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.write_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.upstream_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.upstream) |pool| {
+        try validateUpstreamPool(pool);
+    }
 
     if (cfg.tls_auto and (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0)) {
         return error.InvalidConfigValue;
@@ -1808,6 +1833,9 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         }
         if (domain.php_binary) |php_binary| {
             if (php_binary.len == 0) return error.InvalidConfigValue;
+        }
+        if (domain.upstream) |pool| {
+            try validateUpstreamPool(pool);
         }
 
         const fallback_upstream = if (domain.upstream) |upstream| upstream else cfg.upstream;
@@ -2840,11 +2868,52 @@ fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig 
         host = host_port[0..col];
         port = std.fmt.parseInt(u16, host_port[col + 1 ..], 10) catch if (scheme_https) 443 else 80;
     }
+    if (host.len == 0) return error.InvalidUpstream;
 
     const dupe_host = try allocator.dupe(u8, host);
     const dupe_path = try allocator.dupe(u8, if (base_path.len == 0) "/" else base_path);
 
     return UpstreamConfig{ .host = dupe_host, .port = port, .base_path = dupe_path, .https = scheme_https };
+}
+
+fn parseUpstreamPool(allocator: std.mem.Allocator, raw: []const u8) !UpstreamPoolConfig {
+    var pool = UpstreamPoolConfig{
+        .targets = .empty,
+        .policy = .round_robin,
+    };
+
+    var parts = std.mem.tokenizeAny(u8, raw, " \t,");
+    while (parts.next()) |part| {
+        const value = trimValue(part);
+        if (value.len == 0) continue;
+        try pool.targets.append(allocator, try parseUpstream(allocator, value));
+    }
+
+    if (pool.targets.items.len == 0) return error.InvalidUpstream;
+    return pool;
+}
+
+fn upstreamPoolTargetCount(pool: UpstreamPoolConfig) usize {
+    return pool.targets.items.len;
+}
+
+fn selectUpstream(pool: *const UpstreamPoolConfig) ?*const UpstreamConfig {
+    if (pool.targets.items.len == 0) return null;
+    return switch (pool.policy) {
+        .round_robin => blk: {
+            const ticket = upstream_round_robin_cursor.fetchAdd(1, .monotonic);
+            break :blk &pool.targets.items[ticket % pool.targets.items.len];
+        },
+    };
+}
+
+fn printUpstreamPool(pool: UpstreamPoolConfig) void {
+    std.debug.print(" upstream=round_robin[", .{});
+    for (pool.targets.items, 0..) |up, i| {
+        if (i > 0) std.debug.print(",", .{});
+        std.debug.print("{s}:{d}{s}", .{ up.host, up.port, up.base_path });
+    }
+    std.debug.print("]", .{});
 }
 
 // Build a target path for proxying while avoiding `//` and leading path glitches.
@@ -3049,6 +3118,14 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     };
 
     return error.CloseConnection;
+}
+
+fn forwardToUpstreamPool(stream: std.Io.net.Stream, allocator: std.mem.Allocator, pool: *const UpstreamPoolConfig, req: HttpRequest, upstream_timeout_ms: u32) !void {
+    const upstream = selectUpstream(pool) orelse {
+        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, false, null);
+        return;
+    };
+    try forwardToUpstream(stream, allocator, upstream, req, upstream_timeout_ms);
 }
 
 fn handlePhp(
@@ -3396,7 +3473,7 @@ fn domainPhpInfoPage(cfg: *const ServerConfig, domain: ?*const DomainConfig) boo
     return cfg.php_info_page;
 }
 
-fn domainUpstream(cfg: *const ServerConfig, domain: ?*const DomainConfig) ?UpstreamConfig {
+fn domainUpstream(cfg: *const ServerConfig, domain: ?*const DomainConfig) ?UpstreamPoolConfig {
     if (domain) |d| {
         if (d.upstream) |value| return value;
     }
@@ -3481,12 +3558,12 @@ fn handleNamedRoute(
             return;
         },
         .proxy => {
-            const maybe_upstream = if (route.upstream) |up| up else domainUpstream(cfg, domain);
-            const upstream = maybe_upstream orelse {
+            const maybe_pool = if (route.upstream) |pool| pool else domainUpstream(cfg, domain);
+            const pool = maybe_pool orelse {
                 try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
                 return;
             };
-            try forwardToUpstream(stream, allocator, &upstream, req, cfg.upstream_timeout_ms);
+            try forwardToUpstreamPool(stream, allocator, &pool, req, cfg.upstream_timeout_ms);
             return;
         },
     }
@@ -3573,6 +3650,24 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("fallback", findDomainForHost(&cfg, "other.test").?.name);
     try std.testing.expectEqualStrings("site-assets", findDomainRoute(findDomainForHost(&cfg, "example.test"), "/assets/domain.txt").?.name);
     try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/global.txt").?.name);
+}
+
+test "upstream pools parse multiple targets and rotate selection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000/api, http://127.0.0.1:9001");
+
+    try std.testing.expectEqual(@as(usize, 2), pool.targets.items.len);
+    try std.testing.expectEqualStrings("127.0.0.1", pool.targets.items[0].host);
+    try std.testing.expectEqual(@as(u16, 9000), pool.targets.items[0].port);
+    try std.testing.expectEqualStrings("/api", pool.targets.items[0].base_path);
+    try std.testing.expectEqual(@as(u16, 9001), pool.targets.items[1].port);
+
+    const first = selectUpstream(&pool).?;
+    const second = selectUpstream(&pool).?;
+    try std.testing.expect(first.port != second.port);
 }
 
 fn routeRequest(
@@ -3988,8 +4083,8 @@ fn routeRequest(
             }
         }
 
-        if (domainUpstream(cfg, domain)) |up| {
-            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
+        if (domainUpstream(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, &pool, req, cfg.upstream_timeout_ms);
             return;
         }
 
@@ -4014,8 +4109,8 @@ fn routeRequest(
             return;
         }
 
-        if (domainUpstream(cfg, domain)) |up| {
-            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
+        if (domainUpstream(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, &pool, req, cfg.upstream_timeout_ms);
             return;
         }
 
@@ -4032,8 +4127,8 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
-        if (domainUpstream(cfg, domain)) |up| {
-            try forwardToUpstream(stream, allocator, &up, req, cfg.upstream_timeout_ms);
+        if (domainUpstream(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, &pool, req, cfg.upstream_timeout_ms);
             return;
         }
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
@@ -5307,9 +5402,9 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                 std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary });
             },
             .proxy => {
-                const maybe_upstream = if (route.upstream) |up| up else cfg.upstream;
-                if (maybe_upstream) |up| {
-                    std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+                const maybe_upstream = if (route.upstream) |pool| pool else cfg.upstream;
+                if (maybe_upstream) |pool| {
+                    printUpstreamPool(pool);
                 } else {
                     std.debug.print(" upstream=<unset>", .{});
                 }
@@ -5329,7 +5424,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
         }
         std.debug.print(" root={s} index={s}", .{ domainStaticDir(cfg, domain), domainIndexFile(cfg, domain) });
         if (domainServeStaticRoot(cfg, domain)) std.debug.print(" serve_static_root=true", .{});
-        if (domain.upstream) |up| std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+        if (domain.upstream) |pool| printUpstreamPool(pool);
         std.debug.print("\n", .{});
 
         for (domain.routes.items) |route| {
@@ -5345,9 +5440,9 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                     std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain) });
                 },
                 .proxy => {
-                    const maybe_upstream = if (route.upstream) |up| up else domainUpstream(cfg, domain);
-                    if (maybe_upstream) |up| {
-                        std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+                    const maybe_upstream = if (route.upstream) |pool| pool else domainUpstream(cfg, domain);
+                    if (maybe_upstream) |pool| {
+                        printUpstreamPool(pool);
                     } else {
                         std.debug.print(" upstream=<unset>", .{});
                     }
@@ -5382,7 +5477,7 @@ fn usage() void {
             "Usage:\n" ++
             "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
-            "[--proxy http://HOST:PORT[/path]] [--h2-upstream http://HOST:PORT[/path]] " ++
+            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
@@ -5412,7 +5507,7 @@ fn usage() void {
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++
             "  zig build run -- --config server.conf\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000\n" ++
+            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
@@ -5629,7 +5724,7 @@ pub fn main(init: std.process.Init) !void {
                 usage();
                 return;
             };
-            cfg.upstream = if (disablesOptionalUrl(value)) null else parseUpstream(std.heap.page_allocator, value) catch null;
+            cfg.upstream = if (disablesOptionalUrl(value)) null else parseUpstreamPool(std.heap.page_allocator, value) catch null;
         } else if (std.mem.eql(u8, arg, "--h2-upstream") or std.mem.eql(u8, arg, "--http2-upstream")) {
             const value = args.next() orelse {
                 usage();
@@ -5856,8 +5951,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Serving on http://{s}:{d}\n", .{ cfg.host, cfg.port });
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
     if (cfg.upstream != null) {
-        const up = cfg.upstream.?;
-        std.debug.print("Reverse proxy to: {s}:{d} (base {s})\n", .{ up.host, up.port, up.base_path });
+        const pool = cfg.upstream.?;
+        std.debug.print("Reverse proxy pool: round_robin over {d} target(s)\n", .{upstreamPoolTargetCount(pool)});
     }
     if (cfg.h2_upstream != null) {
         const hup = cfg.h2_upstream.?;

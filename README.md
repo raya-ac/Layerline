@@ -5,7 +5,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
-- Reverse-proxy fallback for anything the local server does not handle.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools with round-robin target selection.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
@@ -27,7 +27,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is reverse-proxy depth: multiple upstreams per route, load-balancing policy, health state, retry behavior, and cleaner upstream diagnostics. That work should build on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper upstream behavior: active health checks, retry budgets, circuit breakers, keep-alive upstream pools, and cleaner upstream diagnostics. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -82,9 +82,10 @@ php_root = public
 php_bin = php-cgi
 # /test.php renders phpinfo(); keep disabled outside local diagnostics.
 php_info_page = false
-# Set proxy to an upstream URL to forward unknown local routes.
+# Set proxy to one upstream URL, or a comma/space-separated pool, to forward unknown local routes.
 # Use off/false/no/0/none/null to disable it.
 proxy = off
+#proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
 # Named route syntax: route = NAME /path-or-prefix/* static|php|proxy
 # Route-local settings inherit global values unless overridden.
 #route = assets /assets/* static
@@ -94,7 +95,7 @@ proxy = off
 #route_php_root.app = public
 #route_php_bin.app = php-cgi
 #route = api /api/* proxy
-#route_proxy.api = http://127.0.0.1:9000
+#route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 # nginx-style domain/server config. Global settings remain the fallback.
 #server = main
 #server_name.main = example.com www.example.com
@@ -106,7 +107,7 @@ proxy = off
 #server_route_php_bin.main.app = php-cgi
 #server = wildcard
 #server_name.wildcard = *.example.net
-#server_proxy.wildcard = http://127.0.0.1:9000
+#server_proxy.wildcard = http://127.0.0.1:9000, http://127.0.0.1:9001
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
 tls = false
@@ -218,10 +219,10 @@ route_php_root.app = public
 route_php_bin.app = php-cgi
 
 route = api /api/* proxy
-route_proxy.api = http://127.0.0.1:9000
+route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 ```
 
-Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool; target selection is round-robin. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## Domain Server Configs
 
@@ -243,7 +244,7 @@ server_route_php_bin.main.app = php-cgi
 
 server = api
 server_name.api = api.example.com
-server_proxy.api = http://127.0.0.1:9000
+server_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 ```
 
 `server_name.NAME` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them.
