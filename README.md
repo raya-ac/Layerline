@@ -285,11 +285,13 @@ zig build run -- --h2-upstream http://127.0.0.1:9001
 
 ## PHP support
 
-The server will attempt to execute matching paths using `php-cgi` (or configured `--php-bin`):
+The server executes matching paths through CGI. Use `php-cgi` for real HTTP-style `header()` output, and set an absolute path if it is not on `PATH`:
 
 ```bash
 zig build run -- --php-bin /usr/bin/php-cgi --php-root public
 ```
+
+If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
 
 Example PHP file:
 

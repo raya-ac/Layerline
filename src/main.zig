@@ -299,6 +299,184 @@ fn trimValue(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n");
 }
 
+const CgiHeaderSplit = struct {
+    headers: []const u8,
+    body: []const u8,
+};
+
+const CgiStatus = struct {
+    code: u16,
+    text: []const u8,
+};
+
+fn splitCgiHeaderBlock(output: []const u8) ?CgiHeaderSplit {
+    if (std.mem.indexOf(u8, output, "\r\n\r\n")) |idx| {
+        return .{ .headers = output[0..idx], .body = output[idx + 4 ..] };
+    }
+    if (std.mem.indexOf(u8, output, "\n\n")) |idx| {
+        return .{ .headers = output[0..idx], .body = output[idx + 2 ..] };
+    }
+    return null;
+}
+
+fn findCgiHeaderValue(headers: []const u8, target_name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const key = trimValue(line[0..colon]);
+            const value = trimValue(line[colon + 1 ..]);
+            if (std.ascii.eqlIgnoreCase(key, target_name)) return value;
+        }
+    }
+    return null;
+}
+
+fn statusTextForCode(status_code: u16) []const u8 {
+    return switch (status_code) {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        426 => "Upgrade Required",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        505 => "HTTP Version Not Supported",
+        else => if (status_code >= 500) "Internal Server Error" else if (status_code >= 400) "Bad Request" else "OK",
+    };
+}
+
+fn parseCgiStatus(headers: []const u8) CgiStatus {
+    const raw_status = findCgiHeaderValue(headers, "Status") orelse return .{ .code = 200, .text = "OK" };
+    const status_line = trimValue(raw_status);
+    if (status_line.len < 3) return .{ .code = 200, .text = "OK" };
+
+    const code = std.fmt.parseInt(u16, status_line[0..@min(3, status_line.len)], 10) catch 200;
+    if (code < 100 or code > 599) return .{ .code = 200, .text = "OK" };
+
+    if (status_line.len > 3) {
+        const reason = trimValue(status_line[3..]);
+        if (reason.len > 0) return .{ .code = code, .text = reason };
+    }
+
+    return .{ .code = code, .text = statusTextForCode(code) };
+}
+
+fn isSkippedCgiResponseHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "Status") or
+        std.ascii.eqlIgnoreCase(name, "Content-Type") or
+        std.ascii.eqlIgnoreCase(name, "Content-Length") or
+        std.ascii.eqlIgnoreCase(name, "Connection") or
+        std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
+        std.ascii.eqlIgnoreCase(name, "Proxy-Authenticate") or
+        std.ascii.eqlIgnoreCase(name, "Proxy-Authorization") or
+        std.ascii.eqlIgnoreCase(name, "TE") or
+        std.ascii.eqlIgnoreCase(name, "Trailer") or
+        std.ascii.eqlIgnoreCase(name, "Trailers") or
+        std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
+        std.ascii.eqlIgnoreCase(name, "Upgrade") or
+        std.ascii.eqlIgnoreCase(name, "Server");
+}
+
+fn buildCgiExtraHeaders(allocator: std.mem.Allocator, headers: []const u8) !?[]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |line| {
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            const name = trimValue(trimmed[0..colon]);
+            const value = trimValue(trimmed[colon + 1 ..]);
+            if (name.len == 0 or value.len == 0 or isSkippedCgiResponseHeader(name)) continue;
+            try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
+        }
+    }
+
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isCgiHeaderNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
+}
+
+fn putCgiRequestHeaders(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    request_headers: []const u8,
+) !void {
+    var lines = std.mem.splitSequence(u8, request_headers, "\r\n");
+    while (lines.next()) |line| {
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const name = trimValue(line[0..colon]);
+            const value = trimValue(line[colon + 1 ..]);
+            if (name.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(name, "Content-Type") or std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+
+            var env_name = std.ArrayList(u8).empty;
+            defer env_name.deinit(allocator);
+            try env_name.appendSlice(allocator, "HTTP_");
+            for (name) |c| {
+                if (!isCgiHeaderNameChar(c)) {
+                    env_name.clearRetainingCapacity();
+                    break;
+                }
+                try env_name.append(allocator, if (c == '-') '_' else std.ascii.toUpper(c));
+            }
+            if (env_name.items.len <= "HTTP_".len) continue;
+            try env.put(env_name.items, value);
+        }
+    }
+}
+
+fn isPhpCgiBinary(path: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return std.mem.indexOf(u8, path, "php-cgi") != null;
+    return std.mem.indexOf(u8, path[slash + 1 ..], "php-cgi") != null;
+}
+
+test "splits CGI output with CRLF or LF separators" {
+    const crlf = splitCgiHeaderBlock("Content-Type: text/plain\r\n\r\nbody").?;
+    try std.testing.expectEqualStrings("Content-Type: text/plain", crlf.headers);
+    try std.testing.expectEqualStrings("body", crlf.body);
+
+    const lf = splitCgiHeaderBlock("Content-Type: text/plain\n\nbody").?;
+    try std.testing.expectEqualStrings("Content-Type: text/plain", lf.headers);
+    try std.testing.expectEqualStrings("body", lf.body);
+}
+
+test "parses CGI status headers with reason text" {
+    const status = parseCgiStatus("Status: 404 Not Found\nContent-Type: text/plain");
+    try std.testing.expectEqual(@as(u16, 404), status.code);
+    try std.testing.expectEqualStrings("Not Found", status.text);
+
+    const default_status = parseCgiStatus("Content-Type: text/plain");
+    try std.testing.expectEqual(@as(u16, 200), default_status.code);
+    try std.testing.expectEqualStrings("OK", default_status.text);
+}
+
 fn firstToken(raw: []const u8, delimiter: u8, start: usize) ?[]const u8 {
     if (raw.len == 0 or start >= raw.len) return null;
     const remaining = raw[start..];
@@ -2235,6 +2413,7 @@ fn handlePhp(
     req: HttpRequest,
     close_connection: bool,
     is_head: bool,
+    process_env: *const std.process.Environ.Map,
 ) !void {
     if (cfg.php_binary.len == 0) {
         try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP support is not configured for this server.", close_connection, false, null);
@@ -2263,15 +2442,69 @@ fn handlePhp(
     defer argv.deinit(allocator);
 
     try argv.append(allocator, cfg.php_binary);
-    try argv.append(allocator, "-f");
-    try argv.append(allocator, script_path);
+    if (!isPhpCgiBinary(cfg.php_binary)) {
+        try argv.append(allocator, "-f");
+        try argv.append(allocator, script_path);
+    }
 
-    var child = try std.process.spawn(io, .{
+    var child_env = try process_env.clone(allocator);
+    defer child_env.deinit();
+
+    const request_uri = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        req.path,
+        if (req.query.len > 0) "?" else "",
+        req.query,
+    });
+    defer allocator.free(request_uri);
+
+    const content_length = try std.fmt.allocPrint(allocator, "{d}", .{req.body.len});
+    defer allocator.free(content_length);
+
+    const server_port = try std.fmt.allocPrint(allocator, "{d}", .{cfg.port});
+    defer allocator.free(server_port);
+
+    try child_env.put("GATEWAY_INTERFACE", "CGI/1.1");
+    try child_env.put("SERVER_SOFTWARE", SERVER_HEADER);
+    try child_env.put("SERVER_NAME", cfg.host);
+    try child_env.put("SERVER_PORT", server_port);
+    try child_env.put("SERVER_PROTOCOL", req.version);
+    try child_env.put("REQUEST_METHOD", req.method);
+    try child_env.put("REQUEST_URI", request_uri);
+    try child_env.put("SCRIPT_NAME", req.path);
+    try child_env.put("SCRIPT_FILENAME", script_path);
+    try child_env.put("PATH_TRANSLATED", script_path);
+    try child_env.put("PATH_INFO", "");
+    try child_env.put("QUERY_STRING", req.query);
+    try child_env.put("DOCUMENT_ROOT", cfg.php_root);
+    try child_env.put("REQUEST_SCHEME", "http");
+    try child_env.put("HTTPS", "off");
+    try child_env.put("REDIRECT_STATUS", "200");
+    try child_env.put("CONTENT_LENGTH", content_length);
+    try child_env.put("CONTENT_TYPE", findHeaderValue(req.headers, "Content-Type") orelse "");
+    try putCgiRequestHeaders(allocator, &child_env, req.headers);
+
+    // PHP-CGI wants the script in the CGI environment. Plain `php` gets a
+    // script argument as a fallback for local development setups.
+    var child = std.process.spawn(io, .{
         .argv = argv.items,
+        .environ_map = &child_env,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
-    });
+    }) catch |err| {
+        std.debug.print("PHP spawn failed for {s}: {}\n", .{ cfg.php_binary, err });
+        try sendCoolErrorWithConnection(
+            stream,
+            allocator,
+            502,
+            "Bad Gateway",
+            "PHP worker could not be started. Check php_bin and make sure php-cgi is installed or configured with an absolute path.",
+            close_connection,
+            false,
+            null,
+        );
+        return;
+    };
     defer child.kill(io);
 
     if (child.stdin) |in_pipe| {
@@ -2285,7 +2518,22 @@ fn handlePhp(
     const max_output = cfg.max_php_output_bytes;
     const output = if (child.stdout) |out_pipe| blk: {
         var out_reader = out_pipe.reader(io, &.{});
-        const captured_output = try out_reader.interface.allocRemaining(allocator, .limited(max_output));
+        const captured_output = out_reader.interface.allocRemaining(allocator, .limited(max_output)) catch |err| switch (err) {
+            error.StreamTooLong => {
+                try sendCoolErrorWithConnection(
+                    stream,
+                    allocator,
+                    502,
+                    "Bad Gateway",
+                    "PHP response exceeded max_php_output_bytes.",
+                    close_connection,
+                    false,
+                    null,
+                );
+                return;
+            },
+            else => |e| return e,
+        };
         break :blk captured_output;
     } else return error.InternalServerError;
     defer allocator.free(output);
@@ -2323,35 +2571,28 @@ fn handlePhp(
         },
     }
 
-    const sep = std.mem.indexOf(u8, output, "\r\n\r\n");
-    if (sep == null) {
+    const split = splitCgiHeaderBlock(output) orelse {
         if (is_head) {
             try sendResponseNoBodyWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", output.len, close_connection);
         } else {
             try sendResponseWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", output, close_connection);
         }
         return;
-    }
+    };
 
-    const idx = sep.?;
-    const headers = output[0..idx];
-    const body = output[idx + 4 ..];
+    const headers = split.headers;
+    const body = split.body;
 
-    const status = if (findHeaderValue(headers, "Status")) |status_line| blk: {
-        const sp = std.mem.indexOfScalar(u8, status_line, ' ');
-        if (sp) |p| {
-            break :blk std.fmt.parseInt(u16, status_line[0..p], 10) catch 200;
-        }
-        break :blk 200;
-    } else 200;
+    const status = parseCgiStatus(headers);
+    const ctype_out = findCgiHeaderValue(headers, "Content-Type") orelse "text/plain; charset=utf-8";
+    const extra_headers = try buildCgiExtraHeaders(allocator, headers);
+    defer if (extra_headers) |h| allocator.free(h);
 
-    const ctype_out = findHeaderValue(headers, "Content-Type") orelse "text/plain; charset=utf-8";
-    const status_text = if (status == 200) "OK" else if (status == 201) "Created" else if (status == 204) "No Content" else "Internal Server Error";
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnection(stream, status, status_text, ctype_out, body.len, close_connection);
+    if (http_response.canSendBody(status.code, is_head)) {
+        try sendResponseWithConnectionAndHeaders(stream, status.code, status.text, ctype_out, body, close_connection, extra_headers);
     } else {
-        try sendResponseWithConnection(stream, status, status_text, ctype_out, body, close_connection);
+        const declared_len = if (is_head) body.len else 0;
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, status.code, status.text, ctype_out, declared_len, close_connection, extra_headers);
     }
 }
 
@@ -2361,6 +2602,7 @@ fn routeRequest(
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     req: HttpRequest,
+    process_env: *const std.process.Environ.Map,
 ) !void {
     // Route locally first, then fall back to proxying so known endpoints stay predictable.
     current_response_headers = cfg.response_headers.items;
@@ -2708,7 +2950,7 @@ fn routeRequest(
         }
 
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
-            try handlePhp(io, stream, allocator, cfg, req, should_close, is_head);
+            try handlePhp(io, stream, allocator, cfg, req, should_close, is_head, process_env);
             return;
         }
 
@@ -2755,7 +2997,7 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "POST")) {
         if (std.mem.endsWith(u8, req.path, ".php")) {
-            try handlePhp(io, stream, allocator, cfg, req, should_close, false);
+            try handlePhp(io, stream, allocator, cfg, req, should_close, false, process_env);
             return;
         }
 
@@ -2798,6 +3040,7 @@ fn handleConnection(
     stream: std.Io.net.Stream,
     cfg: *const ServerConfig,
     allocator: std.mem.Allocator,
+    process_env: *const std.process.Environ.Map,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2943,7 +3186,7 @@ fn handleConnection(
         }
 
         std.debug.print("{s} {s}\n", .{ req.method, req.path });
-        routeRequest(io, stream, req_alloc, cfg, req) catch |err| switch (err) {
+        routeRequest(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
             error.CloseConnection => break,
             else => {
                 server_metrics.routeError();
@@ -2961,6 +3204,7 @@ fn serveConnectionTask(
     cfg: *const ServerConfig,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
+    process_env: *const std.process.Environ.Map,
 ) void {
     bindThreadIo(io);
 
@@ -2970,7 +3214,7 @@ fn serveConnectionTask(
         streamClose(stream);
     }
 
-    handleConnection(io, stream, cfg, allocator) catch |err| {
+    handleConnection(io, stream, cfg, allocator, process_env) catch |err| {
         std.debug.print("Connection handler error: {}\n", .{err});
     };
 }
@@ -4432,6 +4676,7 @@ pub fn main(init: std.process.Init) !void {
                 &cfg,
                 std.heap.page_allocator,
                 &concurrency,
+                init.environ_map,
             },
         ) catch |err| {
             std.debug.print("Failed to start connection worker: {}\n", .{err});
