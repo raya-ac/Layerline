@@ -106,7 +106,7 @@ Sources:
 ## Immediate Build Order
 
 1. Config validation and route gates.
-2. Named route model and route-local settings.
+2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented; route-local TLS/cache/security policy remains next.
 3. Timeouts and graceful shutdown.
 4. Reverse proxy upstream pools.
 5. FastCGI and PHP front-controller.

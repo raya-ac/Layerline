@@ -142,6 +142,43 @@ const RedirectRule = struct {
     prefix_match: bool,
 };
 
+const RouteMatchKind = enum {
+    exact,
+    prefix,
+};
+
+const RouteHandlerKind = enum {
+    static,
+    php,
+    proxy,
+};
+
+const RouteStringProperty = enum {
+    static_dir,
+    index_file,
+    php_root,
+    php_binary,
+};
+
+const RouteBoolProperty = enum {
+    php_info_page,
+    strip_prefix,
+};
+
+const RouteConfig = struct {
+    name: []const u8,
+    pattern: []const u8,
+    match_kind: RouteMatchKind,
+    handler: RouteHandlerKind,
+    strip_prefix: bool,
+    static_dir: ?[]const u8,
+    index_file: ?[]const u8,
+    php_root: ?[]const u8,
+    php_binary: ?[]const u8,
+    php_info_page: ?bool,
+    upstream: ?UpstreamConfig,
+};
+
 // All server behavior is described in this single config object.
 const ServerConfig = struct {
     host: []const u8,
@@ -167,6 +204,7 @@ const ServerConfig = struct {
     http3_port: u16,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
+    routes: std.ArrayList(RouteConfig),
     max_request_bytes: usize,
     max_body_bytes: usize,
     max_static_file_bytes: usize,
@@ -1068,6 +1106,116 @@ fn parseRedirectRule(allocator: std.mem.Allocator, raw: []const u8) !RedirectRul
     };
 }
 
+fn routeHandlerName(handler: RouteHandlerKind) []const u8 {
+    return switch (handler) {
+        .static => "static",
+        .php => "php",
+        .proxy => "proxy",
+    };
+}
+
+fn routeMatchName(match_kind: RouteMatchKind) []const u8 {
+    return switch (match_kind) {
+        .exact => "exact",
+        .prefix => "prefix",
+    };
+}
+
+fn parseRouteHandler(value: []const u8) !RouteHandlerKind {
+    if (std.mem.eql(u8, value, "static")) return .static;
+    if (std.mem.eql(u8, value, "php")) return .php;
+    if (std.mem.eql(u8, value, "proxy")) return .proxy;
+    return error.InvalidConfigValue;
+}
+
+fn isRouteNameValid(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+fn findRouteConfigMutable(cfg: *ServerConfig, name: []const u8) ?*RouteConfig {
+    for (cfg.routes.items) |*route| {
+        if (std.mem.eql(u8, route.name, name)) return route;
+    }
+    return null;
+}
+
+fn findRoutePropertyName(key: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const name = key[prefix.len..];
+    if (name.len == 0) return null;
+    return name;
+}
+
+fn setRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parts = std.mem.tokenizeAny(u8, raw, " \t");
+    const name = parts.next() orelse return error.InvalidConfigValue;
+    const pattern_raw = parts.next() orelse return error.InvalidConfigValue;
+    const handler_raw = parts.next() orelse return error.InvalidConfigValue;
+    if (parts.next() != null) return error.InvalidConfigValue;
+    if (!isRouteNameValid(name)) return error.InvalidConfigValue;
+    if (findRouteConfigMutable(cfg, name) != null) return error.DuplicateConfigRoute;
+    if (pattern_raw.len == 0 or pattern_raw[0] != '/') return error.InvalidConfigValue;
+
+    const match_kind: RouteMatchKind = if (std.mem.endsWith(u8, pattern_raw, "*")) .prefix else .exact;
+    const pattern_without_star = if (match_kind == .prefix) pattern_raw[0 .. pattern_raw.len - 1] else pattern_raw;
+    const normalized_pattern = if (pattern_without_star.len == 0) "/" else pattern_without_star;
+
+    try cfg.routes.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .pattern = try allocator.dupe(u8, normalized_pattern),
+        .match_kind = match_kind,
+        .handler = try parseRouteHandler(handler_raw),
+        .strip_prefix = true,
+        .static_dir = null,
+        .index_file = null,
+        .php_root = null,
+        .php_binary = null,
+        .php_info_page = null,
+        .upstream = null,
+    });
+}
+
+fn setRouteStringProperty(
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    route_name: []const u8,
+    value: []const u8,
+    field: RouteStringProperty,
+) !void {
+    if (value.len == 0) return error.InvalidConfigValue;
+    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+    const dupe_value = try allocator.dupe(u8, value);
+    switch (field) {
+        .static_dir => route.static_dir = dupe_value,
+        .index_file => route.index_file = dupe_value,
+        .php_root => route.php_root = dupe_value,
+        .php_binary => route.php_binary = dupe_value,
+    }
+}
+
+fn setRouteProxyProperty(cfg: *ServerConfig, allocator: std.mem.Allocator, route_name: []const u8, value: []const u8) !void {
+    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+    if (disablesOptionalUrl(value)) {
+        route.upstream = null;
+    } else {
+        route.upstream = try parseUpstream(allocator, value);
+    }
+}
+
+fn setRouteBoolProperty(cfg: *ServerConfig, route_name: []const u8, value: []const u8, field: RouteBoolProperty) !void {
+    const route = findRouteConfigMutable(cfg, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .php_info_page => route.php_info_page = parsed,
+        .strip_prefix => route.strip_prefix = parsed,
+    }
+}
+
 // Map one config file line to fields. Config files are strict so typos do not
 // silently change server behavior.
 fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -1144,6 +1292,32 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
+    } else if (std.mem.eql(u8, k, "route")) {
+        try setRouteLine(cfg, allocator, v);
+    } else if (findRoutePropertyName(k, "route_dir.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_static_dir.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_index.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "route_index_file.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .index_file);
+    } else if (findRoutePropertyName(k, "route_php_root.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .php_root);
+    } else if (findRoutePropertyName(k, "route_php_bin.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_binary.")) |name| {
+        try setRouteStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_info_page.")) |name| {
+        try setRouteBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_phpinfo_page.")) |name| {
+        try setRouteBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_proxy.")) |name| {
+        try setRouteProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_upstream.")) |name| {
+        try setRouteProxyProperty(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
+        try setRouteBoolProperty(cfg, name, v, .strip_prefix);
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -1283,6 +1457,26 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if ((cfg.cloudflare_zone_id == null or cfg.cloudflare_zone_id.?.len == 0) and (cfg.cloudflare_zone_name == null or cfg.cloudflare_zone_name.?.len == 0)) return error.InvalidConfigValue;
         if (cfg.cloudflare_record_name == null or cfg.cloudflare_record_name.?.len == 0) return error.InvalidConfigValue;
         if (cfg.cloudflare_record_content == null or cfg.cloudflare_record_content.?.len == 0) return error.InvalidConfigValue;
+    }
+
+    for (cfg.routes.items) |route| {
+        if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
+        if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
+        if (route.static_dir) |static_dir| {
+            if (static_dir.len == 0) return error.InvalidConfigValue;
+        }
+        if (route.index_file) |index_file| {
+            if (index_file.len == 0) return error.InvalidConfigValue;
+        }
+        if (route.php_root) |php_root| {
+            if (php_root.len == 0) return error.InvalidConfigValue;
+        }
+        if (route.php_binary) |php_binary| {
+            if (php_binary.len == 0) return error.InvalidConfigValue;
+        }
+        if (route.handler == .proxy and route.upstream == null and cfg.upstream == null) {
+            return error.InvalidConfigValue;
+        }
     }
 }
 
@@ -2502,18 +2696,35 @@ fn handlePhp(
     is_head: bool,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    if (cfg.php_binary.len == 0) {
+    const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
+    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, rel_path, close_connection, is_head, process_env);
+}
+
+fn handlePhpScript(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    req: HttpRequest,
+    php_root: []const u8,
+    php_binary: []const u8,
+    script_rel_path: []const u8,
+    close_connection: bool,
+    is_head: bool,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    if (php_binary.len == 0) {
         try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP support is not configured for this server.", close_connection, false, null);
         return;
     }
 
-    const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
+    const rel_path = script_rel_path;
     if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null) {
         try sendNotFoundWithConnection(allocator, stream, close_connection);
         return;
     }
 
-    const script_path = try std.fs.path.join(allocator, &.{ cfg.php_root, rel_path });
+    const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
     defer allocator.free(script_path);
 
     const script_stat = std.Io.Dir.cwd().statFile(io, script_path, .{}) catch {
@@ -2528,8 +2739,8 @@ fn handlePhp(
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
 
-    try argv.append(allocator, cfg.php_binary);
-    if (!isPhpCgiBinary(cfg.php_binary)) {
+    try argv.append(allocator, php_binary);
+    if (!isPhpCgiBinary(php_binary)) {
         try argv.append(allocator, "-f");
         try argv.append(allocator, script_path);
     }
@@ -2562,7 +2773,7 @@ fn handlePhp(
     try child_env.put("PATH_TRANSLATED", script_path);
     try child_env.put("PATH_INFO", "");
     try child_env.put("QUERY_STRING", req.query);
-    try child_env.put("DOCUMENT_ROOT", cfg.php_root);
+    try child_env.put("DOCUMENT_ROOT", php_root);
     try child_env.put("REQUEST_SCHEME", "http");
     try child_env.put("HTTPS", "off");
     try child_env.put("REDIRECT_STATUS", "200");
@@ -2579,7 +2790,7 @@ fn handlePhp(
         .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| {
-        std.debug.print("PHP spawn failed for {s}: {}\n", .{ cfg.php_binary, err });
+        std.debug.print("PHP spawn failed for {s}: {}\n", .{ php_binary, err });
         try sendCoolErrorWithConnection(
             stream,
             allocator,
@@ -2683,6 +2894,164 @@ fn handlePhp(
     }
 }
 
+fn routeMatches(route: *const RouteConfig, path: []const u8) bool {
+    return switch (route.match_kind) {
+        .exact => std.mem.eql(u8, path, route.pattern),
+        .prefix => std.mem.startsWith(u8, path, route.pattern),
+    };
+}
+
+fn findNamedRoute(cfg: *const ServerConfig, path: []const u8) ?*const RouteConfig {
+    var best: ?*const RouteConfig = null;
+    var best_len: usize = 0;
+    for (cfg.routes.items) |*route| {
+        if (!routeMatches(route, path)) continue;
+        if (route.match_kind == .exact) return route;
+        if (route.pattern.len >= best_len) {
+            best = route;
+            best_len = route.pattern.len;
+        }
+    }
+    return best;
+}
+
+fn routeFileRelativePath(allocator: std.mem.Allocator, route: *const RouteConfig, request_path: []const u8, index_file: []const u8) ![]const u8 {
+    if (!route.strip_prefix) {
+        return makeStaticPathFromRequest(allocator, request_path, index_file);
+    }
+
+    const raw_rel = switch (route.match_kind) {
+        .exact => "",
+        .prefix => if (request_path.len > route.pattern.len) request_path[route.pattern.len..] else "",
+    };
+    const rel = if (raw_rel.len > 0 and raw_rel[0] == '/') raw_rel[1..] else raw_rel;
+    if (rel.len == 0) return allocator.dupe(u8, index_file);
+    return allocator.dupe(u8, rel);
+}
+
+fn handleNamedRoute(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    route: *const RouteConfig,
+    req: HttpRequest,
+    close_connection: bool,
+    is_head: bool,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    if (std.mem.eql(u8, req.method, "OPTIONS")) {
+        const allow = switch (route.handler) {
+            .static => "GET,HEAD,OPTIONS",
+            .php => "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
+            .proxy => "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
+        };
+        const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allow});
+        defer allocator.free(allow_header);
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, 204, "No Content", "text/plain; charset=utf-8", 0, close_connection, allow_header);
+        return;
+    }
+
+    switch (route.handler) {
+        .static => {
+            if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
+                try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection);
+                return;
+            }
+            const static_dir = route.static_dir orelse cfg.static_dir;
+            const index_file = route.index_file orelse cfg.index_file;
+            const rel = try routeFileRelativePath(allocator, route, req.path, index_file);
+            defer allocator.free(rel);
+            try serveStatic(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes);
+            return;
+        },
+        .php => {
+            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse cfg.php_info_page)) {
+                try sendNotFoundWithConnection(allocator, stream, close_connection);
+                return;
+            }
+            const php_root = route.php_root orelse cfg.php_root;
+            const php_binary = route.php_binary orelse cfg.php_binary;
+            const script_rel = try routeFileRelativePath(allocator, route, req.path, cfg.index_file);
+            defer allocator.free(script_rel);
+            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, script_rel, close_connection, is_head, process_env);
+            return;
+        },
+        .proxy => {
+            const maybe_upstream = if (route.upstream) |up| up else cfg.upstream;
+            const upstream = maybe_upstream orelse {
+                try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
+                return;
+            };
+            try forwardToUpstream(stream, allocator, &upstream, req);
+            return;
+        },
+    }
+}
+
+test "named routes prefer exact and longest prefix matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = ServerConfig{
+        .host = "127.0.0.1",
+        .port = 8080,
+        .static_dir = "public",
+        .serve_static_root = false,
+        .index_file = "index.html",
+        .php_root = "public",
+        .php_binary = "php-cgi",
+        .php_info_page = false,
+        .upstream = null,
+        .tls_enabled = false,
+        .tls_cert = null,
+        .tls_key = null,
+        .tls_auto = false,
+        .letsencrypt_email = null,
+        .letsencrypt_domains = null,
+        .letsencrypt_webroot = "public/.well-known/acme-challenge",
+        .letsencrypt_certbot = "certbot",
+        .letsencrypt_staging = false,
+        .h2_upstream = null,
+        .http3_enabled = false,
+        .http3_port = 8443,
+        .response_headers = .empty,
+        .redirects = .empty,
+        .routes = .empty,
+        .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
+        .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
+        .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
+        .max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+        .max_concurrent_connections = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+        .worker_stack_size = DEFAULT_WORKER_STACK_BYTES,
+        .cloudflare_auto_deploy = false,
+        .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
+        .cloudflare_api_base = "https://api.cloudflare.com/client/v4",
+        .cloudflare_token = null,
+        .cloudflare_zone_id = null,
+        .cloudflare_zone_name = null,
+        .cloudflare_record_name = null,
+        .cloudflare_record_type = "A",
+        .cloudflare_record_content = null,
+        .cloudflare_record_ttl = 300,
+        .cloudflare_record_proxied = false,
+        .cloudflare_record_comment = null,
+    };
+
+    try setRouteLine(&cfg, allocator, "assets /assets/* static");
+    try setRouteLine(&cfg, allocator, "private /assets/private/* static");
+    try setRouteLine(&cfg, allocator, "health /health proxy");
+
+    try std.testing.expectEqualStrings("health", findNamedRoute(&cfg, "/health").?.name);
+    try std.testing.expectEqualStrings("private", findNamedRoute(&cfg, "/assets/private/a.txt").?.name);
+    try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/hello.txt").?.name);
+    try std.testing.expect(findNamedRoute(&cfg, "/missing") == null);
+
+    const rel = try routeFileRelativePath(allocator, findNamedRoute(&cfg, "/assets/hello.txt").?, "/assets/hello.txt", "index.html");
+    try std.testing.expectEqualStrings("hello.txt", rel);
+}
+
 fn routeRequest(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -2701,6 +3070,11 @@ fn routeRequest(
 
     if (findRedirectRule(cfg, req.path)) |redirect| {
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
+        return;
+    }
+
+    if (findNamedRoute(cfg, req.path)) |route| {
+        try handleNamedRoute(io, stream, allocator, cfg, route, req, should_close, is_head, process_env);
         return;
     }
 
@@ -4333,12 +4707,45 @@ fn serveHttp3ProbeTask(io: std.Io, cfg: *const ServerConfig) void {
     }
 }
 
+fn dumpRoutes(cfg: *const ServerConfig) void {
+    if (cfg.routes.items.len == 0) {
+        std.debug.print("Layerline routes: no named routes configured; built-in routes remain active.\n", .{});
+        return;
+    }
+
+    std.debug.print("Layerline routes ({d}):\n", .{cfg.routes.items.len});
+    for (cfg.routes.items) |route| {
+        std.debug.print(
+            "  {s}: {s} {s} -> {s}",
+            .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) },
+        );
+        switch (route.handler) {
+            .static => {
+                std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse cfg.static_dir, route.index_file orelse cfg.index_file });
+            },
+            .php => {
+                std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary });
+            },
+            .proxy => {
+                const maybe_upstream = if (route.upstream) |up| up else cfg.upstream;
+                if (maybe_upstream) |up| {
+                    std.debug.print(" upstream={s}:{d}{s}", .{ up.host, up.port, up.base_path });
+                } else {
+                    std.debug.print(" upstream=<unset>", .{});
+                }
+            },
+        }
+        if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
+        std.debug.print("\n", .{});
+    }
+}
+
 // Emit current runtime usage, flags, and sample invocations.
 fn usage() void {
     std.debug.print(
         "Layerline HTTP server\n\n" ++
             "Usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
             "[--proxy http://HOST:PORT[/path]] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
@@ -4353,12 +4760,14 @@ fn usage() void {
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
-            "cf_record_ttl, cf_record_proxied, cf_record_comment\n" ++
+            "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
+            "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_strip_prefix.NAME\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
             "  zig build run\n" ++
             "  zig build run -- --validate-config\n" ++
+            "  zig build run -- --dump-routes\n" ++
             "  zig build run -- --port 4000\n" ++
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++
@@ -4417,6 +4826,7 @@ pub fn main(init: std.process.Init) !void {
         .http3_port = 8443,
         .response_headers = .empty,
         .redirects = .empty,
+        .routes = .empty,
         .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
         .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
         .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
@@ -4456,6 +4866,7 @@ pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.iterate(init.minimal.args);
     _ = args.next();
     var validate_only = false;
+    var dump_routes = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
@@ -4464,6 +4875,8 @@ pub fn main(init: std.process.Init) !void {
             _ = args.next();
         } else if (std.mem.eql(u8, arg, "--validate-config") or std.mem.eql(u8, arg, "--check-config")) {
             validate_only = true;
+        } else if (std.mem.eql(u8, arg, "--dump-routes") or std.mem.eql(u8, arg, "--routes")) {
+            dump_routes = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
             if (args.next()) |value| {
                 cfg.tls_enabled = parseBool(value) orelse cfg.tls_enabled;
@@ -4707,6 +5120,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (validate_only) {
         std.debug.print("Layerline config OK: {s}:{d}\n", .{ cfg.host, cfg.port });
+    }
+    if (dump_routes) {
+        dumpRoutes(&cfg);
+    }
+    if (validate_only or dump_routes) {
         return;
     }
 

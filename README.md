@@ -6,6 +6,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php`.
 - Reverse-proxy fallback for anything the local server does not handle.
+- Named route config for route-local static, PHP, and proxy behavior.
 - Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
@@ -55,6 +56,7 @@ Validate a config without opening sockets:
 ```bash
 zig build run -- --validate-config
 zig build run -- --config server.conf --validate-config
+zig build run -- --dump-routes
 ```
 
 Config files are strict: unknown keys, malformed lines, invalid booleans, invalid numbers, invalid headers, and invalid redirects fail with a line-numbered error.
@@ -75,6 +77,16 @@ php_info_page = false
 # Set proxy to an upstream URL to forward unknown local routes.
 # Use off/false/no/0/none/null to disable it.
 proxy = off
+# Named route syntax: route = NAME /path-or-prefix/* static|php|proxy
+# Route-local settings inherit global values unless overridden.
+#route = assets /assets/* static
+#route_dir.assets = public
+#route_index.assets = index.html
+#route = app /app/* php
+#route_php_root.app = public
+#route_php_bin.app = php-cgi
+#route = api /api/* proxy
+#route_proxy.api = http://127.0.0.1:9000
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
 tls = false
@@ -165,6 +177,25 @@ Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix 
 redirect = /old /new 308
 redirect = /docs/* /documentation/ 308
 ```
+
+## Named Routes
+
+Named routes are the route-local config surface that future Caddy/nginx-class behavior will hang from. A route line has a name, a match pattern, and a handler:
+
+```conf
+route = assets /assets/* static
+route_dir.assets = public
+route_index.assets = index.html
+
+route = app /app/* php
+route_php_root.app = public
+route_php_bin.app = php-cgi
+
+route = api /api/* proxy
+route_proxy.api = http://127.0.0.1:9000
+```
+
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## TLS options in config / CLI
 
