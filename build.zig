@@ -51,6 +51,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_h3_state_tests = b.addRunArtifact(h3_state_tests);
 
+    const h2_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/h2_native.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_h2_tests = b.addRunArtifact(h2_tests);
+
     const quic_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/quic_native.zig"),
@@ -79,6 +88,7 @@ pub fn build(b: *std.Build) void {
     const run_reactor_tests = b.addRunArtifact(reactor_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_h2_tests.step);
     test_step.dependOn(&run_h3_tests.step);
     test_step.dependOn(&run_h3_state_tests.step);
     test_step.dependOn(&run_http_response_tests.step);

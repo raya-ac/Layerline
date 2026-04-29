@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const h2_native = @import("h2_native.zig");
 const h3_native = @import("h3_native.zig");
 const h3_state = @import("h3_state.zig");
 const http_response = @import("http_response.zig");
@@ -3295,43 +3296,653 @@ fn parseRequest(
     };
 }
 
-fn handleHttp2Preface(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, prefill: []const u8) !void {
-    if (cfg.h2_upstream == null) {
-        try sendCoolErrorWithConnection(
-            stream,
-            allocator,
-            426,
-            "Upgrade Required",
-            "HTTP/2 requests require an HTTP/2-aware upstream. Configure --h2-upstream (for example, Caddy/nghttp2/nginx h2c target) and keep this binary as an HTTP/1 origin.",
-            false,
-            false,
-            null,
-        );
+const H2BufferedResponse = struct {
+    status_code: u16,
+    content_type: []const u8,
+    body: []const u8,
+    headers: []const h2_native.Header = &.{},
+};
+
+const H2Frame = struct {
+    header: h2_native.FrameHeader,
+    payload: []u8,
+};
+
+const H2PendingReader = struct {
+    stream: std.Io.net.Stream,
+    pending: []const u8,
+
+    fn readExact(self: *H2PendingReader, out: []u8) !void {
+        var written: usize = 0;
+        if (self.pending.len > 0) {
+            const n = @min(out.len, self.pending.len);
+            @memcpy(out[0..n], self.pending[0..n]);
+            self.pending = self.pending[n..];
+            written = n;
+        }
+
+        while (written < out.len) {
+            const n = try streamRead(self.stream, out[written..]);
+            if (n == 0) return error.ConnectionClosed;
+            written += n;
+        }
+    }
+};
+
+fn h2HeaderNameIndex(name: []const u8) ?u64 {
+    if (std.ascii.eqlIgnoreCase(name, "accept-ranges")) return 18;
+    if (std.ascii.eqlIgnoreCase(name, "allow")) return 22;
+    if (std.ascii.eqlIgnoreCase(name, "cache-control")) return 24;
+    if (std.ascii.eqlIgnoreCase(name, "content-encoding")) return 26;
+    if (std.ascii.eqlIgnoreCase(name, "content-length")) return 28;
+    if (std.ascii.eqlIgnoreCase(name, "content-range")) return 30;
+    if (std.ascii.eqlIgnoreCase(name, "content-type")) return 31;
+    if (std.ascii.eqlIgnoreCase(name, "date")) return 33;
+    if (std.ascii.eqlIgnoreCase(name, "etag")) return 34;
+    if (std.ascii.eqlIgnoreCase(name, "last-modified")) return 44;
+    if (std.ascii.eqlIgnoreCase(name, "location")) return 46;
+    if (std.ascii.eqlIgnoreCase(name, "server")) return 54;
+    if (std.ascii.eqlIgnoreCase(name, "set-cookie")) return 55;
+    if (std.ascii.eqlIgnoreCase(name, "strict-transport-security")) return 56;
+    if (std.ascii.eqlIgnoreCase(name, "vary")) return 59;
+    return null;
+}
+
+fn isSkippedHttp2ResponseHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "content-type") or
+        std.ascii.eqlIgnoreCase(name, "keep-alive") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authenticate") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(name, "te") or
+        std.ascii.eqlIgnoreCase(name, "trailer") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "upgrade");
+}
+
+fn lowerHeaderName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const lowered = try allocator.alloc(u8, name.len);
+    for (name, 0..) |byte, index| {
+        lowered[index] = std.ascii.toLower(byte);
+    }
+    return lowered;
+}
+
+fn appendHttp2Header(allocator: std.mem.Allocator, block: *std.ArrayList(u8), name: []const u8, value: []const u8) !void {
+    if (h2HeaderNameIndex(name)) |index| {
+        try h2_native.appendHeaderIndexedName(allocator, block, index, value);
         return;
     }
 
-    const upstream = cfg.h2_upstream.?;
-    if (upstream.https) {
-        try sendCoolErrorWithConnection(
-            stream,
-            allocator,
-            501,
-            "Not Implemented",
-            "HTTP/2 upstream to HTTPS is not supported in this passthrough mode. Use an HTTP/1 backend for h2c passthrough.",
-            false,
-            false,
-            null,
-        );
-        return;
+    const lowered = try lowerHeaderName(allocator, name);
+    try h2_native.appendHeaderLiteralName(allocator, block, lowered, value);
+}
+
+fn sendHttp2Frame(stream: std.Io.net.Stream, frame_type: u8, flags: u8, stream_id: u32, payload: []const u8) !void {
+    var header: [9]u8 = undefined;
+    const rendered = try h2_native.writeFrameHeader(&header, payload.len, frame_type, flags, stream_id);
+    try streamWriteAll(stream, rendered);
+    if (payload.len > 0) try streamWriteAll(stream, payload);
+}
+
+fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, response: H2BufferedResponse, is_head: bool) !void {
+    var header_block = std.ArrayList(u8).empty;
+    defer header_block.deinit(allocator);
+
+    try h2_native.appendStatus(allocator, &header_block, response.status_code);
+    try h2_native.appendHeaderIndexedName(allocator, &header_block, 54, SERVER_HEADER);
+    try h2_native.appendHeaderIndexedName(allocator, &header_block, 31, response.content_type);
+
+    var len_buf: [32]u8 = undefined;
+    const body_len = if (http_response.canSendBody(response.status_code, is_head)) response.body.len else 0;
+    const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{body_len});
+    try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
+
+    for (response.headers) |header| {
+        if (isSkippedHttp2ResponseHeader(header.name)) continue;
+        try appendHttp2Header(allocator, &header_block, header.name, header.value);
     }
+    for (current_response_headers) |header| {
+        if (isSkippedHttp2ResponseHeader(header.name)) continue;
+        try appendHttp2Header(allocator, &header_block, header.name, header.value);
+    }
+
+    const header_flags = h2_native.FLAG_END_HEADERS | if (body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0);
+    try sendHttp2Frame(stream, h2_native.FRAME_HEADERS, header_flags, stream_id, header_block.items);
+
+    if (body_len > 0) {
+        var sent: usize = 0;
+        while (sent < body_len) {
+            const chunk_len = @min(@as(usize, 16 * 1024), body_len - sent);
+            const flags = if (sent + chunk_len == body_len) h2_native.FLAG_END_STREAM else @as(u8, 0);
+            try sendHttp2Frame(stream, h2_native.FRAME_DATA, flags, stream_id, response.body[sent .. sent + chunk_len]);
+            sent += chunk_len;
+        }
+    }
+
+    server_metrics.responseSent(response.status_code, body_len);
+}
+
+fn h2CoolErrorResponse(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !H2BufferedResponse {
+    const body = try renderCoolErrorPage(allocator, status_code, status_text, detail);
+    return .{ .status_code = status_code, .content_type = "text/html; charset=utf-8", .body = body };
+}
+
+fn h2TextResponse(status_code: u16, content_type: []const u8, body: []const u8) H2BufferedResponse {
+    return .{ .status_code = status_code, .content_type = content_type, .body = body };
+}
+
+fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize) !H2BufferedResponse {
+    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null or std.mem.indexOfScalar(u8, rel_path, '\\') != null) {
+        return h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid static file path.");
+    }
+
+    const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
+    const stat = statRegularFile(io, file_path) catch |err| {
+        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) {
+            return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+        }
+        return err;
+    };
+    if (stat.size > max_file_bytes) {
+        return h2CoolErrorResponse(allocator, 413, "Payload Too Large", "Static file is too large for configured limits.");
+    }
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
+        if (err == error.StreamTooLong) {
+            return h2CoolErrorResponse(allocator, 413, "Payload Too Large", "Static file is too large for configured limits.");
+        }
+        return err;
+    };
+    server_metrics.staticBodySent(data.len, .buffered);
+    return .{ .status_code = 200, .content_type = contentTypeFromPath(rel_path), .body = data };
+}
+
+fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, token: []const u8) !H2BufferedResponse {
+    if (token.len == 0 or std.mem.indexOf(u8, token, "..") != null or std.mem.indexOfScalar(u8, token, '\\') != null or std.mem.indexOfScalar(u8, token, '/') != null) {
+        return h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid ACME challenge path.");
+    }
+
+    const file_path = try std.fs.path.join(allocator, &.{ cfg.letsencrypt_webroot, token });
+    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
+        if (err == error.NotDir or err == error.FileNotFound) {
+            return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+        }
+        if (err == error.StreamTooLong) {
+            return h2CoolErrorResponse(allocator, 413, "Payload Too Large", "ACME challenge file is too large.");
+        }
+        return err;
+    };
+    if (data.len > 0 and std.mem.indexOfScalar(u8, data, 0) != null) {
+        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+    }
+    return .{ .status_code = 200, .content_type = "text/plain; charset=utf-8", .body = data };
+}
+
+fn parseHttp2Request(allocator: std.mem.Allocator, decoded: *const h2_native.DecodedHeaders) !HttpRequest {
+    const method = decoded.get(":method") orelse return error.BadRequest;
+    const path_and_query = decoded.get(":path") orelse return error.BadRequest;
+    const authority = decoded.get(":authority") orelse decoded.get("host") orelse "";
+
+    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
+    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
+    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
+
+    var headers = std.ArrayList(u8).empty;
+    errdefer headers.deinit(allocator);
+    if (authority.len > 0) {
+        try headers.print(allocator, "Host: {s}\r\n", .{authority});
+    }
+    for (decoded.headers.items) |header| {
+        if (header.name.len > 0 and header.name[0] == ':') continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        try headers.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+    }
+
+    return .{
+        .method = method,
+        .path = path,
+        .query = query,
+        .headers = try headers.toOwnedSlice(allocator),
+        .version = "HTTP/2.0",
+        .body = "",
+        .close_connection = true,
+    };
+}
+
+fn buildHttp2RedirectResponse(allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest) !H2BufferedResponse {
+    const location = try buildRedirectLocation(allocator, rule, req);
+    const body = try std.fmt.allocPrint(allocator, "Redirecting to {s}\n", .{location});
+    const headers = try allocator.alloc(h2_native.Header, 1);
+    headers[0] = .{ .name = "location", .value = location };
+    return .{ .status_code = rule.status_code, .content_type = "text/plain; charset=utf-8", .body = body, .headers = headers };
+}
+
+fn appendForwardedRequestHeaders(allocator: std.mem.Allocator, out: *std.ArrayList(u8), req: HttpRequest, upstream: *const UpstreamConfig, cfg: *const ServerConfig) !void {
+    const forwarded_host = findHeaderValue(req.headers, "Host") orelse upstream.host;
+    const forwarded_proto = if (findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
+        trimValue(proto)
+    else if (cfg.tls_enabled)
+        "https"
+    else
+        "http";
+
+    try out.print(allocator, "Host: {s}\r\nConnection: close\r\n", .{trimValue(forwarded_host)});
+
+    var saw_forwarded_host = false;
+    var saw_forwarded_proto = false;
+    var headers = std.mem.splitSequence(u8, req.headers, "\r\n");
+    while (headers.next()) |line| {
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            const name = trimValue(trimmed[0..colon]);
+            if (isSkippedProxyHeader(name)) continue;
+            const value = trimValue(trimmed[colon + 1 ..]);
+            if (value.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
+            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
+            try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
+        }
+    }
+    if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{trimValue(forwarded_host)});
+    if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
+}
+
+fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, max_bytes: usize) ![]u8 {
+    var raw = std.ArrayList(u8).empty;
+    errdefer raw.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try streamRead(upstream_conn, &buf);
+        if (n == 0) break;
+        if (raw.items.len + n > max_bytes) return error.PayloadTooLarge;
+        try raw.appendSlice(allocator, buf[0..n]);
+    }
+    return raw.toOwnedSlice(allocator);
+}
+
+fn decodeChunkedBuffer(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var cursor = bytes;
+    while (true) {
+        const line_end = std.mem.indexOf(u8, cursor, "\r\n") orelse return error.BadGateway;
+        const line = cursor[0..line_end];
+        const ext = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+        const size = std.fmt.parseInt(usize, trimValue(line[0..ext]), 16) catch return error.BadGateway;
+        cursor = cursor[line_end + 2 ..];
+        if (size == 0) return out.toOwnedSlice(allocator);
+        if (cursor.len < size + 2) return error.BadGateway;
+        try out.appendSlice(allocator, cursor[0..size]);
+        if (!std.mem.eql(u8, cursor[size .. size + 2], "\r\n")) return error.BadGateway;
+        cursor = cursor[size + 2 ..];
+    }
+}
+
+fn collectHttp2UpstreamHeaders(allocator: std.mem.Allocator, response_headers: []const u8) ![]h2_native.Header {
+    var out = std.ArrayList(h2_native.Header).empty;
+    errdefer out.deinit(allocator);
+
+    var lines = std.mem.splitSequence(u8, response_headers, "\r\n");
+    while (lines.next()) |line| {
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const name = trimValue(trimmed[0..colon]);
+        if (isSkippedHttp2ResponseHeader(name)) continue;
+        const value = trimValue(trimmed[colon + 1 ..]);
+        if (value.len == 0) continue;
+        const lowered = try lowerHeaderName(allocator, name);
+        try out.append(allocator, .{ .name = lowered, .value = try allocator.dupe(u8, value) });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn fetchHttp2UpstreamResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
+    if (upstream.https) return error.UnsupportedUpstreamScheme;
 
     const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
     defer streamClose(upstream_conn);
     try setStreamTimeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
 
-    // Preserve any bytes already read (including partial preface/frame data)
-    // and bridge both directions.
-    try proxyRawBidirectional(stream, upstream_conn, prefill);
+    const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
+    var request = std.ArrayList(u8).empty;
+    defer request.deinit(allocator);
+    try request.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, proxy_path });
+    try appendForwardedRequestHeaders(allocator, &request, req, upstream, cfg);
+    try request.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
+    try request.appendSlice(allocator, req.body);
+    try streamWriteAll(upstream_conn, request.items);
+
+    const raw = try readHttp1ResponseToBuffer(allocator, upstream_conn, cfg.max_static_file_bytes + DEFAULT_MAX_REQUEST_BYTES);
+    const header_end = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadGateway) + 4;
+    const header_bytes = raw[0..header_end];
+    const body_tail = raw[header_end..];
+    const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
+    const response_headers = header_bytes[status_line_end + 2 .. header_end - 4];
+    const framing = try parseUpstreamResponseFraming(header_bytes, response_headers);
+    const status_code = framing.status_code orelse 502;
+
+    const body = if (responseHasNoBody(req.method, status_code))
+        try allocator.dupe(u8, "")
+    else if (framing.transfer_chunked)
+        try decodeChunkedBuffer(allocator, body_tail)
+    else if (framing.content_length) |content_length| blk: {
+        if (body_tail.len < content_length) return error.BadGateway;
+        break :blk try allocator.dupe(u8, body_tail[0..content_length]);
+    } else try allocator.dupe(u8, body_tail);
+
+    const content_type = if (findHeaderValue(response_headers, "Content-Type")) |ctype|
+        try allocator.dupe(u8, trimValue(ctype))
+    else
+        "application/octet-stream";
+    const headers = try collectHttp2UpstreamHeaders(allocator, response_headers);
+    return .{ .status_code = status_code, .content_type = content_type, .body = body, .headers = headers };
+}
+
+fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
+    if (pool.targets.items.len == 0) return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.");
+
+    const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
+    const now_ms = upstreamNowMs();
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, req);
+    var considered: usize = 0;
+    var attempts: usize = 0;
+    var skipped_ejected: usize = 0;
+    var last_error: ?anyerror = null;
+
+    while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
+        const upstream = upstreamAtAttempt(pool, start_ticket, considered);
+        if (upstreamIsEjected(upstream, now_ms)) {
+            skipped_ejected += 1;
+            server_metrics.upstreamEjectedSkip();
+            continue;
+        }
+        if (attempts > 0) server_metrics.upstreamRetried();
+        attempts += 1;
+        server_metrics.upstreamRequestStarted();
+        upstreamBeginAttempt(upstream);
+        const response = fetchHttp2UpstreamResponse(allocator, upstream, req, cfg) catch |err| {
+            upstreamEndAttempt(upstream);
+            last_error = err;
+            server_metrics.upstreamRequestFailed();
+            if (upstreamRecordFailure(upstream, now_ms, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
+                server_metrics.upstreamEjected();
+            }
+            continue;
+        };
+        upstreamEndAttempt(upstream);
+        upstreamRecordSuccess(upstream);
+        return response;
+    }
+
+    if (attempts == 0 and skipped_ejected > 0) {
+        return h2CoolErrorResponse(allocator, 503, "Service Unavailable", "All configured upstream targets are in passive-health cooldown.");
+    }
+    if (last_error) |err| switch (err) {
+        error.RequestTimeout => return h2CoolErrorResponse(allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out."),
+        error.UnsupportedUpstreamScheme => return h2CoolErrorResponse(allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this server path."),
+        error.PayloadTooLarge => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Upstream response exceeds configured response buffer."),
+        else => {},
+    };
+    return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "All configured upstream attempts failed.");
+}
+
+const H2_DEFAULT_PAGE =
+    \\<!doctype html>
+    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    \\<title>Layerline HTTP/2</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    \\<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ed;color:#11110f;font:16px/1.5 system-ui,sans-serif}main{max-width:760px;padding:48px}h1{font-size:clamp(56px,10vw,120px);line-height:.85;margin:0}p{color:#5d5e58;max-width:48ch}.tag{font:12px/1.2 ui-monospace,monospace;text-transform:uppercase;color:#77786f}</style>
+    \\</head><body><main><div class="tag">native h2c route</div><h1>Layerline</h1><p>This response came from Layerline's native HTTP/2 frame path: SETTINGS, HPACK request headers, HEADERS, and DATA frames emitted by the Zig server.</p></main></body></html>
+;
+
+fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
+    _ = process_env;
+    current_response_headers = cfg.response_headers.items;
+
+    const is_head = std.mem.eql(u8, req.method, "HEAD");
+    const domain = findDomainForRequestMutable(cfg, req.headers);
+
+    if (findDomainRedirectRule(domain, req.path)) |redirect| return buildHttp2RedirectResponse(allocator, redirect, req);
+    if (findRedirectRule(cfg, req.path)) |redirect| return buildHttp2RedirectResponse(allocator, redirect, req);
+
+    if (findDomainRouteMutable(domain, req.path)) |route| {
+        return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
+    }
+    if (findNamedRouteMutable(cfg, req.path)) |route| {
+        return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
+    }
+
+    if ((std.mem.eql(u8, req.method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
+        return readAcmeChallengeForHttp2(io, allocator, cfg, req.path["/.well-known/acme-challenge/".len..]);
+    }
+
+    if (domain != null) {
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+        }
+    }
+
+    if (std.mem.eql(u8, req.method, "GET") or is_head) {
+        if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
+            return h2TextResponse(200, "image/svg+xml", SERVER_ICON_SVG);
+        }
+        if (std.mem.eql(u8, req.path, "/")) {
+            return h2TextResponse(200, "text/html; charset=utf-8", H2_DEFAULT_PAGE);
+        }
+        if (std.mem.eql(u8, req.path, "/health")) {
+            return h2TextResponse(200, "text/plain; charset=utf-8", "ok\n");
+        }
+        if (std.mem.eql(u8, req.path, "/metrics")) {
+            return .{ .status_code = 200, .content_type = "text/plain; version=0.0.4; charset=utf-8", .body = try renderMetrics(allocator) };
+        }
+        if (std.mem.eql(u8, req.path, "/time")) {
+            return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()}) };
+        }
+        if (std.mem.eql(u8, req.path, "/api/echo")) {
+            if (findQueryValue(req.query, "msg")) |msg| {
+                return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg}) };
+            }
+            return h2TextResponse(200, "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n");
+        }
+        if (std.mem.startsWith(u8, req.path, "/static/")) {
+            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), req.path["/static/".len..], cfg.max_static_file_bytes);
+        }
+        if (domainServeStaticRoot(cfg, domain) and
+            !std.mem.startsWith(u8, req.path, "/api/") and
+            !std.mem.startsWith(u8, req.path, "/php/") and
+            !std.mem.eql(u8, req.path, "/health") and
+            !std.mem.eql(u8, req.path, "/time") and
+            !std.mem.eql(u8, req.path, "/"))
+        {
+            const rel = try makeStaticPathFromRequest(allocator, req.path, domainIndexFile(cfg, domain));
+            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
+        }
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+        }
+        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+    }
+
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/api/echo")) {
+        return .{ .status_code = 200, .content_type = "text/plain; charset=utf-8", .body = req.body };
+    }
+    if (std.mem.eql(u8, req.method, "OPTIONS")) {
+        const headers = try allocator.alloc(h2_native.Header, 1);
+        headers[0] = .{ .name = "allow", .value = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS" };
+        return .{ .status_code = 204, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headers };
+    }
+    if (domainUpstreamMutable(cfg, domain)) |pool| {
+        return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+    }
+    return h2CoolErrorResponse(allocator, 501, "Not Implemented", "This server has not implemented that HTTP/2 behavior yet.");
+}
+
+fn buildHttp2RouteResponse(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, domain: ?*DomainConfig, route: *RouteConfig, req: HttpRequest) !H2BufferedResponse {
+    const is_head = std.mem.eql(u8, req.method, "HEAD");
+    switch (route.handler) {
+        .static => {
+            if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
+                const headers = try allocator.alloc(h2_native.Header, 1);
+                headers[0] = .{ .name = "allow", .value = "GET,HEAD,OPTIONS" };
+                var response = try h2CoolErrorResponse(allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.");
+                response.headers = headers;
+                return response;
+            }
+            const rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
+            return readStaticFileForHttp2(io, allocator, route.static_dir orelse domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
+        },
+        .proxy => {
+            const pool = if (route.upstream) |*route_pool|
+                route_pool
+            else
+                domainUpstreamMutable(cfg, domain) orelse return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
+            return fetchHttp2UpstreamPoolResponse(allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg);
+        },
+        .php => return h2CoolErrorResponse(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing is not wired yet; use HTTP/1 for CGI/PHP routes."),
+    }
+}
+
+fn readHttp2Frame(reader: *H2PendingReader, allocator: std.mem.Allocator, max_payload_bytes: usize) !H2Frame {
+    var header_bytes: [9]u8 = undefined;
+    try reader.readExact(&header_bytes);
+    const header = try h2_native.parseFrameHeader(&header_bytes);
+    if (header.length > max_payload_bytes) return error.RequestTooLarge;
+    const payload = try allocator.alloc(u8, header.length);
+    errdefer allocator.free(payload);
+    if (payload.len > 0) try reader.readExact(payload);
+    return .{ .header = header, .payload = payload };
+}
+
+fn sendHttp2Rst(stream: std.Io.net.Stream, stream_id: u32, code: u32) !void {
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &payload, code, .big);
+    try sendHttp2Frame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload);
+}
+
+fn handleHttp2HeadersFrame(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    hpack_decoder: *h2_native.HpackDecoder,
+    cfg: *ServerConfig,
+    process_env: *const std.process.Environ.Map,
+    frame: H2Frame,
+) !void {
+    if (frame.header.stream_id == 0 or (frame.header.flags & h2_native.FLAG_END_HEADERS) == 0) {
+        if (frame.header.stream_id != 0) try sendHttp2Rst(stream, frame.header.stream_id, 0x1);
+        return;
+    }
+
+    var offset: usize = 0;
+    var pad_len: usize = 0;
+    if ((frame.header.flags & h2_native.FLAG_PADDED) != 0) {
+        if (offset >= frame.payload.len) return error.BadRequest;
+        pad_len = frame.payload[offset];
+        offset += 1;
+    }
+    if ((frame.header.flags & h2_native.FLAG_PRIORITY) != 0) {
+        if (frame.payload.len < offset + 5) return error.BadRequest;
+        offset += 5;
+    }
+    if (frame.payload.len < offset + pad_len) return error.BadRequest;
+    const header_block = frame.payload[offset .. frame.payload.len - pad_len];
+
+    var decoded = hpack_decoder.decodeHeaderBlock(allocator, header_block) catch |err| {
+        const response = switch (err) {
+            else => try h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid HTTP/2 header block."),
+        };
+        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
+        return;
+    };
+    defer decoded.deinit(allocator);
+
+    const req = parseHttp2Request(allocator, &decoded) catch {
+        const response = try h2CoolErrorResponse(allocator, 400, "Bad Request", "Missing required HTTP/2 pseudo-headers.");
+        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
+        return;
+    };
+
+    if ((frame.header.flags & h2_native.FLAG_END_STREAM) == 0) {
+        const response = try h2CoolErrorResponse(allocator, 501, "Not Implemented", "HTTP/2 request bodies are not supported in this route path yet.");
+        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
+        return;
+    }
+
+    server_metrics.requestStarted();
+    std.debug.print("HTTP/2 {s} {s}\n", .{ req.method, req.path });
+    const response = buildHttp2ResponseForRequest(io, allocator, cfg, req, process_env) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try h2CoolErrorResponse(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request."),
+    };
+    try sendHttp2Response(stream, allocator, frame.header.stream_id, response, std.mem.eql(u8, req.method, "HEAD"));
+}
+
+fn handleHttp2Preface(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    prefill: []const u8,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    var preface_buf: [HTTP2_PREFACE_MAGIC.len]u8 = undefined;
+    const copied = @min(prefill.len, HTTP2_PREFACE_MAGIC.len);
+    if (copied > 0) @memcpy(preface_buf[0..copied], prefill[0..copied]);
+    var reader = H2PendingReader{
+        .stream = stream,
+        .pending = if (prefill.len > copied) prefill[copied..] else "",
+    };
+    if (copied < HTTP2_PREFACE_MAGIC.len) {
+        try reader.readExact(preface_buf[copied..]);
+    }
+    if (!std.mem.eql(u8, &preface_buf, HTTP2_PREFACE_MAGIC)) {
+        try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", "Invalid HTTP/2 connection preface.", true, false, null);
+        return;
+    }
+
+    try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
+    std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var hpack_decoder = h2_native.HpackDecoder.init(allocator);
+    defer hpack_decoder.deinit();
+
+    while (true) {
+        _ = arena.reset(.retain_capacity);
+        const req_alloc = arena.allocator();
+        const frame = readHttp2Frame(&reader, req_alloc, @max(cfg.max_request_bytes, cfg.max_body_bytes)) catch |err| switch (err) {
+            error.ConnectionClosed => return,
+            error.RequestTimeout => return,
+            else => return err,
+        };
+
+        switch (frame.header.frame_type) {
+            h2_native.FRAME_SETTINGS => {
+                if ((frame.header.flags & h2_native.FLAG_ACK) == 0) {
+                    try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, h2_native.FLAG_ACK, 0, "");
+                }
+            },
+            h2_native.FRAME_PING => {
+                if (frame.payload.len == 8 and (frame.header.flags & h2_native.FLAG_ACK) == 0) {
+                    try sendHttp2Frame(stream, h2_native.FRAME_PING, h2_native.FLAG_ACK, 0, frame.payload);
+                }
+            },
+            h2_native.FRAME_HEADERS => {
+                try handleHttp2HeadersFrame(io, stream, req_alloc, &hpack_decoder, cfg, process_env, frame);
+            },
+            h2_native.FRAME_DATA => {
+                if (frame.header.stream_id != 0) try sendHttp2Rst(stream, frame.header.stream_id, 0x7);
+            },
+            h2_native.FRAME_GOAWAY => return,
+            h2_native.FRAME_WINDOW_UPDATE => {},
+            else => {},
+        }
+    }
 }
 
 // Parse scheme/host/port/path strings from a proxy URL into normalized fields.
@@ -5791,7 +6402,7 @@ fn handleConnection(
         const prefill = prefill_buf[0..prefill_len];
 
         if (isLikelyHttp2Preface(prefill)) {
-            try handleHttp2Preface(stream, req_alloc, cfg, prefill);
+            try handleHttp2Preface(io, stream, req_alloc, cfg, prefill, process_env);
             return;
         }
 
