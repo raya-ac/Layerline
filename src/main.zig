@@ -4104,10 +4104,28 @@ fn findNamedRoute(cfg: *const ServerConfig, path: []const u8) ?*const RouteConfi
     return findNamedRouteIn(cfg.routes.items, path);
 }
 
+fn findNamedRouteMutable(cfg: *ServerConfig, path: []const u8) ?*RouteConfig {
+    return findNamedRouteInMutable(&cfg.routes, path);
+}
+
 fn findNamedRouteIn(routes: []const RouteConfig, path: []const u8) ?*const RouteConfig {
     var best: ?*const RouteConfig = null;
     var best_len: usize = 0;
     for (routes) |*route| {
+        if (!routeMatches(route, path)) continue;
+        if (route.match_kind == .exact) return route;
+        if (route.pattern.len >= best_len) {
+            best = route;
+            best_len = route.pattern.len;
+        }
+    }
+    return best;
+}
+
+fn findNamedRouteInMutable(routes: *std.ArrayList(RouteConfig), path: []const u8) ?*RouteConfig {
+    var best: ?*RouteConfig = null;
+    var best_len: usize = 0;
+    for (routes.items) |*route| {
         if (!routeMatches(route, path)) continue;
         if (route.match_kind == .exact) return route;
         if (route.pattern.len >= best_len) {
@@ -4183,9 +4201,32 @@ fn findDomainForHost(cfg: *const ServerConfig, raw_host: []const u8) ?*const Dom
     return best;
 }
 
+fn findDomainForHostMutable(cfg: *ServerConfig, raw_host: []const u8) ?*DomainConfig {
+    const host = stripHostPort(raw_host);
+    var best: ?*DomainConfig = null;
+    var best_score: usize = 0;
+
+    for (cfg.domains.items) |*domain| {
+        for (domain.server_names.items) |server_name| {
+            const score = serverNameMatchScore(server_name, host);
+            if (score > best_score) {
+                best = domain;
+                best_score = score;
+            }
+        }
+    }
+
+    return best;
+}
+
 fn findDomainForRequest(cfg: *const ServerConfig, headers: []const u8) ?*const DomainConfig {
     const host = findHeaderValue(headers, "Host") orelse return null;
     return findDomainForHost(cfg, host);
+}
+
+fn findDomainForRequestMutable(cfg: *ServerConfig, headers: []const u8) ?*DomainConfig {
+    const host = findHeaderValue(headers, "Host") orelse return null;
+    return findDomainForHostMutable(cfg, host);
 }
 
 fn domainStaticDir(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
@@ -4237,6 +4278,14 @@ fn domainUpstream(cfg: *const ServerConfig, domain: ?*const DomainConfig) ?Upstr
     return cfg.upstream;
 }
 
+fn domainUpstreamMutable(cfg: *ServerConfig, domain: ?*DomainConfig) ?*UpstreamPoolConfig {
+    if (domain) |d| {
+        if (d.upstream) |*value| return value;
+    }
+    if (cfg.upstream) |*value| return value;
+    return null;
+}
+
 fn domainUpstreamPolicy(cfg: *const ServerConfig, domain: ?*const DomainConfig) UpstreamPoolPolicy {
     if (domain) |d| {
         if (d.upstream_policy) |policy| return policy;
@@ -4263,6 +4312,13 @@ fn findDomainRoute(domain: ?*const DomainConfig, path: []const u8) ?*const Route
     return null;
 }
 
+fn findDomainRouteMutable(domain: ?*DomainConfig, path: []const u8) ?*RouteConfig {
+    if (domain) |d| {
+        return findNamedRouteInMutable(&d.routes, path);
+    }
+    return null;
+}
+
 fn routeFileRelativePath(allocator: std.mem.Allocator, route: *const RouteConfig, request_path: []const u8, index_file: []const u8) ![]const u8 {
     if (!route.strip_prefix) {
         return makeStaticPathFromRequest(allocator, request_path, index_file);
@@ -4281,9 +4337,9 @@ fn handleNamedRoute(
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    domain: ?*const DomainConfig,
-    route: *const RouteConfig,
+    cfg: *ServerConfig,
+    domain: ?*DomainConfig,
+    route: *RouteConfig,
     req: HttpRequest,
     close_connection: bool,
     is_head: bool,
@@ -4327,12 +4383,14 @@ fn handleNamedRoute(
             return;
         },
         .proxy => {
-            const maybe_pool = if (route.upstream) |pool| pool else domainUpstream(cfg, domain);
-            var pool = maybe_pool orelse {
-                try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
-                return;
-            };
-            try forwardToUpstreamPool(stream, allocator, &pool, routeUpstreamPolicy(cfg, domain, route), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+            const pool = if (route.upstream) |*route_pool|
+                route_pool
+            else
+                domainUpstreamMutable(cfg, domain) orelse {
+                    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
+                    return;
+                };
+            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
             return;
         },
     }
@@ -4428,6 +4486,24 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
     try std.testing.expectEqual(@as(u32, 750), cfg.upstream_health_check_timeout_ms);
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
+
+    cfg.upstream = try parseUpstreamPool(allocator, "http://127.0.0.1:9100");
+    const fallback_pool = domainUpstreamMutable(&cfg, null).?;
+    try std.testing.expect(!upstreamRecordFailure(&fallback_pool.targets.items[0], 1_000, 2, 500));
+    try std.testing.expectEqual(@as(usize, 1), domainUpstreamMutable(&cfg, null).?.targets.items[0].passive_failures.load(.monotonic));
+
+    try applyConfigLine(&cfg, allocator, "route_proxy.health", "http://127.0.0.1:9101");
+    const health_route = findNamedRouteMutable(&cfg, "/health").?;
+    if (health_route.upstream) |*route_pool| {
+        try std.testing.expect(!upstreamRecordFailure(&route_pool.targets.items[0], 1_000, 2, 500));
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    if (findNamedRouteMutable(&cfg, "/health").?.upstream) |*route_pool| {
+        try std.testing.expectEqual(@as(usize, 1), route_pool.targets.items[0].passive_failures.load(.monotonic));
+    } else {
+        return error.TestUnexpectedResult;
+    }
 
     const rel = try routeFileRelativePath(allocator, findNamedRoute(&cfg, "/assets/hello.txt").?, "/assets/hello.txt", "index.html");
     try std.testing.expectEqualStrings("hello.txt", rel);
@@ -4586,7 +4662,7 @@ fn routeRequest(
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
+    cfg: *ServerConfig,
     req: HttpRequest,
     process_env: *const std.process.Environ.Map,
 ) !void {
@@ -4597,7 +4673,7 @@ fn routeRequest(
     const should_close = req.close_connection;
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
-    const domain = findDomainForRequest(cfg, req.headers);
+    const domain = findDomainForRequestMutable(cfg, req.headers);
 
     if (findDomainRedirectRule(domain, req.path)) |redirect| {
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
@@ -4609,12 +4685,12 @@ fn routeRequest(
         return;
     }
 
-    if (findDomainRoute(domain, req.path)) |route| {
+    if (findDomainRouteMutable(domain, req.path)) |route| {
         try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
         return;
     }
 
-    if (findNamedRoute(cfg, req.path)) |route| {
+    if (findNamedRouteMutable(cfg, req.path)) |route| {
         try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
         return;
     }
@@ -5078,9 +5154,8 @@ fn routeRequest(
             }
         }
 
-        if (domainUpstream(cfg, domain)) |pool_value| {
-            var pool = pool_value;
-            try forwardToUpstreamPool(stream, allocator, &pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
             return;
         }
 
@@ -5105,9 +5180,8 @@ fn routeRequest(
             return;
         }
 
-        if (domainUpstream(cfg, domain)) |pool_value| {
-            var pool = pool_value;
-            try forwardToUpstreamPool(stream, allocator, &pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
             return;
         }
 
@@ -5124,9 +5198,8 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
-        if (domainUpstream(cfg, domain)) |pool_value| {
-            var pool = pool_value;
-            try forwardToUpstreamPool(stream, allocator, &pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
+        if (domainUpstreamMutable(cfg, domain)) |pool| {
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg.upstream_timeout_ms, cfg.upstream_retries, cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms);
             return;
         }
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
@@ -5139,7 +5212,7 @@ fn routeRequest(
 fn handleConnection(
     io: std.Io,
     stream: std.Io.net.Stream,
-    cfg: *const ServerConfig,
+    cfg: *ServerConfig,
     allocator: std.mem.Allocator,
     process_env: *const std.process.Environ.Map,
 ) !void {
@@ -5341,7 +5414,7 @@ fn handleConnection(
 fn serveConnectionTask(
     io: std.Io,
     stream: std.Io.net.Stream,
-    cfg: *const ServerConfig,
+    cfg: *ServerConfig,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
     process_env: *const std.process.Environ.Map,
