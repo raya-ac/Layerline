@@ -4906,7 +4906,26 @@ fn buildHttp2RouteResponse(io: std.Io, allocator: std.mem.Allocator, cfg: *Serve
                 domainUpstreamMutable(cfg, domain) orelse return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
             return fetchHttp2UpstreamPoolResponse(allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg);
         },
-        .php => return h2CoolErrorResponse(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing is not wired yet; use HTTP/1 for CGI/PHP routes."),
+        .php => {
+            if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
+                const headers = try allocator.alloc(h2_native.Header, 1);
+                headers[0] = .{ .name = "allow", .value = "GET,HEAD,OPTIONS" };
+                var response = try h2CoolErrorResponse(allocator, 405, "Method Not Allowed", "HTTP/2 PHP routes currently accept GET and HEAD.");
+                response.headers = headers;
+                return response;
+            }
+            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
+                return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+            }
+            if (routePhpFrontController(cfg, domain, route)) {
+                const target = try makePhpFrontControllerTarget(allocator, route, req.path, routePhpIndex(cfg, domain, route));
+                defer target.deinit(allocator);
+                return buildHttp2PhpFastcgiResponse(io, allocator, cfg, req, route.php_root orelse domainPhpRoot(cfg, domain), routePhpFastcgi(cfg, domain, route), target.script_rel_path, target.script_name, target.path_info, routeUpstreamTimeoutMs(cfg, domain, route));
+            }
+            const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
+            defer allocator.free(script_rel);
+            return buildHttp2PhpFastcgiResponse(io, allocator, cfg, req, route.php_root orelse domainPhpRoot(cfg, domain), routePhpFastcgi(cfg, domain, route), script_rel, req.path, "", routeUpstreamTimeoutMs(cfg, domain, route));
+        },
     }
 }
 
@@ -6688,8 +6707,53 @@ fn sendPhpOutput(stream: std.Io.net.Stream, allocator: std.mem.Allocator, output
     }
 }
 
-fn handlePhpFastcgi(
-    stream: std.Io.net.Stream,
+fn collectCgiHttp2Headers(allocator: std.mem.Allocator, headers: []const u8) ![]h2_native.Header {
+    var out = std.ArrayList(h2_native.Header).empty;
+    errdefer out.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |line| {
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+            const name = trimValue(trimmed[0..colon]);
+            const value = trimValue(trimmed[colon + 1 ..]);
+            if (name.len == 0 or value.len == 0 or isSkippedCgiResponseHeader(name) or isSkippedHttp2ResponseHeader(name)) continue;
+            try out.append(allocator, .{
+                .name = try allocator.dupe(u8, name),
+                .value = try allocator.dupe(u8, value),
+            });
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn h2PhpOutputResponse(allocator: std.mem.Allocator, output: []const u8) !H2BufferedResponse {
+    const split = splitCgiHeaderBlock(output) orelse {
+        return .{
+            .status_code = 200,
+            .content_type = "text/plain; charset=utf-8",
+            .body = try allocator.dupe(u8, output),
+        };
+    };
+
+    const status = parseCgiStatus(split.headers);
+    const content_type = if (findCgiHeaderValue(split.headers, "Content-Type")) |ctype|
+        try allocator.dupe(u8, trimValue(ctype))
+    else
+        "text/plain; charset=utf-8";
+    const headers = try collectCgiHttp2Headers(allocator, split.headers);
+
+    return .{
+        .status_code = status.code,
+        .content_type = content_type,
+        .body = try allocator.dupe(u8, split.body),
+        .headers = headers,
+    };
+}
+
+fn runPhpFastcgiRequest(
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     req: HttpRequest,
@@ -6699,19 +6763,10 @@ fn handlePhpFastcgi(
     script_name: []const u8,
     path_info: []const u8,
     timeout_ms: u32,
-    close_connection: bool,
-    is_head: bool,
-) !void {
-    const endpoint = parseFastcgiEndpoint(php_fastcgi) catch {
-        try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid.", close_connection, false, null);
-        return;
-    };
+) !FastcgiRunResult {
+    const endpoint = parseFastcgiEndpoint(php_fastcgi) catch return error.InvalidFastcgiEndpoint;
 
-    const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, upstreamNowMs()) catch |err| {
-        std.debug.print("PHP FastCGI connect failed for {s}: {}\n", .{ php_fastcgi, err });
-        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached.", close_connection, false, null);
-        return;
-    };
+    const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, upstreamNowMs()) catch return error.FastcgiConnectFailed;
     const conn = lease.stream;
     var reusable_fastcgi_conn = false;
     defer fastcgiReleaseConnection(php_fastcgi, cfg, lease, reusable_fastcgi_conn, upstreamNowMs());
@@ -6727,9 +6782,50 @@ fn handlePhpFastcgi(
     if (req.body.len > 0) try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, req.body);
     try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, "");
 
-    const result = readFastcgiResponse(allocator, conn, request_id, cfg.max_php_output_bytes) catch |err| switch (err) {
+    const result = try readFastcgiResponse(allocator, conn, request_id, cfg.max_php_output_bytes);
+    errdefer result.deinit(allocator);
+
+    if (result.protocol_status != FASTCGI_REQUEST_COMPLETE) return error.FastcgiProtocolFailed;
+    if (result.app_status != 0) return error.FastcgiAppFailed;
+
+    reusable_fastcgi_conn = fastcgiKeepaliveConfigured(cfg);
+    return result;
+}
+
+fn handlePhpFastcgi(
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    req: HttpRequest,
+    php_root: []const u8,
+    php_fastcgi: []const u8,
+    script_path: []const u8,
+    script_name: []const u8,
+    path_info: []const u8,
+    timeout_ms: u32,
+    close_connection: bool,
+    is_head: bool,
+) !void {
+    const result = runPhpFastcgiRequest(allocator, cfg, req, php_root, php_fastcgi, script_path, script_name, path_info, timeout_ms) catch |err| switch (err) {
+        error.InvalidFastcgiEndpoint => {
+            try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid.", close_connection, false, null);
+            return;
+        },
+        error.FastcgiConnectFailed => {
+            std.debug.print("PHP FastCGI connect failed for {s}\n", .{php_fastcgi});
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached.", close_connection, false, null);
+            return;
+        },
         error.StreamTooLong => {
             try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI response exceeded max_php_output_bytes.", close_connection, false, null);
+            return;
+        },
+        error.FastcgiProtocolFailed => {
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI request did not complete cleanly.", close_connection, false, null);
+            return;
+        },
+        error.FastcgiAppFailed => {
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI app returned a non-zero status.", close_connection, false, null);
             return;
         },
         else => |e| return e,
@@ -6740,17 +6836,54 @@ fn handlePhpFastcgi(
         std.debug.print("PHP FastCGI stderr: {s}\n", .{result.stderr});
     }
 
-    if (result.protocol_status != FASTCGI_REQUEST_COMPLETE) {
-        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI request did not complete cleanly.", close_connection, false, null);
-        return;
-    }
-    if (result.app_status != 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI app returned a non-zero status.", close_connection, false, null);
-        return;
+    try sendPhpOutput(stream, allocator, result.stdout, close_connection, is_head);
+}
+
+fn buildHttp2PhpFastcgiResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    req: HttpRequest,
+    php_root: []const u8,
+    php_fastcgi: ?[]const u8,
+    script_rel_path: []const u8,
+    script_name: []const u8,
+    path_info: []const u8,
+    timeout_ms: u32,
+) !H2BufferedResponse {
+    const endpoint = php_fastcgi orelse return h2CoolErrorResponse(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing currently requires FastCGI.");
+    if (disablesOptionalUrl(endpoint)) return h2CoolErrorResponse(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing currently requires FastCGI.");
+
+    const rel_path = script_rel_path;
+    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null) {
+        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
     }
 
-    reusable_fastcgi_conn = fastcgiKeepaliveConfigured(cfg);
-    try sendPhpOutput(stream, allocator, result.stdout, close_connection, is_head);
+    const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
+    defer allocator.free(script_path);
+
+    const script_stat = std.Io.Dir.cwd().statFile(io, script_path, .{}) catch {
+        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+    };
+    if (script_stat.kind != .file) {
+        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
+    }
+
+    const result = runPhpFastcgiRequest(allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, timeout_ms) catch |err| switch (err) {
+        error.InvalidFastcgiEndpoint => return h2CoolErrorResponse(allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid."),
+        error.FastcgiConnectFailed => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached."),
+        error.StreamTooLong => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "PHP FastCGI response exceeded max_php_output_bytes."),
+        error.FastcgiProtocolFailed => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "PHP FastCGI request did not complete cleanly."),
+        error.FastcgiAppFailed => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "PHP FastCGI app returned a non-zero status."),
+        else => |e| return e,
+    };
+    defer result.deinit(allocator);
+
+    if (result.stderr.len > 0) {
+        std.debug.print("PHP FastCGI stderr: {s}\n", .{result.stderr});
+    }
+
+    return h2PhpOutputResponse(allocator, result.stdout);
 }
 
 fn handlePhpScript(

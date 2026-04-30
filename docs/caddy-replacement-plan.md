@@ -26,7 +26,7 @@ Commit each section independently after tests and at least one live smoke where 
 2. Route/domain backend policy: timeout inheritance, route-local proxy/PHP/FastCGI controls, and route dump visibility.
 3. WebSocket and raw upgrade proxying for HTTP/1.1 upstreams. Initial route/domain proxy support for `101 Switching Protocols` tunnels is implemented; CONNECT and HTTP/2 extended CONNECT remain.
 4. FastCGI pooling with max idle, max requests, idle expiry, and forced close on unsafe responses. Initial FCGI_KEEP_CONN pooling is implemented with process-wide endpoint-keyed idle reuse and metrics.
-5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health.
+5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health. Static, proxy, redirects, metrics/health, inherited headers, and GET/HEAD FastCGI PHP routes are implemented; request bodies, flow-control hardening, and conformance work remain.
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
 7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs.
 8. Compression policy: gzip first, then brotli/zstd if available without bloating the core.
