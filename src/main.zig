@@ -51,6 +51,7 @@ const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
 const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = 512 * 1024;
 const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_MAX_PENDING_BODY_STREAMS = 128;
+const HTTP2_ERROR_NO_ERROR: u32 = 0x0;
 const HTTP2_ERROR_PROTOCOL: u32 = 0x1;
 const HTTP2_ERROR_STREAM_CLOSED: u32 = 0x5;
 const HTTP2_ERROR_REFUSED_STREAM: u32 = 0x7;
@@ -7629,6 +7630,18 @@ fn sendHttp2Rst(stream: std.Io.net.Stream, stream_id: u32, code: u32) !void {
     try sendHttp2Frame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload);
 }
 
+fn makeHttp2GoawayPayload(last_stream_id: u32, code: u32) [8]u8 {
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], last_stream_id & 0x7fff_ffff, .big);
+    std.mem.writeInt(u32, payload[4..8], code, .big);
+    return payload;
+}
+
+fn sendHttp2Goaway(stream: std.Io.net.Stream, last_stream_id: u32, code: u32) !void {
+    const payload = makeHttp2GoawayPayload(last_stream_id, code);
+    try sendHttp2Frame(stream, h2_native.FRAME_GOAWAY, 0, 0, &payload);
+}
+
 fn sendHttp2WindowUpdate(stream: std.Io.net.Stream, stream_id: u32, increment: usize) !void {
     if (increment == 0) return;
     if (increment > 0x7fff_ffff) return error.BadRequest;
@@ -7888,8 +7901,15 @@ fn runHttp2FrameLoop(
         for (body_states.items) |*state| state.deinit(allocator);
         body_states.deinit(allocator);
     }
+    var requests_seen: usize = 0;
+    var last_stream_id: u32 = 0;
 
     while (true) {
+        if (shutdown_requested.load(.acquire)) {
+            try sendHttp2Goaway(stream, last_stream_id, HTTP2_ERROR_NO_ERROR);
+            return;
+        }
+
         _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
         const frame = readHttp2Frame(reader, req_alloc, @max(cfg.max_request_bytes, cfg.max_body_bytes)) catch |err| switch (err) {
@@ -7910,7 +7930,13 @@ fn runHttp2FrameLoop(
                 }
             },
             h2_native.FRAME_HEADERS => {
+                if (frame.header.stream_id > last_stream_id) last_stream_id = frame.header.stream_id;
+                if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection) {
+                    try sendHttp2Rst(stream, frame.header.stream_id, HTTP2_ERROR_REFUSED_STREAM);
+                    continue;
+                }
                 try handleHttp2HeadersFrame(io, stream, req_alloc, allocator, &hpack_decoder, cfg, process_env, &body_states, frame);
+                requests_seen += 1;
             },
             h2_native.FRAME_DATA => {
                 try handleHttp2DataFrame(io, stream, req_alloc, allocator, cfg, process_env, &body_states, frame);
@@ -7918,6 +7944,11 @@ fn runHttp2FrameLoop(
             h2_native.FRAME_GOAWAY => return,
             h2_native.FRAME_WINDOW_UPDATE => {},
             else => {},
+        }
+
+        if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection and body_states.items.len == 0) {
+            try sendHttp2Goaway(stream, last_stream_id, HTTP2_ERROR_NO_ERROR);
+            return;
         }
     }
 }
@@ -10808,6 +10839,12 @@ test "gzip response preparation compresses eligible text bodies" {
     try std.testing.expect(prepared.body.len < body.len);
     try std.testing.expectEqual(@as(u8, 0x1f), prepared.body[0]);
     try std.testing.expectEqual(@as(u8, 0x8b), prepared.body[1]);
+}
+
+test "http2 goaway payload masks reserved stream bit" {
+    const payload = makeHttp2GoawayPayload(0xffff_ffff, HTTP2_ERROR_NO_ERROR);
+    try std.testing.expectEqual(@as(u32, 0x7fff_ffff), std.mem.readInt(u32, payload[0..4], .big));
+    try std.testing.expectEqual(@as(u32, HTTP2_ERROR_NO_ERROR), std.mem.readInt(u32, payload[4..8], .big));
 }
 
 test "chunked upstream body scanner detects trailers and terminator" {
