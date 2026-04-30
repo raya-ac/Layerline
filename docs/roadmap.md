@@ -35,7 +35,7 @@ Sources:
 
 - Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
 - MIME database and override config.
-- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, and stale-while-revalidate headers.
+- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, and `server_route_cache_control.DOMAIN.ROUTE` shortcuts are implemented on top of inherited response-header policy.
 - Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters.
 - Static transforms: safe template mode, include variables, generated headers, and route-local error pages.
 - Large-file performance: sendfile on supported targets, fallback streaming, mmap evaluation, rate limiting, and backpressure tests.
@@ -113,7 +113,7 @@ Sources:
 6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics and GET/HEAD FastCGI PHP routes; request bodies, flow control, GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
-9. Cache and compression.
+9. Cache and compression. Initial inherited Cache-Control policy shortcuts are implemented; dynamic compression and richer cache-status/stale policy remain next.
 10. Admin API and hot reload.
 
 The next engineering milestone should be HTTP/2 request-body and flow-control hardening, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

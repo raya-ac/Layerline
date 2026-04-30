@@ -239,6 +239,15 @@ route_header.app = Cache-Control: no-store
 server_route_header.main.app = X-App-Policy: isolated
 ```
 
+Cache policy has a first-class shortcut that emits `Cache-Control` at the same scopes:
+
+```conf
+cache_control = public, max-age=60
+server_cache_control.main = private, max-age=30
+route_cache_control.app = no-store
+server_route_cache_control.main.assets = public, max-age=31536000, immutable
+```
+
 Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
 
 ```conf
@@ -291,10 +300,11 @@ tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 add_header = Strict-Transport-Security: max-age=31536000
 add_header = X-Content-Type-Options: nosniff
+cache_control = private, max-age=30
 
 route = assets /assets/* static
 route_dir.assets = public
-route_header.assets = Cache-Control: public, max-age=31536000, immutable
+route_cache_control.assets = public, max-age=31536000, immutable
 
 route = app /app/* php
 route_php_root.app = public

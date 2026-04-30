@@ -30,7 +30,7 @@ Commit each section independently after tests and at least one live smoke where 
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
 7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs.
 8. Compression policy: gzip first, then brotli/zstd if available without bloating the core.
-9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache.
+9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config.
 11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands.
 12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke.
