@@ -114,7 +114,7 @@ Sources:
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics and GET/HEAD FastCGI PHP routes; request bodies, flow control, GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
-10. Admin API and hot reload.
+10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, and metrics; reload and mutating upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 
 The next engineering milestone should be HTTP/2 request-body and flow-control hardening, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

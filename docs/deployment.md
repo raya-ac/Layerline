@@ -10,6 +10,7 @@ Use predictable paths so service files, certbot, and rollback scripts agree:
 /usr/local/bin/layerline
 /etc/layerline/server.conf
 /etc/layerline/domains-enabled/*.conf
+/run/layerline/admin.sock
 /var/www/layerline/public
 /var/lib/layerline
 /var/log/layerline
@@ -19,8 +20,8 @@ Create a service user:
 
 ```bash
 sudo useradd --system --home /var/lib/layerline --shell /usr/sbin/nologin layerline
-sudo mkdir -p /etc/layerline/domains-enabled /var/www/layerline/public /var/lib/layerline /var/log/layerline
-sudo chown -R layerline:layerline /var/www/layerline /var/lib/layerline /var/log/layerline
+sudo mkdir -p /etc/layerline/domains-enabled /run/layerline /var/www/layerline/public /var/lib/layerline /var/log/layerline
+sudo chown -R layerline:layerline /run/layerline /var/www/layerline /var/lib/layerline /var/log/layerline
 ```
 
 Install the binary and config:
@@ -118,6 +119,7 @@ Run these before moving traffic:
 /usr/local/bin/layerline --validate-config --config /etc/layerline/server.conf
 curl -fsS http://127.0.0.1:8080/health
 curl -fsSI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/ | grep -i '^Content-Encoding: gzip'
+printf 'status\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
 ```
 

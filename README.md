@@ -15,6 +15,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
+- Optional read-only Unix-socket admin surface for status, config validation, routes, and metrics.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, and GET/HEAD FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
@@ -27,7 +28,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, a read-only Unix admin socket, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is HTTP/2 request-body/flow-control hardening and richer cache behavior: route-local stale/cache-status policy, GOAWAY behavior, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -141,6 +142,8 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
+# Read-only local admin socket: status, validate, routes, metrics.
+#admin_socket = /tmp/layerline-admin.sock
 # Opt-in dynamic gzip for buffered text responses.
 #compression = false
 #compression_min_bytes = 512
@@ -240,6 +243,23 @@ compression_max_bytes = 1048576
 Layerline skips bodies that are too small, too large, already encoded, or not a compressible content type. Static files should still prefer `.br`/`.gz` sidecars when possible so large assets stay on the sendfile/precompressed path.
 
 When dynamic compression is enabled, Layerline raises worker stack size to at least 512 KiB unless `worker_stack_size` is already higher. That keeps Zig's gzip encoder off the tiny default worker stack while leaving compression disabled deployments at the smaller default.
+
+## Admin Socket
+
+Set `admin_socket` to enable a local Unix socket for read-only operations:
+
+```conf
+admin_socket = /tmp/layerline-admin.sock
+```
+
+Commands are one line each: `status`, `validate`, `routes`, `metrics`, and `help`.
+
+```bash
+printf 'status\n' | nc -U /tmp/layerline-admin.sock
+printf 'routes\n' | nc -U /tmp/layerline-admin.sock
+```
+
+This socket deliberately does not reload config yet. Reload needs an owned immutable config snapshot per worker so existing requests can drain on the old config while new requests move to the new one.
 
 ## Header and Redirect Rules
 

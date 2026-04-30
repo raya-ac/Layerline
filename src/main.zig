@@ -52,6 +52,7 @@ const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
+const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
@@ -488,6 +489,8 @@ const ServerConfig = struct {
     h2_upstream: ?UpstreamConfig,
     http3_enabled: bool,
     http3_port: u16,
+    admin_enabled: bool,
+    admin_socket_path: ?[]const u8,
     compression_enabled: bool,
     gzip_enabled: bool,
     compression_min_bytes: usize,
@@ -2310,6 +2313,17 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.http3_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "http3_port")) {
         cfg.http3_port = try parseConfigU16(v);
+    } else if (std.mem.eql(u8, k, "admin") or std.mem.eql(u8, k, "admin_enabled")) {
+        cfg.admin_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "admin_socket") or std.mem.eql(u8, k, "admin_socket_path")) {
+        if (disablesOptionalUrl(v)) {
+            cfg.admin_enabled = false;
+            cfg.admin_socket_path = null;
+        } else {
+            if (v.len == 0) return error.InvalidConfigValue;
+            cfg.admin_enabled = true;
+            cfg.admin_socket_path = try allocator.dupe(u8, v);
+        }
     } else if (std.mem.eql(u8, k, "compression") or std.mem.eql(u8, k, "compress") or std.mem.eql(u8, k, "encode")) {
         cfg.compression_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "gzip") or std.mem.eql(u8, k, "gzip_enabled")) {
@@ -3009,6 +3023,11 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.php_fastcgi) |endpoint| try validateFastcgiEndpoint(endpoint);
     if (!isSafeRelativeScriptPath(cfg.php_index)) return error.InvalidConfigValue;
     if (cfg.http3_enabled and cfg.http3_port == 0) return error.InvalidConfigValue;
+    if (cfg.admin_enabled) {
+        const socket_path = cfg.admin_socket_path orelse return error.InvalidConfigValue;
+        if (socket_path.len == 0) return error.InvalidConfigValue;
+        _ = std.Io.net.UnixAddress.init(socket_path) catch return error.InvalidConfigValue;
+    }
     if (cfg.compression_enabled) {
         if (!cfg.gzip_enabled) return error.InvalidConfigValue;
         if (cfg.compression_min_bytes == 0) return error.InvalidConfigValue;
@@ -3541,6 +3560,145 @@ fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_co
     const body = try renderMetrics(allocator);
     defer allocator.free(body);
     try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
+}
+
+fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
+        .{
+            SERVER_NAME,
+            cfg.host,
+            cfg.port,
+            cfg.http3_enabled,
+            cfg.compression_enabled,
+            cfg.admin_enabled,
+            ServerMetrics.load(&server_metrics.active_connections),
+            ServerMetrics.load(&server_metrics.requests_total),
+            ServerMetrics.load(&server_metrics.responses_total),
+        },
+    );
+}
+
+fn renderAdminRoutes(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.print(allocator, "global host={s} port={d} static_dir={s} index={s}\n", .{ cfg.host, cfg.port, cfg.static_dir, cfg.index_file });
+    for (cfg.routes.items) |route| {
+        try out.print(allocator, "route {s}: {s} {s} -> {s}\n", .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) });
+    }
+    for (cfg.domains.items) |domain| {
+        try out.print(allocator, "server {s} names=", .{domain.name});
+        for (domain.server_names.items, 0..) |name, index| {
+            if (index > 0) try out.append(allocator, ',');
+            try out.appendSlice(allocator, name);
+        }
+        try out.print(allocator, " root={s} index={s}\n", .{ domainStaticDir(cfg, &domain), domainIndexFile(cfg, &domain) });
+        for (domain.routes.items) |route| {
+            try out.print(allocator, "  route {s}: {s} {s} -> {s}\n", .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) });
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    try streamWriteAll(stream, bytes);
+    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try streamWriteAll(stream, "\n");
+}
+
+fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8) !void {
+    const command = trimValue(command_raw);
+    if (command.len == 0 or std.mem.eql(u8, command, "help")) {
+        try sendAdminText(stream, "commands: status, validate, routes, metrics, help\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "status")) {
+        const body = try renderAdminStatus(allocator, cfg);
+        defer allocator.free(body);
+        try sendAdminText(stream, body);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "validate") or std.mem.eql(u8, command, "validate-config")) {
+        validateConfig(cfg) catch |err| {
+            const body = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
+            defer allocator.free(body);
+            try sendAdminText(stream, body);
+            return;
+        };
+        try sendAdminText(stream, "OK config\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "routes")) {
+        const body = try renderAdminRoutes(allocator, cfg);
+        defer allocator.free(body);
+        try sendAdminText(stream, body);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "metrics")) {
+        const body = try renderMetrics(allocator);
+        defer allocator.free(body);
+        try sendAdminText(stream, body);
+        return;
+    }
+
+    try sendAdminText(stream, "ERROR unknown command\n");
+}
+
+fn handleAdminConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
+    setStreamTimeouts(stream, 1_000, 1_000) catch {};
+    var buffer: [1024]u8 = undefined;
+    const n = try streamRead(stream, &buffer);
+    if (n == 0) return;
+    try handleAdminCommand(stream, allocator, cfg, buffer[0..n]);
+}
+
+const AdminSocketContext = struct {
+    io: std.Io,
+    cfg: *ServerConfig,
+    socket_path: []const u8,
+};
+
+fn unlinkUnixSocket(path: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    std.Io.Dir.deleteFileAbsolute(activeIo(), path) catch {};
+}
+
+fn serveAdminSocketTask(ctx: AdminSocketContext) void {
+    bindThreadIo(ctx.io);
+    unlinkUnixSocket(ctx.socket_path);
+
+    const address = std.Io.net.UnixAddress.init(ctx.socket_path) catch |err| {
+        std.debug.print("Admin socket path invalid: {s}: {}\n", .{ ctx.socket_path, err });
+        return;
+    };
+    var server = address.listen(ctx.io, .{ .kernel_backlog = 16 }) catch |err| {
+        std.debug.print("Admin socket listen failed: {s}: {}\n", .{ ctx.socket_path, err });
+        return;
+    };
+    defer {
+        server.deinit(ctx.io);
+        unlinkUnixSocket(ctx.socket_path);
+    }
+
+    std.debug.print("Admin socket: {s}\n", .{ctx.socket_path});
+    while (!shutdown_requested.load(.acquire)) {
+        const conn = server.accept(ctx.io) catch |err| {
+            if (shutdown_requested.load(.acquire)) break;
+            std.debug.print("Admin socket accept failed: {}\n", .{err});
+            ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            continue;
+        };
+        handleAdminConnection(conn, std.heap.page_allocator, ctx.cfg) catch |err| {
+            std.debug.print("Admin command failed: {}\n", .{err});
+        };
+        streamClose(conn);
+    }
 }
 
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool) !void {
@@ -7711,6 +7869,8 @@ test "named routes prefer exact and longest prefix matches" {
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
+        .admin_enabled = false,
+        .admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -7781,6 +7941,7 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "compression", "true");
     try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
     try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
+    try applyConfigLine(&cfg, allocator, "admin_socket", "/tmp/layerline-test-admin.sock");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -7813,6 +7974,8 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(cfg.gzip_enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.compression_min_bytes);
     try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
+    try std.testing.expect(cfg.admin_enabled);
+    try std.testing.expectEqualStrings("/tmp/layerline-test-admin.sock", cfg.admin_socket_path.?);
     normalizeConfig(&cfg);
     try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
     try std.testing.expect(cfg.upstream_health_check_enabled);
@@ -10115,7 +10278,7 @@ fn usage() void {
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
@@ -10129,7 +10292,7 @@ fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
@@ -10215,6 +10378,8 @@ pub fn main(init: std.process.Init) !void {
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
+        .admin_enabled = false,
+        .admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -10466,6 +10631,24 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.http3_port = std.fmt.parseInt(u16, value, 10) catch cfg.http3_port;
+        } else if (std.mem.eql(u8, arg, "--admin")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.admin_enabled = parseBool(value) orelse cfg.admin_enabled;
+        } else if (std.mem.eql(u8, arg, "--admin-socket") or std.mem.eql(u8, arg, "--admin-socket-path")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            if (disablesOptionalUrl(value)) {
+                cfg.admin_enabled = false;
+                cfg.admin_socket_path = null;
+            } else {
+                cfg.admin_enabled = true;
+                cfg.admin_socket_path = value;
+            }
         } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "--compress") or std.mem.eql(u8, arg, "--encode")) {
             const value = args.next() orelse {
                 usage();
@@ -10851,6 +11034,14 @@ pub fn main(init: std.process.Init) !void {
         };
         h3_worker.detach();
     }
+    if (cfg.admin_enabled) {
+        const admin_socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
+        const admin_worker = std.Thread.spawn(.{}, serveAdminSocketTask, .{AdminSocketContext{ .io = init.io, .cfg = &cfg, .socket_path = admin_socket_path }}) catch |err| {
+            std.debug.print("Failed to start admin socket: {}\n", .{err});
+            return;
+        };
+        admin_worker.detach();
+    }
 
     while (!shutdown_requested.load(.acquire)) {
         const conn = server.accept(init.io) catch |err| {
@@ -10898,4 +11089,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Shutdown requested; draining active connections for up to {d}ms.\n", .{cfg.graceful_shutdown_timeout_ms});
     waitForConnectionDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
+    if (cfg.admin_enabled) {
+        unlinkUnixSocket(cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH);
+    }
 }
