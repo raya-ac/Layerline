@@ -14,8 +14,9 @@ This is a practical build that blends local serving with edge-style deployment:
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
+- Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
-- Prometheus-style runtime metrics at `/metrics`, including static sendfile/buffered transfer counters and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
+- Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, and GET/HEAD FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
 - Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
@@ -26,9 +27,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is HTTP/2 request-body/flow-control hardening and cache/compression behavior: route-local cache policy, response compression, GOAWAY behavior, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is HTTP/2 request-body/flow-control hardening and richer cache behavior: route-local stale/cache-status policy, GOAWAY behavior, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -136,6 +137,10 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
+# Opt-in dynamic gzip for buffered text responses.
+#compression = false
+#compression_min_bytes = 512
+#compression_max_bytes = 1048576
 tls = false
 # Let's Encrypt auto TLS bootstrap (webroot mode)
 #tls_auto = true
@@ -217,6 +222,20 @@ Argument precedence (highest wins):
 - Range requests use the original file representation so byte offsets stay predictable.
 - On Darwin targets, response bodies are transferred with `sendfile` when the socket and file descriptor support it; unsupported platforms or syscalls fall back to the bounded buffered path.
 - If no local static match is found, the reverse proxy (if configured) handles the request.
+
+## Compression
+
+Dynamic gzip is opt-in and applies to buffered text-like responses on HTTP/1.1 and native HTTP/2 when the client advertises `Accept-Encoding: gzip`:
+
+```conf
+compression = true
+compression_min_bytes = 512
+compression_max_bytes = 1048576
+```
+
+Layerline skips bodies that are too small, too large, already encoded, or not a compressible content type. Static files should still prefer `.br`/`.gz` sidecars when possible so large assets stay on the sendfile/precompressed path.
+
+When dynamic compression is enabled, Layerline raises worker stack size to at least 512 KiB unless `worker_stack_size` is already higher. That keeps Zig's gzip encoder off the tiny default worker stack while leaving compression disabled deployments at the smaller default.
 
 ## Header and Redirect Rules
 
@@ -406,7 +425,7 @@ Common host limits to revisit before aggressive load tests:
 
 - `GET /` → HTML welcome page.
 - `GET /health` → plain health check.
-- `GET /metrics` → Prometheus-style counters for connections, requests, responses, static bytes, upstream proxy attempts, and native H3 packets.
+- `GET /metrics` → Prometheus-style counters for connections, requests, responses, compressed bytes, static bytes, upstream proxy attempts, and native H3 packets.
 - `GET /time` → JSON with current epoch seconds.
 - `GET /api/echo?msg=hello` → JSON `{"msg":"hello"}`.
 - `POST /api/echo` → echoes the POST body as plain text.

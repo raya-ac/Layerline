@@ -14,7 +14,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 - HTTP/3 either fully routes app responses or is clearly opt-in as a demo surface, not a replacement claim.
 - Config validation catches bad domain, route, TLS, PHP, and upstream policy before startup or reload.
 - Reload can validate and swap config without dropping existing connections.
-- Compression, cache policy, redirects, headers, health, and metrics have route/domain controls. Response header inheritance is now implemented for global, domain, and route scopes; cache/compression/security presets still need richer controls.
+- Compression, cache policy, redirects, headers, health, and metrics have route/domain controls. Response header inheritance and cache shortcuts are implemented for global, domain, and route scopes; dynamic gzip is implemented globally for buffered HTTP/1.1 and HTTP/2 responses, while route/domain compression presets still need richer controls.
 - Logs identify request path, status, latency, upstream, protocol, and failure reason.
 - There is a deployment runbook for Linux service management, limits, certs, logs, and rollback.
 
@@ -29,7 +29,7 @@ Commit each section independently after tests and at least one live smoke where 
 5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health. Static, proxy, redirects, metrics/health, inherited headers, and GET/HEAD FastCGI PHP routes are implemented; request bodies, flow-control hardening, and conformance work remain.
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
 7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs.
-8. Compression policy: gzip first, then brotli/zstd if available without bloating the core.
+8. Compression policy: gzip first, then brotli/zstd if available without bloating the core. Initial opt-in dynamic gzip is implemented for buffered HTTP/1.1 and HTTP/2 text responses.
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config.
 11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands.

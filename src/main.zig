@@ -44,6 +44,10 @@ const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
 const DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX = 1;
 const DEFAULT_UPSTREAM_SLOW_START_MS = 10_000;
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
+const DEFAULT_COMPRESSION_MIN_BYTES = 512;
+const DEFAULT_COMPRESSION_MAX_BYTES = 1024 * 1024;
+const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
+const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = 512 * 1024;
 const HTTP2_PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
@@ -97,6 +101,8 @@ const SERVER_ICON_SVG =
 threadlocal var current_io: ?std.Io = null;
 threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
+threadlocal var current_request_headers: []const u8 = "";
+threadlocal var current_compression_policy: CompressionPolicy = .disabled;
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
 
@@ -339,6 +345,20 @@ const ResponseHeaderRule = struct {
     value: []const u8,
 };
 
+const CompressionPolicy = struct {
+    enabled: bool,
+    gzip_enabled: bool,
+    min_bytes: usize,
+    max_bytes: usize,
+
+    const disabled = CompressionPolicy{
+        .enabled = false,
+        .gzip_enabled = true,
+        .min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
+        .max_bytes = DEFAULT_COMPRESSION_MAX_BYTES,
+    };
+};
+
 const RedirectRule = struct {
     from: []const u8,
     to: []const u8,
@@ -468,6 +488,10 @@ const ServerConfig = struct {
     h2_upstream: ?UpstreamConfig,
     http3_enabled: bool,
     http3_port: u16,
+    compression_enabled: bool,
+    gzip_enabled: bool,
+    compression_min_bytes: usize,
+    compression_max_bytes: usize,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
@@ -544,6 +568,114 @@ fn buildResponseHeaderContext(allocator: std.mem.Allocator, cfg: *const ServerCo
     appendResponseHeaderSlice(owned, &cursor, domain_headers);
     appendResponseHeaderSlice(owned, &cursor, route_headers);
     return .{ .items = owned, .owned = owned };
+}
+
+fn compressionPolicyFromConfig(cfg: *const ServerConfig) CompressionPolicy {
+    return .{
+        .enabled = cfg.compression_enabled,
+        .gzip_enabled = cfg.gzip_enabled,
+        .min_bytes = cfg.compression_min_bytes,
+        .max_bytes = cfg.compression_max_bytes,
+    };
+}
+
+fn responseHeaderRulesContain(headers: []const ResponseHeaderRule, name: []const u8) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    }
+    return false;
+}
+
+fn headerBlockContainsHeader(headers: ?[]const u8, name: []const u8) bool {
+    const raw_headers = headers orelse return false;
+    var lines = std.mem.splitSequence(u8, raw_headers, "\r\n");
+    while (lines.next()) |line| {
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const header_name = trimValue(trimmed[0..colon]);
+        if (std.ascii.eqlIgnoreCase(header_name, name)) return true;
+    }
+    return false;
+}
+
+fn h2HeadersContain(headers: []const h2_native.Header, name: []const u8) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    }
+    return false;
+}
+
+fn isCompressibleContentType(content_type: []const u8) bool {
+    const semicolon = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    const base = trimValue(content_type[0..semicolon]);
+    return std.mem.startsWith(u8, base, "text/") or
+        std.ascii.eqlIgnoreCase(base, "application/javascript") or
+        std.ascii.eqlIgnoreCase(base, "application/json") or
+        std.ascii.eqlIgnoreCase(base, "application/xml") or
+        std.ascii.eqlIgnoreCase(base, "application/wasm") or
+        std.ascii.eqlIgnoreCase(base, "image/svg+xml");
+}
+
+fn gzipCompressAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var output = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), body.len / 2));
+    errdefer output.deinit();
+
+    const work_buffer = try allocator.alloc(u8, DEFAULT_COMPRESSION_WORK_BUFFER_BYTES);
+    defer allocator.free(work_buffer);
+
+    const GzipCompressor = std.compress.flate.Compress;
+    const gzip = try allocator.create(GzipCompressor);
+    defer allocator.destroy(gzip);
+
+    gzip.* = try GzipCompressor.init(&output.writer, work_buffer, .gzip, .fastest);
+    try gzip.writer.writeAll(body);
+    try gzip.finish();
+    return output.toOwnedSlice();
+}
+
+const PreparedResponseBody = struct {
+    body: []const u8,
+    encoding: ?[]const u8 = null,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: PreparedResponseBody, allocator: std.mem.Allocator) void {
+        if (self.owned) |owned| allocator.free(owned);
+    }
+};
+
+fn prepareResponseBody(
+    allocator: std.mem.Allocator,
+    status_code: u16,
+    content_type: []const u8,
+    body: []const u8,
+    is_head: bool,
+    extra_headers: ?[]const u8,
+    h2_headers: []const h2_native.Header,
+) !PreparedResponseBody {
+    const policy = current_compression_policy;
+    if (!http_response.canSendBody(status_code, is_head) or
+        !policy.enabled or
+        !policy.gzip_enabled or
+        body.len < policy.min_bytes or
+        body.len > policy.max_bytes or
+        !isCompressibleContentType(content_type) or
+        !acceptsContentCoding(current_request_headers, "gzip") or
+        headerBlockContainsHeader(extra_headers, "Content-Encoding") or
+        h2HeadersContain(h2_headers, "content-encoding") or
+        responseHeaderRulesContain(current_response_headers, "Content-Encoding"))
+    {
+        return .{ .body = body };
+    }
+
+    const compressed = try gzipCompressAlloc(allocator, body);
+    if (compressed.len >= body.len) {
+        allocator.free(compressed);
+        return .{ .body = body };
+    }
+
+    server_metrics.compressedResponseSent(compressed.len);
+    return .{ .body = compressed, .encoding = "gzip", .owned = compressed };
 }
 
 fn parseContentLength(headers: []const u8) !usize {
@@ -1343,6 +1475,8 @@ const ServerMetrics = struct {
     static_sendfile_responses_total: std.atomic.Value(usize),
     static_buffered_responses_total: std.atomic.Value(usize),
     static_body_bytes_total: std.atomic.Value(usize),
+    compressed_responses_total: std.atomic.Value(usize),
+    compressed_body_bytes_total: std.atomic.Value(usize),
     upstream_requests_total: std.atomic.Value(usize),
     upstream_failures_total: std.atomic.Value(usize),
     upstream_retries_total: std.atomic.Value(usize),
@@ -1380,6 +1514,8 @@ const ServerMetrics = struct {
             .static_sendfile_responses_total = std.atomic.Value(usize).init(0),
             .static_buffered_responses_total = std.atomic.Value(usize).init(0),
             .static_body_bytes_total = std.atomic.Value(usize).init(0),
+            .compressed_responses_total = std.atomic.Value(usize).init(0),
+            .compressed_body_bytes_total = std.atomic.Value(usize).init(0),
             .upstream_requests_total = std.atomic.Value(usize).init(0),
             .upstream_failures_total = std.atomic.Value(usize).init(0),
             .upstream_retries_total = std.atomic.Value(usize).init(0),
@@ -1457,6 +1593,11 @@ const ServerMetrics = struct {
             .buffered => ServerMetrics.inc(&self.static_buffered_responses_total),
         }
         ServerMetrics.add(&self.static_body_bytes_total, body_bytes);
+    }
+
+    fn compressedResponseSent(self: *ServerMetrics, body_bytes: usize) void {
+        ServerMetrics.inc(&self.compressed_responses_total);
+        ServerMetrics.add(&self.compressed_body_bytes_total, body_bytes);
     }
 
     fn upstreamRequestStarted(self: *ServerMetrics) void {
@@ -2169,6 +2310,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.http3_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "http3_port")) {
         cfg.http3_port = try parseConfigU16(v);
+    } else if (std.mem.eql(u8, k, "compression") or std.mem.eql(u8, k, "compress") or std.mem.eql(u8, k, "encode")) {
+        cfg.compression_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "gzip") or std.mem.eql(u8, k, "gzip_enabled")) {
+        cfg.gzip_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "compression_min_bytes") or std.mem.eql(u8, k, "gzip_min_bytes")) {
+        cfg.compression_min_bytes = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "compression_max_bytes") or std.mem.eql(u8, k, "gzip_max_bytes")) {
+        cfg.compression_max_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
@@ -2797,6 +2946,9 @@ fn normalizeConfig(cfg: *ServerConfig) void {
     if (cfg.worker_stack_size < 16 * 1024) {
         cfg.worker_stack_size = 16 * 1024;
     }
+    if (cfg.compression_enabled and cfg.worker_stack_size < DEFAULT_COMPRESSION_WORKER_STACK_BYTES) {
+        cfg.worker_stack_size = DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
+    }
 }
 
 fn validateUpstreamPool(pool: UpstreamPoolConfig) !void {
@@ -2857,6 +3009,11 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.php_fastcgi) |endpoint| try validateFastcgiEndpoint(endpoint);
     if (!isSafeRelativeScriptPath(cfg.php_index)) return error.InvalidConfigValue;
     if (cfg.http3_enabled and cfg.http3_port == 0) return error.InvalidConfigValue;
+    if (cfg.compression_enabled) {
+        if (!cfg.gzip_enabled) return error.InvalidConfigValue;
+        if (cfg.compression_min_bytes == 0) return error.InvalidConfigValue;
+        if (cfg.compression_max_bytes < cfg.compression_min_bytes) return error.InvalidConfigValue;
+    }
     if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
     if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
@@ -3065,7 +3222,10 @@ fn sendCoolErrorWithConnectionOnly(
 }
 
 fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, extra_headers: ?[]const u8) !void {
-    const body_len = body.len;
+    const prepared = try prepareResponseBody(std.heap.page_allocator, status_code, content_type, body, false, extra_headers, &.{});
+    defer prepared.deinit(std.heap.page_allocator);
+
+    const body_len = prepared.body.len;
     var header_buffer: [4096]u8 = undefined;
     const base_headers = try http_response.formatHttp1BaseHeaders(&header_buffer, .{
         .status_code = status_code,
@@ -3079,10 +3239,13 @@ fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: 
     if (extra_headers) |headers| {
         try streamWriteAll(stream, headers);
     }
+    if (prepared.encoding) |encoding| {
+        try streamWriteFmt(stream, "Content-Encoding: {s}\r\nVary: Accept-Encoding\r\n", .{encoding});
+    }
     try streamWriteConfiguredResponseHeaders(stream);
     try streamWriteAll(stream, "\r\n");
 
-    if (body_len > 0) try streamWriteAll(stream, body);
+    if (body_len > 0) try streamWriteAll(stream, prepared.body);
     server_metrics.responseSent(status_code, body_len);
 }
 
@@ -3263,6 +3426,12 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             "# HELP layerline_static_buffered_responses_total Static file responses transferred through the buffered fallback.\n" ++
             "# TYPE layerline_static_buffered_responses_total counter\n" ++
             "layerline_static_buffered_responses_total {d}\n" ++
+            "# HELP layerline_compressed_responses_total Responses compressed by Layerline before write.\n" ++
+            "# TYPE layerline_compressed_responses_total counter\n" ++
+            "layerline_compressed_responses_total {d}\n" ++
+            "# HELP layerline_compressed_body_bytes_total Compressed response body bytes written by Layerline.\n" ++
+            "# TYPE layerline_compressed_body_bytes_total counter\n" ++
+            "layerline_compressed_body_bytes_total {d}\n" ++
             "# HELP layerline_upstream_requests_total Reverse proxy upstream forwarding attempts.\n" ++
             "# TYPE layerline_upstream_requests_total counter\n" ++
             "layerline_upstream_requests_total {d}\n" ++
@@ -3322,6 +3491,8 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.static_responses_total),
             ServerMetrics.load(&server_metrics.static_sendfile_responses_total),
             ServerMetrics.load(&server_metrics.static_buffered_responses_total),
+            ServerMetrics.load(&server_metrics.compressed_responses_total),
+            ServerMetrics.load(&server_metrics.compressed_body_bytes_total),
             ServerMetrics.load(&server_metrics.upstream_requests_total),
             ServerMetrics.load(&server_metrics.upstream_failures_total),
             ServerMetrics.load(&server_metrics.upstream_retries_total),
@@ -3459,19 +3630,36 @@ fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content
     );
 }
 
+fn contentCodingQAllows(item: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, item, ';');
+    _ = parts.next();
+    while (parts.next()) |part| {
+        const param = trimValue(part);
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        const name = trimValue(param[0..eq]);
+        if (!std.ascii.eqlIgnoreCase(name, "q")) continue;
+        const value = trimValue(param[eq + 1 ..]);
+        const q = std.fmt.parseFloat(f64, value) catch return false;
+        return q > 0.0;
+    }
+    return true;
+}
+
 fn acceptsContentCoding(request_headers: []const u8, coding: []const u8) bool {
     const raw = findHeaderValue(request_headers, "Accept-Encoding") orelse return false;
+    var wildcard_allowed: ?bool = null;
     var cursor = raw;
     while (cursor.len > 0) {
         const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
         const item = trimValue(cursor[0..comma_pos]);
         const semicolon_pos = std.mem.indexOfScalar(u8, item, ';') orelse item.len;
         const token = trimValue(item[0..semicolon_pos]);
-        if (std.mem.eql(u8, token, "*") or std.ascii.eqlIgnoreCase(token, coding)) return true;
+        if (std.ascii.eqlIgnoreCase(token, coding)) return contentCodingQAllows(item);
+        if (std.mem.eql(u8, token, "*")) wildcard_allowed = contentCodingQAllows(item);
         if (comma_pos >= cursor.len) break;
         cursor = cursor[comma_pos + 1 ..];
     }
-    return false;
+    return wildcard_allowed orelse false;
 }
 
 fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
@@ -4530,18 +4718,25 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
     var header_block = std.ArrayList(u8).empty;
     defer header_block.deinit(allocator);
 
+    const prepared = try prepareResponseBody(allocator, response.status_code, response.content_type, response.body, is_head, null, response.headers);
+    defer prepared.deinit(allocator);
+
     try h2_native.appendStatus(allocator, &header_block, response.status_code);
     try h2_native.appendHeaderIndexedName(allocator, &header_block, 54, SERVER_HEADER);
     try h2_native.appendHeaderIndexedName(allocator, &header_block, 31, response.content_type);
 
     var len_buf: [32]u8 = undefined;
-    const body_len = if (http_response.canSendBody(response.status_code, is_head)) response.body.len else 0;
+    const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
     const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{body_len});
     try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
 
     for (response.headers) |header| {
         if (isSkippedHttp2ResponseHeader(header.name)) continue;
         try appendHttp2Header(allocator, &header_block, header.name, header.value);
+    }
+    if (prepared.encoding) |encoding| {
+        try appendHttp2Header(allocator, &header_block, "content-encoding", encoding);
+        try appendHttp2Header(allocator, &header_block, "vary", "Accept-Encoding");
     }
     for (current_response_headers) |header| {
         if (isSkippedHttp2ResponseHeader(header.name)) continue;
@@ -4556,7 +4751,7 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
         while (sent < body_len) {
             const chunk_len = @min(@as(usize, 16 * 1024), body_len - sent);
             const flags = if (sent + chunk_len == body_len) h2_native.FLAG_END_STREAM else @as(u8, 0);
-            try sendHttp2Frame(stream, h2_native.FRAME_DATA, flags, stream_id, response.body[sent .. sent + chunk_len]);
+            try sendHttp2Frame(stream, h2_native.FRAME_DATA, flags, stream_id, prepared.body[sent .. sent + chunk_len]);
             sent += chunk_len;
         }
     }
@@ -5036,6 +5231,12 @@ fn handleHttp2HeadersFrame(
         try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
         return;
     };
+    current_request_headers = req.headers;
+    current_compression_policy = compressionPolicyFromConfig(cfg);
+    defer {
+        current_request_headers = "";
+        current_compression_policy = .disabled;
+    }
 
     if ((frame.header.flags & h2_native.FLAG_END_STREAM) == 0) {
         const response = try h2CoolErrorResponse(allocator, 501, "Not Implemented", "HTTP/2 request bodies are not supported in this route path yet.");
@@ -7510,6 +7711,10 @@ test "named routes prefer exact and longest prefix matches" {
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
+        .compression_enabled = false,
+        .gzip_enabled = true,
+        .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
+        .compression_max_bytes = DEFAULT_COMPRESSION_MAX_BYTES,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -7573,6 +7778,9 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_idle", "12");
     try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_idle_timeout_ms", "35000");
     try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_requests", "125");
+    try applyConfigLine(&cfg, allocator, "compression", "true");
+    try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
+    try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -7601,6 +7809,12 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 12), cfg.fastcgi_keepalive_max_idle);
     try std.testing.expectEqual(@as(u32, 35000), cfg.fastcgi_keepalive_idle_timeout_ms);
     try std.testing.expectEqual(@as(usize, 125), cfg.fastcgi_keepalive_max_requests);
+    try std.testing.expect(cfg.compression_enabled);
+    try std.testing.expect(cfg.gzip_enabled);
+    try std.testing.expectEqual(@as(usize, 128), cfg.compression_min_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
+    normalizeConfig(&cfg);
+    try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
     try std.testing.expect(cfg.upstream_health_check_enabled);
     try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
     try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
@@ -7866,6 +8080,41 @@ test "health check status parser accepts normal HTTP status lines" {
     try std.testing.expectEqual(@as(?u16, null), parseHttpStatusCode("not-http\r\n\r\n"));
 }
 
+test "accept encoding q values control gzip negotiation" {
+    try std.testing.expect(acceptsContentCoding("Accept-Encoding: br, gzip\r\n", "gzip"));
+    try std.testing.expect(acceptsContentCoding("Accept-Encoding: *;q=0.5\r\n", "gzip"));
+    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: gzip;q=0, br\r\n", "gzip"));
+    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: *;q=1, gzip;q=0\r\n", "gzip"));
+    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: gzip;q=0.0\r\n", "gzip"));
+}
+
+test "gzip response preparation compresses eligible text bodies" {
+    var body: [2048]u8 = undefined;
+    @memset(&body, 'a');
+
+    current_request_headers = "Accept-Encoding: gzip\r\n";
+    current_response_headers = &.{};
+    current_compression_policy = .{
+        .enabled = true,
+        .gzip_enabled = true,
+        .min_bytes = 1,
+        .max_bytes = 4096,
+    };
+    defer {
+        current_request_headers = "";
+        current_response_headers = &.{};
+        current_compression_policy = .disabled;
+    }
+
+    const prepared = try prepareResponseBody(std.testing.allocator, 200, "text/plain; charset=utf-8", &body, false, null, &.{});
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("gzip", prepared.encoding.?);
+    try std.testing.expect(prepared.body.len < body.len);
+    try std.testing.expectEqual(@as(u8, 0x1f), prepared.body[0]);
+    try std.testing.expectEqual(@as(u8, 0x8b), prepared.body[1]);
+}
+
 test "chunked upstream body scanner detects trailers and terminator" {
     var scanner = ChunkedBodyScanner{};
     var completed = false;
@@ -7921,6 +8170,12 @@ fn routeRequest(
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
     const domain = findDomainForRequestMutable(cfg, req.headers);
+    current_request_headers = req.headers;
+    current_compression_policy = compressionPolicyFromConfig(cfg);
+    defer {
+        current_request_headers = "";
+        current_compression_policy = .disabled;
+    }
 
     const base_header_context = try buildResponseHeaderContext(allocator, cfg, domain, null);
     defer base_header_context.deinit(allocator);
@@ -9860,7 +10115,7 @@ fn usage() void {
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
@@ -9874,7 +10129,7 @@ fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
@@ -9960,6 +10215,10 @@ pub fn main(init: std.process.Init) !void {
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
+        .compression_enabled = false,
+        .gzip_enabled = true,
+        .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
+        .compression_max_bytes = DEFAULT_COMPRESSION_MAX_BYTES,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -10207,6 +10466,30 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.http3_port = std.fmt.parseInt(u16, value, 10) catch cfg.http3_port;
+        } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "--compress") or std.mem.eql(u8, arg, "--encode")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.compression_enabled = parseBool(value) orelse cfg.compression_enabled;
+        } else if (std.mem.eql(u8, arg, "--gzip")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.gzip_enabled = parseBool(value) orelse cfg.gzip_enabled;
+        } else if (std.mem.eql(u8, arg, "--compression-min-bytes") or std.mem.eql(u8, arg, "--gzip-min-bytes")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.compression_min_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.compression_min_bytes;
+        } else if (std.mem.eql(u8, arg, "--compression-max-bytes") or std.mem.eql(u8, arg, "--gzip-max-bytes")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.compression_max_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.compression_max_bytes;
         } else if (std.mem.eql(u8, arg, "--max-request-bytes")) {
             const value = args.next() orelse {
                 usage();
