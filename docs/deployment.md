@@ -123,6 +123,12 @@ printf 'status\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
 ```
 
+For a local release candidate before copying files onto the host, run the self-starting verifier:
+
+```bash
+./scripts/verify-layerline.sh
+```
+
 If HTTP/2 is enabled through native TLS or h2c testing, add:
 
 ```bash

@@ -33,7 +33,7 @@ Commit each section independently after tests and at least one live smoke where 
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config. Initial read-only status/validate/routes/metrics commands are implemented; reload and mutating controls remain.
 11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands. Initial templates and runbook are implemented.
-12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke.
+12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke. Initial self-starting verifier covers HTTP/1, h2c, gzip, admin socket, static files, and shutdown cleanup.
 
 ## Not Ready Means Not Ready
 

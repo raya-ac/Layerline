@@ -42,6 +42,7 @@ The next roadmap slice is HTTP/2 request-body/flow-control hardening and richer 
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, h2c, gzip, admin socket, static files, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -61,6 +62,12 @@ zig build run -- --help
 zig build run -- --config server.conf
 zig build run -- --port 4000
 zig build run -- --port 8080 --dir public
+```
+
+Run the self-starting local verification harness:
+
+```bash
+./scripts/verify-layerline.sh
 ```
 
 ## Config file
