@@ -3647,16 +3647,21 @@ const RawProxyContext = struct {
     io: std.Io,
     src: std.Io.net.Stream,
     dst: std.Io.net.Stream,
+    tls_channel: ?*TlsChannel = null,
 };
 
 fn proxyRawStream(ctx: RawProxyContext) void {
     bindThreadIo(ctx.io);
+    current_tls_channel = ctx.tls_channel;
+    defer current_tls_channel = null;
+
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = streamRead(ctx.src, &buf) catch return;
-        if (n == 0) return;
-        streamWriteAll(ctx.dst, buf[0..n]) catch return;
+        const n = streamRead(ctx.src, &buf) catch break;
+        if (n == 0) break;
+        streamWriteAll(ctx.dst, buf[0..n]) catch break;
     }
+    ctx.dst.shutdown(activeIo(), .send) catch {};
 }
 
 fn proxyRawBidirectional(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_payload: []const u8) !void {
@@ -3665,15 +3670,16 @@ fn proxyRawBidirectional(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_pay
     }
 
     const io = activeIo();
+    const tls_channel = current_tls_channel;
     const t1 = try std.Thread.spawn(
         .{},
         proxyRawStream,
-        .{RawProxyContext{ .io = io, .src = a, .dst = b }},
+        .{RawProxyContext{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel }},
     );
     const t2 = try std.Thread.spawn(
         .{},
         proxyRawStream,
-        .{RawProxyContext{ .io = io, .src = b, .dst = a }},
+        .{RawProxyContext{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel }},
     );
     t1.join();
     t2.join();
@@ -5352,6 +5358,12 @@ fn isSkippedProxyHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Host");
 }
 
+fn isHttpUpgradeRequest(req: HttpRequest) bool {
+    const upgrade = findHeaderValue(req.headers, "Upgrade") orelse return false;
+    const connection = findHeaderValue(req.headers, "Connection") orelse return false;
+    return trimValue(upgrade).len > 0 and hasConnectionToken(connection, "upgrade");
+}
+
 fn isSkippedProxyResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "Connection") or
         std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
@@ -5688,12 +5700,34 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
     return .{ .reusable = false };
 }
 
+fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream) !void {
+    var response_buffer: [DEFAULT_MAX_REQUEST_BYTES]u8 = undefined;
+    var used: usize = 0;
+
+    while (used < response_buffer.len) {
+        const n = try streamRead(upstream_conn, response_buffer[used..]);
+        if (n == 0) return error.BadGateway;
+        used += n;
+        if (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") != null) break;
+    }
+
+    const header_end = (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") orelse return error.BadGateway) + 4;
+    const header_bytes = response_buffer[0..header_end];
+    const body_tail = response_buffer[header_end..used];
+    const status_code = parseHttpStatusCode(header_bytes) orelse return error.BadGateway;
+    if (status_code != 101) return error.BadGateway;
+
+    streamWriteAll(stream, header_bytes) catch return error.CloseConnection;
+    try proxyRawBidirectional(upstream_conn, stream, body_tail);
+}
+
 fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32) !void {
     if (upstream.https) {
         return error.UnsupportedUpstreamScheme;
     }
 
-    const keepalive_enabled = upstreamKeepaliveConfigured(cfg);
+    const upgrade_request = isHttpUpgradeRequest(req);
+    const keepalive_enabled = upstreamKeepaliveConfigured(cfg) and !upgrade_request;
     const lease = try upstreamAcquireConnection(allocator, upstream, cfg, upstreamNowMs());
     var lease_released = false;
     defer if (!lease_released) {
@@ -5728,9 +5762,12 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
             req.method,
             proxy_path,
             forwarded_host,
-            if (keepalive_enabled) "keep-alive" else "close",
+            if (upgrade_request) "Upgrade" else if (keepalive_enabled) "keep-alive" else "close",
         },
     );
+    if (upgrade_request) {
+        try out.print(allocator, "Upgrade: {s}\r\n", .{trimValue(findHeaderValue(req.headers, "Upgrade").?)});
+    }
 
     var saw_forwarded_host = false;
     var saw_forwarded_proto = false;
@@ -5754,11 +5791,11 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{forwarded_host});
     if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
 
-    try out.print(
-        allocator,
-        "Content-Length: {d}\r\n\r\n",
-        .{req.body.len},
-    );
+    if (upgrade_request and req.body.len == 0) {
+        try out.appendSlice(allocator, "\r\n");
+    } else {
+        try out.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
+    }
     const request_line = try out.toOwnedSlice(allocator);
     defer allocator.free(request_line);
 
@@ -5775,6 +5812,11 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
             },
             else => |e| return e,
         };
+    }
+
+    if (upgrade_request) {
+        try forwardUpgradeResponse(stream, lease.stream);
+        return error.CloseConnection;
     }
 
     const result = forwardUpstreamResponse(stream, lease.stream, req) catch |err| switch (err) {

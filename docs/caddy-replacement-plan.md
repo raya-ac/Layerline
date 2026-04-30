@@ -24,7 +24,7 @@ Commit each section independently after tests and at least one live smoke where 
 
 1. Replacement readiness document and acceptance checklist.
 2. Route/domain backend policy: timeout inheritance, route-local proxy/PHP/FastCGI controls, and route dump visibility.
-3. WebSocket and raw upgrade proxying for HTTP/1.1 upstreams.
+3. WebSocket and raw upgrade proxying for HTTP/1.1 upstreams. Initial route/domain proxy support for `101 Switching Protocols` tunnels is implemented; CONNECT and HTTP/2 extended CONNECT remain.
 4. FastCGI pooling with max idle, max requests, idle expiry, and forced close on unsafe responses.
 5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health.
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
