@@ -20,6 +20,7 @@ TMP_DIR=$(mktemp -d)
 SOCKET="$TMP_DIR/layerline-admin.sock"
 ADMIN_CREDS="$TMP_DIR/layerline-admin.creds"
 ACCESS_LOG="$TMP_DIR/access.log"
+SITE_DIR="$TMP_DIR/domains-enabled"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -81,6 +82,7 @@ host = $HOST
 port = $PORT
 dir = public
 serve_static_root = true
+domain_config_dir = $SITE_DIR
 admin_socket = $SOCKET
 admin_ui = true
 admin_ui_path = /_layerline/admin
@@ -90,6 +92,7 @@ compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
 CONF
+mkdir -p "$SITE_DIR"
 
 log "starting temporary server on http://$HOST:$PORT"
 (
@@ -110,13 +113,15 @@ ok "static file route"
 
 GZIP_HEADERS="$TMP_DIR/gzip.headers"
 GZIP_BODY="$TMP_DIR/gzip.body"
-curl -fsS --raw -D "$GZIP_HEADERS" -o "$GZIP_BODY" -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/"
+GZIP_PAYLOAD=$(printf 'layerline%.0s' {1..200})
+GZIP_URL="http://$HOST:$PORT/api/echo?msg=$GZIP_PAYLOAD"
+curl -fsS --raw -D "$GZIP_HEADERS" -o "$GZIP_BODY" -H 'Accept-Encoding: gzip' "$GZIP_URL"
 header_has "$GZIP_HEADERS" '^Content-Encoding: gzip' || die "gzip response header missing"
 [[ $(od -An -tx1 -N2 "$GZIP_BODY" | tr -d ' \n') == 1f8b ]] || die "gzip response did not start with gzip magic"
 ok "HTTP/1 gzip response"
 
 IDENTITY_HEADERS="$TMP_DIR/identity.headers"
-curl -fsS --raw -D "$IDENTITY_HEADERS" -o /dev/null -H 'Accept-Encoding: gzip;q=0' "http://$HOST:$PORT/"
+curl -fsS --raw -D "$IDENTITY_HEADERS" -o /dev/null -H 'Accept-Encoding: gzip;q=0' "$GZIP_URL"
 if header_has "$IDENTITY_HEADERS" '^Content-Encoding: gzip'; then
   die "gzip q=0 response was compressed"
 fi
@@ -125,7 +130,7 @@ ok "gzip q=0 negotiation"
 if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_HEADERS="$TMP_DIR/h2.headers"
   H2_BODY="$TMP_DIR/h2.body"
-  curl -fsS --http2-prior-knowledge --raw -D "$H2_HEADERS" -o "$H2_BODY" -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/"
+  curl -fsS --http2-prior-knowledge --raw -D "$H2_HEADERS" -o "$H2_BODY" -H 'Accept-Encoding: gzip' "$GZIP_URL"
   header_has "$H2_HEADERS" '^content-encoding: gzip' || die "h2 gzip response header missing"
   [[ $(od -An -tx1 -N2 "$H2_BODY" | tr -d ' \n') == 1f8b ]] || die "h2 gzip response did not start with gzip magic"
   ok "h2c gzip response"
@@ -200,8 +205,19 @@ ok "admin UI requires login"
 ADMIN_DASH_BODY="$TMP_DIR/admin-dashboard.body"
 curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
 grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "admin UI dashboard was not served with setup cookie"
+grep -Fq 'Add site' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include site management"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 ok "admin UI authenticated dashboard"
+
+curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-add-site.body" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'name=verify&server_names=verify.test+www.verify.test&root=public&index=index.html&serve_static_root=on&proxy=http%3A%2F%2F127.0.0.1%3A9000&upstream_policy=least_connections' \
+  "$ADMIN_URL/sites/add"
+[[ -s "$SITE_DIR/verify.conf" ]] || die "admin UI did not create a site config file"
+grep -Fq 'server_name = verify.test www.verify.test' "$SITE_DIR/verify.conf" || die "admin site config missing server names"
+grep -Fq 'proxy = http://127.0.0.1:9000' "$SITE_DIR/verify.conf" || die "admin site config missing proxy"
+grep -Fq 'Created ' "$TMP_DIR/admin-add-site.body" || die "admin add-site response did not confirm creation"
+ok "admin UI creates site configs"
 
 [[ -s $ACCESS_LOG ]] || die "access log was not written"
 grep -Fq '"method":"GET"' "$ACCESS_LOG" || die "access log missing method"

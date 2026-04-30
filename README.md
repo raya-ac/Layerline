@@ -1,4 +1,9 @@
-# Layerline (Zig HTTP Server)
+# Layerline
+
+Modern Zig web server for direct edge serving: static sites, PHP, reverse proxying, virtual hosts, TLS, metrics, admin controls, and native HTTP/2/HTTP/3 work.
+
+- Website: [layerline.dev](https://layerline.dev)
+- Repository: [github.com/raya-ac/Layerline](https://github.com/raya-ac/Layerline)
 
 This is a practical build that blends local serving with edge-style deployment:
 
@@ -38,6 +43,8 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 
 - `src/main.zig` – server implementation.
 - `build.zig` – Zig build script.
+- `public/index.html` and `public/site.css` – the Layerline website served when `serve_static_root = true`.
+- `public/laina.png` – Laina, the Layerline route-operator mascot used by the website.
 - `public/hello.txt` – sample static file.
 - `public/index.php` – sample php endpoint (if PHP binary is installed and configured).
 - `server.conf` – sample config file.
@@ -292,11 +299,25 @@ The browser admin UI is disabled by default. Enable it only on a trusted admin p
 admin_ui = true
 admin_ui_path = /_layerline/admin
 admin_credentials_path = /etc/layerline/admin.credentials
+domain_config_dir = domains-enabled
 ```
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The first dashboard is intentionally conservative: status, routes, certificate posture, and metrics are visible from the same process that is serving traffic. Mutating controls like reload still need the safe config snapshot work from the roadmap.
+The dashboard is now an actual control surface: it lists active virtual hosts, shows enabled domain config files, validates the runtime config, exposes status/routes/certs/metrics, and can create new nginx-style site files under `domain_config_dir`. Site-file writes are deliberately staged: restart Layerline for new sites to become active until the hot-reload config snapshot work lands.
+
+## Website and branding
+
+The default repository website lives in `public/index.html` and `public/site.css`. With `serve_static_root = true`, Layerline serves it at `/` before falling back to the built-in diagnostic homepage. The site presents Layerline as a production web server project, links to GitHub, shows setup snippets, compares the current feature surface with Caddy and nginx, and uses the Laina mascot asset from `public/laina.png`.
+
+For a site config:
+
+```conf
+dir = public
+serve_static_root = true
+index_file = index.html
+domain_config_dir = domains-enabled
+```
 
 ## Access Logs
 

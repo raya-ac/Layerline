@@ -30,7 +30,7 @@ Sources:
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields. Initial opt-in JSON access logs are implemented for HTTP/1 and HTTP/2 request handling with method, path, query, host, protocol, status, bytes, latency, handler, route error, and upstream target fields; request IDs, TLS fields, and h3 logging remain.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
-- Expand the admin control UI beyond the implemented first-launch setup/login dashboard into reload, upstream drain/eject, cert renewal, config diff, and redacted config inspection.
+- Expand the admin control UI beyond the implemented first-launch setup/login dashboard and site-file controls into hot reload, upstream drain/eject, cert renewal, config diff, and redacted config inspection.
 
 ## Phase 2: Static Files and Content Handling
 
@@ -115,8 +115,8 @@ Sources:
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, and consumed-body WINDOW_UPDATE; GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
-10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; reload and mutating upstream/cert controls remain.
+10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, enabled domain files, runtime validation, and new site-file creation. Hot reload plus live upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
-12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
+12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, admin site-file creation, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
 The next engineering milestone should be HTTP/2 GOAWAY/connection policy, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
