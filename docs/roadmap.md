@@ -24,7 +24,7 @@ Sources:
 
 ## Phase 1: Core Server Correctness
 
-- Harden HTTP/1 parsing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, and strict keep-alive semantics.
+- Harden HTTP/1 parsing and response framing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, HEAD/error response body suppression, and strict keep-alive semantics.
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control.
@@ -117,6 +117,6 @@ Sources:
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
 10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; reload and mutating upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
-12. Conformance harness. Initial self-starting verifier covers HTTP/1, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
+12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
 The next engineering milestone should be HTTP/2 GOAWAY/connection policy, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

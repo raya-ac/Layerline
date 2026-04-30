@@ -138,6 +138,13 @@ else
 fi
 
 require_command nc
+require_command perl
+
+HEAD_404_RAW="$TMP_DIR/head-404.raw"
+printf 'HEAD /missing-head-check HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$HEAD_404_RAW"
+grep -Fq '404 Not Found' "$HEAD_404_RAW" || die "HEAD 404 did not return 404"
+perl -0ne 'exit(/\r\n\r\n\z/ ? 0 : 1)' "$HEAD_404_RAW" || die "HEAD 404 response included a body"
+ok "HEAD 404 has no body"
 
 ADMIN_STATUS=$(printf 'status\n' | nc -U "$SOCKET")
 case "$ADMIN_STATUS" in

@@ -44,7 +44,7 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, h2c, h2 request bodies, gzip, admin socket, static files, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, gzip, admin socket, static files, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.

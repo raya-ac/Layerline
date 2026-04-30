@@ -6,7 +6,7 @@ Layerline is not a Caddy replacement until it can be the public edge for normal 
 
 Layerline can replace Caddy for `layerline.dev` or similar sites only after these gates pass:
 
-- Static files, PHP/FastCGI, and reverse proxy routes work from nginx-style per-domain config files.
+- Static files, PHP/FastCGI, reverse proxy routes, and HEAD/error response framing work from nginx-style per-domain config files.
 - TLS can load configured certs and keep serving HTTP/1.1 and HTTP/2 through ALPN.
 - ACME renewal is automated or the deployment has a documented certbot/webroot renewal path. Initial in-process `certbot renew --webroot` scheduling is implemented; live TLS material reload still depends on the hot-reload work.
 - WebSocket upgrade proxying works for app frameworks and realtime dashboards.
@@ -33,7 +33,7 @@ Commit each section independently after tests and at least one live smoke where 
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API and web UI: validate, reload, routes, metrics, upstream health, cert status, redacted config, and authenticated browser controls. Initial read-only Unix socket commands plus first-launch browser setup/login/dashboard are implemented; reload and mutating controls remain.
 11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands. Initial templates and runbook are implemented.
-12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke. Initial self-starting verifier covers HTTP/1, h2c, h2 request bodies, gzip, admin socket, admin web first-launch flow, static files, and shutdown cleanup.
+12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, h2c, h2 request bodies, gzip, admin socket, admin web first-launch flow, static files, and shutdown cleanup.
 
 ## Not Ready Means Not Ready
 

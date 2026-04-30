@@ -3479,7 +3479,11 @@ fn sendNotFound(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
 }
 
 fn sendNotFoundWithConnection(allocator: std.mem.Allocator, stream: std.Io.net.Stream, close_connection: bool) !void {
-    try sendCoolErrorWithConnectionOnly(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.", close_connection);
+    try sendNotFoundForMethod(allocator, stream, close_connection, false);
+}
+
+fn sendNotFoundForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
+    try sendCoolErrorWithConnection(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.", close_connection, is_head, null);
 }
 
 fn sendBadRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8) !void {
@@ -3487,7 +3491,11 @@ fn sendBadRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reaso
 }
 
 fn sendBadRequestWithConnection(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8, close_connection: bool) !void {
-    try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", reason, close_connection, false, null);
+    try sendBadRequestForMethod(allocator, stream, reason, close_connection, false);
+}
+
+fn sendBadRequestForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8, close_connection: bool, is_head: bool) !void {
+    try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", reason, close_connection, is_head, null);
 }
 
 fn sendMethodNotAllowed(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
@@ -4554,7 +4562,7 @@ fn handleAdminUi(
         return;
     }
     if (!(std.mem.eql(u8, method, "GET") or is_head or std.mem.eql(u8, method, "POST"))) {
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
+        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
         return;
     }
 
@@ -4569,7 +4577,7 @@ fn handleAdminUi(
             try sendAdminSetupPage(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
             return;
         }
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
+        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
         return;
     }
 
@@ -4599,7 +4607,7 @@ fn handleAdminUi(
         return;
     }
 
-    try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
+    try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
 }
 
 fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
@@ -4707,10 +4715,10 @@ fn serveAdminSocketTask(ctx: AdminSocketContext) void {
     }
 }
 
-fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool) !void {
+fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool, is_head: bool) !void {
     const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allowed_methods});
     defer allocator.free(allow_header);
-    try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, false, allow_header);
+    try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, is_head, allow_header);
 }
 
 const ByteRange = struct {
@@ -4910,7 +4918,7 @@ fn serveStatic(
     // Static paths are deliberately boring: no parent hops, no backslashes, no
     // directory listings. If it is not a plain file, it is not served.
     if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null or std.mem.indexOfScalar(u8, rel_path, '\\') != null) {
-        try sendBadRequestWithConnection(allocator, stream, "Invalid static file path.", close_connection);
+        try sendBadRequestForMethod(allocator, stream, "Invalid static file path.", close_connection, is_head);
         return;
     }
 
@@ -4919,11 +4927,11 @@ fn serveStatic(
 
     var stat = statRegularFile(io, file_path) catch |err| {
         if (err == error.NotDir or err == error.FileNotFound) {
-            try sendNotFoundWithConnection(allocator, stream, close_connection);
+            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
             return;
         }
         if (err == error.NotFile) {
-            try sendNotFoundWithConnection(allocator, stream, close_connection);
+            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
             return;
         }
         return err;
@@ -4965,7 +4973,7 @@ fn serveStatic(
             "Payload Too Large",
             "Static file is too large for configured limits.",
             close_connection,
-            false,
+            is_head,
             null,
         );
         return;
@@ -4993,7 +5001,7 @@ fn serveStatic(
                 return;
             },
             error.BadRequest => {
-                try sendBadRequestWithConnection(allocator, stream, "Invalid Range header.", close_connection);
+                try sendBadRequestForMethod(allocator, stream, "Invalid Range header.", close_connection, is_head);
                 return;
             },
         };
@@ -5033,7 +5041,7 @@ fn serveAcmeChallenge(
     is_head: bool,
 ) !void {
     if (token.len == 0 or std.mem.indexOf(u8, token, "..") != null or std.mem.indexOfScalar(u8, token, '\\') != null or std.mem.indexOfScalar(u8, token, '/') != null) {
-        try sendBadRequestWithConnection(allocator, stream, "Invalid ACME challenge path.", close_connection);
+        try sendBadRequestForMethod(allocator, stream, "Invalid ACME challenge path.", close_connection, is_head);
         return;
     }
 
@@ -5042,11 +5050,11 @@ fn serveAcmeChallenge(
 
     const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
         if (err == error.StreamTooLong) {
-            try sendCoolErrorWithConnection(stream, allocator, 413, "Payload Too Large", "ACME challenge file is too large.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 413, "Payload Too Large", "ACME challenge file is too large.", close_connection, is_head, null);
             return;
         }
         if (err == error.NotDir or err == error.FileNotFound) {
-            try sendNotFoundWithConnection(allocator, stream, close_connection);
+            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
             return;
         }
         return err;
@@ -5055,7 +5063,7 @@ fn serveAcmeChallenge(
 
     // ACME files are expected to be small; enforce strict plaintext response.
     if (data.len > 0 and std.mem.indexOfScalar(u8, data, 0) != null) {
-        try sendNotFoundWithConnection(allocator, stream, close_connection);
+        try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
         return;
     }
 
@@ -7920,8 +7928,9 @@ fn forwardToUpstreamPool(
     req: HttpRequest,
     cfg: *const ServerConfig,
 ) !void {
+    const is_head = std.mem.eql(u8, req.method, "HEAD");
     if (pool.targets.items.len == 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, false, null);
+        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, is_head, null);
         return;
     }
 
@@ -7976,23 +7985,23 @@ fn forwardToUpstreamPool(
     }
 
     if (attempts == 0 and skipped_ejected > 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.", true, false, null);
+        try sendCoolErrorWithConnection(stream, allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.", true, is_head, null);
         return;
     }
 
     if (last_error) |err| switch (err) {
         error.RequestTimeout => {
-            try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out.", true, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out.", true, is_head, null);
             return;
         },
         error.UnsupportedUpstreamScheme => {
-            try sendCoolErrorWithConnection(stream, allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this single-file server path. Use HTTPS reverse proxy in front of this binary.", true, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this single-file server path. Use HTTPS reverse proxy in front of this binary.", true, is_head, null);
             return;
         },
         else => {},
     };
 
-    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "All configured upstream attempts failed.", true, false, null);
+    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "All configured upstream attempts failed.", true, is_head, null);
 }
 
 fn handlePhp(
@@ -8472,24 +8481,24 @@ fn handlePhpFastcgi(
 ) !void {
     const result = runPhpFastcgiRequest(allocator, cfg, req, php_root, php_fastcgi, script_path, script_name, path_info, timeout_ms) catch |err| switch (err) {
         error.InvalidFastcgiEndpoint => {
-            try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid.", close_connection, is_head, null);
             return;
         },
         error.FastcgiConnectFailed => {
             std.debug.print("PHP FastCGI connect failed for {s}\n", .{php_fastcgi});
-            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached.", close_connection, is_head, null);
             return;
         },
         error.StreamTooLong => {
-            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI response exceeded max_php_output_bytes.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI response exceeded max_php_output_bytes.", close_connection, is_head, null);
             return;
         },
         error.FastcgiProtocolFailed => {
-            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI request did not complete cleanly.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI request did not complete cleanly.", close_connection, is_head, null);
             return;
         },
         error.FastcgiAppFailed => {
-            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI app returned a non-zero status.", close_connection, false, null);
+            try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI app returned a non-zero status.", close_connection, is_head, null);
             return;
         },
         else => |e| return e,
@@ -8569,7 +8578,7 @@ fn handlePhpScript(
 ) !void {
     const rel_path = script_rel_path;
     if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null) {
-        try sendNotFoundWithConnection(allocator, stream, close_connection);
+        try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
         return;
     }
 
@@ -8577,11 +8586,11 @@ fn handlePhpScript(
     defer allocator.free(script_path);
 
     const script_stat = std.Io.Dir.cwd().statFile(io, script_path, .{}) catch {
-        try sendNotFoundWithConnection(allocator, stream, close_connection);
+        try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
         return;
     };
     if (script_stat.kind != .file) {
-        try sendNotFoundWithConnection(allocator, stream, close_connection);
+        try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
         return;
     }
 
@@ -8593,7 +8602,7 @@ fn handlePhpScript(
     }
 
     if (php_binary.len == 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP support is not configured for this server.", close_connection, false, null);
+        try sendCoolErrorWithConnection(stream, allocator, 500, "Server Error", "PHP support is not configured for this server.", close_connection, is_head, null);
         return;
     }
 
@@ -8666,7 +8675,7 @@ fn handlePhpScript(
             "Bad Gateway",
             "PHP worker could not be started. Check php_bin and make sure php-cgi is installed or configured with an absolute path.",
             close_connection,
-            false,
+            is_head,
             null,
         );
         return;
@@ -8693,7 +8702,7 @@ fn handlePhpScript(
                     "Bad Gateway",
                     "PHP response exceeded max_php_output_bytes.",
                     close_connection,
-                    false,
+                    is_head,
                     null,
                 );
                 return;
@@ -8716,7 +8725,7 @@ fn handlePhpScript(
                     "Bad Gateway",
                     "PHP process exited with a non-zero status.",
                     close_connection,
-                    false,
+                    is_head,
                     null,
                 );
                 return;
@@ -8730,7 +8739,7 @@ fn handlePhpScript(
                 "Bad Gateway",
                 "PHP process terminated abnormally.",
                 close_connection,
-                false,
+                is_head,
                 null,
             );
             return;
@@ -9062,7 +9071,7 @@ fn handleNamedRoute(
         .static => {
             accessLogSetHandler("route_static");
             if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
-                try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection);
+                try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection, is_head);
                 return;
             }
             const static_dir = route.static_dir orelse domainStaticDir(cfg, domain);
@@ -9075,7 +9084,7 @@ fn handleNamedRoute(
         .php => {
             accessLogSetHandler("route_php");
             if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
-                try sendNotFoundWithConnection(allocator, stream, close_connection);
+                try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
                 return;
             }
             const php_root = route.php_root orelse domainPhpRoot(cfg, domain);
@@ -9096,7 +9105,7 @@ fn handleNamedRoute(
                 route_pool
             else
                 domainUpstreamMutable(cfg, domain) orelse {
-                    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
+                    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, is_head, null);
                     return;
                 };
             try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), routeUpstreamTimeoutMs(cfg, domain, route), req, cfg);
@@ -10105,7 +10114,7 @@ fn routeRequest(
         }
 
         if (std.mem.eql(u8, req.path, "/test.php") and !domainPhpInfoPage(cfg, domain)) {
-            try sendNotFoundWithConnection(allocator, stream, should_close);
+            try sendNotFoundForMethod(allocator, stream, should_close, is_head);
             return;
         }
 
@@ -10164,7 +10173,7 @@ fn routeRequest(
         }
 
         accessLogSetHandler("not_found");
-        try sendNotFoundWithConnection(allocator, stream, should_close);
+        try sendNotFoundForMethod(allocator, stream, should_close, is_head);
         return;
     }
 
@@ -10226,7 +10235,7 @@ fn routeRequest(
             return;
         }
         accessLogSetHandler("method_not_allowed");
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
+        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close, false);
         return;
     }
 
