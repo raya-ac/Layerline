@@ -7348,8 +7348,16 @@ fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: 
         }
         return err;
     };
+    const etag = try makeStaticEtag(allocator, stat);
+    const headers = try allocator.alloc(h2_native.Header, 5);
+    headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
+    headers[1] = .{ .name = "etag", .value = etag };
+    headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
+    headers[3] = .{ .name = "cache-status", .value = "Layerline; hit; ttl=60; detail=\"static-file\"" };
+    headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+
     server_metrics.staticBodySent(data.len, .buffered);
-    return .{ .status_code = 200, .content_type = contentTypeFromPath(rel_path), .body = data };
+    return .{ .status_code = 200, .content_type = contentTypeFromPath(rel_path), .body = data, .headers = headers };
 }
 
 fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, token: []const u8) !H2BufferedResponse {

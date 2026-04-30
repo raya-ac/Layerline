@@ -135,6 +135,11 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   grep -Fq 'Origin Surface Web Server' "$H2_ROOT_BODY" || die "h2 root page did not serve static website"
   ok "h2c root static website"
 
+  H2_STATIC_HEADERS="$TMP_DIR/h2-static.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
+  header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="static-file"' || die "h2 static Cache-Status header missing"
+  ok "h2c static cache status"
+
   H2_HEADERS="$TMP_DIR/h2.headers"
   H2_BODY="$TMP_DIR/h2.body"
   curl -fsS --http2-prior-knowledge --raw -D "$H2_HEADERS" -o "$H2_BODY" -H 'Accept-Encoding: gzip' "$GZIP_URL"
