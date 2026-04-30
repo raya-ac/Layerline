@@ -5923,6 +5923,7 @@ fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content
             "Accept-Ranges: bytes\r\n" ++
                 "ETag: {s}\r\n" ++
                 "Cache-Control: public, max-age=60\r\n" ++
+                "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n" ++
                 "Vary: Accept-Encoding\r\n" ++
                 "Content-Encoding: {s}\r\n",
             .{ etag, encoding },
@@ -5934,6 +5935,7 @@ fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content
         "Accept-Ranges: bytes\r\n" ++
             "ETag: {s}\r\n" ++
             "Cache-Control: public, max-age=60\r\n" ++
+            "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n" ++
             "Vary: Accept-Encoding\r\n",
         .{etag},
     );
@@ -10845,6 +10847,16 @@ test "http2 goaway payload masks reserved stream bit" {
     const payload = makeHttp2GoawayPayload(0xffff_ffff, HTTP2_ERROR_NO_ERROR);
     try std.testing.expectEqual(@as(u32, 0x7fff_ffff), std.mem.readInt(u32, payload[0..4], .big));
     try std.testing.expectEqual(@as(u32, HTTP2_ERROR_NO_ERROR), std.mem.readInt(u32, payload[4..8], .big));
+}
+
+test "static cache headers include cache status detail" {
+    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", null);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n") != null);
+
+    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "br");
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n") != null);
 }
 
 test "chunked upstream body scanner detects trailers and terminator" {
