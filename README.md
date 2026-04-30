@@ -4,7 +4,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
-- PHP route execution for `.php` paths via `php-cgi`/`php`, plus opt-in `index.php` front-controller fallback with PATH_INFO.
+- PHP route execution for `.php` paths via `php-cgi`/`php` or php-fpm/FastCGI, plus opt-in `index.php` front-controller fallback with PATH_INFO.
 - Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, circuit breaker half-open probes, slow start, upstream keep-alive pooling, and opt-in active health checks.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, PHP front-controller fallback, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport, PHP front-controller fallback, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI transport, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is dynamic application support and cache/compression behavior: route-local FastCGI pooling/timeouts, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -82,6 +82,7 @@ serve_static_root = true
 index_file = index.html
 php_root = public
 php_bin = php-cgi
+php_fastcgi = off
 php_index = index.php
 # Send unknown local paths to php_index with PATH_INFO for framework-style apps.
 php_front_controller = false
@@ -122,6 +123,7 @@ proxy = off
 #route = app /app/* php
 #route_php_root.app = public
 #route_php_bin.app = php-cgi
+#route_php_fastcgi.app = 127.0.0.1:9000
 #route_php_index.app = index.php
 #route_php_front_controller.app = true
 #route = api /api/* proxy
@@ -279,6 +281,7 @@ route_dir.assets = public
 route = app /app/* php
 route_php_root.app = public
 route_php_bin.app = php-cgi
+route_php_fastcgi.app = off
 route_php_index.app = index.php
 route_php_front_controller.app = true
 
@@ -448,11 +451,22 @@ zig build run -- --h2-upstream http://127.0.0.1:9001
 
 ## PHP support
 
-The server executes matching paths through CGI. Use `php-cgi` for real HTTP-style `header()` output, and set an absolute path if it is not on `PATH`:
+The server executes matching paths through CGI by default. Use `php-cgi` for real HTTP-style `header()` output, and set an absolute path if it is not on `PATH`:
 
 ```bash
 zig build run -- --php-bin /usr/bin/php-cgi --php-root public
 ```
+
+For persistent PHP workers, point Layerline at php-fpm. TCP and Unix socket endpoints are supported:
+
+```text
+php_root = public
+php_fastcgi = 127.0.0.1:9000
+# or:
+php_fastcgi = unix:/run/php/php-fpm.sock
+```
+
+Route and domain config can override or disable FastCGI with `route_php_fastcgi.NAME`, `server_php_fastcgi.NAME`, and `server_route_php_fastcgi.DOMAIN.ROUTE`. When `php_fastcgi` is set, Layerline speaks FastCGI directly and only falls back to CGI if FastCGI is disabled with `off`/`false`/`none`.
 
 If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
 
