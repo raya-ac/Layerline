@@ -15,12 +15,12 @@ This is a practical build that blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
-- Optional read-only Unix-socket admin surface for status, config validation, routes, and metrics.
+- Optional read-only Unix-socket admin surface for status, config validation, routes, cert visibility, and metrics.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, and GET/HEAD FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
-- Auto Let’s Encrypt (certbot) bootstrap and ACME challenge serving.
+- Auto Let’s Encrypt (certbot) bootstrap, ACME challenge serving, and periodic renewal loop.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
 - High-load knobs (`--max-requests-per-connection`, `--max-php-output-bytes`, `--worker-stack-size`) to tune behavior under sustained pressure.
@@ -149,7 +149,7 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
-# Read-only local admin socket: status, validate, routes, metrics.
+# Read-only local admin socket: status, validate, routes, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Opt-in dynamic gzip for buffered text responses.
 #compression = false
@@ -163,6 +163,8 @@ tls = false
 #letsencrypt_webroot = public/.well-known/acme-challenge
 #letsencrypt_certbot = /usr/bin/certbot
 #letsencrypt_staging = false
+#letsencrypt_renew = true
+#letsencrypt_renew_interval_ms = 43200000
 #cf_auto_deploy = false
 #cf_api_base = https://api.cloudflare.com/client/v4
 #cf_token = your-api-token
@@ -259,11 +261,12 @@ Set `admin_socket` to enable a local Unix socket for read-only operations:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `routes`, `metrics`, and `help`.
+Commands are one line each: `status`, `validate`, `routes`, `certs`, `metrics`, and `help`.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
 printf 'routes\n' | nc -U /tmp/layerline-admin.sock
+printf 'certs\n' | nc -U /tmp/layerline-admin.sock
 ```
 
 This socket deliberately does not reload config yet. Reload needs an owned immutable config snapshot per worker so existing requests can drain on the old config while new requests move to the new one.
@@ -385,7 +388,7 @@ The configured certificate path supports ECDSA P-256 private keys in SEC1 (`BEGI
 
 ### Auto Let's Encrypt
 
-The server can run `certbot` in webroot mode automatically on startup when both `--tls-auto true` and `--letsencrypt-domains` are provided.
+The server can run `certbot` in webroot mode automatically on startup when both `--tls-auto true` and `--letsencrypt-domains` are provided. With `letsencrypt_renew = true`, Layerline also starts a background `certbot renew` loop; the default interval is 12 hours.
 
 ```bash
 zig build run -- \
@@ -393,12 +396,15 @@ zig build run -- \
   --letsencrypt-email admin@example.com \
   --letsencrypt-domains example.com,www.example.com \
   --letsencrypt-webroot public/.well-known/acme-challenge \
+  --letsencrypt-renew true \
   --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/example.com/privkey.pem \
   --dir public
 ```
 
 Keep the challenge root reachable at `/.well-known/acme-challenge/<token>` for successful issuance.
+
+Renewal updates the certificate files on disk. Until hot reload lands, restart Layerline after renewal if you need the running process to pick up new TLS material immediately.
 
 ### Cloudflare automatic deployment
 

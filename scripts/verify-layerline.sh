@@ -144,9 +144,15 @@ case "$ADMIN_ROUTES" in
   *) die "admin routes response was unexpected: $ADMIN_ROUTES" ;;
 esac
 
+ADMIN_CERTS=$(printf 'certs\n' | nc -U "$SOCKET")
+case "$ADMIN_CERTS" in
+  *"global tls=false"*"acme renewals="*) ok "admin certs" ;;
+  *) die "admin certs response was unexpected: $ADMIN_CERTS" ;;
+esac
+
 ADMIN_METRICS=$(printf 'metrics\n' | nc -U "$SOCKET")
 case "$ADMIN_METRICS" in
-  *'layerline_requests_total'*) ok "admin metrics" ;;
+  *'layerline_requests_total'*'layerline_acme_renewals_total'*) ok "admin metrics" ;;
   *) die "admin metrics response was unexpected" ;;
 esac
 

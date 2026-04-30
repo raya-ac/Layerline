@@ -60,8 +60,8 @@ Sources:
 
 ## Phase 5: TLS, ACME, and Protocols
 
-- Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 and RSA configured certificate loading, RSA-PSS CertificateVerify, SNI certificate selection for domain configs, and self-signed local fallback; session resumption, OCSP stapling, automated renewal, and mTLS remain next.
-- ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs.
+- Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 and RSA configured certificate loading, RSA-PSS CertificateVerify, SNI certificate selection for domain configs, and self-signed local fallback; session resumption, OCSP stapling, live certificate reload, and mTLS remain next.
+- ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs. Initial certbot/webroot startup issuance and periodic `certbot renew` scheduling are implemented, with admin cert visibility and renewal metrics.
 - HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade. Initial h2 route parity now covers static routes, redirects, health/metrics, reverse proxy routes, inherited response headers, and GET/HEAD FastCGI PHP routes; request bodies, richer flow-control behavior, and GOAWAY policy remain next.
 - HTTP/3 full routing: route all app responses over QUIC, not just the default page; QPACK dynamic table policy; stream lifecycle; connection migration stance; anti-amplification limits.
 - Protocol conformance tests using external clients and captured packet tests.
@@ -114,7 +114,7 @@ Sources:
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics and GET/HEAD FastCGI PHP routes; request bodies, flow control, GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
-10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, and metrics; reload and mutating upstream/cert controls remain.
+10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; reload and mutating upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, static files, gzip negotiation, native h2c, admin socket commands, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 

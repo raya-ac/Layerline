@@ -8,7 +8,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 
 - Static files, PHP/FastCGI, and reverse proxy routes work from nginx-style per-domain config files.
 - TLS can load configured certs and keep serving HTTP/1.1 and HTTP/2 through ALPN.
-- ACME renewal is automated or the deployment has a documented certbot/webroot renewal path.
+- ACME renewal is automated or the deployment has a documented certbot/webroot renewal path. Initial in-process `certbot renew --webroot` scheduling is implemented; live TLS material reload still depends on the hot-reload work.
 - WebSocket upgrade proxying works for app frameworks and realtime dashboards.
 - HTTP/2 routing is usable for normal static, PHP, and proxy routes.
 - HTTP/3 either fully routes app responses or is clearly opt-in as a demo surface, not a replacement claim.
@@ -28,10 +28,10 @@ Commit each section independently after tests and at least one live smoke where 
 4. FastCGI pooling with max idle, max requests, idle expiry, and forced close on unsafe responses. Initial FCGI_KEEP_CONN pooling is implemented with process-wide endpoint-keyed idle reuse and metrics.
 5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health. Static, proxy, redirects, metrics/health, inherited headers, and GET/HEAD FastCGI PHP routes are implemented; request bodies, flow-control hardening, and conformance work remain.
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
-7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs.
+7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs. Initial startup issuance plus periodic renewal scheduling, staging mode, admin cert visibility, and renewal counters are implemented; live SNI material reload remains blocked on safe config snapshot ownership.
 8. Compression policy: gzip first, then brotli/zstd if available without bloating the core. Initial opt-in dynamic gzip is implemented for buffered HTTP/1.1 and HTTP/2 text responses.
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
-10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config. Initial read-only status/validate/routes/metrics commands are implemented; reload and mutating controls remain.
+10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config. Initial read-only status/validate/routes/certs/metrics commands are implemented; reload and mutating controls remain.
 11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands. Initial templates and runbook are implemented.
 12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke. Initial self-starting verifier covers HTTP/1, h2c, gzip, admin socket, static files, and shutdown cleanup.
 

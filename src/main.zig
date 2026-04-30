@@ -44,6 +44,7 @@ const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
 const DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX = 1;
 const DEFAULT_UPSTREAM_SLOW_START_MS = 10_000;
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
+const DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_COMPRESSION_MIN_BYTES = 512;
 const DEFAULT_COMPRESSION_MAX_BYTES = 1024 * 1024;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
@@ -486,6 +487,8 @@ const ServerConfig = struct {
     letsencrypt_webroot: []const u8,
     letsencrypt_certbot: []const u8,
     letsencrypt_staging: bool,
+    letsencrypt_renew: bool,
+    letsencrypt_renew_interval_ms: u32,
     h2_upstream: ?UpstreamConfig,
     http3_enabled: bool,
     http3_port: u16,
@@ -1064,6 +1067,56 @@ fn listLetsencryptDomains(allocator: std.mem.Allocator, raw: []const u8, out: *s
     return has_domain;
 }
 
+fn appendLetsEncryptWebrootArgs(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    webroot: []const u8,
+    staging: bool,
+) !void {
+    try args.appendSlice(allocator, &.{
+        "--non-interactive",
+        "--webroot",
+        "-w",
+        webroot,
+        "--config-dir",
+        "/etc/letsencrypt",
+    });
+    if (staging) try args.append(allocator, "--staging");
+}
+
+fn buildLetsEncryptCertonlyArgs(
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domains: []const []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    try out.append(allocator, "certonly");
+    try out.append(allocator, "--agree-tos");
+    try out.append(allocator, "--keep-until-expiring");
+    try appendLetsEncryptWebrootArgs(allocator, out, cfg.letsencrypt_webroot, cfg.letsencrypt_staging);
+
+    if (cfg.letsencrypt_email) |email| {
+        try out.append(allocator, "--email");
+        try out.append(allocator, email);
+    } else {
+        try out.append(allocator, "--register-unsafely-without-email");
+    }
+
+    for (domains) |domain| {
+        try out.append(allocator, "-d");
+        try out.append(allocator, domain);
+    }
+}
+
+fn buildLetsEncryptRenewArgs(
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    out: *std.ArrayList([]const u8),
+) !void {
+    try out.append(allocator, "renew");
+    try appendLetsEncryptWebrootArgs(allocator, out, cfg.letsencrypt_webroot, cfg.letsencrypt_staging);
+}
+
 fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) ![]const u8 {
     var full_args = std.ArrayList([]const u8).empty;
     defer full_args.deinit(allocator);
@@ -1354,34 +1407,56 @@ fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Server
 
     var cert_args = std.ArrayList([]const u8).empty;
     defer cert_args.deinit(allocator);
-    try cert_args.appendSlice(allocator, &.{
-        "certonly",
-        "--non-interactive",
-        "--agree-tos",
-        "--keep-until-expiring",
-        "--webroot",
-        "-w",
-        cfg.letsencrypt_webroot,
-        "--config-dir",
-        "/etc/letsencrypt",
-    });
-    if (cfg.letsencrypt_staging) {
-        try cert_args.append(allocator, "--staging");
-    }
-    if (cfg.letsencrypt_email) |email| {
-        try cert_args.append(allocator, "--email");
-        try cert_args.append(allocator, email);
-    } else {
-        try cert_args.append(allocator, "--register-unsafely-without-email");
-    }
-
-    for (domains.items) |domain| {
-        try cert_args.append(allocator, "-d");
-        try cert_args.append(allocator, domain);
-    }
+    try buildLetsEncryptCertonlyArgs(allocator, cfg, domains.items, &cert_args);
 
     std.debug.print("Running Let's Encrypt setup for {d} domain(s) via {s}\n", .{ domains.items.len, cfg.letsencrypt_certbot });
     try runCommand(io, allocator, cfg.letsencrypt_certbot, cert_args.items);
+}
+
+fn runLetsEncryptRenewal(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    if (!cfg.tls_auto or !cfg.letsencrypt_renew) return;
+    if (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0) return;
+    if (cfg.letsencrypt_webroot.len == 0) return;
+
+    var renew_args = std.ArrayList([]const u8).empty;
+    defer renew_args.deinit(allocator);
+    try buildLetsEncryptRenewArgs(allocator, cfg, &renew_args);
+
+    std.debug.print("Running Let's Encrypt renewal via {s}\n", .{cfg.letsencrypt_certbot});
+    server_metrics.acmeRenewalStarted();
+    runCommand(io, allocator, cfg.letsencrypt_certbot, renew_args.items) catch |err| {
+        server_metrics.acmeRenewalFailed();
+        return err;
+    };
+    server_metrics.acmeRenewalSucceeded();
+    std.debug.print("Let's Encrypt renewal completed. Restart or future hot reload is still required for already-loaded TLS material.\n", .{});
+}
+
+const LetsEncryptRenewalContext = struct {
+    io: std.Io,
+    cfg: *const ServerConfig,
+};
+
+fn sleepUntilShutdown(io: std.Io, total_ms: u32) bool {
+    var remaining = total_ms;
+    while (remaining > 0 and !shutdown_requested.load(.acquire)) {
+        const step_ms: u32 = @min(@as(u32, 1_000), remaining);
+        io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
+        remaining -= step_ms;
+    }
+    return shutdown_requested.load(.acquire);
+}
+
+fn letsEncryptRenewalTask(ctx: LetsEncryptRenewalContext) void {
+    bindThreadIo(ctx.io);
+    std.debug.print("Let's Encrypt renewal loop: interval={d}ms webroot={s}\n", .{ ctx.cfg.letsencrypt_renew_interval_ms, ctx.cfg.letsencrypt_webroot });
+
+    while (!shutdown_requested.load(.acquire)) {
+        if (sleepUntilShutdown(ctx.io, ctx.cfg.letsencrypt_renew_interval_ms)) break;
+        runLetsEncryptRenewal(ctx.io, std.heap.page_allocator, ctx.cfg) catch |err| {
+            std.debug.print("Let's Encrypt renewal failed: {}\n", .{err});
+        };
+    }
 }
 
 fn loadConfiguredTlsMaterial(
@@ -1496,6 +1571,9 @@ const ServerMetrics = struct {
     upstream_health_checks_total: std.atomic.Value(usize),
     upstream_health_check_failures_total: std.atomic.Value(usize),
     upstream_health_check_recoveries_total: std.atomic.Value(usize),
+    acme_renewals_total: std.atomic.Value(usize),
+    acme_renewal_successes_total: std.atomic.Value(usize),
+    acme_renewal_failures_total: std.atomic.Value(usize),
     h3_responses_total: std.atomic.Value(usize),
     h3_packets_sent_total: std.atomic.Value(usize),
 
@@ -1535,6 +1613,9 @@ const ServerMetrics = struct {
             .upstream_health_checks_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_failures_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_recoveries_total = std.atomic.Value(usize).init(0),
+            .acme_renewals_total = std.atomic.Value(usize).init(0),
+            .acme_renewal_successes_total = std.atomic.Value(usize).init(0),
+            .acme_renewal_failures_total = std.atomic.Value(usize).init(0),
             .h3_responses_total = std.atomic.Value(usize).init(0),
             .h3_packets_sent_total = std.atomic.Value(usize).init(0),
         };
@@ -1665,6 +1746,18 @@ const ServerMetrics = struct {
 
     fn upstreamHealthCheckRecovered(self: *ServerMetrics) void {
         ServerMetrics.inc(&self.upstream_health_check_recoveries_total);
+    }
+
+    fn acmeRenewalStarted(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.acme_renewals_total);
+    }
+
+    fn acmeRenewalSucceeded(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.acme_renewal_successes_total);
+    }
+
+    fn acmeRenewalFailed(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.acme_renewal_failures_total);
     }
 
     fn h3ResponseSent(self: *ServerMetrics, packet_count: usize) void {
@@ -2303,6 +2396,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.letsencrypt_certbot = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "letsencrypt_staging")) {
         cfg.letsencrypt_staging = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "letsencrypt_renew") or std.mem.eql(u8, k, "tls_renew") or std.mem.eql(u8, k, "acme_renew")) {
+        cfg.letsencrypt_renew = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "letsencrypt_renew_interval_ms") or std.mem.eql(u8, k, "tls_renew_interval_ms") or std.mem.eql(u8, k, "acme_renew_interval_ms")) {
+        cfg.letsencrypt_renew_interval_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "h2_upstream") or std.mem.eql(u8, k, "http2_upstream")) {
         if (disablesOptionalUrl(v)) {
             cfg.h2_upstream = null;
@@ -3058,6 +3155,9 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.tls_auto and (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0)) {
         return error.InvalidConfigValue;
     }
+    if (cfg.tls_auto and cfg.letsencrypt_renew) {
+        if (cfg.letsencrypt_renew_interval_ms < 60_000) return error.InvalidConfigValue;
+    }
     if (cfg.cloudflare_auto_deploy) {
         if (cfg.cloudflare_token == null or cfg.cloudflare_token.?.len == 0) return error.InvalidConfigValue;
         if ((cfg.cloudflare_zone_id == null or cfg.cloudflare_zone_id.?.len == 0) and (cfg.cloudflare_zone_name == null or cfg.cloudflare_zone_name.?.len == 0)) return error.InvalidConfigValue;
@@ -3530,6 +3630,25 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
     );
     defer allocator.free(base_metrics);
 
+    const acme_metrics = try std.fmt.allocPrint(
+        allocator,
+        "# HELP layerline_acme_renewals_total ACME renewal attempts started by the background renewal loop.\n" ++
+            "# TYPE layerline_acme_renewals_total counter\n" ++
+            "layerline_acme_renewals_total {d}\n" ++
+            "# HELP layerline_acme_renewal_successes_total ACME renewal attempts that completed successfully.\n" ++
+            "# TYPE layerline_acme_renewal_successes_total counter\n" ++
+            "layerline_acme_renewal_successes_total {d}\n" ++
+            "# HELP layerline_acme_renewal_failures_total ACME renewal attempts that returned an error.\n" ++
+            "# TYPE layerline_acme_renewal_failures_total counter\n" ++
+            "layerline_acme_renewal_failures_total {d}\n",
+        .{
+            ServerMetrics.load(&server_metrics.acme_renewals_total),
+            ServerMetrics.load(&server_metrics.acme_renewal_successes_total),
+            ServerMetrics.load(&server_metrics.acme_renewal_failures_total),
+        },
+    );
+    defer allocator.free(acme_metrics);
+
     const fastcgi_metrics = try std.fmt.allocPrint(
         allocator,
         "# HELP layerline_fastcgi_connections_opened_total New connections opened to FastCGI workers.\n" ++
@@ -3553,7 +3672,7 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
     );
     defer allocator.free(fastcgi_metrics);
 
-    return std.mem.concat(allocator, u8, &.{ base_metrics, fastcgi_metrics });
+    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, fastcgi_metrics });
 }
 
 fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
@@ -3565,7 +3684,7 @@ fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_co
 fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
+        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
         .{
             SERVER_NAME,
             cfg.host,
@@ -3573,6 +3692,9 @@ fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]
             cfg.http3_enabled,
             cfg.compression_enabled,
             cfg.admin_enabled,
+            cfg.tls_enabled,
+            cfg.tls_auto,
+            cfg.letsencrypt_renew,
             ServerMetrics.load(&server_metrics.active_connections),
             ServerMetrics.load(&server_metrics.requests_total),
             ServerMetrics.load(&server_metrics.responses_total),
@@ -3603,6 +3725,63 @@ fn renderAdminRoutes(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]
     return out.toOwnedSlice(allocator);
 }
 
+fn boolText(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+fn optionalPath(value: ?[]const u8) []const u8 {
+    return value orelse "<none>";
+}
+
+fn renderAdminCerts(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.print(
+        allocator,
+        "global tls={s} tls_auto={s} renew={s} renew_interval_ms={d} cert={s} key={s}\n",
+        .{
+            boolText(cfg.tls_enabled),
+            boolText(cfg.tls_auto),
+            boolText(cfg.letsencrypt_renew),
+            cfg.letsencrypt_renew_interval_ms,
+            optionalPath(cfg.tls_cert),
+            if (cfg.tls_key != null) "<configured>" else "<none>",
+        },
+    );
+    try out.print(
+        allocator,
+        "acme renewals={d} successes={d} failures={d} certbot={s} webroot={s} staging={s}\n",
+        .{
+            ServerMetrics.load(&server_metrics.acme_renewals_total),
+            ServerMetrics.load(&server_metrics.acme_renewal_successes_total),
+            ServerMetrics.load(&server_metrics.acme_renewal_failures_total),
+            cfg.letsencrypt_certbot,
+            cfg.letsencrypt_webroot,
+            boolText(cfg.letsencrypt_staging),
+        },
+    );
+
+    for (cfg.domains.items) |domain| {
+        try out.print(
+            allocator,
+            "server {s} cert={s} key={s} names=",
+            .{
+                domain.name,
+                optionalPath(domain.tls_cert),
+                if (domain.tls_key != null) "<configured>" else "<none>",
+            },
+        );
+        for (domain.server_names.items, 0..) |name, index| {
+            if (index > 0) try out.append(allocator, ',');
+            try out.appendSlice(allocator, name);
+        }
+        try out.append(allocator, '\n');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
     try streamWriteAll(stream, bytes);
     if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try streamWriteAll(stream, "\n");
@@ -3611,7 +3790,7 @@ fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
 fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8) !void {
     const command = trimValue(command_raw);
     if (command.len == 0 or std.mem.eql(u8, command, "help")) {
-        try sendAdminText(stream, "commands: status, validate, routes, metrics, help\n");
+        try sendAdminText(stream, "commands: status, validate, routes, certs, metrics, help\n");
         return;
     }
 
@@ -3635,6 +3814,13 @@ fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
 
     if (std.mem.eql(u8, command, "routes")) {
         const body = try renderAdminRoutes(allocator, cfg);
+        defer allocator.free(body);
+        try sendAdminText(stream, body);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "certs") or std.mem.eql(u8, command, "certificates")) {
+        const body = try renderAdminCerts(allocator, cfg);
         defer allocator.free(body);
         try sendAdminText(stream, body);
         return;
@@ -7866,6 +8052,8 @@ test "named routes prefer exact and longest prefix matches" {
         .letsencrypt_webroot = "public/.well-known/acme-challenge",
         .letsencrypt_certbot = "certbot",
         .letsencrypt_staging = false,
+        .letsencrypt_renew = true,
+        .letsencrypt_renew_interval_ms = DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS,
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
@@ -7942,6 +8130,8 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
     try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
     try applyConfigLine(&cfg, allocator, "admin_socket", "/tmp/layerline-test-admin.sock");
+    try applyConfigLine(&cfg, allocator, "letsencrypt_renew", "false");
+    try applyConfigLine(&cfg, allocator, "letsencrypt_renew_interval_ms", "7200000");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -7976,6 +8166,8 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
     try std.testing.expect(cfg.admin_enabled);
     try std.testing.expectEqualStrings("/tmp/layerline-test-admin.sock", cfg.admin_socket_path.?);
+    try std.testing.expect(!cfg.letsencrypt_renew);
+    try std.testing.expectEqual(@as(u32, 7200000), cfg.letsencrypt_renew_interval_ms);
     normalizeConfig(&cfg);
     try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
     try std.testing.expect(cfg.upstream_health_check_enabled);
@@ -10280,7 +10472,7 @@ fn usage() void {
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
-            "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] " ++
+            "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
             "[--cf-record-type A|AAAA|CNAME|TXT] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
@@ -10293,7 +10485,7 @@ fn usage() void {
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
-            "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
+            "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
@@ -10359,6 +10551,8 @@ pub fn main(init: std.process.Init) !void {
         .letsencrypt_webroot = "public/.well-known/acme-challenge",
         .letsencrypt_certbot = "certbot",
         .letsencrypt_staging = false,
+        .letsencrypt_renew = true,
+        .letsencrypt_renew_interval_ms = DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS,
         .cloudflare_auto_deploy = false,
         .cloudflare_api_base = "https://api.cloudflare.com/client/v4",
         .cloudflare_token = null,
@@ -10513,6 +10707,18 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.letsencrypt_staging = parseBool(value) orelse cfg.letsencrypt_staging;
+        } else if (std.mem.eql(u8, arg, "--letsencrypt-renew") or std.mem.eql(u8, arg, "--tls-renew") or std.mem.eql(u8, arg, "--acme-renew")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.letsencrypt_renew = parseBool(value) orelse cfg.letsencrypt_renew;
+        } else if (std.mem.eql(u8, arg, "--letsencrypt-renew-interval-ms") or std.mem.eql(u8, arg, "--tls-renew-interval-ms") or std.mem.eql(u8, arg, "--acme-renew-interval-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.letsencrypt_renew_interval_ms = std.fmt.parseInt(u32, value, 10) catch cfg.letsencrypt_renew_interval_ms;
         } else if (std.mem.eql(u8, arg, "--tls-cert")) {
             cfg.tls_cert = args.next() orelse {
                 usage();
@@ -11041,6 +11247,13 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         admin_worker.detach();
+    }
+    if (cfg.tls_auto and cfg.letsencrypt_renew) {
+        const acme_worker = std.Thread.spawn(.{}, letsEncryptRenewalTask, .{LetsEncryptRenewalContext{ .io = init.io, .cfg = &cfg }}) catch |err| {
+            std.debug.print("Failed to start Let's Encrypt renewal loop: {}\n", .{err});
+            return;
+        };
+        acme_worker.detach();
     }
 
     while (!shutdown_requested.load(.acquire)) {

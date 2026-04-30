@@ -104,12 +104,14 @@ Layerline serves the challenge directory directly, so keep the runtime config po
 
 ```conf
 letsencrypt_webroot = /var/www/layerline/public/.well-known/acme-challenge
+letsencrypt_renew = true
+letsencrypt_renew_interval_ms = 43200000
 tls = true
 tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 ```
 
-Until Layerline has an in-process renewal loop and reload, run certbot renewal from systemd timers or cron, validate config, then restart Layerline during a maintenance window.
+With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --webroot` loop. Renewal updates the certificate files on disk; until hot reload lands, restart Layerline during a maintenance window when a renewed certificate needs to be picked up by the running process.
 
 ## Smoke Checks
 
@@ -120,6 +122,7 @@ Run these before moving traffic:
 curl -fsS http://127.0.0.1:8080/health
 curl -fsSI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/ | grep -i '^Content-Encoding: gzip'
 printf 'status\n' | nc -U /run/layerline/admin.sock
+printf 'certs\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
 ```
 
