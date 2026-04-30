@@ -247,6 +247,8 @@ const ShutdownWatcherContext = struct {
     io: std.Io,
     server: *std.Io.net.Server,
     closed: *std.atomic.Value(bool),
+    wake_host: ?[]const u8 = null,
+    wake_port: u16 = 0,
 };
 
 fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
@@ -255,6 +257,13 @@ fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
         ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
     }
 
+    if (ctx.wake_host) |host| {
+        if (ctx.wake_port != 0) {
+            if (connectTcpHost(std.heap.page_allocator, host, ctx.wake_port)) |wake| {
+                streamClose(wake);
+            } else |_| {}
+        }
+    }
     if (!ctx.closed.swap(true, .acq_rel)) {
         ctx.server.socket.close(ctx.io);
     }
@@ -279,6 +288,12 @@ fn connectTcpHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !st
 
     const host_name = try std.Io.net.HostName.init(host);
     return host_name.connect(activeIo(), port, .{ .mode = .stream });
+}
+
+fn listenerWakeHost(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "0.0.0.0")) return "127.0.0.1";
+    if (std.mem.eql(u8, host, "::")) return "::1";
+    return host;
 }
 
 fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgiEndpoint) !std.Io.net.Stream {
@@ -10661,6 +10676,10 @@ fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
             ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
             continue;
         };
+        if (shutdown_requested.load(.acquire)) {
+            streamClose(conn);
+            break;
+        }
 
         if (!ctx.state.tryAcquire(ctx.cfg.max_concurrent_connections)) {
             server_metrics.connectionRejected();
@@ -12868,7 +12887,7 @@ pub fn main(init: std.process.Init) !void {
     const shutdown_watcher = std.Thread.spawn(
         .{},
         shutdownWatcherTask,
-        .{ShutdownWatcherContext{ .io = init.io, .server = &server, .closed = &listener_closed_by_shutdown }},
+        .{ShutdownWatcherContext{ .io = init.io, .server = &server, .closed = &listener_closed_by_shutdown, .wake_host = listenerWakeHost(cfg.host), .wake_port = cfg.port }},
     ) catch |err| {
         std.debug.print("Failed to start shutdown watcher: {}\n", .{err});
         return;
@@ -12879,7 +12898,7 @@ pub fn main(init: std.process.Init) !void {
         const http_shutdown_watcher = std.Thread.spawn(
             .{},
             shutdownWatcherTask,
-            .{ShutdownWatcherContext{ .io = init.io, .server = http_server, .closed = &redirect_listener_closed_by_shutdown }},
+            .{ShutdownWatcherContext{ .io = init.io, .server = http_server, .closed = &redirect_listener_closed_by_shutdown, .wake_host = listenerWakeHost(cfg.host), .wake_port = cfg.http_redirect_port }},
         ) catch |err| {
             std.debug.print("Failed to start HTTP redirect shutdown watcher: {}\n", .{err});
             return;
@@ -12972,6 +12991,10 @@ pub fn main(init: std.process.Init) !void {
             init.io.sleep(.fromMilliseconds(25), .awake) catch {};
             continue;
         };
+        if (shutdown_requested.load(.acquire)) {
+            streamClose(conn);
+            break;
+        }
 
         if (!concurrency.tryAcquire(cfg.max_concurrent_connections)) {
             server_metrics.connectionRejected();
