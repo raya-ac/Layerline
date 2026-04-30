@@ -48,6 +48,7 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
+- `deploy/systemd/layerline-cert-renew.{service,timer}` – certbot renewal timer with Layerline restart deploy hook.
 - `deploy/launchd/dev.layerline.layerline.plist` – macOS launchd service template.
 - `Dockerfile` – runtime image template for an already built `zig-out/bin/layerline`.
 - HTTP/2/HTTP/3 deployment notes in this README.
@@ -437,7 +438,7 @@ zig build run -- \
 
 Keep the challenge root reachable at `/.well-known/acme-challenge/<token>` for successful issuance.
 
-Renewal updates the certificate files on disk. Until hot reload lands, restart Layerline after renewal if you need the running process to pick up new TLS material immediately.
+Renewal updates the certificate files on disk. Until hot reload lands, the running process must restart to pick up new TLS material. For production systemd hosts, install `deploy/systemd/layerline-cert-renew.timer`; its certbot deploy hook restarts Layerline only after a renewed certificate is deployed.
 
 ### Cloudflare automatic deployment
 

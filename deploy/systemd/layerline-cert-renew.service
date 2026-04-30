@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew Layerline TLS certificates
+Documentation=https://github.com/raya-ac/Layerline
+Wants=network-online.target
+After=network-online.target layerline.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --webroot -w /var/www/layerline/public --quiet --deploy-hook "/usr/bin/systemctl try-reload-or-restart layerline.service"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Twice-daily Layerline TLS certificate renewal
+Documentation=https://github.com/raya-ac/Layerline
+
+[Timer]
+OnCalendar=*-*-* 03,15:17:00
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

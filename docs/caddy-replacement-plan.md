@@ -8,7 +8,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 
 - Static files, PHP/FastCGI, reverse proxy routes, and HEAD/error response framing work from nginx-style per-domain config files.
 - TLS can load configured certs and keep serving HTTP/1.1 and HTTP/2 through ALPN.
-- ACME renewal is automated or the deployment has a documented certbot/webroot renewal path. Initial in-process `certbot renew --webroot` scheduling is implemented; live TLS material reload still depends on the hot-reload work.
+- ACME renewal is automated or the deployment has a documented certbot/webroot renewal path. Initial in-process `certbot renew --webroot` scheduling is implemented, and systemd renewal timer assets now restart Layerline from certbot's deploy hook; live TLS material reload still depends on the hot-reload work.
 - WebSocket upgrade proxying works for app frameworks and realtime dashboards.
 - HTTP/2 routing is usable for normal static, PHP, and proxy routes.
 - HTTP/3 either fully routes app responses or is clearly opt-in as a demo surface, not a replacement claim.
@@ -28,7 +28,7 @@ Commit each section independently after tests and at least one live smoke where 
 4. FastCGI pooling with max idle, max requests, idle expiry, and forced close on unsafe responses. Initial FCGI_KEEP_CONN pooling is implemented with process-wide endpoint-keyed idle reuse and metrics.
 5. HTTP/2 route parity for static, PHP/FastCGI, proxy, redirects, errors, metrics, and health. Static, proxy, redirects, metrics/health, inherited headers, FastCGI PHP routes, bounded DATA request bodies, content-length validation, and WINDOW_UPDATE on consumed bodies are implemented; GOAWAY policy, prioritization stance, and broader conformance work remain.
 6. Hot reload: validate candidate config, atomically swap route tables, keep existing workers on old config until drained.
-7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs. Initial startup issuance plus periodic renewal scheduling, staging mode, admin cert visibility, and renewal counters are implemented; live SNI material reload remains blocked on safe config snapshot ownership.
+7. ACME renewal loop: scheduled certbot/webroot renewal, SNI material reload, staging mode, and clear failure logs. Initial startup issuance plus periodic renewal scheduling, systemd certbot renewal/restart timer assets, staging mode, admin cert visibility, and renewal counters are implemented; live SNI material reload remains blocked on safe config snapshot ownership.
 8. Compression policy: gzip first, then brotli/zstd if available without bloating the core. Initial opt-in dynamic gzip is implemented for buffered HTTP/1.1 and HTTP/2 text responses.
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API and web UI: validate, reload, routes, metrics, upstream health, cert status, redacted config, and authenticated browser controls. Initial read-only Unix socket commands plus first-launch browser setup/login/dashboard are implemented; reload and mutating controls remain.
