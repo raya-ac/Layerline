@@ -128,6 +128,11 @@ fi
 ok "gzip q=0 negotiation"
 
 if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
+  H2_ROOT_BODY="$TMP_DIR/h2-root.body"
+  curl -fsS --http2-prior-knowledge "http://$HOST:$PORT/" -o "$H2_ROOT_BODY"
+  grep -Fq 'Origin Surface Web Server' "$H2_ROOT_BODY" || die "h2 root page did not serve static website"
+  ok "h2c root static website"
+
   H2_HEADERS="$TMP_DIR/h2.headers"
   H2_BODY="$TMP_DIR/h2.body"
   curl -fsS --http2-prior-knowledge --raw -D "$H2_HEADERS" -o "$H2_BODY" -H 'Accept-Encoding: gzip' "$GZIP_URL"

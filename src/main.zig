@@ -7494,6 +7494,10 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
             accessLogSetHandler("builtin_asset");
             return h2TextResponse(200, "image/svg+xml", SERVER_ICON_SVG);
         }
+        if (std.mem.eql(u8, req.path, "/") and domainServeStaticRoot(cfg, domain)) {
+            accessLogSetHandler("static_root");
+            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), domainIndexFile(cfg, domain), cfg.max_static_file_bytes);
+        }
         if (std.mem.eql(u8, req.path, "/")) {
             accessLogSetHandler("builtin_root");
             return h2TextResponse(200, "text/html; charset=utf-8", H2_DEFAULT_PAGE);
