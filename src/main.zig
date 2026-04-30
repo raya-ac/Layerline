@@ -35,6 +35,9 @@ const DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS = 10_000;
 const DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE = 16;
 const DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS = 100;
+const DEFAULT_FASTCGI_KEEPALIVE_MAX_IDLE = 8;
+const DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS = 100;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 1_000;
 const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
@@ -59,6 +62,7 @@ const FASTCGI_STDIN: u8 = 5;
 const FASTCGI_STDOUT: u8 = 6;
 const FASTCGI_STDERR: u8 = 7;
 const FASTCGI_RESPONDER: u16 = 1;
+const FASTCGI_KEEP_CONN: u8 = 1;
 const FASTCGI_REQUEST_COMPLETE: u8 = 0;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
@@ -273,6 +277,25 @@ const UpstreamKeepAlivePool = struct {
     }
 };
 
+const FastcgiIdleConnection = struct {
+    stream: std.Io.net.Stream,
+    endpoint_name: []const u8,
+    expires_at_ms: i64,
+    requests_served: usize,
+};
+
+const FastcgiKeepAlivePool = struct {
+    mutex: std.Io.Mutex,
+    idle: std.ArrayList(FastcgiIdleConnection),
+
+    fn init() FastcgiKeepAlivePool {
+        return .{
+            .mutex = .init,
+            .idle = .empty,
+        };
+    }
+};
+
 // Parsed form of a configured upstream endpoint.
 const UpstreamConfig = struct {
     host: []const u8,
@@ -468,6 +491,10 @@ const ServerConfig = struct {
     upstream_keepalive_max_idle: usize,
     upstream_keepalive_idle_timeout_ms: u32,
     upstream_keepalive_max_requests: usize,
+    fastcgi_keepalive_enabled: bool,
+    fastcgi_keepalive_max_idle: usize,
+    fastcgi_keepalive_idle_timeout_ms: u32,
+    fastcgi_keepalive_max_requests: usize,
     upstream_health_check_enabled: bool,
     upstream_health_check_path: []const u8,
     upstream_health_check_interval_ms: u32,
@@ -1325,6 +1352,10 @@ const ServerMetrics = struct {
     upstream_connections_reused_total: std.atomic.Value(usize),
     upstream_connections_pooled_total: std.atomic.Value(usize),
     upstream_connections_discarded_total: std.atomic.Value(usize),
+    fastcgi_connections_opened_total: std.atomic.Value(usize),
+    fastcgi_connections_reused_total: std.atomic.Value(usize),
+    fastcgi_connections_pooled_total: std.atomic.Value(usize),
+    fastcgi_connections_discarded_total: std.atomic.Value(usize),
     upstream_health_checks_total: std.atomic.Value(usize),
     upstream_health_check_failures_total: std.atomic.Value(usize),
     upstream_health_check_recoveries_total: std.atomic.Value(usize),
@@ -1358,6 +1389,10 @@ const ServerMetrics = struct {
             .upstream_connections_reused_total = std.atomic.Value(usize).init(0),
             .upstream_connections_pooled_total = std.atomic.Value(usize).init(0),
             .upstream_connections_discarded_total = std.atomic.Value(usize).init(0),
+            .fastcgi_connections_opened_total = std.atomic.Value(usize).init(0),
+            .fastcgi_connections_reused_total = std.atomic.Value(usize).init(0),
+            .fastcgi_connections_pooled_total = std.atomic.Value(usize).init(0),
+            .fastcgi_connections_discarded_total = std.atomic.Value(usize).init(0),
             .upstream_health_checks_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_failures_total = std.atomic.Value(usize).init(0),
             .upstream_health_check_recoveries_total = std.atomic.Value(usize).init(0),
@@ -1460,6 +1495,22 @@ const ServerMetrics = struct {
         ServerMetrics.inc(&self.upstream_connections_discarded_total);
     }
 
+    fn fastcgiConnectionOpened(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.fastcgi_connections_opened_total);
+    }
+
+    fn fastcgiConnectionReused(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.fastcgi_connections_reused_total);
+    }
+
+    fn fastcgiConnectionPooled(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.fastcgi_connections_pooled_total);
+    }
+
+    fn fastcgiConnectionDiscarded(self: *ServerMetrics) void {
+        ServerMetrics.inc(&self.fastcgi_connections_discarded_total);
+    }
+
     fn upstreamHealthCheckRan(self: *ServerMetrics) void {
         ServerMetrics.inc(&self.upstream_health_checks_total);
     }
@@ -1481,6 +1532,7 @@ const ServerMetrics = struct {
 var server_metrics = ServerMetrics.init();
 var upstream_round_robin_cursor = std.atomic.Value(usize).init(0);
 var upstream_random_cursor = std.atomic.Value(u64).init(0x9e3779b97f4a7c15);
+var fastcgi_keepalive_pool = FastcgiKeepAlivePool.init();
 
 const StaticTransferMode = enum {
     sendfile,
@@ -2330,6 +2382,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.upstream_keepalive_idle_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "upstream_keepalive_max_requests") or std.mem.eql(u8, k, "proxy_keepalive_max_requests")) {
         cfg.upstream_keepalive_max_requests = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "fastcgi_keepalive") or std.mem.eql(u8, k, "php_fastcgi_keepalive") or std.mem.eql(u8, k, "fastcgi_keep_conn")) {
+        cfg.fastcgi_keepalive_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "fastcgi_keepalive_max_idle") or std.mem.eql(u8, k, "php_fastcgi_keepalive_max_idle")) {
+        cfg.fastcgi_keepalive_max_idle = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "fastcgi_keepalive_idle_timeout_ms") or std.mem.eql(u8, k, "php_fastcgi_keepalive_idle_timeout_ms")) {
+        cfg.fastcgi_keepalive_idle_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "fastcgi_keepalive_max_requests") or std.mem.eql(u8, k, "php_fastcgi_keepalive_max_requests")) {
+        cfg.fastcgi_keepalive_max_requests = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "upstream_health_check") or std.mem.eql(u8, k, "upstream_health_check_enabled") or std.mem.eql(u8, k, "active_health_check") or std.mem.eql(u8, k, "proxy_health_check")) {
         cfg.upstream_health_check_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "upstream_health_check_path") or std.mem.eql(u8, k, "proxy_health_check_path")) {
@@ -2688,6 +2748,12 @@ fn normalizeConfig(cfg: *ServerConfig) void {
     if (cfg.upstream_keepalive_idle_timeout_ms == 0) {
         cfg.upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS;
     }
+    if (cfg.fastcgi_keepalive_max_requests == 0) {
+        cfg.fastcgi_keepalive_max_requests = DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS;
+    }
+    if (cfg.fastcgi_keepalive_idle_timeout_ms == 0) {
+        cfg.fastcgi_keepalive_idle_timeout_ms = DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS;
+    }
     if (cfg.worker_stack_size < 16 * 1024) {
         cfg.worker_stack_size = 16 * 1024;
     }
@@ -2761,6 +2827,7 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.idle_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.write_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.upstream_timeout_ms == 0) return error.InvalidConfigValue;
+    if (cfg.fastcgi_keepalive_enabled and cfg.fastcgi_keepalive_max_requests == 0) return error.InvalidConfigValue;
     if (cfg.upstream_max_failures > 0 and cfg.upstream_fail_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.upstream_health_check_enabled) {
         if (cfg.upstream_health_check_path.len == 0 or cfg.upstream_health_check_path[0] != '/') return error.InvalidConfigValue;
@@ -3114,7 +3181,7 @@ fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bo
 }
 
 fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
-    return std.fmt.allocPrint(
+    const base_metrics = try std.fmt.allocPrint(
         allocator,
         "# HELP layerline_connections_active Active TCP connections currently owned by Layerline workers.\n" ++
             "# TYPE layerline_connections_active gauge\n" ++
@@ -3231,6 +3298,32 @@ fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
             ServerMetrics.load(&server_metrics.h3_packets_sent_total),
         },
     );
+    defer allocator.free(base_metrics);
+
+    const fastcgi_metrics = try std.fmt.allocPrint(
+        allocator,
+        "# HELP layerline_fastcgi_connections_opened_total New connections opened to FastCGI workers.\n" ++
+            "# TYPE layerline_fastcgi_connections_opened_total counter\n" ++
+            "layerline_fastcgi_connections_opened_total {d}\n" ++
+            "# HELP layerline_fastcgi_connections_reused_total Idle FastCGI worker connections reused from the keep-alive pool.\n" ++
+            "# TYPE layerline_fastcgi_connections_reused_total counter\n" ++
+            "layerline_fastcgi_connections_reused_total {d}\n" ++
+            "# HELP layerline_fastcgi_connections_pooled_total FastCGI worker connections returned to the idle keep-alive pool.\n" ++
+            "# TYPE layerline_fastcgi_connections_pooled_total counter\n" ++
+            "layerline_fastcgi_connections_pooled_total {d}\n" ++
+            "# HELP layerline_fastcgi_connections_discarded_total FastCGI worker connections closed instead of pooled or reused.\n" ++
+            "# TYPE layerline_fastcgi_connections_discarded_total counter\n" ++
+            "layerline_fastcgi_connections_discarded_total {d}\n",
+        .{
+            ServerMetrics.load(&server_metrics.fastcgi_connections_opened_total),
+            ServerMetrics.load(&server_metrics.fastcgi_connections_reused_total),
+            ServerMetrics.load(&server_metrics.fastcgi_connections_pooled_total),
+            ServerMetrics.load(&server_metrics.fastcgi_connections_discarded_total),
+        },
+    );
+    defer allocator.free(fastcgi_metrics);
+
+    return std.mem.concat(allocator, u8, &.{ base_metrics, fastcgi_metrics });
 }
 
 fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
@@ -5641,6 +5734,95 @@ fn upstreamReleaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig
     server_metrics.upstreamConnectionPooled();
 }
 
+const FastcgiConnectionLease = struct {
+    stream: std.Io.net.Stream,
+    requests_served: usize,
+};
+
+fn fastcgiKeepaliveConfigured(cfg: *const ServerConfig) bool {
+    return cfg.fastcgi_keepalive_enabled and cfg.fastcgi_keepalive_max_idle > 0;
+}
+
+fn closeIdleFastcgiConnection(conn: FastcgiIdleConnection) void {
+    streamClose(conn.stream);
+    server_metrics.fastcgiConnectionDiscarded();
+}
+
+fn fastcgiAcquireConnection(allocator: std.mem.Allocator, endpoint_name: []const u8, endpoint: PhpFastcgiEndpoint, cfg: *const ServerConfig, timeout_ms: u32, now_ms: i64) !FastcgiConnectionLease {
+    if (fastcgiKeepaliveConfigured(cfg)) {
+        const io = activeIo();
+        fastcgi_keepalive_pool.mutex.lockUncancelable(io);
+        defer fastcgi_keepalive_pool.mutex.unlock(io);
+
+        var index: usize = 0;
+        while (index < fastcgi_keepalive_pool.idle.items.len) {
+            const conn = fastcgi_keepalive_pool.idle.items[index];
+            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.fastcgi_keepalive_max_requests) {
+                closeIdleFastcgiConnection(fastcgi_keepalive_pool.idle.orderedRemove(index));
+                continue;
+            }
+            if (std.mem.eql(u8, conn.endpoint_name, endpoint_name)) {
+                const reused = fastcgi_keepalive_pool.idle.orderedRemove(index);
+                setStreamTimeouts(reused.stream, timeout_ms, timeout_ms) catch |err| {
+                    closeIdleFastcgiConnection(reused);
+                    return err;
+                };
+                server_metrics.fastcgiConnectionReused();
+                return .{
+                    .stream = reused.stream,
+                    .requests_served = reused.requests_served,
+                };
+            }
+            index += 1;
+        }
+    }
+
+    const conn = try connectFastcgiEndpoint(allocator, endpoint);
+    try setStreamTimeouts(conn, timeout_ms, timeout_ms);
+    server_metrics.fastcgiConnectionOpened();
+    return .{
+        .stream = conn,
+        .requests_served = 0,
+    };
+}
+
+fn fastcgiReleaseConnection(endpoint_name: []const u8, cfg: *const ServerConfig, lease: FastcgiConnectionLease, reusable: bool, now_ms: i64) void {
+    if (!reusable or !fastcgiKeepaliveConfigured(cfg)) {
+        streamClose(lease.stream);
+        server_metrics.fastcgiConnectionDiscarded();
+        return;
+    }
+
+    const served = lease.requests_served + 1;
+    if (served >= cfg.fastcgi_keepalive_max_requests) {
+        streamClose(lease.stream);
+        server_metrics.fastcgiConnectionDiscarded();
+        return;
+    }
+
+    const idle_conn = FastcgiIdleConnection{
+        .stream = lease.stream,
+        .endpoint_name = endpoint_name,
+        .expires_at_ms = now_ms + @as(i64, @intCast(cfg.fastcgi_keepalive_idle_timeout_ms)),
+        .requests_served = served,
+    };
+
+    const io = activeIo();
+    fastcgi_keepalive_pool.mutex.lockUncancelable(io);
+    defer fastcgi_keepalive_pool.mutex.unlock(io);
+
+    while (fastcgi_keepalive_pool.idle.items.len >= cfg.fastcgi_keepalive_max_idle) {
+        closeIdleFastcgiConnection(fastcgi_keepalive_pool.idle.orderedRemove(0));
+    }
+
+    fastcgi_keepalive_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
+        streamClose(idle_conn.stream);
+        server_metrics.fastcgiConnectionDiscarded();
+        return;
+    };
+    server_metrics.fastcgiConnectionPooled();
+}
+
 fn parseOptionalContentLength(headers: []const u8) !?usize {
     if (findHeaderValue(headers, "Content-Length")) |raw| {
         const value = trimValue(raw);
@@ -6525,23 +6707,24 @@ fn handlePhpFastcgi(
         return;
     };
 
-    const conn = connectFastcgiEndpoint(allocator, endpoint) catch |err| {
+    const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, upstreamNowMs()) catch |err| {
         std.debug.print("PHP FastCGI connect failed for {s}: {}\n", .{ php_fastcgi, err });
         try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached.", close_connection, false, null);
         return;
     };
-    defer streamClose(conn);
-    try setStreamTimeouts(conn, timeout_ms, timeout_ms);
+    const conn = lease.stream;
+    var reusable_fastcgi_conn = false;
+    defer fastcgiReleaseConnection(php_fastcgi, cfg, lease, reusable_fastcgi_conn, upstreamNowMs());
 
     const request_id: u16 = 1;
-    const begin_body = [_]u8{ 0, @intCast(FASTCGI_RESPONDER), 0, 0, 0, 0, 0, 0 };
+    const begin_body = [_]u8{ 0, @intCast(FASTCGI_RESPONDER), if (fastcgiKeepaliveConfigured(cfg)) FASTCGI_KEEP_CONN else 0, 0, 0, 0, 0, 0 };
     try writeFastcgiRecord(conn, FASTCGI_BEGIN_REQUEST, request_id, &begin_body);
 
     const params = try buildPhpFastcgiParams(allocator, cfg, req, php_root, script_path, script_name, path_info);
     defer allocator.free(params);
     try writeFastcgiRecord(conn, FASTCGI_PARAMS, request_id, params);
     try writeFastcgiRecord(conn, FASTCGI_PARAMS, request_id, "");
-    try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, req.body);
+    if (req.body.len > 0) try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, req.body);
     try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, "");
 
     const result = readFastcgiResponse(allocator, conn, request_id, cfg.max_php_output_bytes) catch |err| switch (err) {
@@ -6566,6 +6749,7 @@ fn handlePhpFastcgi(
         return;
     }
 
+    reusable_fastcgi_conn = fastcgiKeepaliveConfigured(cfg);
     try sendPhpOutput(stream, allocator, result.stdout, close_connection, is_head);
 }
 
@@ -7176,6 +7360,10 @@ test "named routes prefer exact and longest prefix matches" {
         .upstream_keepalive_max_idle = DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE,
         .upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS,
         .upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS,
+        .fastcgi_keepalive_enabled = true,
+        .fastcgi_keepalive_max_idle = DEFAULT_FASTCGI_KEEPALIVE_MAX_IDLE,
+        .fastcgi_keepalive_idle_timeout_ms = DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .fastcgi_keepalive_max_requests = DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS,
         .upstream_health_check_enabled = false,
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
@@ -7208,6 +7396,10 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_idle", "24");
     try applyConfigLine(&cfg, allocator, "upstream_keepalive_idle_timeout_ms", "45000");
     try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_requests", "250");
+    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive", "true");
+    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_idle", "12");
+    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_idle_timeout_ms", "35000");
+    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_requests", "125");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -7230,6 +7422,10 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 24), cfg.upstream_keepalive_max_idle);
     try std.testing.expectEqual(@as(u32, 45000), cfg.upstream_keepalive_idle_timeout_ms);
     try std.testing.expectEqual(@as(usize, 250), cfg.upstream_keepalive_max_requests);
+    try std.testing.expect(cfg.fastcgi_keepalive_enabled);
+    try std.testing.expectEqual(@as(usize, 12), cfg.fastcgi_keepalive_max_idle);
+    try std.testing.expectEqual(@as(u32, 35000), cfg.fastcgi_keepalive_idle_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 125), cfg.fastcgi_keepalive_max_requests);
     try std.testing.expect(cfg.upstream_health_check_enabled);
     try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
     try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
@@ -9492,6 +9688,7 @@ fn usage() void {
             "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N] [--read-header-timeout-ms N] " ++
             "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] [--upstream-retries N] [--upstream-max-failures N] [--upstream-fail-timeout-ms N] " ++
             "[--upstream-keepalive true|false] [--upstream-keepalive-max-idle N] [--upstream-keepalive-idle-timeout-ms N] [--upstream-keepalive-max-requests N] " ++
+            "[--fastcgi-keepalive true|false] [--fastcgi-keepalive-max-idle N] [--fastcgi-keepalive-idle-timeout-ms N] [--fastcgi-keepalive-max-requests N] " ++
             "[--upstream-health-check true|false] [--upstream-health-path /health] [--upstream-health-interval-ms N] [--upstream-health-timeout-ms N] " ++
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
@@ -9499,7 +9696,7 @@ fn usage() void {
             "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
-            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
+            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
             "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, route_header.NAME, server/domain/vhost, " ++
@@ -9605,6 +9802,10 @@ pub fn main(init: std.process.Init) !void {
         .upstream_keepalive_max_idle = DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE,
         .upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS,
         .upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS,
+        .fastcgi_keepalive_enabled = true,
+        .fastcgi_keepalive_max_idle = DEFAULT_FASTCGI_KEEPALIVE_MAX_IDLE,
+        .fastcgi_keepalive_idle_timeout_ms = DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .fastcgi_keepalive_max_requests = DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS,
         .upstream_health_check_enabled = false,
         .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
         .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
@@ -9933,6 +10134,30 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.upstream_keepalive_max_requests = std.fmt.parseInt(usize, value, 10) catch cfg.upstream_keepalive_max_requests;
+        } else if (std.mem.eql(u8, arg, "--fastcgi-keepalive") or std.mem.eql(u8, arg, "--php-fastcgi-keepalive") or std.mem.eql(u8, arg, "--fastcgi-keep-conn")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.fastcgi_keepalive_enabled = parseBool(value) orelse cfg.fastcgi_keepalive_enabled;
+        } else if (std.mem.eql(u8, arg, "--fastcgi-keepalive-max-idle") or std.mem.eql(u8, arg, "--php-fastcgi-keepalive-max-idle")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.fastcgi_keepalive_max_idle = std.fmt.parseInt(usize, value, 10) catch cfg.fastcgi_keepalive_max_idle;
+        } else if (std.mem.eql(u8, arg, "--fastcgi-keepalive-idle-timeout-ms") or std.mem.eql(u8, arg, "--php-fastcgi-keepalive-idle-timeout-ms")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.fastcgi_keepalive_idle_timeout_ms = std.fmt.parseInt(u32, value, 10) catch cfg.fastcgi_keepalive_idle_timeout_ms;
+        } else if (std.mem.eql(u8, arg, "--fastcgi-keepalive-max-requests") or std.mem.eql(u8, arg, "--php-fastcgi-keepalive-max-requests")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.fastcgi_keepalive_max_requests = std.fmt.parseInt(usize, value, 10) catch cfg.fastcgi_keepalive_max_requests;
         } else if (std.mem.eql(u8, arg, "--upstream-health-check") or std.mem.eql(u8, arg, "--proxy-health-check")) {
             const value = args.next() orelse {
                 usage();
