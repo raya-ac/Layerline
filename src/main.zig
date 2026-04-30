@@ -22,6 +22,7 @@ const DEFAULT_MAX_CONCURRENT_CONNECTIONS = 1_000_000;
 const DEFAULT_WORKER_STACK_BYTES = 64 * 1024;
 // PHP can be noisy. Treat child output as untrusted input too.
 const DEFAULT_MAX_PHP_OUTPUT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_PHP_INDEX = "index.php";
 const DEFAULT_READ_HEADER_TIMEOUT_MS = 10_000;
 const DEFAULT_READ_BODY_TIMEOUT_MS = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
@@ -308,10 +309,12 @@ const RouteStringProperty = enum {
     index_file,
     php_root,
     php_binary,
+    php_index,
 };
 
 const RouteBoolProperty = enum {
     php_info_page,
+    php_front_controller,
     strip_prefix,
 };
 
@@ -320,6 +323,7 @@ const DomainStringProperty = enum {
     index_file,
     php_root,
     php_binary,
+    php_index,
     tls_cert,
     tls_key,
 };
@@ -327,6 +331,7 @@ const DomainStringProperty = enum {
 const DomainBoolProperty = enum {
     serve_static_root,
     php_info_page,
+    php_front_controller,
 };
 
 const RouteConfig = struct {
@@ -339,7 +344,9 @@ const RouteConfig = struct {
     index_file: ?[]const u8,
     php_root: ?[]const u8,
     php_binary: ?[]const u8,
+    php_index: ?[]const u8,
     php_info_page: ?bool,
+    php_front_controller: ?bool,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
 };
@@ -352,7 +359,9 @@ const DomainConfig = struct {
     index_file: ?[]const u8,
     php_root: ?[]const u8,
     php_binary: ?[]const u8,
+    php_index: ?[]const u8,
     php_info_page: ?bool,
+    php_front_controller: ?bool,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
     tls_material: ?tls_pem.ConfiguredTlsMaterial,
@@ -371,7 +380,9 @@ const ServerConfig = struct {
     index_file: []const u8,
     php_root: []const u8,
     php_binary: []const u8,
+    php_index: []const u8,
     php_info_page: bool,
+    php_front_controller: bool,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: UpstreamPoolPolicy,
     tls_enabled: bool,
@@ -1594,7 +1605,9 @@ fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Alloc
         .index_file = null,
         .php_root = null,
         .php_binary = null,
+        .php_index = null,
         .php_info_page = null,
+        .php_front_controller = null,
         .upstream = null,
         .upstream_policy = null,
     });
@@ -1619,6 +1632,7 @@ fn setRouteStringProperty(
         .index_file => route.index_file = dupe_value,
         .php_root => route.php_root = dupe_value,
         .php_binary => route.php_binary = dupe_value,
+        .php_index => route.php_index = dupe_value,
     }
 }
 
@@ -1641,6 +1655,7 @@ fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const
     const parsed = try parseConfigBool(value);
     switch (field) {
         .php_info_page => route.php_info_page = parsed,
+        .php_front_controller => route.php_front_controller = parsed,
         .strip_prefix => route.strip_prefix = parsed,
     }
 }
@@ -1666,7 +1681,9 @@ fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainConfi
         .index_file = null,
         .php_root = null,
         .php_binary = null,
+        .php_index = null,
         .php_info_page = null,
+        .php_front_controller = null,
         .tls_cert = null,
         .tls_key = null,
         .tls_material = null,
@@ -1719,6 +1736,7 @@ fn setDomainStringProperty(
         .index_file => domain.index_file = dupe_value,
         .php_root => domain.php_root = dupe_value,
         .php_binary => domain.php_binary = dupe_value,
+        .php_index => domain.php_index = dupe_value,
         .tls_cert => domain.tls_cert = dupe_value,
         .tls_key => domain.tls_key = dupe_value,
     }
@@ -1730,6 +1748,7 @@ fn setDomainBoolProperty(cfg: *ServerConfig, domain_name: []const u8, value: []c
     switch (field) {
         .serve_static_root => domain.serve_static_root = parsed,
         .php_info_page => domain.php_info_page = parsed,
+        .php_front_controller => domain.php_front_controller = parsed,
     }
 }
 
@@ -1807,8 +1826,13 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
     } else if (std.mem.eql(u8, k, "php_binary") or std.mem.eql(u8, k, "php_bin")) {
         if (v.len == 0) return error.InvalidConfigValue;
         cfg.php_binary = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "php_index") or std.mem.eql(u8, k, "php_index_file")) {
+        if (v.len == 0 or std.mem.indexOf(u8, v, "..") != null or std.mem.startsWith(u8, v, "/")) return error.InvalidConfigValue;
+        cfg.php_index = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page") or std.mem.eql(u8, k, "enable_php_info_page")) {
         cfg.php_info_page = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "php_front_controller") or std.mem.eql(u8, k, "php_front_controller_enabled")) {
+        cfg.php_front_controller = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "proxy")) {
         if (disablesOptionalUrl(v)) {
             cfg.upstream = null;
@@ -1890,6 +1914,10 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "server_php_binary.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_php_index.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .php_index);
+    } else if (findRoutePropertyName(k, "server_php_index_file.")) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .php_index);
     } else if (findRoutePropertyName(k, "server_tls_cert.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .tls_cert);
     } else if (findRoutePropertyName(k, "server_tls_key.")) |name| {
@@ -1898,6 +1926,8 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainBoolProperty(cfg, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "server_phpinfo_page.")) |name| {
         try setDomainBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_php_front_controller.")) |name| {
+        try setDomainBoolProperty(cfg, name, v, .php_front_controller);
     } else if (findRoutePropertyName(k, "server_proxy.")) |name| {
         try setDomainProxyProperty(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_upstream.")) |name| {
@@ -1927,10 +1957,16 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainRouteStringProperty(cfg, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "server_route_php_binary.")) |name| {
         try setDomainRouteStringProperty(cfg, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "server_route_php_index.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .php_index);
+    } else if (findRoutePropertyName(k, "server_route_php_index_file.")) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .php_index);
     } else if (findRoutePropertyName(k, "server_route_php_info_page.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "server_route_phpinfo_page.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "server_route_php_front_controller.")) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .php_front_controller);
     } else if (findRoutePropertyName(k, "server_route_proxy.")) |name| {
         try setDomainRouteProxyProperty(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_route_upstream.")) |name| {
@@ -1959,10 +1995,16 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "route_php_binary.")) |name| {
         try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_index.")) |name| {
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_index);
+    } else if (findRoutePropertyName(k, "route_php_index_file.")) |name| {
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .php_index);
     } else if (findRoutePropertyName(k, "route_php_info_page.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "route_phpinfo_page.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_php_front_controller.")) |name| {
+        try setRouteBoolProperty(&cfg.routes, name, v, .php_front_controller);
     } else if (findRoutePropertyName(k, "route_proxy.")) |name| {
         try setRouteProxyProperty(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_upstream.")) |name| {
@@ -2151,6 +2193,7 @@ fn setDomainStringPropertyDirect(allocator: std.mem.Allocator, domain: *DomainCo
         .index_file => domain.index_file = dupe_value,
         .php_root => domain.php_root = dupe_value,
         .php_binary => domain.php_binary = dupe_value,
+        .php_index => domain.php_index = dupe_value,
         .tls_cert => domain.tls_cert = dupe_value,
         .tls_key => domain.tls_key = dupe_value,
     }
@@ -2161,6 +2204,7 @@ fn setDomainBoolPropertyDirect(domain: *DomainConfig, value: []const u8, field: 
     switch (field) {
         .serve_static_root => domain.serve_static_root = parsed,
         .php_info_page => domain.php_info_page = parsed,
+        .php_front_controller => domain.php_front_controller = parsed,
     }
 }
 
@@ -2195,8 +2239,12 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setDomainStringPropertyDirect(allocator, domain, v, .php_root);
     } else if (std.mem.eql(u8, k, "php_binary") or std.mem.eql(u8, k, "php_bin")) {
         try setDomainStringPropertyDirect(allocator, domain, v, .php_binary);
+    } else if (std.mem.eql(u8, k, "php_index") or std.mem.eql(u8, k, "php_index_file")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .php_index);
     } else if (std.mem.eql(u8, k, "php_info_page") or std.mem.eql(u8, k, "phpinfo_page")) {
         try setDomainBoolPropertyDirect(domain, v, .php_info_page);
+    } else if (std.mem.eql(u8, k, "php_front_controller") or std.mem.eql(u8, k, "php_front_controller_enabled")) {
+        try setDomainBoolPropertyDirect(domain, v, .php_front_controller);
     } else if (std.mem.eql(u8, k, "tls_cert") or std.mem.eql(u8, k, "ssl_certificate")) {
         try setDomainStringPropertyDirect(allocator, domain, v, .tls_cert);
     } else if (std.mem.eql(u8, k, "tls_key") or std.mem.eql(u8, k, "ssl_certificate_key")) {
@@ -2223,10 +2271,16 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setRouteStringProperty(&domain.routes, allocator, name, v, .php_binary);
     } else if (findRoutePropertyName(k, "route_php_binary.")) |name| {
         try setRouteStringProperty(&domain.routes, allocator, name, v, .php_binary);
+    } else if (findRoutePropertyName(k, "route_php_index.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .php_index);
+    } else if (findRoutePropertyName(k, "route_php_index_file.")) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .php_index);
     } else if (findRoutePropertyName(k, "route_php_info_page.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .php_info_page);
     } else if (findRoutePropertyName(k, "route_phpinfo_page.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .php_info_page);
+    } else if (findRoutePropertyName(k, "route_php_front_controller.")) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .php_front_controller);
     } else if (findRoutePropertyName(k, "route_proxy.")) |name| {
         try setRouteProxyProperty(&domain.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_upstream.")) |name| {
@@ -2336,6 +2390,13 @@ fn validateUpstreamPool(pool: UpstreamPoolConfig) !void {
     }
 }
 
+fn isSafeRelativeScriptPath(path: []const u8) bool {
+    return path.len > 0 and
+        path[0] != '/' and
+        std.mem.indexOf(u8, path, "..") == null and
+        std.mem.indexOfScalar(u8, path, '\x00') == null;
+}
+
 fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPoolConfig) !void {
     if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
     if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
@@ -2350,6 +2411,9 @@ fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPo
     }
     if (route.php_binary) |php_binary| {
         if (php_binary.len == 0) return error.InvalidConfigValue;
+    }
+    if (route.php_index) |php_index| {
+        if (!isSafeRelativeScriptPath(php_index)) return error.InvalidConfigValue;
     }
     if (route.upstream) |pool| {
         try validateUpstreamPool(pool);
@@ -2366,6 +2430,7 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.index_file.len == 0) return error.InvalidConfigValue;
     if (cfg.php_root.len == 0) return error.InvalidConfigValue;
     if (cfg.php_binary.len == 0) return error.InvalidConfigValue;
+    if (!isSafeRelativeScriptPath(cfg.php_index)) return error.InvalidConfigValue;
     if (cfg.http3_enabled and cfg.http3_port == 0) return error.InvalidConfigValue;
     if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
     if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
@@ -2419,6 +2484,9 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         }
         if (domain.php_binary) |php_binary| {
             if (php_binary.len == 0) return error.InvalidConfigValue;
+        }
+        if (domain.php_index) |php_index| {
+            if (!isSafeRelativeScriptPath(php_index)) return error.InvalidConfigValue;
         }
         if ((domain.tls_cert == null) != (domain.tls_key == null)) return error.InvalidConfigValue;
         if (domain.upstream) |pool| {
@@ -5698,7 +5766,97 @@ fn handlePhp(
     process_env: *const std.process.Environ.Map,
 ) !void {
     const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, rel_path, close_connection, is_head, process_env);
+    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, rel_path, req.path, "", close_connection, is_head, process_env);
+}
+
+const PhpFrontControllerTarget = struct {
+    script_rel_path: []const u8,
+    script_name: []const u8,
+    path_info: []const u8,
+
+    fn deinit(self: *const PhpFrontControllerTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.script_rel_path);
+        allocator.free(self.script_name);
+        allocator.free(self.path_info);
+    }
+};
+
+fn appendUrlPath(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    if (value.len == 0) return;
+    const segment = if (value[0] == '/') value[1..] else value;
+    if (segment.len == 0) return;
+    if (out.items.len == 0 or out.items[out.items.len - 1] != '/') try out.append(allocator, '/');
+    try out.appendSlice(allocator, segment);
+}
+
+fn phpFrontControllerScriptName(allocator: std.mem.Allocator, route: ?*const RouteConfig, php_index: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '/');
+
+    if (route) |r| {
+        if (r.strip_prefix and r.match_kind == .prefix) {
+            try appendUrlPath(&out, allocator, r.pattern);
+        }
+    }
+    try appendUrlPath(&out, allocator, php_index);
+    return out.toOwnedSlice(allocator);
+}
+
+fn phpFrontControllerPathInfo(allocator: std.mem.Allocator, route: ?*const RouteConfig, request_path: []const u8, script_name: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, request_path, script_name)) return allocator.dupe(u8, "");
+
+    if (route) |r| {
+        if (r.strip_prefix and r.match_kind == .prefix) {
+            const raw = if (request_path.len > r.pattern.len) request_path[r.pattern.len..] else "";
+            if (raw.len == 0) return allocator.dupe(u8, "/");
+            return if (raw[0] == '/')
+                allocator.dupe(u8, raw)
+            else
+                std.fmt.allocPrint(allocator, "/{s}", .{raw});
+        }
+    }
+
+    return if (request_path.len == 0)
+        allocator.dupe(u8, "/")
+    else
+        allocator.dupe(u8, request_path);
+}
+
+fn makePhpFrontControllerTarget(allocator: std.mem.Allocator, route: ?*const RouteConfig, request_path: []const u8, php_index: []const u8) !PhpFrontControllerTarget {
+    if (!isSafeRelativeScriptPath(php_index)) return error.InvalidConfigValue;
+
+    const script_rel_path = try allocator.dupe(u8, php_index);
+    errdefer allocator.free(script_rel_path);
+    const script_name = try phpFrontControllerScriptName(allocator, route, php_index);
+    errdefer allocator.free(script_name);
+    const path_info = try phpFrontControllerPathInfo(allocator, route, request_path, script_name);
+    errdefer allocator.free(path_info);
+
+    return .{
+        .script_rel_path = script_rel_path,
+        .script_name = script_name,
+        .path_info = path_info,
+    };
+}
+
+fn handlePhpFrontController(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    req: HttpRequest,
+    route: ?*const RouteConfig,
+    php_root: []const u8,
+    php_binary: []const u8,
+    php_index: []const u8,
+    close_connection: bool,
+    is_head: bool,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    const target = try makePhpFrontControllerTarget(allocator, route, req.path, php_index);
+    defer target.deinit(allocator);
+    try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, target.script_rel_path, target.script_name, target.path_info, close_connection, is_head, process_env);
 }
 
 fn handlePhpScript(
@@ -5710,6 +5868,8 @@ fn handlePhpScript(
     php_root: []const u8,
     php_binary: []const u8,
     script_rel_path: []const u8,
+    script_name: []const u8,
+    path_info: []const u8,
     close_connection: bool,
     is_head: bool,
     process_env: *const std.process.Environ.Map,
@@ -5769,10 +5929,17 @@ fn handlePhpScript(
     try child_env.put("SERVER_PROTOCOL", req.version);
     try child_env.put("REQUEST_METHOD", req.method);
     try child_env.put("REQUEST_URI", request_uri);
-    try child_env.put("SCRIPT_NAME", req.path);
+    const path_translated = if (path_info.len > 0 and path_info[0] == '/') blk: {
+        const translated_rel = path_info[1..];
+        break :blk try std.fs.path.join(allocator, &.{ php_root, translated_rel });
+    } else try allocator.dupe(u8, script_path);
+    defer allocator.free(path_translated);
+
+    try child_env.put("SCRIPT_NAME", script_name);
     try child_env.put("SCRIPT_FILENAME", script_path);
-    try child_env.put("PATH_TRANSLATED", script_path);
-    try child_env.put("PATH_INFO", "");
+    try child_env.put("PHP_SELF", script_name);
+    try child_env.put("PATH_TRANSLATED", path_translated);
+    try child_env.put("PATH_INFO", path_info);
     try child_env.put("QUERY_STRING", req.query);
     try child_env.put("DOCUMENT_ROOT", php_root);
     try child_env.put("REQUEST_SCHEME", "http");
@@ -6066,11 +6233,35 @@ fn domainPhpBinary(cfg: *const ServerConfig, domain: ?*const DomainConfig) []con
     return cfg.php_binary;
 }
 
+fn domainPhpIndex(cfg: *const ServerConfig, domain: ?*const DomainConfig) []const u8 {
+    if (domain) |d| {
+        if (d.php_index) |value| return value;
+    }
+    return cfg.php_index;
+}
+
 fn domainPhpInfoPage(cfg: *const ServerConfig, domain: ?*const DomainConfig) bool {
     if (domain) |d| {
         if (d.php_info_page) |value| return value;
     }
     return cfg.php_info_page;
+}
+
+fn domainPhpFrontController(cfg: *const ServerConfig, domain: ?*const DomainConfig) bool {
+    if (domain) |d| {
+        if (d.php_front_controller) |value| return value;
+    }
+    return cfg.php_front_controller;
+}
+
+fn routePhpIndex(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: *const RouteConfig) []const u8 {
+    if (route.php_index) |value| return value;
+    return domainPhpIndex(cfg, domain);
+}
+
+fn routePhpFrontController(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: *const RouteConfig) bool {
+    if (route.php_front_controller) |value| return value;
+    return domainPhpFrontController(cfg, domain);
 }
 
 fn domainUpstream(cfg: *const ServerConfig, domain: ?*const DomainConfig) ?UpstreamPoolConfig {
@@ -6179,9 +6370,13 @@ fn handleNamedRoute(
             }
             const php_root = route.php_root orelse domainPhpRoot(cfg, domain);
             const php_binary = route.php_binary orelse domainPhpBinary(cfg, domain);
+            if (routePhpFrontController(cfg, domain, route)) {
+                try handlePhpFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, routePhpIndex(cfg, domain, route), close_connection, is_head, process_env);
+                return;
+            }
             const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
             defer allocator.free(script_rel);
-            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, script_rel, close_connection, is_head, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, script_rel, req.path, "", close_connection, is_head, process_env);
             return;
         },
         .proxy => {
@@ -6211,7 +6406,9 @@ test "named routes prefer exact and longest prefix matches" {
         .index_file = "index.html",
         .php_root = "public",
         .php_binary = "php-cgi",
+        .php_index = DEFAULT_PHP_INDEX,
         .php_info_page = false,
+        .php_front_controller = false,
         .upstream = null,
         .upstream_policy = .round_robin,
         .tls_enabled = false,
@@ -6375,6 +6572,27 @@ test "named routes prefer exact and longest prefix matches" {
     try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate_key", "/certs/file/privkey.pem");
     try std.testing.expectEqualStrings("/certs/file/fullchain.pem", file_domain.tls_cert.?);
     try std.testing.expectEqualStrings("/certs/file/privkey.pem", file_domain.tls_key.?);
+}
+
+test "php front controller target keeps script and path info separate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var global_target = try makePhpFrontControllerTarget(allocator, null, "/orders/42", DEFAULT_PHP_INDEX);
+    defer global_target.deinit(allocator);
+    try std.testing.expectEqualStrings("index.php", global_target.script_rel_path);
+    try std.testing.expectEqualStrings("/index.php", global_target.script_name);
+    try std.testing.expectEqualStrings("/orders/42", global_target.path_info);
+
+    var routes = std.ArrayList(RouteConfig).empty;
+    try setRouteLineFor(&routes, allocator, "app /app/* php");
+    const route = &routes.items[0];
+    var route_target = try makePhpFrontControllerTarget(allocator, route, "/app/users/7", DEFAULT_PHP_INDEX);
+    defer route_target.deinit(allocator);
+    try std.testing.expectEqualStrings("index.php", route_target.script_rel_path);
+    try std.testing.expectEqualStrings("/app/index.php", route_target.script_name);
+    try std.testing.expectEqualStrings("/users/7", route_target.path_info);
 }
 
 test "upstream pools parse multiple targets and rotate selection" {
@@ -6617,6 +6835,11 @@ fn routeRequest(
     if (std.mem.eql(u8, method, "GET") or is_head) {
         if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
             try sendServerIcon(stream, should_close, is_head);
+            return;
+        }
+
+        if (std.mem.eql(u8, req.path, "/") and domainPhpFrontController(cfg, domain)) {
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
             return;
         }
 
@@ -7030,7 +7253,7 @@ fn routeRequest(
 
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, should_close, is_head, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
             return;
         }
 
@@ -7067,6 +7290,11 @@ fn routeRequest(
             }
         }
 
+        if (domainPhpFrontController(cfg, domain)) {
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
+            return;
+        }
+
         if (domainUpstreamMutable(cfg, domain)) |pool| {
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
             return;
@@ -7084,12 +7312,17 @@ fn routeRequest(
 
         if (std.mem.endsWith(u8, req.path, ".php")) {
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, should_close, false, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/api/echo")) {
             try sendResponseWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", req.body, should_close);
+            return;
+        }
+
+        if (domainPhpFrontController(cfg, domain)) {
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
             return;
         }
 
@@ -7111,6 +7344,11 @@ fn routeRequest(
     }
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
+        if (domainPhpFrontController(cfg, domain)) {
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
+            return;
+        }
+
         if (domainUpstreamMutable(cfg, domain)) |pool| {
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
             return;
@@ -8394,7 +8632,8 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                 std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse cfg.static_dir, route.index_file orelse cfg.index_file });
             },
             .php => {
-                std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary });
+                std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary, route.php_index orelse cfg.php_index });
+                if (route.php_front_controller orelse cfg.php_front_controller) std.debug.print(" front_controller=true", .{});
             },
             .proxy => {
                 const maybe_upstream = if (route.upstream) |pool| pool else cfg.upstream;
@@ -8432,7 +8671,8 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                     std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse domainStaticDir(cfg, domain), route.index_file orelse domainIndexFile(cfg, domain) });
                 },
                 .php => {
-                    std.debug.print(" php_root={s} php_bin={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain) });
+                    std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain), routePhpIndex(cfg, domain, &route) });
+                    if (routePhpFrontController(cfg, domain, &route)) std.debug.print(" front_controller=true", .{});
                 },
                 .proxy => {
                     const maybe_upstream = if (route.upstream) |pool| pool else domainUpstream(cfg, domain);
@@ -8471,7 +8711,7 @@ fn usage() void {
         "Layerline HTTP server\n\n" ++
             "Usage:\n" ++
             "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
-            "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-info-page true|false] " ++
+            "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
             "[--http3 true|false] [--http3-port PORT] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
@@ -8487,15 +8727,15 @@ fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
+            "route_php_bin.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE\n" ++
+            "server_upstream_policy.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
@@ -8505,6 +8745,7 @@ fn usage() void {
             "  zig build run -- --port 4000\n" ++
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++
+            "  zig build run -- --php-front-controller true --php-index index.php\n" ++
             "  zig build run -- --config server.conf\n" ++
             "  zig build run -- --domain-config-dir domains-enabled --dump-routes\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
@@ -8541,7 +8782,9 @@ pub fn main(init: std.process.Init) !void {
         .index_file = "index.html",
         .php_root = "public",
         .php_binary = "php-cgi",
+        .php_index = DEFAULT_PHP_INDEX,
         .php_info_page = false,
+        .php_front_controller = false,
         .tls_enabled = false,
         .tls_auto = false,
         .letsencrypt_email = null,
@@ -8740,12 +8983,23 @@ pub fn main(init: std.process.Init) !void {
                 usage();
                 return;
             };
+        } else if (std.mem.eql(u8, arg, "--php-index") or std.mem.eql(u8, arg, "--php-index-file")) {
+            cfg.php_index = args.next() orelse {
+                usage();
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--php-info-page") or std.mem.eql(u8, arg, "--phpinfo-page")) {
             const value = args.next() orelse {
                 usage();
                 return;
             };
             cfg.php_info_page = parseBool(value) orelse cfg.php_info_page;
+        } else if (std.mem.eql(u8, arg, "--php-front-controller")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.php_front_controller = parseBool(value) orelse cfg.php_front_controller;
         } else if (std.mem.eql(u8, arg, "--proxy") or std.mem.eql(u8, arg, "-x")) {
             const value = args.next() orelse {
                 usage();

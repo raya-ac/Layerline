@@ -4,7 +4,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
-- PHP route execution for `.php` paths via `php-cgi`/`php`.
+- PHP route execution for `.php` paths via `php-cgi`/`php`, plus opt-in `index.php` front-controller fallback with PATH_INFO.
 - Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, circuit breaker half-open probes, slow start, upstream keep-alive pooling, and opt-in active health checks.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, PHP front-controller fallback, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI/PHP front-controller handling, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI transport, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -82,6 +82,9 @@ serve_static_root = true
 index_file = index.html
 php_root = public
 php_bin = php-cgi
+php_index = index.php
+# Send unknown local paths to php_index with PATH_INFO for framework-style apps.
+php_front_controller = false
 # /test.php renders phpinfo(); keep disabled outside local diagnostics.
 php_info_page = false
 # Set proxy to one upstream URL, or a comma/space-separated pool, to forward unknown local routes.
@@ -119,6 +122,8 @@ proxy = off
 #route = app /app/* php
 #route_php_root.app = public
 #route_php_bin.app = php-cgi
+#route_php_index.app = index.php
+#route_php_front_controller.app = true
 #route = api /api/* proxy
 #route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 # Nginx-style per-domain files live outside this main runtime config.
@@ -274,6 +279,8 @@ route_dir.assets = public
 route = app /app/* php
 route_php_root.app = public
 route_php_bin.app = php-cgi
+route_php_index.app = index.php
+route_php_front_controller.app = true
 
 proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
 upstream_policy = random
@@ -448,6 +455,24 @@ zig build run -- --php-bin /usr/bin/php-cgi --php-root public
 ```
 
 If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
+
+For framework-style apps, enable the front controller. Layerline will still serve real static files first when `serve_static_root = true`, then run `php_index` and set `SCRIPT_NAME`, `SCRIPT_FILENAME`, `PATH_INFO`, `PATH_TRANSLATED`, and `REQUEST_URI` for the original request.
+
+```text
+php_root = public
+php_bin = /usr/bin/php-cgi
+php_index = index.php
+php_front_controller = true
+```
+
+Route-local front controllers work the same way:
+
+```text
+route = app /app/* php
+route_php_root.app = public
+route_php_index.app = index.php
+route_php_front_controller.app = true
+```
 
 The bundled `/test.php` phpinfo page is disabled by default because it exposes runtime details. Enable it only when you need diagnostics:
 
