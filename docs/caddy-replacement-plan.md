@@ -1,10 +1,10 @@
 # Layerline Caddy Replacement Plan
 
-Layerline is not a Caddy replacement until it can be the public edge for normal production sites without a second web server in front of it. The bar is operational, not cosmetic: it must keep apps online, reload config safely, terminate TLS reliably, proxy modern app protocols, and expose enough diagnostics to debug failures.
+Layerline is already the public edge for the controlled `layerline.dev` deployment and fronts `memorylayer.run` without Caddy in front of it. That is not the same thing as a broad Caddy/nginx replacement claim. The general replacement bar is operational, not cosmetic: it must keep apps online, reload config safely, terminate TLS reliably, proxy modern app protocols, and expose enough diagnostics to debug failures.
 
 ## Replacement Gate
 
-Layerline can replace Caddy for `layerline.dev` or similar sites only after these gates pass:
+Layerline can replace Caddy for controlled sites now when the deployment accepts the current restart-based reload bridge and HTTP/3 limits. For a broader drop-in replacement story, these gates need to pass:
 
 - Static files, PHP/FastCGI, reverse proxy routes, and HEAD/error response framing work from nginx-style per-domain config files.
 - TLS can load configured certs and keep serving HTTP/1.1 and HTTP/2 through ALPN.
@@ -37,4 +37,4 @@ Commit each section independently after tests and at least one live smoke where 
 
 ## Not Ready Means Not Ready
 
-Until those gates pass, Layerline can replace Caddy only for narrow controlled services. It should not be described as a full Caddy replacement while HTTP/3 full routing, in-memory hot reload, full protocol conformance, live certificate reload, and live mutating operational admin controls are incomplete.
+Layerline is ready for narrow controlled services where config activation can go through the managed restart bridge and HTTP/3 is not required for full app routing. It should not be described as a full Caddy/nginx replacement while HTTP/3 full routing, in-memory hot reload, full protocol conformance, live certificate reload, and live mutating operational admin controls are incomplete.

@@ -121,7 +121,7 @@ proxy = http://127.0.0.1:3000</code></pre>
             <li>Add new sites by writing enabled domain config files.</li>
             <li>Save main server settings with a backup beside the config.</li>
             <li>Inspect redacted config previews without leaking tokens or private key paths.</li>
-            <li>Validate runtime config before restarting into staged changes.</li>
+            <li>Validate activation config and TLS material before managed restart.</li>
           </ul>
         </div>
         <pre><code>admin_ui = true
@@ -152,7 +152,7 @@ domain_config_dir = domains-enabled</code></pre>
           </tbody>
         </table>
       </div>
-      <p class="note">Layerline can already serve normal HTTP/1.1 and HTTP/2 routes, own TLS, proxy apps, host PHP, and expose admin diagnostics. Full HTTP/3 route dispatch, hot reload, and long soak conformance remain roadmap work.</p>
+      <p class="note">Layerline already serves layerline.dev and fronts memorylayer.run as the active edge. It can serve normal HTTP/1.1 and HTTP/2 routes, own TLS, proxy apps, host PHP, and expose admin diagnostics. Full HTTP/3 route dispatch, in-memory hot reload, and long soak conformance remain roadmap work.</p>
     </section>
 
     <section class="section setup" id="setup">
@@ -188,8 +188,8 @@ zig build run -- --validate-config</code></pre>
       </div>
       <div class="roadmap-grid">
         <div><strong>Ready now</strong><span>Static, PHP/FastCGI, proxy pools, domain files, TLS material loading, HTTP/2 routing, admin setup, metrics, logs.</span></div>
-        <div><strong>In progress</strong><span>Full HTTP/3 route dispatch, hot reload, richer HTTP/2 policy, broader conformance, cache behavior, cert reload.</span></div>
-        <div><strong>Next gate</strong><span>Replace Caddy only after reload, TLS renewal, route controls, soak tests, and deployment rollback paths pass together.</span></div>
+        <div><strong>In progress</strong><span>Full HTTP/3 route dispatch, in-memory hot reload, broader h2/h3 conformance, route-local stale/cache behavior, cert reload.</span></div>
+        <div><strong>Next gate</strong><span>General Caddy-class replacement after reload, live TLS material, route controls, soak tests, and rollback paths pass together.</span></div>
       </div>
     </section>
   </main>

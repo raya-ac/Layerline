@@ -144,7 +144,7 @@ http_redirect_https_port = 443
 http_redirect_status = 308
 ```
 
-With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --webroot` loop. For production, prefer the systemd `layerline-cert-renew.timer` because its certbot deploy hook restarts Layerline only after a renewed certificate is deployed. Renewal updates the certificate files on disk; until hot reload lands, the running process must restart to pick up new TLS material.
+With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --webroot` loop. For production, prefer the systemd `layerline-cert-renew.timer` because its certbot deploy hook restarts Layerline only after a renewed certificate is deployed. Renewal updates the certificate files on disk; until in-memory hot reload lands, the running process must restart to pick up new TLS material.
 
 ## Smoke Checks
 

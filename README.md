@@ -17,7 +17,7 @@
   </p>
 </div>
 
-Layerline is a single-binary web server that can sit at the public edge without hiding behind Caddy or nginx. It serves the live [layerline.dev](https://layerline.dev) site today, while the roadmap keeps the remaining production gaps explicit instead of pretending they are solved.
+Layerline is a single-binary web server that can sit at the public edge without hiding behind Caddy or nginx. It serves the live [layerline.dev](https://layerline.dev) site and fronts [memorylayer.run](https://memorylayer.run) today, while the roadmap keeps the remaining production gaps explicit instead of pretending they are solved.
 
 ## At A Glance
 
@@ -51,7 +51,7 @@ Layerline blends local serving with edge-style deployment:
 
 ## What It Replaces
 
-Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, and admin controls in one Zig binary. It is already usable for controlled services and the project website; full Caddy replacement still depends on the remaining hot-reload, HTTP/3 route-dispatch, and soak-test work tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
+Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, and admin controls in one Zig binary. It is already serving controlled production traffic for Layerline-hosted sites; general Caddy-class replacement still depends on the remaining in-memory reload, HTTP/3 route-dispatch, and soak-test work tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
 
 ## Current status
 
@@ -299,7 +299,7 @@ When dynamic compression is enabled, Layerline raises worker stack size to at le
 
 ## Admin Socket
 
-Set `admin_socket` to enable a local Unix socket for read-only operations:
+Set `admin_socket` to enable a local Unix socket for operational commands:
 
 ```conf
 admin_socket = /tmp/layerline-admin.sock
@@ -313,7 +313,7 @@ printf 'routes\n' | nc -U /tmp/layerline-admin.sock
 printf 'certs\n' | nc -U /tmp/layerline-admin.sock
 ```
 
-This socket deliberately does not reload config yet. Reload needs an owned immutable config snapshot per worker so existing requests can drain on the old config while new requests move to the new one.
+This socket does not do in-memory hot reload yet. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it. True reload still needs an owned immutable config snapshot per worker so existing requests can drain on the old config while new requests move to the new one.
 
 ## Admin Web UI
 
@@ -328,7 +328,7 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: restart Layerline for those changes to become active until the hot-reload config snapshot work lands.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use managed restart for those changes to become active until the in-memory config snapshot work lands.
 
 ## Website and branding
 
@@ -499,7 +499,7 @@ zig build run -- \
 
 `letsencrypt_webroot` follows certbot webroot semantics: point it at the public root, and Layerline serves files from `<webroot>/.well-known/acme-challenge/<token>`. Older configs that point directly at `.well-known/acme-challenge` still work, but new production configs should use the public root. Enable `http_redirect = true` when Layerline owns both ports: the plaintext listener serves ACME challenges and redirects every other request to HTTPS with the original host, path, and query.
 
-Renewal updates the certificate files on disk. Until hot reload lands, the running process must restart to pick up new TLS material. For production systemd hosts, install `deploy/systemd/layerline-cert-renew.timer`; its certbot deploy hook restarts Layerline only after a renewed certificate is deployed.
+Renewal updates the certificate files on disk. Until in-memory hot reload lands, the running process must restart to pick up new TLS material. For production systemd hosts, install `deploy/systemd/layerline-cert-renew.timer`; its certbot deploy hook restarts Layerline only after a renewed certificate is deployed.
 
 ### Cloudflare automatic deployment
 
@@ -545,7 +545,7 @@ zig build run -- \
 ```
 
 When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
-This process still uses one worker thread per accepted socket, so for very high live-connection counts it should sit behind HAProxy/Nginx/Caddy or another edge balancer while native evented IO is built out.
+This process still uses one worker thread per accepted socket, so extreme live-connection fan-in should use a dedicated L4/edge balancing tier while native evented IO is built out.
 `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for active handlers to drain.
 Common host limits to revisit before aggressive load tests:
 
