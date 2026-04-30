@@ -612,6 +612,102 @@ const ServerConfig = struct {
     cloudflare_record_comment: ?[]const u8,
 };
 
+fn defaultServerConfig() ServerConfig {
+    return .{
+        .config_path = DEFAULT_CONFIG_PATH,
+        .host = "127.0.0.1",
+        .port = 8080,
+        .static_dir = "public",
+        .serve_static_root = false,
+        .index_file = "index.html",
+        .php_root = "public",
+        .php_binary = "php-cgi",
+        .php_index = DEFAULT_PHP_INDEX,
+        .php_fastcgi = null,
+        .php_info_page = false,
+        .php_front_controller = false,
+        .tls_enabled = false,
+        .tls_auto = false,
+        .letsencrypt_email = null,
+        .letsencrypt_domains = null,
+        .letsencrypt_webroot = "public",
+        .letsencrypt_certbot = "certbot",
+        .letsencrypt_staging = false,
+        .letsencrypt_renew = true,
+        .letsencrypt_renew_interval_ms = DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS,
+        .http_redirect_enabled = false,
+        .http_redirect_port = 80,
+        .http_redirect_https_port = 443,
+        .http_redirect_status = 308,
+        .cloudflare_auto_deploy = false,
+        .cloudflare_api_base = "https://api.cloudflare.com/client/v4",
+        .cloudflare_token = null,
+        .cloudflare_zone_id = null,
+        .cloudflare_zone_name = null,
+        .cloudflare_record_name = null,
+        .cloudflare_record_type = "A",
+        .cloudflare_record_content = null,
+        .cloudflare_record_ttl = 300,
+        .cloudflare_record_proxied = false,
+        .cloudflare_record_comment = null,
+        .upstream = null,
+        .upstream_policy = .round_robin,
+        .tls_cert = null,
+        .tls_key = null,
+        .tls_material = null,
+        .h2_upstream = null,
+        .http3_enabled = false,
+        .http3_port = 8443,
+        .admin_enabled = false,
+        .admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
+        .admin_ui_enabled = false,
+        .admin_ui_path = DEFAULT_ADMIN_UI_PATH,
+        .admin_credentials_path = DEFAULT_ADMIN_CREDENTIALS_PATH,
+        .access_log_enabled = false,
+        .access_log_path = DEFAULT_ACCESS_LOG_PATH,
+        .compression_enabled = false,
+        .gzip_enabled = true,
+        .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
+        .compression_max_bytes = DEFAULT_COMPRESSION_MAX_BYTES,
+        .response_headers = .empty,
+        .redirects = .empty,
+        .routes = .empty,
+        .domains = .empty,
+        .domain_config_dir = null,
+        .max_request_bytes = DEFAULT_MAX_REQUEST_BYTES,
+        .max_body_bytes = DEFAULT_MAX_BODY_BYTES,
+        .max_static_file_bytes = DEFAULT_MAX_STATIC_FILE_BYTES,
+        .max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+        .max_concurrent_connections = DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+        .worker_stack_size = DEFAULT_WORKER_STACK_BYTES,
+        .read_header_timeout_ms = DEFAULT_READ_HEADER_TIMEOUT_MS,
+        .read_body_timeout_ms = DEFAULT_READ_BODY_TIMEOUT_MS,
+        .idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS,
+        .write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS,
+        .upstream_timeout_ms = DEFAULT_UPSTREAM_TIMEOUT_MS,
+        .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
+        .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
+        .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,
+        .upstream_keepalive_enabled = true,
+        .upstream_keepalive_max_idle = DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE,
+        .upstream_keepalive_idle_timeout_ms = DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .upstream_keepalive_max_requests = DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS,
+        .fastcgi_keepalive_enabled = true,
+        .fastcgi_keepalive_max_idle = DEFAULT_FASTCGI_KEEPALIVE_MAX_IDLE,
+        .fastcgi_keepalive_idle_timeout_ms = DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS,
+        .fastcgi_keepalive_max_requests = DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS,
+        .upstream_health_check_enabled = false,
+        .upstream_health_check_path = DEFAULT_UPSTREAM_HEALTH_CHECK_PATH,
+        .upstream_health_check_interval_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS,
+        .upstream_health_check_timeout_ms = DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS,
+        .upstream_circuit_breaker_enabled = true,
+        .upstream_circuit_half_open_max = DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX,
+        .upstream_slow_start_ms = DEFAULT_UPSTREAM_SLOW_START_MS,
+        .graceful_shutdown_timeout_ms = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+        .max_php_output_bytes = DEFAULT_MAX_PHP_OUTPUT_BYTES,
+    };
+}
+
 const ResponseHeaderContext = struct {
     items: []const ResponseHeaderRule,
     owned: ?[]ResponseHeaderRule = null,
@@ -3350,6 +3446,23 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     }
 }
 
+fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const candidate_allocator = arena.allocator();
+
+    var candidate = defaultServerConfig();
+    candidate.config_path = cfg.config_path;
+    try loadConfig(io, candidate_allocator, &candidate, candidate.config_path);
+    try loadConfiguredDomainConfigs(io, candidate_allocator, &candidate);
+    normalizeConfig(&candidate);
+    try validateConfig(&candidate);
+
+    // Catch bad certificate paths before an operator asks a supervisor to
+    // restart into them. The arena drops the temporary material afterwards.
+    try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
+}
+
 fn contentTypeFromPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
@@ -5122,18 +5235,18 @@ fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Allocator
 fn appendAdminMainConfigPreview(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     try out.appendSlice(allocator,
         \\<section class="block span-all" id="config">
-        \\  <div class="section-head"><div><h2>Config management</h2><p>Runtime validation plus redacted previews of the main config and enabled site files.</p></div><span class="pill">restart required after writes</span></div>
+        \\  <div class="section-head"><div><h2>Config management</h2><p>Activation preflight plus redacted previews of the main config and enabled site files.</p></div><span class="pill">managed restart applies writes</span></div>
         \\
     );
     try out.appendSlice(allocator, "<pre>");
-    validateConfig(cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
+    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "ERROR activation config invalid: {}\n", .{err});
         defer allocator.free(message);
         try appendHtmlEscaped(out, allocator, message);
         try out.appendSlice(allocator, "</pre></section>\n");
         return;
     };
-    try appendHtmlEscaped(out, allocator, "OK config\n");
+    try appendHtmlEscaped(out, allocator, "OK activation config\n");
     try appendHtmlEscaped(out, allocator, "main_config = ");
     try appendHtmlEscaped(out, allocator, cfg.config_path);
     try appendHtmlEscaped(out, allocator, "\n");
@@ -5248,6 +5361,8 @@ fn renderAdminDashboardPage(io: std.Io, allocator: std.mem.Allocator, cfg: *cons
     try out.appendSlice(allocator, "<div class=\"actions\"><form method=\"post\" action=\"");
     try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/validate\"><button type=\"submit\">Validate config</button></form><form method=\"post\" action=\"");
+    try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
+    try out.appendSlice(allocator, "/restart\"><button type=\"submit\">Graceful restart</button></form><form method=\"post\" action=\"");
     try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/logout\"><button type=\"submit\">Log out</button></form></div>\n");
     if (maybe_notice) |message| try appendAdminNotice(&out, allocator, "", message);
@@ -5482,13 +5597,25 @@ fn handleAdminLoginPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator,
 }
 
 fn handleAdminValidatePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool) !void {
-    validateConfig(cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "Runtime config is invalid: {}", .{err});
+    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Activation config is invalid: {}", .{err});
         defer allocator.free(message);
         try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
         return;
     };
-    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, "Runtime config is valid.", null, 200, "OK", close_connection, false);
+    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, "Activation config is valid. A managed restart can apply staged writes.", null, 200, "OK", close_connection, false);
+}
+
+fn handleAdminRestartPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool) !void {
+    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Restart blocked because activation config is invalid: {}", .{err});
+        defer allocator.free(message);
+        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    shutdown_requested.store(true, .release);
+    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted", close_connection, false);
 }
 
 fn handleAdminAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
@@ -5730,6 +5857,10 @@ fn handleAdminUi(
         try handleAdminValidatePost(io, stream, allocator, cfg, credentials, close_connection);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/restart")) {
+        try handleAdminRestartPost(io, stream, allocator, cfg, credentials, close_connection);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
         try handleAdminAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection);
         return;
@@ -5755,7 +5886,7 @@ fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
 fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8) !void {
     const command = trimValue(command_raw);
     if (command.len == 0 or std.mem.eql(u8, command, "help")) {
-        try sendAdminText(stream, "commands: status, validate, routes, certs, metrics, help\n");
+        try sendAdminText(stream, "commands: status, validate, validate-runtime, restart, routes, certs, metrics, help\n");
         return;
     }
 
@@ -5767,13 +5898,36 @@ fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
     }
 
     if (std.mem.eql(u8, command, "validate") or std.mem.eql(u8, command, "validate-config")) {
-        validateConfig(cfg) catch |err| {
+        validateConfigFileForActivation(activeIo(), allocator, cfg) catch |err| {
             const body = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
             defer allocator.free(body);
             try sendAdminText(stream, body);
             return;
         };
-        try sendAdminText(stream, "OK config\n");
+        try sendAdminText(stream, "OK activation config\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "validate-runtime")) {
+        validateConfig(cfg) catch |err| {
+            const body = try std.fmt.allocPrint(allocator, "ERROR runtime config invalid: {}\n", .{err});
+            defer allocator.free(body);
+            try sendAdminText(stream, body);
+            return;
+        };
+        try sendAdminText(stream, "OK runtime config\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "restart") or std.mem.eql(u8, command, "graceful-restart")) {
+        validateConfigFileForActivation(activeIo(), allocator, cfg) catch |err| {
+            const body = try std.fmt.allocPrint(allocator, "ERROR restart blocked: {}\n", .{err});
+            defer allocator.free(body);
+            try sendAdminText(stream, body);
+            return;
+        };
+        try sendAdminText(stream, "OK graceful restart requested\n");
+        shutdown_requested.store(true, .release);
         return;
     }
 
