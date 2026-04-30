@@ -74,6 +74,7 @@ const ADMIN_SALT_BYTES = 16;
 const ADMIN_HASH_BYTES = 32;
 const ADMIN_SESSION_BYTES = 32;
 const ADMIN_SITE_CONFIG_MAX_BYTES = 16 * 1024;
+const ADMIN_MAIN_CONFIG_MAX_BYTES = 256 * 1024;
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
@@ -517,6 +518,7 @@ const DomainConfig = struct {
 
 // All server behavior is described in this single config object.
 const ServerConfig = struct {
+    config_path: []const u8,
     host: []const u8,
     port: u16,
     static_dir: []const u8,
@@ -4011,6 +4013,54 @@ fn adminConfigValueSafe(value: []const u8) bool {
     return std.mem.indexOfAny(u8, value, "\r\n\x00") == null;
 }
 
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn adminConfigKeySensitive(key: []const u8) bool {
+    return asciiContainsIgnoreCase(key, "token") or
+        asciiContainsIgnoreCase(key, "secret") or
+        asciiContainsIgnoreCase(key, "password") or
+        asciiContainsIgnoreCase(key, "credential") or
+        asciiContainsIgnoreCase(key, "private_key") or
+        asciiContainsIgnoreCase(key, "tls_key") or
+        asciiContainsIgnoreCase(key, "ssl_certificate_key");
+}
+
+fn appendRedactedConfigEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+        const trimmed = trimValue(line);
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            try appendHtmlEscaped(out, allocator, line);
+            try out.append(allocator, '\n');
+            continue;
+        }
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+            try appendHtmlEscaped(out, allocator, line);
+            try out.append(allocator, '\n');
+            continue;
+        };
+        const key = trimValue(line[0..eq]);
+        if (adminConfigKeySensitive(key)) {
+            try appendHtmlEscaped(out, allocator, key);
+            try out.appendSlice(allocator, " = &lt;redacted&gt;\n");
+            continue;
+        }
+
+        try appendHtmlEscaped(out, allocator, line);
+        try out.append(allocator, '\n');
+    }
+}
+
 fn adminTrimmedField(fields: []const FormField, name: []const u8) []const u8 {
     return trimValue(formValue(fields, name) orelse "");
 }
@@ -4024,6 +4074,126 @@ fn appendDomainConfigLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator,
     try out.print(allocator, "{s} = {s}\n", .{ key, value });
 }
 
+const AdminConfigSetting = struct {
+    key: []const u8,
+    value: []const u8,
+    emit: bool = true,
+};
+
+fn adminConfigSettingMatches(setting: AdminConfigSetting, key: []const u8) bool {
+    if (std.mem.eql(u8, setting.key, key)) return true;
+    if (std.mem.eql(u8, setting.key, "static_dir")) return std.mem.eql(u8, key, "dir");
+    if (std.mem.eql(u8, setting.key, "index_file")) return std.mem.eql(u8, key, "index");
+    if (std.mem.eql(u8, setting.key, "php_binary")) return std.mem.eql(u8, key, "php_bin");
+    if (std.mem.eql(u8, setting.key, "admin_socket")) return std.mem.eql(u8, key, "admin_socket_path");
+    if (std.mem.eql(u8, setting.key, "access_log")) return std.mem.eql(u8, key, "access_log_path");
+    return false;
+}
+
+fn adminConfigSettingIndex(settings: []const AdminConfigSetting, key: []const u8) ?usize {
+    for (settings, 0..) |setting, index| {
+        if (adminConfigSettingMatches(setting, key)) return index;
+    }
+    return null;
+}
+
+fn appendAdminConfigSettingLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, setting: AdminConfigSetting) !void {
+    if (!setting.emit) return;
+    try appendDomainConfigLine(out, allocator, setting.key, setting.value);
+}
+
+fn buildAdminConfigWithSettings(allocator: std.mem.Allocator, existing: []const u8, settings: []const AdminConfigSetting) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const written = try allocator.alloc(bool, settings.len);
+    defer allocator.free(written);
+    @memset(written, false);
+
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+        const trimmed = trimValue(line);
+        if (trimmed.len > 0 and trimmed[0] != '#') {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                const key = trimValue(line[0..eq]);
+                if (adminConfigSettingIndex(settings, key)) |setting_index| {
+                    if (!written[setting_index]) {
+                        try appendAdminConfigSettingLine(&out, allocator, settings[setting_index]);
+                        written[setting_index] = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        try out.appendSlice(allocator, line);
+        try out.append(allocator, '\n');
+    }
+
+    var appended_header = false;
+    for (settings, 0..) |setting, index| {
+        if (written[index] or !setting.emit) continue;
+        if (!appended_header) {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+            try out.appendSlice(allocator, "\n# Managed by Layerline Admin settings\n");
+            appended_header = true;
+        }
+        try appendAdminConfigSettingLine(&out, allocator, setting);
+    }
+
+    if (out.items.len > ADMIN_MAIN_CONFIG_MAX_BYTES) return error.InvalidConfigValue;
+    return out.toOwnedSlice(allocator);
+}
+
+fn validateAdminSettingsPatch(allocator: std.mem.Allocator, cfg: *const ServerConfig, settings: []const AdminConfigSetting, tls_cert: []const u8, tls_key: []const u8) !void {
+    if ((tls_cert.len == 0) != (tls_key.len == 0)) return error.InvalidConfigValue;
+
+    var trial = cfg.*;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    for (settings) |setting| {
+        if (!setting.emit) continue;
+        if (!adminConfigValueSafe(setting.value)) return error.InvalidConfigValue;
+        try applyConfigLine(&trial, scratch, setting.key, setting.value);
+    }
+    try validateConfig(&trial);
+}
+
+fn writeAdminMainConfigFile(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, settings: []const AdminConfigSetting) ![]const u8 {
+    const path = cfg.config_path;
+    const maybe_existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(ADMIN_MAIN_CONFIG_MAX_BYTES)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (maybe_existing) |existing| allocator.free(existing);
+
+    const existing = maybe_existing orelse "";
+    const merged = try buildAdminConfigWithSettings(allocator, existing, settings);
+    defer allocator.free(merged);
+
+    try ensureParentDir(io, path);
+    if (maybe_existing) |existing_content| {
+        const backup_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{path});
+        defer allocator.free(backup_path);
+        try ensureParentDir(io, backup_path);
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = backup_path,
+            .data = existing_content,
+            .flags = .{ .permissions = @enumFromInt(0o640) },
+        });
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = merged,
+        .flags = .{ .permissions = @enumFromInt(0o640) },
+    });
+
+    return try allocator.dupe(u8, path);
+}
+
 fn validateAdminSiteInput(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -4035,24 +4205,45 @@ fn validateAdminSiteInput(
     php_fastcgi: []const u8,
     tls_cert: []const u8,
     tls_key: []const u8,
+    route_name: []const u8,
+    route_pattern: []const u8,
+    route_handler: []const u8,
+    route_static_dir: []const u8,
+    route_proxy: []const u8,
+    route_php_fastcgi: []const u8,
 ) !void {
     if (!isDomainConfigNameValid(name)) return error.InvalidConfigValue;
     if (server_names.len == 0 or root.len == 0 or index.len == 0) return error.InvalidConfigValue;
-    const values = [_][]const u8{ server_names, root, index, proxy, upstream_policy, php_fastcgi, tls_cert, tls_key };
+    const values = [_][]const u8{ server_names, root, index, proxy, upstream_policy, php_fastcgi, tls_cert, tls_key, route_name, route_pattern, route_handler, route_static_dir, route_proxy, route_php_fastcgi };
     for (values) |value| {
         if (!adminConfigValueSafe(value)) return error.InvalidConfigValue;
     }
 
-    var domain = try initDomainConfig(allocator, name);
-    try appendServerNames(allocator, &domain, server_names);
+    var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+
+    var domain = try initDomainConfig(scratch, name);
+    try appendServerNames(scratch, &domain, server_names);
 
     if (proxy.len > 0) {
-        const pool = try parseUpstreamPool(allocator, proxy);
+        const pool = try parseUpstreamPool(scratch, proxy);
         try validateUpstreamPool(pool);
     }
     if (upstream_policy.len > 0) _ = try parseOptionalUpstreamPoolPolicy(upstream_policy);
     if (php_fastcgi.len > 0 and !disablesOptionalUrl(php_fastcgi)) try validateFastcgiEndpoint(php_fastcgi);
     if ((tls_cert.len == 0) != (tls_key.len == 0)) return error.InvalidConfigValue;
+
+    const has_route = route_name.len > 0 or route_pattern.len > 0 or route_handler.len > 0 or route_static_dir.len > 0 or route_proxy.len > 0 or route_php_fastcgi.len > 0;
+    if (has_route) {
+        if (route_name.len == 0 or route_pattern.len == 0 or route_handler.len == 0) return error.InvalidConfigValue;
+        const line = try std.fmt.allocPrint(scratch, "{s} {s} {s}", .{ route_name, route_pattern, route_handler });
+        try setRouteLineFor(&domain.routes, scratch, line);
+        if (route_static_dir.len > 0) try setRouteStringProperty(&domain.routes, scratch, route_name, route_static_dir, .static_dir);
+        if (route_proxy.len > 0) try setRouteProxyProperty(&domain.routes, scratch, route_name, route_proxy);
+        if (route_php_fastcgi.len > 0) try setRouteStringProperty(&domain.routes, scratch, route_name, route_php_fastcgi, .php_fastcgi);
+        try validateRouteConfig(&domain.routes.items[0], null);
+    }
 }
 
 fn buildAdminSiteConfig(
@@ -4068,8 +4259,15 @@ fn buildAdminSiteConfig(
     php_front_controller: bool,
     tls_cert: []const u8,
     tls_key: []const u8,
+    route_name: []const u8,
+    route_pattern: []const u8,
+    route_handler: []const u8,
+    route_static_dir: []const u8,
+    route_proxy: []const u8,
+    route_php_fastcgi: []const u8,
+    route_php_front_controller: bool,
 ) ![]const u8 {
-    try validateAdminSiteInput(allocator, name, server_names, root, index, proxy, upstream_policy, php_fastcgi, tls_cert, tls_key);
+    try validateAdminSiteInput(allocator, name, server_names, root, index, proxy, upstream_policy, php_fastcgi, tls_cert, tls_key, route_name, route_pattern, route_handler, route_static_dir, route_proxy, route_php_fastcgi);
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -4086,6 +4284,32 @@ fn buildAdminSiteConfig(
     if (upstream_policy.len > 0) try appendDomainConfigLine(&out, allocator, "upstream_policy", upstream_policy);
     if (tls_cert.len > 0) try appendDomainConfigLine(&out, allocator, "tls_cert", tls_cert);
     if (tls_key.len > 0) try appendDomainConfigLine(&out, allocator, "tls_key", tls_key);
+    if (route_name.len > 0) {
+        try out.append(allocator, '\n');
+        const route_line = try std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ route_name, route_pattern, route_handler });
+        defer allocator.free(route_line);
+        try appendDomainConfigLine(&out, allocator, "route", route_line);
+        if (route_static_dir.len > 0) {
+            const key = try std.fmt.allocPrint(allocator, "route_dir.{s}", .{route_name});
+            defer allocator.free(key);
+            try appendDomainConfigLine(&out, allocator, key, route_static_dir);
+        }
+        if (route_proxy.len > 0) {
+            const key = try std.fmt.allocPrint(allocator, "route_proxy.{s}", .{route_name});
+            defer allocator.free(key);
+            try appendDomainConfigLine(&out, allocator, key, route_proxy);
+        }
+        if (route_php_fastcgi.len > 0) {
+            const key = try std.fmt.allocPrint(allocator, "route_php_fastcgi.{s}", .{route_name});
+            defer allocator.free(key);
+            try appendDomainConfigLine(&out, allocator, key, route_php_fastcgi);
+        }
+        if (route_php_front_controller) {
+            const key = try std.fmt.allocPrint(allocator, "route_php_front_controller.{s}", .{route_name});
+            defer allocator.free(key);
+            try appendDomainConfigLine(&out, allocator, key, "true");
+        }
+    }
 
     if (out.items.len > ADMIN_SITE_CONFIG_MAX_BYTES) return error.InvalidConfigValue;
     return out.toOwnedSlice(allocator);
@@ -4263,12 +4487,57 @@ test "admin site config builder emits domain file" {
         false,
         "",
         "",
+        "app",
+        "/app/*",
+        "proxy",
+        "",
+        "http://127.0.0.1:9001",
+        "",
+        false,
     );
 
     try std.testing.expect(std.mem.indexOf(u8, config, "name = verify\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, config, "server_name = verify.test www.verify.test\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, config, "proxy = http://127.0.0.1:9000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, config, "upstream_policy = least_connections\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config, "route = app /app/* proxy\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config, "route_proxy.app = http://127.0.0.1:9001\n") != null);
+}
+
+test "admin config preview redacts sensitive keys" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendRedactedConfigEscaped(&out, std.testing.allocator, "server_name = example.test\ntls_key = /private/key.pem\ncf_token = secret\n");
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "server_name = example.test\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "tls_key = &lt;redacted&gt;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cf_token = &lt;redacted&gt;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "/private/key.pem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "secret") == null);
+}
+
+test "admin settings merge preserves comments and replaces owned keys" {
+    const settings = [_]AdminConfigSetting{
+        .{ .key = "host", .value = "0.0.0.0" },
+        .{ .key = "static_dir", .value = "www" },
+        .{ .key = "proxy", .value = "off" },
+        .{ .key = "tls_key", .value = "", .emit = false },
+        .{ .key = "admin_ui", .value = "true" },
+    };
+    const merged = try buildAdminConfigWithSettings(
+        std.testing.allocator,
+        "# keep me\nhost = 127.0.0.1\ndir = public\nproxy = http://127.0.0.1:9000\ntls_key = /private/key.pem\n",
+        settings[0..],
+    );
+    defer std.testing.allocator.free(merged);
+
+    try std.testing.expect(std.mem.indexOf(u8, merged, "# keep me\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "host = 0.0.0.0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "static_dir = www\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "proxy = off\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "admin_ui = true\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "dir = public") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "/private/key.pem") == null);
 }
 
 fn deriveAdminPasswordHash(password: []const u8, salt: [ADMIN_SALT_BYTES]u8, rounds: u32) ![ADMIN_HASH_BYTES]u8 {
@@ -4497,6 +4766,7 @@ fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
         \\  form.stack {{ display: grid; gap: 14px; }}
         \\  .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
         \\  .full {{ grid-column: 1 / -1; }}
+        \\  .form-section {{ grid-column: 1 / -1; margin: 10px 0 0; padding-top: 12px; border-top: 1px solid rgba(17,17,15,.1); font-size: 13px; text-transform: uppercase; color: #686963; letter-spacing: 0; }}
         \\  label {{ display: grid; gap: 6px; color: #4f504a; font-size: 13px; }}
         \\  input, select, textarea {{ min-height: 42px; border: 1px solid rgba(17,17,15,.2); border-radius: 8px; padding: 9px 11px; background: rgba(255,255,255,.72); color: #11110f; font: inherit; }}
         \\  input[type="checkbox"] {{ width: 18px; height: 18px; min-height: 18px; padding: 0; }}
@@ -4518,6 +4788,10 @@ fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
         \\  .file-list {{ display: grid; gap: 8px; }}
         \\  .file-row {{ display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(17,17,15,.1); }}
         \\  .file-row:last-child {{ border-bottom: 0; }}
+        \\  details.config-file {{ border-bottom: 1px solid rgba(17,17,15,.1); padding: 8px 0; }}
+        \\  details.config-file:last-child {{ border-bottom: 0; }}
+        \\  details.config-file summary {{ cursor: pointer; display: flex; justify-content: space-between; gap: 12px; list-style: none; }}
+        \\  details.config-file summary::-webkit-details-marker {{ display: none; }}
         \\  pre {{ overflow: auto; max-height: 360px; margin: 0; padding: 14px; border: 1px solid rgba(17,17,15,.13); border-radius: 8px; background: #11110f; color: #f6f0e5; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }}
         \\  .actions {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 18px; }}
         \\  @media (max-width: 900px) {{ .workspace, .form-grid {{ grid-template-columns: 1fr; }} .full, .span-all {{ grid-column: auto; }} }}
@@ -4535,12 +4809,13 @@ fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
         \\    <a class="navlink" href="/">Site</a>
         \\    <a class="navlink" href="{s}">Dashboard</a>
         \\    <a class="navlink" href="{s}#sites">Sites</a>
+        \\    <a class="navlink" href="{s}#settings">Settings</a>
         \\    <a class="navlink" href="{s}#config">Config</a>
         \\  </nav>
         \\</header>
         \\
     ,
-        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
+        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
     );
 }
 
@@ -4700,12 +4975,194 @@ fn appendAdminDomainFiles(io: std.Io, out: *std.ArrayList(u8), allocator: std.me
     while (try it.next(io)) |entry| {
         if (!isDomainConfigFileName(entry.name)) continue;
         found = true;
-        try out.appendSlice(allocator, "<div class=\"file-row\"><code>");
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(path);
+        const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(ADMIN_SITE_CONFIG_MAX_BYTES)) catch |err| switch (err) {
+            error.FileTooBig => {
+                try out.appendSlice(allocator, "<div class=\"file-row\"><code>");
+                try appendHtmlEscaped(out, allocator, entry.name);
+                try out.appendSlice(allocator, "</code><span class=\"muted\">too large to preview</span></div>\n");
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(content);
+
+        try out.appendSlice(allocator, "<details class=\"config-file\"><summary><code>");
         try appendHtmlEscaped(out, allocator, entry.name);
-        try out.appendSlice(allocator, "</code><span class=\"muted\">loaded on process start</span></div>\n");
+        try out.appendSlice(allocator, "</code><span class=\"muted\">redacted preview</span></summary><pre>");
+        try appendRedactedConfigEscaped(out, allocator, content);
+        try out.appendSlice(allocator, "</pre></details>\n");
     }
     if (!found) try out.appendSlice(allocator, "<p class=\"muted\">No enabled site files yet.</p>\n");
     try out.appendSlice(allocator, "</div></section>\n");
+}
+
+fn appendAdminTextInput(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, name: []const u8, value: []const u8, placeholder: []const u8) !void {
+    try out.appendSlice(allocator, "<label>");
+    try appendHtmlEscaped(out, allocator, label);
+    try out.appendSlice(allocator, "<input name=\"");
+    try appendHtmlEscaped(out, allocator, name);
+    try out.appendSlice(allocator, "\" value=\"");
+    try appendHtmlEscaped(out, allocator, value);
+    try out.appendSlice(allocator, "\" placeholder=\"");
+    try appendHtmlEscaped(out, allocator, placeholder);
+    try out.appendSlice(allocator, "\"></label>\n");
+}
+
+fn appendAdminNumberInput(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, name: []const u8, value: anytype) !void {
+    try out.appendSlice(allocator, "<label>");
+    try appendHtmlEscaped(out, allocator, label);
+    try out.print(allocator, "<input name=\"{s}\" value=\"{d}\" inputmode=\"numeric\"></label>\n", .{ name, value });
+}
+
+fn appendAdminBoolSelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, name: []const u8, value: bool) !void {
+    try out.appendSlice(allocator, "<label>");
+    try appendHtmlEscaped(out, allocator, label);
+    try out.print(
+        allocator,
+        "<select name=\"{s}\"><option value=\"true\" {s}>true</option><option value=\"false\" {s}>false</option></select></label>\n",
+        .{ name, if (value) "selected" else "", if (!value) "selected" else "" },
+    );
+}
+
+fn appendAdminPolicySelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: UpstreamPoolPolicy) !void {
+    try out.appendSlice(allocator, "<label>Load balance<select name=\"upstream_policy\">");
+    const options = [_]UpstreamPoolPolicy{ .round_robin, .random, .least_connections, .weighted, .consistent_hash };
+    for (options) |option| {
+        const name = upstreamPoolPolicyName(option);
+        try out.print(allocator, "<option value=\"{s}\" {s}>{s}</option>", .{ name, if (option == value) "selected" else "", name });
+    }
+    try out.appendSlice(allocator, "</select></label>\n");
+}
+
+fn appendAdminSectionTitle(out: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8) !void {
+    try out.appendSlice(allocator, "<h3 class=\"form-section\">");
+    try appendHtmlEscaped(out, allocator, title);
+    try out.appendSlice(allocator, "</h3>\n");
+}
+
+fn formatAdminUpstreamPoolValue(allocator: std.mem.Allocator, pool: ?UpstreamPoolConfig) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    if (pool) |upstream| {
+        for (upstream.targets.items, 0..) |target, index| {
+            if (index > 0) try out.append(allocator, ' ');
+            try out.print(allocator, "{s}://{s}:{d}{s}", .{ if (target.https) "https" else "http", target.host, target.port, target.base_path });
+            if (target.weight != 1) try out.print(allocator, " weight={d}", .{target.weight});
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    const proxy_value = try formatAdminUpstreamPoolValue(allocator, cfg.upstream);
+    defer allocator.free(proxy_value);
+    try out.appendSlice(allocator,
+        \\<section class="block span-all" id="settings">
+        \\  <div class="section-head"><div><h2>Settings</h2><p>Edit the main process config. Writes are staged to disk and take effect after restart until hot reload lands.</p></div><span class="pill">main config</span></div>
+        \\  <div class="panel"><div class="panel-inner">
+        \\
+    );
+    try out.print(allocator, "<p class=\"muted\">File: <code>{s}</code></p>\n<form class=\"stack\" method=\"post\" action=\"{s}/settings/save\"><div class=\"form-grid\">\n", .{ cfg.config_path, cfg.admin_ui_path });
+    try appendAdminSectionTitle(out, allocator, "Listener");
+    try appendAdminTextInput(out, allocator, "Host", "host", cfg.host, "0.0.0.0");
+    try appendAdminNumberInput(out, allocator, "Port", "port", cfg.port);
+    try appendAdminTextInput(out, allocator, "Static root", "static_dir", cfg.static_dir, "public");
+    try appendAdminTextInput(out, allocator, "Index file", "index_file", cfg.index_file, "index.html");
+    try appendAdminTextInput(out, allocator, "Domain config dir", "domain_config_dir", cfg.domain_config_dir orelse "", "domains-enabled");
+    try appendAdminBoolSelect(out, allocator, "Serve static root", "serve_static_root", cfg.serve_static_root);
+    try appendAdminBoolSelect(out, allocator, "Compression", "compression", cfg.compression_enabled);
+    try appendAdminBoolSelect(out, allocator, "Gzip", "gzip", cfg.gzip_enabled);
+
+    try appendAdminSectionTitle(out, allocator, "PHP and Proxy");
+    try appendAdminTextInput(out, allocator, "PHP root", "php_root", cfg.php_root, "public");
+    try appendAdminTextInput(out, allocator, "PHP binary", "php_binary", cfg.php_binary, "php-cgi");
+    try appendAdminTextInput(out, allocator, "php-fpm / FastCGI", "php_fastcgi", cfg.php_fastcgi orelse "", "127.0.0.1:9000 or unix:/run/php.sock");
+    try appendAdminBoolSelect(out, allocator, "PHP front controller", "php_front_controller", cfg.php_front_controller);
+    try appendAdminTextInput(out, allocator, "Proxy fallback", "proxy", proxy_value, "http://127.0.0.1:3000");
+    try appendAdminPolicySelect(out, allocator, cfg.upstream_policy);
+    try appendAdminNumberInput(out, allocator, "Upstream timeout ms", "upstream_timeout_ms", cfg.upstream_timeout_ms);
+    try appendAdminNumberInput(out, allocator, "Upstream retries", "upstream_retries", cfg.upstream_retries);
+    try appendAdminBoolSelect(out, allocator, "Upstream keep-alive", "upstream_keepalive", cfg.upstream_keepalive_enabled);
+    try appendAdminBoolSelect(out, allocator, "FastCGI keep-alive", "fastcgi_keepalive", cfg.fastcgi_keepalive_enabled);
+
+    try appendAdminSectionTitle(out, allocator, "TLS and Protocols");
+    try appendAdminBoolSelect(out, allocator, "TLS", "tls", cfg.tls_enabled);
+    try appendAdminTextInput(out, allocator, "TLS certificate", "tls_cert", cfg.tls_cert orelse "", "/etc/letsencrypt/live/site/fullchain.pem");
+    try appendAdminTextInput(out, allocator, "TLS private key", "tls_key", cfg.tls_key orelse "", "/etc/letsencrypt/live/site/privkey.pem");
+    try appendAdminBoolSelect(out, allocator, "HTTP to HTTPS redirect", "http_redirect", cfg.http_redirect_enabled);
+    try appendAdminNumberInput(out, allocator, "HTTP redirect port", "http_redirect_port", cfg.http_redirect_port);
+    try appendAdminNumberInput(out, allocator, "HTTPS redirect target", "http_redirect_https_port", cfg.http_redirect_https_port);
+    try appendAdminBoolSelect(out, allocator, "HTTP/3", "http3", cfg.http3_enabled);
+    try appendAdminNumberInput(out, allocator, "HTTP/3 port", "http3_port", cfg.http3_port);
+
+    try appendAdminSectionTitle(out, allocator, "Admin and Limits");
+    try appendAdminTextInput(out, allocator, "Admin socket", "admin_socket", if (cfg.admin_enabled) (cfg.admin_socket_path orelse "") else "off", "/run/layerline/admin.sock");
+    try appendAdminBoolSelect(out, allocator, "Admin UI", "admin_ui", cfg.admin_ui_enabled);
+    try appendAdminTextInput(out, allocator, "Admin UI path", "admin_ui_path", cfg.admin_ui_path, "/_layerline/admin");
+    try appendAdminTextInput(out, allocator, "Admin credentials path", "admin_credentials_path", cfg.admin_credentials_path, "/etc/layerline/admin.credentials");
+    try appendAdminTextInput(out, allocator, "Access log", "access_log", if (cfg.access_log_enabled) cfg.access_log_path else "off", "stderr or /var/log/layerline/access.log");
+    try appendAdminNumberInput(out, allocator, "Max concurrent connections", "max_concurrent_connections", cfg.max_concurrent_connections);
+    try appendAdminNumberInput(out, allocator, "Max request bytes", "max_request_bytes", cfg.max_request_bytes);
+    try appendAdminNumberInput(out, allocator, "Header timeout ms", "read_header_timeout_ms", cfg.read_header_timeout_ms);
+    try appendAdminNumberInput(out, allocator, "Idle timeout ms", "idle_timeout_ms", cfg.idle_timeout_ms);
+    try appendAdminNumberInput(out, allocator, "Worker stack bytes", "worker_stack_size", cfg.worker_stack_size);
+
+    try out.appendSlice(allocator,
+        \\  </div>
+        \\  <div class="actions"><button class="primary" type="submit">Save settings</button><span class="muted">A backup is written beside the config before overwrite.</span></div>
+        \\</form>
+        \\</div></div></section>
+        \\
+    );
+}
+
+fn appendAdminMainConfigPreview(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    try out.appendSlice(allocator,
+        \\<section class="block span-all" id="config">
+        \\  <div class="section-head"><div><h2>Config management</h2><p>Runtime validation plus redacted previews of the main config and enabled site files.</p></div><span class="pill">restart required after writes</span></div>
+        \\
+    );
+    try out.appendSlice(allocator, "<pre>");
+    validateConfig(cfg) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
+        defer allocator.free(message);
+        try appendHtmlEscaped(out, allocator, message);
+        try out.appendSlice(allocator, "</pre></section>\n");
+        return;
+    };
+    try appendHtmlEscaped(out, allocator, "OK config\n");
+    try appendHtmlEscaped(out, allocator, "main_config = ");
+    try appendHtmlEscaped(out, allocator, cfg.config_path);
+    try appendHtmlEscaped(out, allocator, "\n");
+    if (cfg.domain_config_dir) |dir| {
+        try appendHtmlEscaped(out, allocator, "domain_config_dir = ");
+        try appendHtmlEscaped(out, allocator, dir);
+        try appendHtmlEscaped(out, allocator, "\n");
+    } else {
+        try appendHtmlEscaped(out, allocator, "domain_config_dir is not configured\n");
+    }
+    try out.appendSlice(allocator, "</pre>\n");
+
+    const content = std.Io.Dir.cwd().readFileAlloc(io, cfg.config_path, allocator, .limited(ADMIN_MAIN_CONFIG_MAX_BYTES)) catch |err| switch (err) {
+        error.FileNotFound => {
+            try out.appendSlice(allocator, "<p class=\"notice\">The main config file does not exist yet. Saving settings will create it.</p></section>\n");
+            return;
+        },
+        error.FileTooBig => {
+            try out.appendSlice(allocator, "<p class=\"notice error\">The main config is too large to preview safely.</p></section>\n");
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    try out.appendSlice(allocator, "<details class=\"config-file\" open><summary><code>");
+    try appendHtmlEscaped(out, allocator, cfg.config_path);
+    try out.appendSlice(allocator, "</code><span class=\"muted\">redacted preview</span></summary><pre>");
+    try appendRedactedConfigEscaped(out, allocator, content);
+    try out.appendSlice(allocator, "</pre></details></section>\n");
 }
 
 fn appendAdminAddSiteForm(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
@@ -4734,6 +5191,13 @@ fn appendAdminAddSiteForm(out: *std.ArrayList(u8), allocator: std.mem.Allocator,
         \\    <label class="check full"><input type="checkbox" name="php_front_controller" {s}> Use index.php as a front controller</label>
         \\    <label>TLS certificate<input name="tls_cert" placeholder="/etc/letsencrypt/live/site/fullchain.pem" {s}></label>
         \\    <label>TLS private key<input name="tls_key" placeholder="/etc/letsencrypt/live/site/privkey.pem" {s}></label>
+        \\    <label class="full">Initial route name<input name="route_name" placeholder="app" {s}></label>
+        \\    <label>Route pattern<input name="route_pattern" placeholder="/app/*" {s}></label>
+        \\    <label>Route handler<select name="route_handler" {s}><option value="">none</option><option>static</option><option>php</option><option>proxy</option></select></label>
+        \\    <label>Route static root<input name="route_static_dir" placeholder="public" {s}></label>
+        \\    <label>Route proxy<input name="route_proxy" placeholder="http://127.0.0.1:3000" {s}></label>
+        \\    <label>Route FastCGI<input name="route_php_fastcgi" placeholder="127.0.0.1:9000" {s}></label>
+        \\    <label class="check full"><input type="checkbox" name="route_php_front_controller" {s}> Route PHP through index.php front controller</label>
         \\  </div>
         \\  <div class="actions"><button class="primary" type="submit" {s}>Create site config</button></div>
         \\</form>
@@ -4742,6 +5206,13 @@ fn appendAdminAddSiteForm(out: *std.ArrayList(u8), allocator: std.mem.Allocator,
     ,
         .{
             cfg.admin_ui_path,
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
+            if (disabled) "disabled" else "",
             if (disabled) "disabled" else "",
             if (disabled) "disabled" else "",
             if (disabled) "disabled" else "",
@@ -4792,27 +5263,10 @@ fn renderAdminDashboardPage(io: std.Io, allocator: std.mem.Allocator, cfg: *cons
 
     try out.appendSlice(allocator, "<div class=\"workspace\">\n");
     try appendAdminActiveSites(&out, allocator, cfg);
+    try appendAdminSettingsForm(&out, allocator, cfg);
     try appendAdminAddSiteForm(&out, allocator, cfg);
+    try appendAdminMainConfigPreview(io, &out, allocator, cfg);
     try appendAdminDomainFiles(io, &out, allocator, cfg);
-    try out.appendSlice(allocator, "<section class=\"block span-all\" id=\"config\"><div class=\"section-head\"><div><h2>Config management</h2><p>Validation uses the loaded runtime config. Site-file writes are staged for restart until hot reload is implemented.</p></div><span class=\"pill\">restart required after writes</span></div><pre>");
-    validateConfig(cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
-        defer allocator.free(message);
-        try appendHtmlEscaped(&out, allocator, message);
-        try out.appendSlice(allocator, "</pre></section>\n");
-        try out.appendSlice(allocator, "</div>\n</div>\n");
-        try appendAdminShellEnd(&out, allocator);
-        return out.toOwnedSlice(allocator);
-    };
-    try appendHtmlEscaped(&out, allocator, "OK config\n");
-    if (cfg.domain_config_dir) |dir| {
-        try appendHtmlEscaped(&out, allocator, "domain_config_dir = ");
-        try appendHtmlEscaped(&out, allocator, dir);
-        try appendHtmlEscaped(&out, allocator, "\n");
-    } else {
-        try appendHtmlEscaped(&out, allocator, "domain_config_dir is not configured\n");
-    }
-    try out.appendSlice(allocator, "</pre></section>\n");
 
     try out.appendSlice(allocator, "<section class=\"block\" id=\"status\"><h2>Status</h2><pre>");
     try appendHtmlEscaped(&out, allocator, status);
@@ -5052,6 +5506,12 @@ fn handleAdminAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.
     const php_fastcgi = adminTrimmedField(fields.items, "php_fastcgi");
     const tls_cert = adminTrimmedField(fields.items, "tls_cert");
     const tls_key = adminTrimmedField(fields.items, "tls_key");
+    const route_name = adminTrimmedField(fields.items, "route_name");
+    const route_pattern = adminTrimmedField(fields.items, "route_pattern");
+    const route_handler = adminTrimmedField(fields.items, "route_handler");
+    const route_static_dir = adminTrimmedField(fields.items, "route_static_dir");
+    const route_proxy = adminTrimmedField(fields.items, "route_proxy");
+    const route_php_fastcgi = adminTrimmedField(fields.items, "route_php_fastcgi");
 
     const site_config = buildAdminSiteConfig(
         allocator,
@@ -5066,10 +5526,17 @@ fn handleAdminAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.
         adminCheckboxEnabled(fields.items, "php_front_controller"),
         tls_cert,
         tls_key,
+        route_name,
+        route_pattern,
+        route_handler,
+        route_static_dir,
+        route_proxy,
+        route_php_fastcgi,
+        adminCheckboxEnabled(fields.items, "route_php_front_controller"),
     ) catch |err| {
         const message = switch (err) {
             error.InvalidUpstream => "The proxy field must be one or more http:// or https:// upstream URLs.",
-            error.InvalidConfigValue => "The site values are invalid. Use a simple name, at least one server name, and no line breaks in paths.",
+            error.InvalidConfigValue => "The site values are invalid. Use a simple name, server names, safe paths, and complete route fields when adding a route.",
             else => "Layerline could not build that site config.",
         };
         try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
@@ -5091,6 +5558,114 @@ fn handleAdminAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.
     const message = try std.fmt.allocPrint(allocator, "Created {s}. Restart Layerline for the new site to become active.", .{path});
     defer allocator.free(message);
     try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, message, null, 201, "Created", close_connection, false);
+}
+
+fn handleAdminSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
+    var fields = parseUrlEncodedForm(allocator, req.body) catch {
+        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, "The settings form could not be parsed.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer freeFormFields(allocator, &fields);
+
+    const host = adminTrimmedField(fields.items, "host");
+    const port = adminTrimmedField(fields.items, "port");
+    const static_dir = adminTrimmedField(fields.items, "static_dir");
+    const index_file = adminTrimmedField(fields.items, "index_file");
+    const domain_config_dir = adminTrimmedField(fields.items, "domain_config_dir");
+    const serve_static_root = adminTrimmedField(fields.items, "serve_static_root");
+    const compression = adminTrimmedField(fields.items, "compression");
+    const gzip = adminTrimmedField(fields.items, "gzip");
+    const php_root = adminTrimmedField(fields.items, "php_root");
+    const php_binary = adminTrimmedField(fields.items, "php_binary");
+    const php_fastcgi = adminTrimmedField(fields.items, "php_fastcgi");
+    const php_front_controller = adminTrimmedField(fields.items, "php_front_controller");
+    const proxy = adminTrimmedField(fields.items, "proxy");
+    const upstream_policy = adminTrimmedField(fields.items, "upstream_policy");
+    const upstream_timeout_ms = adminTrimmedField(fields.items, "upstream_timeout_ms");
+    const upstream_retries = adminTrimmedField(fields.items, "upstream_retries");
+    const upstream_keepalive = adminTrimmedField(fields.items, "upstream_keepalive");
+    const fastcgi_keepalive = adminTrimmedField(fields.items, "fastcgi_keepalive");
+    const tls = adminTrimmedField(fields.items, "tls");
+    const tls_cert = adminTrimmedField(fields.items, "tls_cert");
+    const tls_key = adminTrimmedField(fields.items, "tls_key");
+    const http_redirect = adminTrimmedField(fields.items, "http_redirect");
+    const http_redirect_port = adminTrimmedField(fields.items, "http_redirect_port");
+    const http_redirect_https_port = adminTrimmedField(fields.items, "http_redirect_https_port");
+    const http3 = adminTrimmedField(fields.items, "http3");
+    const http3_port = adminTrimmedField(fields.items, "http3_port");
+    const admin_socket = adminTrimmedField(fields.items, "admin_socket");
+    const admin_ui = adminTrimmedField(fields.items, "admin_ui");
+    const admin_ui_path = adminTrimmedField(fields.items, "admin_ui_path");
+    const admin_credentials_path = adminTrimmedField(fields.items, "admin_credentials_path");
+    const access_log = adminTrimmedField(fields.items, "access_log");
+    const max_concurrent_connections = adminTrimmedField(fields.items, "max_concurrent_connections");
+    const max_request_bytes = adminTrimmedField(fields.items, "max_request_bytes");
+    const read_header_timeout_ms = adminTrimmedField(fields.items, "read_header_timeout_ms");
+    const idle_timeout_ms = adminTrimmedField(fields.items, "idle_timeout_ms");
+    const worker_stack_size = adminTrimmedField(fields.items, "worker_stack_size");
+
+    const settings = [_]AdminConfigSetting{
+        .{ .key = "host", .value = host },
+        .{ .key = "port", .value = port },
+        .{ .key = "static_dir", .value = static_dir },
+        .{ .key = "index_file", .value = index_file },
+        .{ .key = "domain_config_dir", .value = domain_config_dir, .emit = domain_config_dir.len > 0 },
+        .{ .key = "serve_static_root", .value = serve_static_root },
+        .{ .key = "compression", .value = compression },
+        .{ .key = "gzip", .value = gzip },
+        .{ .key = "php_root", .value = php_root },
+        .{ .key = "php_binary", .value = php_binary },
+        .{ .key = "php_fastcgi", .value = if (php_fastcgi.len > 0) php_fastcgi else "off" },
+        .{ .key = "php_front_controller", .value = php_front_controller },
+        .{ .key = "proxy", .value = if (proxy.len > 0) proxy else "off" },
+        .{ .key = "upstream_policy", .value = upstream_policy },
+        .{ .key = "upstream_timeout_ms", .value = upstream_timeout_ms },
+        .{ .key = "upstream_retries", .value = upstream_retries },
+        .{ .key = "upstream_keepalive", .value = upstream_keepalive },
+        .{ .key = "fastcgi_keepalive", .value = fastcgi_keepalive },
+        .{ .key = "tls", .value = tls },
+        .{ .key = "tls_cert", .value = tls_cert, .emit = tls_cert.len > 0 },
+        .{ .key = "tls_key", .value = tls_key, .emit = tls_key.len > 0 },
+        .{ .key = "http_redirect", .value = http_redirect },
+        .{ .key = "http_redirect_port", .value = http_redirect_port },
+        .{ .key = "http_redirect_https_port", .value = http_redirect_https_port },
+        .{ .key = "http3", .value = http3 },
+        .{ .key = "http3_port", .value = http3_port },
+        .{ .key = "admin_socket", .value = if (admin_socket.len > 0) admin_socket else "off" },
+        .{ .key = "admin_ui", .value = admin_ui },
+        .{ .key = "admin_ui_path", .value = admin_ui_path },
+        .{ .key = "admin_credentials_path", .value = admin_credentials_path },
+        .{ .key = "access_log", .value = if (access_log.len > 0) access_log else "off" },
+        .{ .key = "max_concurrent_connections", .value = max_concurrent_connections },
+        .{ .key = "max_request_bytes", .value = max_request_bytes },
+        .{ .key = "read_header_timeout_ms", .value = read_header_timeout_ms },
+        .{ .key = "idle_timeout_ms", .value = idle_timeout_ms },
+        .{ .key = "worker_stack_size", .value = worker_stack_size },
+    };
+
+    validateAdminSettingsPatch(allocator, cfg, settings[0..], tls_cert, tls_key) catch |err| {
+        const message = switch (err) {
+            error.InvalidConfigValue => "The settings are invalid. Check ports, booleans, paths, TLS cert/key pairs, and upstream URLs.",
+            error.InvalidUpstream => "The proxy field must be one or more http:// or https:// upstream URLs.",
+            else => "Layerline could not validate those settings.",
+        };
+        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    const path = writeAdminMainConfigFile(io, allocator, cfg, settings[0..]) catch |err| {
+        const message = switch (err) {
+            error.InvalidConfigValue => "The generated main config was too large or contained unsafe values.",
+            else => "Layerline could not write the main config file.",
+        };
+        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer allocator.free(path);
+
+    const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}. A backup was written when the file already existed. Restart Layerline for these changes to become active.", .{path});
+    defer allocator.free(message);
+    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
 }
 
 fn handleAdminUi(
@@ -5156,6 +5731,10 @@ fn handleAdminUi(
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
         try handleAdminAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/settings/save")) {
+        try handleAdminSettingsPost(io, stream, allocator, cfg, credentials, req, close_connection);
         return;
     }
 
@@ -9735,6 +10314,7 @@ test "named routes prefer exact and longest prefix matches" {
     const allocator = arena.allocator();
 
     var cfg = ServerConfig{
+        .config_path = DEFAULT_CONFIG_PATH,
         .host = "127.0.0.1",
         .port = 8080,
         .static_dir = "public",
@@ -12575,6 +13155,7 @@ pub fn main(init: std.process.Init) !void {
     listener_closed_by_shutdown.store(false, .release);
 
     var cfg = ServerConfig{
+        .config_path = DEFAULT_CONFIG_PATH,
         .host = "127.0.0.1",
         .port = 8080,
         .static_dir = "public",
@@ -12678,6 +13259,7 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("Failed to load config file: {s}\n", .{path});
                     return err;
                 };
+                cfg.config_path = path;
             } else {
                 usage();
                 return;

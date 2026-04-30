@@ -304,11 +304,11 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, shows enabled domain config files, validates the runtime config, exposes status/routes/certs/metrics, and can create new nginx-style site files under `domain_config_dir`. Site-file writes are deliberately staged: restart Layerline for new sites to become active until the hot-reload config snapshot work lands.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the runtime config, exposes status/routes/certs/metrics, and can create new nginx-style site files under `domain_config_dir`. Main-setting and site-file writes are deliberately staged: restart Layerline for those changes to become active until the hot-reload config snapshot work lands.
 
 ## Website and branding
 
-The default repository website lives in `public/index.html` and `public/site.css`. With `serve_static_root = true`, Layerline serves it at `/` before falling back to the built-in diagnostic homepage. The site presents Layerline as a production web server project, links to GitHub, shows setup snippets, compares the current feature surface with Caddy and nginx, and uses the Laina mascot asset from `public/laina.png`.
+The default repository website lives in `public/index.html` and `public/site.css`. With `serve_static_root = true`, Layerline serves it at `/` before falling back to the built-in diagnostic homepage. The site presents Layerline as a production web server project, links to GitHub and docs, shows setup snippets, explains the main-config plus per-domain-file model, compares the current feature surface with Caddy and nginx, and uses the Laina mascot asset from `public/laina.png`.
 
 For a site config:
 

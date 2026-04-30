@@ -206,17 +206,37 @@ ADMIN_DASH_BODY="$TMP_DIR/admin-dashboard.body"
 curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
 grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "admin UI dashboard was not served with setup cookie"
 grep -Fq 'Add site' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include site management"
+grep -Fq 'Save settings' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include settings management"
+grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 ok "admin UI authenticated dashboard"
 
+curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data "host=$HOST&port=$PORT&static_dir=public&index_file=index.html&domain_config_dir=$SITE_DIR&serve_static_root=true&compression=true&gzip=true&php_root=public&php_binary=php-cgi&php_fastcgi=off&php_front_controller=false&proxy=off&upstream_policy=round_robin&upstream_timeout_ms=5000&upstream_retries=1&upstream_keepalive=true&fastcgi_keepalive=true&tls=false&tls_cert=&tls_key=&http_redirect=false&http_redirect_port=$REDIRECT_PORT&http_redirect_https_port=$PORT&http3=false&http3_port=8443&admin_socket=$SOCKET&admin_ui=true&admin_ui_path=%2F_layerline%2Fadmin&admin_credentials_path=$ADMIN_CREDS&access_log=$ACCESS_LOG&max_concurrent_connections=1024&max_request_bytes=1048576&read_header_timeout_ms=5000&idle_timeout_ms=30000&worker_stack_size=524288" \
+  "$ADMIN_URL/settings/save"
+grep -Fq 'Saved settings to ' "$TMP_DIR/admin-settings.body" || die "admin settings response did not confirm save"
+grep -Fq 'compression = true' "$CONFIG" || die "admin settings did not update main config"
+grep -Fq 'admin_ui = true' "$CONFIG" || die "admin settings did not preserve admin UI"
+[[ -s "$CONFIG.bak" ]] || die "admin settings did not create a config backup"
+ok "admin UI saves main settings"
+
 curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-add-site.body" \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data 'name=verify&server_names=verify.test+www.verify.test&root=public&index=index.html&serve_static_root=on&proxy=http%3A%2F%2F127.0.0.1%3A9000&upstream_policy=least_connections' \
+  --data 'name=verify&server_names=verify.test+www.verify.test&root=public&index=index.html&serve_static_root=on&proxy=http%3A%2F%2F127.0.0.1%3A9000&upstream_policy=least_connections&tls_cert=%2Fcerts%2Fverify%2Ffullchain.pem&tls_key=%2Fcerts%2Fverify%2Fprivkey.pem&route_name=app&route_pattern=%2Fapp%2F%2A&route_handler=proxy&route_proxy=http%3A%2F%2F127.0.0.1%3A9001' \
   "$ADMIN_URL/sites/add"
 [[ -s "$SITE_DIR/verify.conf" ]] || die "admin UI did not create a site config file"
 grep -Fq 'server_name = verify.test www.verify.test' "$SITE_DIR/verify.conf" || die "admin site config missing server names"
 grep -Fq 'proxy = http://127.0.0.1:9000' "$SITE_DIR/verify.conf" || die "admin site config missing proxy"
+grep -Fq 'tls_key = /certs/verify/privkey.pem' "$SITE_DIR/verify.conf" || die "admin site config missing TLS key"
+grep -Fq 'route = app /app/* proxy' "$SITE_DIR/verify.conf" || die "admin site config missing route"
+grep -Fq 'route_proxy.app = http://127.0.0.1:9001' "$SITE_DIR/verify.conf" || die "admin site config missing route proxy"
 grep -Fq 'Created ' "$TMP_DIR/admin-add-site.body" || die "admin add-site response did not confirm creation"
+grep -Fq 'verify.conf' "$TMP_DIR/admin-add-site.body" || die "admin add-site response did not show enabled file"
+grep -Fq 'tls_key = &lt;redacted&gt;' "$TMP_DIR/admin-add-site.body" || die "admin add-site response did not redact TLS key preview"
+if grep -Fq '/certs/verify/privkey.pem' "$TMP_DIR/admin-add-site.body"; then
+  die "admin add-site response leaked TLS key path"
+fi
 ok "admin UI creates site configs"
 
 [[ -s $ACCESS_LOG ]] || die "access log was not written"
