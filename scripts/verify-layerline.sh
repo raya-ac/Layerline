@@ -21,6 +21,7 @@ ACCESS_LOG="$TMP_DIR/access.log"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
+H2_SMOKE=0
 
 cleanup() {
   if [[ -n ${PID:-} ]] && kill -0 "$PID" 2>/dev/null; then
@@ -126,6 +127,12 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   header_has "$H2_HEADERS" '^content-encoding: gzip' || die "h2 gzip response header missing"
   [[ $(od -An -tx1 -N2 "$H2_BODY" | tr -d ' \n') == 1f8b ]] || die "h2 gzip response did not start with gzip magic"
   ok "h2c gzip response"
+
+  H2_POST_BODY="$TMP_DIR/h2-post.body"
+  curl -fsS --http2-prior-knowledge --data 'layerline-h2-body' "http://$HOST:$PORT/api/echo" -o "$H2_POST_BODY"
+  grep -Fq 'layerline-h2-body' "$H2_POST_BODY" || die "h2 request body was not routed"
+  ok "h2c request body"
+  H2_SMOKE=1
 else
   ok "h2c smoke skipped; curl lacks --http2-prior-knowledge"
 fi
@@ -194,6 +201,10 @@ grep -Fq '"protocol":"HTTP/1.1"' "$ACCESS_LOG" || die "access log missing protoc
 grep -Fq '"status":200' "$ACCESS_LOG" || die "access log missing status"
 grep -Fq '"duration_ms":' "$ACCESS_LOG" || die "access log missing duration"
 grep -Fq '"handler":"admin_ui"' "$ACCESS_LOG" || die "access log missing admin UI handler"
+if [[ $H2_SMOKE -eq 1 ]]; then
+  grep -Fq '"protocol":"HTTP/2.0"' "$ACCESS_LOG" || die "access log missing HTTP/2 protocol"
+  grep -Fq '"path":"/api/echo"' "$ACCESS_LOG" || die "access log missing h2 echo path"
+fi
 ok "structured access log"
 
 kill "$PID" 2>/dev/null || true
