@@ -9,7 +9,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - HTTP/1.1 WebSocket/Upgrade proxy tunneling for route and domain proxy targets.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
-- Configured redirects and global response headers, using familiar Caddy/nginx-style primitives.
+- Configured redirects and inherited global/domain/route response headers, using familiar Caddy/nginx-style primitives.
 - Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
@@ -26,7 +26,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport, PHP front-controller fallback, route-local backend timeout overrides, response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI pooling, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -220,11 +220,23 @@ Argument precedence (highest wins):
 
 ## Header and Redirect Rules
 
-Repeat `header` lines in `server.conf` to add global headers to Layerline-generated responses:
+Repeat `header` lines in `server.conf` to add global headers to Layerline-generated responses and normal HTTP/1 proxy responses:
 
 ```conf
 header = X-Frame-Options: DENY
 header = X-Content-Type-Options: nosniff
+```
+
+Headers inherit from global to domain to route. Use inline server keys or per-domain files when a site or route needs its own policy:
+
+```conf
+server = main
+server_name.main = example.com
+server_header.main = Strict-Transport-Security: max-age=31536000
+
+route = app /app/* proxy
+route_header.app = Cache-Control: no-store
+server_route_header.main.app = X-App-Policy: isolated
 ```
 
 Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
@@ -277,9 +289,12 @@ index = index.html
 serve_static_root = true
 tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
+add_header = Strict-Transport-Security: max-age=31536000
+add_header = X-Content-Type-Options: nosniff
 
 route = assets /assets/* static
 route_dir.assets = public
+route_header.assets = Cache-Control: public, max-age=31536000, immutable
 
 route = app /app/* php
 route_php_root.app = public
@@ -294,7 +309,7 @@ upstream_policy = random
 proxy_timeout_ms = 15000
 ```
 
-`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including upstream pool policy and TLS material. Domain-local `tls_cert`/`tls_key` pairs are selected by SNI before Layerline falls back to the global certificate. The older inline form (`server = main`, `server_name.main = ...`, `server_tls_cert.main = ...`) still works, but domain files are the intended layout.
+`server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including response headers, upstream pool policy, and TLS material. Domain-local `tls_cert`/`tls_key` pairs are selected by SNI before Layerline falls back to the global certificate. The older inline form (`server = main`, `server_name.main = ...`, `server_tls_cert.main = ...`) still works, but domain files are the intended layout.
 
 ## TLS options in config / CLI
 

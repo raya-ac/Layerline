@@ -46,7 +46,7 @@ Sources:
 - Active and passive health checks with slow start, outlier ejection, retry budgets, and circuit breakers. Initial upstream attempt/failure/retry/ejection metrics, bounded retry budgets, config-owned health state, passive target cooldown, circuit breaker half-open probes, weighted slow start after recovery, and opt-in active HTTP probes are implemented; per-route health policy and richer circuit thresholds remain next.
 - Upstream connection pools with keep-alive limits, per-host caps, DNS re-resolution, happy-eyeballs dialing, and Unix socket upstreams. Initial per-target HTTP/1 upstream keep-alive pooling with idle caps, idle expiry, max-use rotation, framed fixed/chunked response handling, and connection-pool metrics is implemented.
 - WebSocket and CONNECT tunneling. Initial HTTP/1.1 WebSocket/Upgrade proxy tunneling is implemented for route/domain proxy targets; CONNECT and HTTP/2 extended CONNECT remain next.
-- Header rewrite rules: set, append, delete, regex map, forwarded headers, trusted proxy CIDRs, and host/SNI override.
+- Header rewrite rules: set, append, delete, regex map, forwarded headers, trusted proxy CIDRs, and host/SNI override. Initial inherited response header policy is implemented for global, domain, and route scopes and is applied to Layerline-generated responses plus normal HTTP/1 proxy responses.
 - Response interception: status/header matchers, custom error fallback, maintenance responses, and retry-on conditions.
 - Upstream TLS: SNI, trust store, client certs, certificate pinning, TLS versions, and HTTP/2 or HTTP/3 upstream transport.
 

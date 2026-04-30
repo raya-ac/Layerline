@@ -14,7 +14,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 - HTTP/3 either fully routes app responses or is clearly opt-in as a demo surface, not a replacement claim.
 - Config validation catches bad domain, route, TLS, PHP, and upstream policy before startup or reload.
 - Reload can validate and swap config without dropping existing connections.
-- Compression, cache policy, redirects, headers, health, and metrics have route/domain controls.
+- Compression, cache policy, redirects, headers, health, and metrics have route/domain controls. Response header inheritance is now implemented for global, domain, and route scopes; cache/compression/security presets still need richer controls.
 - Logs identify request path, status, latency, upstream, protocol, and failure reason.
 - There is a deployment runbook for Linux service management, limits, certs, logs, and rollback.
 

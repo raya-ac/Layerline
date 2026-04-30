@@ -391,6 +391,7 @@ const RouteConfig = struct {
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
     upstream_timeout_ms: ?u32,
+    response_headers: std.ArrayList(ResponseHeaderRule),
 };
 
 const DomainConfig = struct {
@@ -411,6 +412,7 @@ const DomainConfig = struct {
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
     upstream_timeout_ms: ?u32,
+    response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
 };
@@ -487,6 +489,35 @@ const ServerConfig = struct {
     cloudflare_record_proxied: bool,
     cloudflare_record_comment: ?[]const u8,
 };
+
+const ResponseHeaderContext = struct {
+    items: []const ResponseHeaderRule,
+    owned: ?[]ResponseHeaderRule = null,
+
+    fn deinit(self: ResponseHeaderContext, allocator: std.mem.Allocator) void {
+        if (self.owned) |owned| allocator.free(owned);
+    }
+};
+
+fn appendResponseHeaderSlice(dest: []ResponseHeaderRule, cursor: *usize, source: []const ResponseHeaderRule) void {
+    if (source.len == 0) return;
+    @memcpy(dest[cursor.* .. cursor.* + source.len], source);
+    cursor.* += source.len;
+}
+
+fn buildResponseHeaderContext(allocator: std.mem.Allocator, cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) !ResponseHeaderContext {
+    const domain_headers = if (domain) |d| d.response_headers.items else &.{};
+    const route_headers = if (route) |r| r.response_headers.items else &.{};
+    const count = cfg.response_headers.items.len + domain_headers.len + route_headers.len;
+    if (count == 0) return .{ .items = &.{} };
+
+    const owned = try allocator.alloc(ResponseHeaderRule, count);
+    var cursor: usize = 0;
+    appendResponseHeaderSlice(owned, &cursor, cfg.response_headers.items);
+    appendResponseHeaderSlice(owned, &cursor, domain_headers);
+    appendResponseHeaderSlice(owned, &cursor, route_headers);
+    return .{ .items = owned, .owned = owned };
+}
 
 fn parseContentLength(headers: []const u8) !usize {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
@@ -1743,6 +1774,7 @@ fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Alloc
         .upstream = null,
         .upstream_policy = null,
         .upstream_timeout_ms = null,
+        .response_headers = .empty,
     });
 }
 
@@ -1803,6 +1835,11 @@ fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const
     }
 }
 
+fn appendRouteResponseHeader(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, route_name: []const u8, value: []const u8) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    if (value.len > 0) try route.response_headers.append(allocator, try parseResponseHeaderRule(allocator, value));
+}
+
 fn isDomainConfigNameValid(name: []const u8) bool {
     return isRouteNameValid(name);
 }
@@ -1834,6 +1871,7 @@ fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainConfi
         .upstream = null,
         .upstream_policy = null,
         .upstream_timeout_ms = null,
+        .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
     };
@@ -1921,6 +1959,11 @@ fn setDomainU32Property(cfg: *ServerConfig, domain_name: []const u8, value: []co
     }
 }
 
+fn appendDomainResponseHeader(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    if (value.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, value));
+}
+
 fn setDomainRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
     const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
     try setRouteLineFor(&domain.routes, allocator, value);
@@ -1960,6 +2003,12 @@ fn setDomainRouteU32Property(cfg: *ServerConfig, property_name: []const u8, valu
     const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
     const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
     try setRouteU32Property(&domain.routes, split.route, value, field);
+}
+
+fn appendDomainRouteResponseHeader(cfg: *ServerConfig, allocator: std.mem.Allocator, property_name: []const u8, value: []const u8) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try appendRouteResponseHeader(&domain.routes, allocator, split.route, value);
 }
 
 // Map one config file line to fields. Config files are strict so typos do not
@@ -2062,6 +2111,12 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
     } else if (findRoutePropertyName(k, "server_names.")) |name| {
         const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
         try appendServerNames(allocator, domain, v);
+    } else if (findRoutePropertyName(k, "server_header.")) |name| {
+        try appendDomainResponseHeader(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_response_header.")) |name| {
+        try appendDomainResponseHeader(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_add_header.")) |name| {
+        try appendDomainResponseHeader(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_root.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "server_dir.")) |name| {
@@ -2175,6 +2230,12 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_route_strip_prefix.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .strip_prefix);
+    } else if (findRoutePropertyName(k, "server_route_header.")) |name| {
+        try appendDomainRouteResponseHeader(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_route_response_header.")) |name| {
+        try appendDomainRouteResponseHeader(cfg, allocator, name, v);
+    } else if (findRoutePropertyName(k, "server_route_add_header.")) |name| {
+        try appendDomainRouteResponseHeader(cfg, allocator, name, v);
     } else if (std.mem.eql(u8, k, "route")) {
         try setRouteLine(cfg, allocator, v);
     } else if (findRoutePropertyName(k, "route_dir.")) |name| {
@@ -2227,6 +2288,12 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .strip_prefix);
+    } else if (findRoutePropertyName(k, "route_header.")) |name| {
+        try appendRouteResponseHeader(&cfg.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
+        try appendRouteResponseHeader(&cfg.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_add_header.")) |name| {
+        try appendRouteResponseHeader(&cfg.routes, allocator, name, v);
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -2476,6 +2543,8 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setDomainUpstreamPolicyPropertyDirect(domain, v);
     } else if (std.mem.eql(u8, k, "upstream_timeout_ms") or std.mem.eql(u8, k, "proxy_timeout_ms") or std.mem.eql(u8, k, "php_timeout_ms") or std.mem.eql(u8, k, "fastcgi_timeout_ms")) {
         try setDomainU32PropertyDirect(domain, v, .upstream_timeout_ms);
+    } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
+        if (v.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "route")) {
@@ -2530,6 +2599,12 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .strip_prefix);
+    } else if (findRoutePropertyName(k, "route_header.")) |name| {
+        try appendRouteResponseHeader(&domain.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
+        try appendRouteResponseHeader(&domain.routes, allocator, name, v);
+    } else if (findRoutePropertyName(k, "route_add_header.")) |name| {
+        try appendRouteResponseHeader(&domain.routes, allocator, name, v);
     } else {
         return error.UnknownConfigKey;
     }
@@ -4633,18 +4708,22 @@ const H2_DEFAULT_PAGE =
 
 fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
     _ = process_env;
-    current_response_headers = cfg.response_headers.items;
-
     const is_head = std.mem.eql(u8, req.method, "HEAD");
     const domain = findDomainForRequestMutable(cfg, req.headers);
+    const base_header_context = try buildResponseHeaderContext(allocator, cfg, domain, null);
+    current_response_headers = base_header_context.items;
 
     if (findDomainRedirectRule(domain, req.path)) |redirect| return buildHttp2RedirectResponse(allocator, redirect, req);
     if (findRedirectRule(cfg, req.path)) |redirect| return buildHttp2RedirectResponse(allocator, redirect, req);
 
     if (findDomainRouteMutable(domain, req.path)) |route| {
+        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
+        current_response_headers = route_header_context.items;
         return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
     }
     if (findNamedRouteMutable(cfg, req.path)) |route| {
+        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
+        current_response_headers = route_header_context.items;
         return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
     }
 
@@ -4770,6 +4849,8 @@ fn handleHttp2HeadersFrame(
     process_env: *const std.process.Environ.Map,
     frame: H2Frame,
 ) !void {
+    current_response_headers = &.{};
+
     if (frame.header.stream_id == 0 or (frame.header.flags & h2_native.FLAG_END_HEADERS) == 0) {
         if (frame.header.stream_id != 0) try sendHttp2Rst(stream, frame.header.stream_id, 0x1);
         return;
@@ -5682,6 +5763,7 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
         streamWriteAll(stream, "\r\n") catch return error.CloseConnection;
     }
 
+    try streamWriteConfiguredResponseHeaders(stream);
     streamWriteAll(stream, "Connection: close\r\n\r\n") catch return error.CloseConnection;
 
     if (responseHasNoBody(req.method, framing.status_code)) {
@@ -7132,6 +7214,8 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_health_check_timeout_ms", "750");
     try applyConfigLine(&cfg, allocator, "upstream_circuit_half_open_max", "2");
     try applyConfigLine(&cfg, allocator, "upstream_slow_start_ms", "6000");
+    try applyConfigLine(&cfg, allocator, "header", "X-Global-Policy: one");
+    try applyConfigLine(&cfg, allocator, "route_header.assets", "X-Route-Policy: assets");
     try applyConfigLine(&cfg, allocator, "route_proxy_policy.health", "round-robin");
     try applyConfigLine(&cfg, allocator, "route_proxy_timeout_ms.health", "1250");
 
@@ -7153,6 +7237,8 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(cfg.upstream_circuit_breaker_enabled);
     try std.testing.expectEqual(@as(usize, 2), cfg.upstream_circuit_half_open_max);
     try std.testing.expectEqual(@as(u32, 6000), cfg.upstream_slow_start_ms);
+    try std.testing.expectEqual(@as(usize, 1), cfg.response_headers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), findNamedRoute(&cfg, "/assets/hello.txt").?.response_headers.items.len);
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
     try std.testing.expectEqual(@as(u32, 1250), routeUpstreamTimeoutMs(&cfg, null, findNamedRoute(&cfg, "/health").?));
 
@@ -7199,8 +7285,10 @@ test "named routes prefer exact and longest prefix matches" {
     try appendServerNames(allocator, findDomainConfigMutable(&cfg, "site").?, "example.test *.example.test");
     try applyConfigLine(&cfg, allocator, "server_tls_cert.site", "/certs/site/fullchain.pem");
     try applyConfigLine(&cfg, allocator, "server_tls_key.site", "/certs/site/privkey.pem");
+    try applyConfigLine(&cfg, allocator, "server_header.site", "X-Site-Policy: site");
     try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
     try setDomainRouteLine(&cfg, allocator, "site", "site-api /api/* proxy");
+    try applyConfigLine(&cfg, allocator, "server_route_header.site.site-api", "X-Api-Policy: route");
     try applyConfigLine(&cfg, allocator, "server_proxy_policy.site", "random");
     try applyConfigLine(&cfg, allocator, "server_proxy_timeout_ms.site", "4200");
     try applyConfigLine(&cfg, allocator, "server_route_proxy_policy.site.site-api", "inherit");
@@ -7219,10 +7307,20 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(UpstreamPoolPolicy.random, routeUpstreamPolicy(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
     try std.testing.expectEqual(@as(u32, 900), routeUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
     try std.testing.expectEqual(@as(u32, 4200), domainUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test")));
+    const site_domain = findDomainForHost(&cfg, "example.test").?;
+    const site_api_route = findDomainRoute(site_domain, "/api/status").?;
+    const response_header_context = try buildResponseHeaderContext(allocator, &cfg, site_domain, site_api_route);
+    defer response_header_context.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), response_header_context.items.len);
+    try std.testing.expectEqualStrings("X-Global-Policy", response_header_context.items[0].name);
+    try std.testing.expectEqualStrings("X-Site-Policy", response_header_context.items[1].name);
+    try std.testing.expectEqualStrings("X-Api-Policy", response_header_context.items[2].name);
 
     var file_domain = try initDomainConfig(allocator, "file-site");
+    try applyDomainConfigLine(&file_domain, allocator, "add_header", "X-File-Policy: file");
     try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate", "/certs/file/fullchain.pem");
     try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate_key", "/certs/file/privkey.pem");
+    try std.testing.expectEqual(@as(usize, 1), file_domain.response_headers.items.len);
     try std.testing.expectEqualStrings("/certs/file/fullchain.pem", file_domain.tls_cert.?);
     try std.testing.expectEqualStrings("/certs/file/privkey.pem", file_domain.tls_key.?);
 }
@@ -7442,13 +7540,15 @@ fn routeRequest(
     process_env: *const std.process.Environ.Map,
 ) !void {
     // Route locally first, then fall back to proxying so known endpoints stay predictable.
-    current_response_headers = cfg.response_headers.items;
-    defer current_response_headers = &.{};
-
     const should_close = req.close_connection;
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
     const domain = findDomainForRequestMutable(cfg, req.headers);
+
+    const base_header_context = try buildResponseHeaderContext(allocator, cfg, domain, null);
+    defer base_header_context.deinit(allocator);
+    current_response_headers = base_header_context.items;
+    defer current_response_headers = &.{};
 
     if (findDomainRedirectRule(domain, req.path)) |redirect| {
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
@@ -7461,11 +7561,17 @@ fn routeRequest(
     }
 
     if (findDomainRouteMutable(domain, req.path)) |route| {
+        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
+        defer route_header_context.deinit(allocator);
+        current_response_headers = route_header_context.items;
         try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
         return;
     }
 
     if (findNamedRouteMutable(cfg, req.path)) |route| {
+        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
+        defer route_header_context.deinit(allocator);
+        current_response_headers = route_header_context.items;
         try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
         return;
     }
@@ -9301,6 +9407,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
             },
         }
         if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
+        if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
         std.debug.print("\n", .{});
     }
 
@@ -9316,6 +9423,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
         if (domainServeStaticRoot(cfg, domain)) std.debug.print(" serve_static_root=true", .{});
         if (domain.upstream) |pool| printUpstreamPool(domainUpstreamPolicy(cfg, domain), pool);
         if (domain.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
+        if (domain.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{domain.response_headers.items.len});
         std.debug.print("\n", .{});
 
         for (domain.routes.items) |route| {
@@ -9344,6 +9452,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                 },
             }
             if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
+            if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
             std.debug.print("\n", .{});
         }
     }
@@ -9393,9 +9502,9 @@ fn usage() void {
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
-            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
+            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, route_header.NAME, server/domain/vhost, " ++
+            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_proxy.NAME, " ++
+            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
