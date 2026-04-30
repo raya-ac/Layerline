@@ -115,5 +115,6 @@ Sources:
 8. HTTP/3 full routing.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
 10. Admin API and hot reload.
+11. Deployment packaging. Initial systemd, launchd, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 
 The next engineering milestone should be HTTP/2 request-body and flow-control hardening, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

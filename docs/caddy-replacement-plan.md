@@ -16,7 +16,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 - Reload can validate and swap config without dropping existing connections.
 - Compression, cache policy, redirects, headers, health, and metrics have route/domain controls. Response header inheritance and cache shortcuts are implemented for global, domain, and route scopes; dynamic gzip is implemented globally for buffered HTTP/1.1 and HTTP/2 responses, while route/domain compression presets still need richer controls.
 - Logs identify request path, status, latency, upstream, protocol, and failure reason.
-- There is a deployment runbook for Linux service management, limits, certs, logs, and rollback.
+- There is a deployment runbook for Linux service management, limits, certs, logs, and rollback. Initial systemd, launchd, runtime Dockerfile, and deployment runbook assets are implemented.
 
 ## Build Sections
 
@@ -32,7 +32,7 @@ Commit each section independently after tests and at least one live smoke where 
 8. Compression policy: gzip first, then brotli/zstd if available without bloating the core. Initial opt-in dynamic gzip is implemented for buffered HTTP/1.1 and HTTP/2 text responses.
 9. Cache policy: route/domain `Cache-Control`, immutable assets, stale-if-error, and cache-status headers before a disk cache. Initial inherited `cache_control` shortcuts are implemented for global, domain, and route scopes.
 10. Admin API over Unix socket: validate, reload, routes, metrics, upstream health, cert status, and redacted config.
-11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands.
+11. Deployment assets: systemd unit, launchd plist, Linux sysctl/ulimit notes, Dockerfile, and rollback commands. Initial templates and runbook are implemented.
 12. Conformance and soak tests: curl/h2load/autocannon, WebSocket echo, php-fpm, slow upstreams, config reload, and TLS smoke.
 
 ## Not Ready Means Not Ready

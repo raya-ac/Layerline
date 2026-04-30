@@ -42,6 +42,10 @@ The next roadmap slice is HTTP/2 request-body/flow-control hardening and richer 
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
+- `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
+- `deploy/systemd/layerline.service` – production-oriented systemd unit template.
+- `deploy/launchd/dev.layerline.layerline.plist` – macOS launchd service template.
+- `Dockerfile` – runtime image template for an already built `zig-out/bin/layerline`.
 - HTTP/2/HTTP/3 deployment notes in this README.
 
 

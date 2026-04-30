@@ -1,0 +1,28 @@
+[Unit]
+Description=Layerline web server
+Documentation=https://github.com/raya-ac/Layerline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=layerline
+Group=layerline
+EnvironmentFile=-/etc/layerline/layerline.env
+ExecStart=/usr/local/bin/layerline --config /etc/layerline/server.conf
+ExecReload=/usr/local/bin/layerline --validate-config --config /etc/layerline/server.conf
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/layerline /var/log/layerline /var/www
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
