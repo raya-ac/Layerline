@@ -57,6 +57,8 @@ const HTTP2_ERROR_REFUSED_STREAM: u32 = 0x7;
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
+const ACME_CHALLENGE_DIR = ".well-known/acme-challenge";
+const ACME_CHALLENGE_PATH_SUFFIX = "/.well-known/acme-challenge";
 const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
 const DEFAULT_ADMIN_UI_PATH = "/_layerline/admin";
 const DEFAULT_ADMIN_CREDENTIALS_PATH = ".layerline-admin";
@@ -244,6 +246,7 @@ fn installShutdownSignalHandlers() void {
 const ShutdownWatcherContext = struct {
     io: std.Io,
     server: *std.Io.net.Server,
+    closed: *std.atomic.Value(bool),
 };
 
 fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
@@ -252,7 +255,7 @@ fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
         ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
     }
 
-    if (!listener_closed_by_shutdown.swap(true, .acq_rel)) {
+    if (!ctx.closed.swap(true, .acq_rel)) {
         ctx.server.socket.close(ctx.io);
     }
 }
@@ -523,6 +526,10 @@ const ServerConfig = struct {
     letsencrypt_staging: bool,
     letsencrypt_renew: bool,
     letsencrypt_renew_interval_ms: u32,
+    http_redirect_enabled: bool,
+    http_redirect_port: u16,
+    http_redirect_https_port: u16,
+    http_redirect_status: u16,
     h2_upstream: ?UpstreamConfig,
     http3_enabled: bool,
     http3_port: u16,
@@ -1106,6 +1113,35 @@ fn listLetsencryptDomains(allocator: std.mem.Allocator, raw: []const u8, out: *s
     return has_domain;
 }
 
+fn stripTrailingPathSeparators(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    return path[0..end];
+}
+
+fn certbotWebrootFromAcmeConfig(webroot: []const u8) []const u8 {
+    const trimmed = stripTrailingPathSeparators(webroot);
+    if (std.mem.endsWith(u8, trimmed, ACME_CHALLENGE_PATH_SUFFIX)) {
+        const root = trimmed[0 .. trimmed.len - ACME_CHALLENGE_PATH_SUFFIX.len];
+        return if (root.len == 0) "/" else root;
+    }
+    return trimmed;
+}
+
+fn buildAcmeChallengeDir(allocator: std.mem.Allocator, webroot: []const u8) ![]const u8 {
+    const trimmed = stripTrailingPathSeparators(webroot);
+    if (std.mem.endsWith(u8, trimmed, ACME_CHALLENGE_PATH_SUFFIX)) {
+        return allocator.dupe(u8, trimmed);
+    }
+    return std.fs.path.join(allocator, &.{ trimmed, ACME_CHALLENGE_DIR });
+}
+
+fn buildAcmeChallengeFilePath(allocator: std.mem.Allocator, webroot: []const u8, token: []const u8) ![]const u8 {
+    const challenge_dir = try buildAcmeChallengeDir(allocator, webroot);
+    defer allocator.free(challenge_dir);
+    return std.fs.path.join(allocator, &.{ challenge_dir, token });
+}
+
 fn appendLetsEncryptWebrootArgs(
     allocator: std.mem.Allocator,
     args: *std.ArrayList([]const u8),
@@ -1116,7 +1152,7 @@ fn appendLetsEncryptWebrootArgs(
         "--non-interactive",
         "--webroot",
         "-w",
-        webroot,
+        certbotWebrootFromAcmeConfig(webroot),
         "--config-dir",
         "/etc/letsencrypt",
     });
@@ -1423,7 +1459,9 @@ fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Server
     }
 
     if (cfg.letsencrypt_webroot.len == 0) return;
-    std.Io.Dir.cwd().createDirPath(io, cfg.letsencrypt_webroot) catch |err| {
+    const challenge_dir = try buildAcmeChallengeDir(allocator, cfg.letsencrypt_webroot);
+    defer allocator.free(challenge_dir);
+    std.Io.Dir.cwd().createDirPath(io, challenge_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
@@ -2440,6 +2478,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         cfg.letsencrypt_renew = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "letsencrypt_renew_interval_ms") or std.mem.eql(u8, k, "tls_renew_interval_ms") or std.mem.eql(u8, k, "acme_renew_interval_ms")) {
         cfg.letsencrypt_renew_interval_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "http_redirect") or std.mem.eql(u8, k, "http_to_https") or std.mem.eql(u8, k, "http_redirect_enabled")) {
+        cfg.http_redirect_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "http_redirect_port") or std.mem.eql(u8, k, "http_to_https_port")) {
+        cfg.http_redirect_port = try parseConfigU16(v);
+    } else if (std.mem.eql(u8, k, "http_redirect_https_port") or std.mem.eql(u8, k, "https_port")) {
+        cfg.http_redirect_https_port = try parseConfigU16(v);
+    } else if (std.mem.eql(u8, k, "http_redirect_status") or std.mem.eql(u8, k, "http_to_https_status")) {
+        cfg.http_redirect_status = try parseConfigU16(v);
     } else if (std.mem.eql(u8, k, "h2_upstream") or std.mem.eql(u8, k, "http2_upstream")) {
         if (disablesOptionalUrl(v)) {
             cfg.h2_upstream = null;
@@ -3229,6 +3275,12 @@ fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.tls_auto and cfg.letsencrypt_renew) {
         if (cfg.letsencrypt_renew_interval_ms < 60_000) return error.InvalidConfigValue;
     }
+    if (cfg.http_redirect_enabled) {
+        if (!cfg.tls_enabled) return error.InvalidConfigValue;
+        if (cfg.http_redirect_port == 0 or cfg.http_redirect_https_port == 0) return error.InvalidConfigValue;
+        if (cfg.http_redirect_port == cfg.port) return error.InvalidConfigValue;
+        if (!isRedirectStatusCode(cfg.http_redirect_status)) return error.InvalidConfigValue;
+    }
     if (cfg.cloudflare_auto_deploy) {
         if (cfg.cloudflare_token == null or cfg.cloudflare_token.?.len == 0) return error.InvalidConfigValue;
         if ((cfg.cloudflare_zone_id == null or cfg.cloudflare_zone_id.?.len == 0) and (cfg.cloudflare_zone_name == null or cfg.cloudflare_zone_name.?.len == 0)) return error.InvalidConfigValue;
@@ -3532,6 +3584,13 @@ fn redirectStatusText(status_code: u16) []const u8 {
     };
 }
 
+fn isRedirectStatusCode(status_code: u16) bool {
+    return switch (status_code) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
+
 fn findRedirectRuleIn(rules: []const RedirectRule, path: []const u8) ?RedirectRule {
     for (rules) |rule| {
         if (rule.prefix_match) {
@@ -3575,6 +3634,70 @@ fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocato
     }
 
     try sendResponseWithConnectionAndHeaders(stream, rule.status_code, redirectStatusText(rule.status_code), "text/plain; charset=utf-8", body, close_connection, extra_headers);
+}
+
+fn isAsciiDigitSlice(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
+}
+
+fn stripPortFromHostForRedirect(raw_host: []const u8) []const u8 {
+    const host = trimValue(raw_host);
+    if (host.len == 0) return host;
+    if (host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return host;
+        return host[0 .. close + 1];
+    }
+
+    var colon_count: usize = 0;
+    for (host) |byte| {
+        if (byte == ':') colon_count += 1;
+    }
+    if (colon_count == 1) {
+        const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse return host;
+        if (isAsciiDigitSlice(host[colon + 1 ..])) return host[0..colon];
+    }
+    return host;
+}
+
+fn isSafeRedirectHost(host: []const u8) bool {
+    if (host.len == 0) return false;
+    if (std.mem.indexOfAny(u8, host, " \t\r\n\x00/?#") != null) return false;
+    if (host[0] != '[' and std.mem.indexOfScalar(u8, host, ':') != null) return false;
+    return true;
+}
+
+fn buildHttpsRedirectLocation(allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest) ![]const u8 {
+    if (req.path.len == 0 or req.path[0] != '/') return error.InvalidRedirectPath;
+    const raw_host = findHeaderValue(req.headers, "Host") orelse return error.MissingHostHeader;
+    const host = stripPortFromHostForRedirect(raw_host);
+    if (!isSafeRedirectHost(host)) return error.InvalidRedirectHost;
+
+    const query_joiner: []const u8 = if (req.query.len > 0) "?" else "";
+    if (cfg.http_redirect_https_port == 443) {
+        return std.fmt.allocPrint(allocator, "https://{s}{s}{s}{s}", .{ host, req.path, query_joiner, req.query });
+    }
+    return std.fmt.allocPrint(allocator, "https://{s}:{d}{s}{s}{s}", .{ host, cfg.http_redirect_https_port, req.path, query_joiner, req.query });
+}
+
+fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
+    const location = try buildHttpsRedirectLocation(allocator, cfg, req);
+    defer allocator.free(location);
+
+    const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
+    defer allocator.free(extra_headers);
+
+    const body = try std.fmt.allocPrint(allocator, "Redirecting to {s}\n", .{location});
+    defer allocator.free(body);
+
+    if (is_head) {
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirectStatusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
+        return;
+    }
+    try sendResponseWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirectStatusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body, close_connection, extra_headers);
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
@@ -3763,11 +3886,14 @@ fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_co
 fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"admin_ui\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
+        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http_redirect\":{},\"http_redirect_port\":{d},\"http_redirect_https_port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"admin_ui\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
         .{
             SERVER_NAME,
             cfg.host,
             cfg.port,
+            cfg.http_redirect_enabled,
+            cfg.http_redirect_port,
+            cfg.http_redirect_https_port,
             cfg.http3_enabled,
             cfg.compression_enabled,
             cfg.admin_enabled,
@@ -3787,6 +3913,9 @@ fn renderAdminRoutes(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]
     errdefer out.deinit(allocator);
 
     try out.print(allocator, "global host={s} port={d} static_dir={s} index={s}\n", .{ cfg.host, cfg.port, cfg.static_dir, cfg.index_file });
+    if (cfg.http_redirect_enabled) {
+        try out.print(allocator, "http_redirect port={d} https_port={d} status={d} webroot={s}\n", .{ cfg.http_redirect_port, cfg.http_redirect_https_port, cfg.http_redirect_status, cfg.letsencrypt_webroot });
+    }
     for (cfg.routes.items) |route| {
         try out.print(allocator, "route {s}: {s} {s} -> {s}\n", .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) });
     }
@@ -4342,6 +4471,7 @@ fn renderAdminDashboardPage(allocator: std.mem.Allocator, cfg: *const ServerConf
     try appendHtmlEscaped(&out, allocator, credentials.username);
     try out.appendSlice(allocator, "</strong></div>\n");
     try out.print(allocator, "<div class=\"metric\"><span>listener</span><strong>{s}:{d}</strong></div>\n", .{ cfg.host, cfg.port });
+    try out.print(allocator, "<div class=\"metric\"><span>http redirect</span><strong>{s}</strong></div>\n", .{if (cfg.http_redirect_enabled) "on" else "off"});
     try out.print(allocator, "<div class=\"metric\"><span>requests</span><strong>{d}</strong></div>\n", .{ServerMetrics.load(&server_metrics.requests_total)});
     try out.appendSlice(allocator, "</div>\n");
 
@@ -5045,7 +5175,7 @@ fn serveAcmeChallenge(
         return;
     }
 
-    const file_path = try std.fs.path.join(allocator, &.{ webroot, token });
+    const file_path = try buildAcmeChallengeFilePath(allocator, webroot, token);
     defer allocator.free(file_path);
 
     const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
@@ -5796,6 +5926,63 @@ fn parseRequest(
     };
 }
 
+fn parseRequestHeadersOnly(
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    max_request_bytes: usize,
+    prefill: []const u8,
+) !HttpRequest {
+    const request_buffer = try allocator.alloc(u8, max_request_bytes);
+    var used: usize = 0;
+
+    const prefill_len = @min(prefill.len, request_buffer.len);
+    if (prefill_len > 0) {
+        @memcpy(request_buffer[0..prefill_len], prefill[0..prefill_len]);
+        used = prefill_len;
+    }
+
+    while (used < request_buffer.len) {
+        if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") != null) break;
+        const n = try streamRead(stream, request_buffer[used..]);
+        if (n == 0) return error.ConnectionClosed;
+        used += n;
+    }
+    if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") == null) return error.RequestTooLarge;
+
+    const header_end = (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") orelse return error.MalformedRequest) + 4;
+    const header_bytes = request_buffer[0..header_end];
+    const request_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.MalformedRequest;
+    const request_line = header_bytes[0..request_line_end];
+    var request_parts = std.mem.splitSequence(u8, request_line, " ");
+
+    const method = request_parts.next() orelse return error.MalformedRequest;
+    const path_and_query = request_parts.next() orelse return error.MalformedRequest;
+    const version = request_parts.next() orelse return error.MalformedRequest;
+
+    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
+    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
+    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
+
+    const headers_start = request_line_end + 2;
+    const headers_end = if (header_end >= 4) header_end - 4 else 0;
+    const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
+
+    if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
+    if (std.mem.startsWith(u8, version, "HTTP/1.1") and findHeaderValue(headers, "Host") == null) {
+        return error.MissingHostHeader;
+    }
+
+    return HttpRequest{
+        .method = method,
+        .path = path,
+        .query = query,
+        .headers = headers,
+        .version = version,
+        .body = "",
+        .close_connection = true,
+    };
+}
+
 const H2BufferedResponse = struct {
     status_code: u16,
     content_type: []const u8,
@@ -6007,7 +6194,8 @@ fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *con
         return h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid ACME challenge path.");
     }
 
-    const file_path = try std.fs.path.join(allocator, &.{ cfg.letsencrypt_webroot, token });
+    const file_path = try buildAcmeChallengeFilePath(allocator, cfg.letsencrypt_webroot, token);
+    defer allocator.free(file_path);
     const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
         if (err == error.NotDir or err == error.FileNotFound) {
             return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
@@ -9140,11 +9328,15 @@ test "named routes prefer exact and longest prefix matches" {
         .tls_auto = false,
         .letsencrypt_email = null,
         .letsencrypt_domains = null,
-        .letsencrypt_webroot = "public/.well-known/acme-challenge",
+        .letsencrypt_webroot = "public",
         .letsencrypt_certbot = "certbot",
         .letsencrypt_staging = false,
         .letsencrypt_renew = true,
         .letsencrypt_renew_interval_ms = DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS,
+        .http_redirect_enabled = false,
+        .http_redirect_port = 80,
+        .http_redirect_https_port = 443,
+        .http_redirect_status = 308,
         .h2_upstream = null,
         .http3_enabled = false,
         .http3_port = 8443,
@@ -9232,6 +9424,10 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "access_log", "/tmp/layerline-access.log");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew", "false");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew_interval_ms", "7200000");
+    try applyConfigLine(&cfg, allocator, "http_redirect", "true");
+    try applyConfigLine(&cfg, allocator, "http_redirect_port", "18080");
+    try applyConfigLine(&cfg, allocator, "http_redirect_https_port", "18443");
+    try applyConfigLine(&cfg, allocator, "http_redirect_status", "308");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
     try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
@@ -9273,6 +9469,34 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("/tmp/layerline-access.log", cfg.access_log_path);
     try std.testing.expect(!cfg.letsencrypt_renew);
     try std.testing.expectEqual(@as(u32, 7200000), cfg.letsencrypt_renew_interval_ms);
+    try std.testing.expect(cfg.http_redirect_enabled);
+    try std.testing.expectEqual(@as(u16, 18080), cfg.http_redirect_port);
+    try std.testing.expectEqual(@as(u16, 18443), cfg.http_redirect_https_port);
+    try std.testing.expectEqual(@as(u16, 308), cfg.http_redirect_status);
+    try std.testing.expectEqualStrings("public", certbotWebrootFromAcmeConfig("public/.well-known/acme-challenge"));
+    const acme_path = try buildAcmeChallengeFilePath(allocator, "public", "token-123");
+    try std.testing.expectEqualStrings("public/.well-known/acme-challenge/token-123", acme_path);
+    const redirect_req = HttpRequest{
+        .method = "GET",
+        .path = "/docs",
+        .query = "q=1",
+        .headers = "Host: example.com:18080\r\n",
+        .version = "HTTP/1.1",
+        .body = "",
+        .close_connection = true,
+    };
+    const redirect_location = try buildHttpsRedirectLocation(allocator, &cfg, redirect_req);
+    try std.testing.expectEqualStrings("https://example.com:18443/docs?q=1", redirect_location);
+    const bad_redirect_req = HttpRequest{
+        .method = "GET",
+        .path = "/docs",
+        .query = "",
+        .headers = "Host: example.com:bad\r\n",
+        .version = "HTTP/1.1",
+        .body = "",
+        .close_connection = true,
+    };
+    try std.testing.expectError(error.InvalidRedirectHost, buildHttpsRedirectLocation(allocator, &cfg, bad_redirect_req));
     normalizeConfig(&cfg);
     try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
     try std.testing.expect(cfg.upstream_health_check_enabled);
@@ -10241,6 +10465,228 @@ fn routeRequest(
 
     accessLogSetHandler("not_implemented");
     try sendNotImplemented(stream, allocator, should_close);
+}
+
+fn routeHttpRedirectRequest(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    req: HttpRequest,
+) !void {
+    const is_head = std.mem.eql(u8, req.method, "HEAD");
+    const close_connection = true;
+
+    current_request_headers = req.headers;
+    current_compression_policy = .disabled;
+    current_response_headers = &.{};
+    defer {
+        current_request_headers = "";
+        current_compression_policy = .disabled;
+        current_response_headers = &.{};
+    }
+
+    if ((std.mem.eql(u8, req.method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
+        accessLogSetHandler("acme_challenge");
+        const token = req.path["/.well-known/acme-challenge/".len..];
+        try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, close_connection, is_head);
+        return;
+    }
+
+    accessLogSetHandler("http_to_https_redirect");
+    sendHttpsRedirect(stream, allocator, cfg, req, close_connection, is_head) catch |err| switch (err) {
+        error.MissingHostHeader => try sendBadRequestForMethod(allocator, stream, "Missing Host header.", close_connection, is_head),
+        error.InvalidRedirectHost => try sendBadRequestForMethod(allocator, stream, "Invalid Host header.", close_connection, is_head),
+        error.InvalidRedirectPath => try sendBadRequestForMethod(allocator, stream, "Invalid request path.", close_connection, is_head),
+        else => return err,
+    };
+}
+
+fn handleHttpRedirectConnection(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const req_alloc = arena.allocator();
+
+    setStreamTimeouts(stream, cfg.read_header_timeout_ms, cfg.write_timeout_ms) catch |err| {
+        std.debug.print("HTTP redirect socket timeout setup failed: {}\n", .{err});
+    };
+
+    var prefill_buf: [64]u8 = undefined;
+    const prefill_len = streamRead(stream, &prefill_buf) catch |err| switch (err) {
+        error.RequestTimeout => {
+            try sendCoolErrorWithConnection(
+                stream,
+                req_alloc,
+                408,
+                "Request Timeout",
+                "No request bytes arrived before the redirect listener timeout.",
+                true,
+                false,
+                null,
+            );
+            return;
+        },
+        else => |e| return e,
+    };
+    if (prefill_len == 0) return;
+    const prefill = prefill_buf[0..prefill_len];
+
+    if (isLikelyHttp2Preface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or isHttp3OverTcpProbe(prefill)) {
+        try sendCoolErrorWithConnection(
+            stream,
+            req_alloc,
+            426,
+            "Upgrade Required",
+            "Use the HTTPS listener for TLS, HTTP/2, or HTTP/3. This socket only handles ACME HTTP-01 and HTTP-to-HTTPS redirects.",
+            true,
+            false,
+            null,
+        );
+        return;
+    }
+
+    var req = parseRequestHeadersOnly(stream, req_alloc, cfg.max_request_bytes, prefill) catch |err| {
+        if (err != error.ConnectionClosed) server_metrics.requestParseError();
+        switch (err) {
+            error.ConnectionClosed => return,
+            error.RequestTimeout => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 408, "Request Timeout", "The request took too long to read.", true, false, null);
+                return;
+            },
+            error.RequestTooLarge => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 413, "Payload Too Large", "Request headers are too large.", true, false, null);
+                return;
+            },
+            error.PayloadTooLarge => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 413, "Payload Too Large", "Request body exceeds configured limit.", true, false, null);
+                return;
+            },
+            error.InvalidContentLength => {
+                try sendBadRequest(req_alloc, stream, "Invalid Content-Length header.");
+                return;
+            },
+            error.UnsupportedTransferEncoding => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 501, "Not Implemented", "Only plain Content-Length and chunked request bodies are supported.", true, false, null);
+                return;
+            },
+            error.ExpectationFailed => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 417, "Expectation Failed", "Only Expect: 100-continue is supported.", true, false, null);
+                return;
+            },
+            error.MalformedRequest => {
+                try sendBadRequest(req_alloc, stream, "Malformed request.");
+                return;
+            },
+            error.BadRequest => {
+                try sendBadRequest(req_alloc, stream, "Bad request.");
+                return;
+            },
+            error.MissingHostHeader => {
+                try sendBadRequest(req_alloc, stream, "Missing Host header.");
+                return;
+            },
+            error.UnsupportedHttpVersion => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 505, "HTTP Version Not Supported", "The redirect listener only accepts HTTP/1.x before sending clients to HTTPS.", true, false, null);
+                return;
+            },
+            else => {
+                try sendCoolErrorWithConnection(stream, req_alloc, 500, "Internal Server Error", "Internal server error while parsing request.", true, false, null);
+                return;
+            },
+        }
+    };
+    req.close_connection = true;
+    server_metrics.requestStarted();
+
+    var access_ctx = AccessLogContext{
+        .enabled = cfg.access_log_enabled,
+        .sink = cfg.access_log_path,
+        .method = req.method,
+        .path = req.path,
+        .query = req.query,
+        .protocol = req.version,
+        .host = findHeaderValue(req.headers, "Host") orelse "",
+        .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+    };
+    current_access_log = &access_ctx;
+    defer current_access_log = null;
+
+    routeHttpRedirectRequest(io, stream, req_alloc, cfg, req) catch |err| {
+        accessLogSetError(@errorName(err));
+        emitAccessLog(0, 0);
+        server_metrics.routeError();
+        return err;
+    };
+    if (!access_ctx.logged) emitAccessLog(0, 0);
+}
+
+fn serveHttpRedirectConnectionTask(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    state: *ConcurrencyState,
+) void {
+    bindThreadIo(io);
+    defer {
+        state.release();
+        streamClose(stream);
+    }
+
+    handleHttpRedirectConnection(io, stream, cfg, allocator) catch |err| {
+        std.debug.print("HTTP redirect handler error: {}\n", .{err});
+    };
+}
+
+const HttpRedirectListenerContext = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    state: *ConcurrencyState,
+};
+
+fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
+    bindThreadIo(ctx.io);
+
+    while (!shutdown_requested.load(.acquire)) {
+        const conn = ctx.server.accept(ctx.io) catch |err| {
+            if (shutdown_requested.load(.acquire)) break;
+            std.debug.print("HTTP redirect accept failed: {}. Continuing to accept.\n", .{err});
+            ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
+            continue;
+        };
+
+        if (!ctx.state.tryAcquire(ctx.cfg.max_concurrent_connections)) {
+            server_metrics.connectionRejected();
+            sendCoolError(
+                conn,
+                ctx.allocator,
+                503,
+                "Service Unavailable",
+                "Maximum concurrent connections reached. Try again in a moment.",
+            ) catch {};
+            streamClose(conn);
+            continue;
+        }
+
+        const worker = std.Thread.spawn(
+            .{ .stack_size = ctx.cfg.worker_stack_size },
+            serveHttpRedirectConnectionTask,
+            .{ ctx.io, conn, ctx.cfg, ctx.allocator, ctx.state },
+        ) catch |err| {
+            std.debug.print("Failed to start HTTP redirect worker: {}\n", .{err});
+            ctx.state.release();
+            streamClose(conn);
+            continue;
+        };
+        worker.detach();
+    }
 }
 
 fn handleConnection(
@@ -11629,6 +12075,7 @@ fn usage() void {
             "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
+            "[--http-redirect true|false] [--http-redirect-port 80] [--http-redirect-https-port 443] [--http-redirect-status 308] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
             "[--cf-record-type A|AAAA|CNAME|TXT] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
             "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
@@ -11641,7 +12088,7 @@ fn usage() void {
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
             "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, access_log, access_log_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
-            "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, " ++
+            "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, http_redirect, http_redirect_port, http_redirect_https_port, http_redirect_status, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
@@ -11706,11 +12153,15 @@ pub fn main(init: std.process.Init) !void {
         .tls_auto = false,
         .letsencrypt_email = null,
         .letsencrypt_domains = null,
-        .letsencrypt_webroot = "public/.well-known/acme-challenge",
+        .letsencrypt_webroot = "public",
         .letsencrypt_certbot = "certbot",
         .letsencrypt_staging = false,
         .letsencrypt_renew = true,
         .letsencrypt_renew_interval_ms = DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS,
+        .http_redirect_enabled = false,
+        .http_redirect_port = 80,
+        .http_redirect_https_port = 443,
+        .http_redirect_status = 308,
         .cloudflare_auto_deploy = false,
         .cloudflare_api_base = "https://api.cloudflare.com/client/v4",
         .cloudflare_token = null,
@@ -11882,6 +12333,30 @@ pub fn main(init: std.process.Init) !void {
                 return;
             };
             cfg.letsencrypt_renew_interval_ms = std.fmt.parseInt(u32, value, 10) catch cfg.letsencrypt_renew_interval_ms;
+        } else if (std.mem.eql(u8, arg, "--http-redirect") or std.mem.eql(u8, arg, "--http-to-https")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http_redirect_enabled = parseBool(value) orelse cfg.http_redirect_enabled;
+        } else if (std.mem.eql(u8, arg, "--http-redirect-port") or std.mem.eql(u8, arg, "--http-to-https-port")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http_redirect_port = std.fmt.parseInt(u16, value, 10) catch cfg.http_redirect_port;
+        } else if (std.mem.eql(u8, arg, "--http-redirect-https-port") or std.mem.eql(u8, arg, "--https-port")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http_redirect_https_port = std.fmt.parseInt(u16, value, 10) catch cfg.http_redirect_https_port;
+        } else if (std.mem.eql(u8, arg, "--http-redirect-status") or std.mem.eql(u8, arg, "--http-to-https-status")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.http_redirect_status = std.fmt.parseInt(u16, value, 10) catch cfg.http_redirect_status;
         } else if (std.mem.eql(u8, arg, "--tls-cert")) {
             cfg.tls_cert = args.next() orelse {
                 usage();
@@ -12372,22 +12847,58 @@ pub fn main(init: std.process.Init) !void {
 
     var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try address.listen(init.io, .{ .reuse_address = true });
+    var redirect_listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
+    var redirect_server: ?std.Io.net.Server = null;
+    if (cfg.http_redirect_enabled) {
+        const redirect_address = try std.Io.net.IpAddress.parse(cfg.host, cfg.http_redirect_port);
+        redirect_server = try redirect_address.listen(init.io, .{ .reuse_address = true });
+    }
     defer {
         if (!listener_closed_by_shutdown.load(.acquire)) {
             server.deinit(init.io);
         }
     }
+    defer {
+        if (redirect_server) |*http_server| {
+            if (!redirect_listener_closed_by_shutdown.load(.acquire)) {
+                http_server.deinit(init.io);
+            }
+        }
+    }
     const shutdown_watcher = std.Thread.spawn(
         .{},
         shutdownWatcherTask,
-        .{ShutdownWatcherContext{ .io = init.io, .server = &server }},
+        .{ShutdownWatcherContext{ .io = init.io, .server = &server, .closed = &listener_closed_by_shutdown }},
     ) catch |err| {
         std.debug.print("Failed to start shutdown watcher: {}\n", .{err});
         return;
     };
     shutdown_watcher.detach();
 
-    std.debug.print("Serving on http://{s}:{d}\n", .{ cfg.host, cfg.port });
+    if (redirect_server) |*http_server| {
+        const http_shutdown_watcher = std.Thread.spawn(
+            .{},
+            shutdownWatcherTask,
+            .{ShutdownWatcherContext{ .io = init.io, .server = http_server, .closed = &redirect_listener_closed_by_shutdown }},
+        ) catch |err| {
+            std.debug.print("Failed to start HTTP redirect shutdown watcher: {}\n", .{err});
+            return;
+        };
+        http_shutdown_watcher.detach();
+
+        const http_redirect_worker = std.Thread.spawn(
+            .{},
+            serveHttpRedirectListenerTask,
+            .{HttpRedirectListenerContext{ .io = init.io, .server = http_server, .cfg = &cfg, .allocator = std.heap.page_allocator, .state = &concurrency }},
+        ) catch |err| {
+            std.debug.print("Failed to start HTTP redirect listener: {}\n", .{err});
+            return;
+        };
+        http_redirect_worker.detach();
+        std.debug.print("HTTP redirect listener on http://{s}:{d} -> https port {d} status {d}\n", .{ cfg.host, cfg.http_redirect_port, cfg.http_redirect_https_port, cfg.http_redirect_status });
+    }
+
+    std.debug.print("Serving on {s}://{s}:{d}\n", .{ if (cfg.tls_enabled) "https" else "http", cfg.host, cfg.port });
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
     if (cfg.upstream != null) {
         const pool = cfg.upstream.?;

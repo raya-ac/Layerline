@@ -62,7 +62,7 @@ Sources:
 ## Phase 5: TLS, ACME, and Protocols
 
 - Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 and RSA configured certificate loading, RSA-PSS CertificateVerify, SNI certificate selection for domain configs, and self-signed local fallback; session resumption, OCSP stapling, live certificate reload, and mTLS remain next.
-- ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs. Initial certbot/webroot startup issuance and periodic `certbot renew` scheduling are implemented, with admin cert visibility and renewal metrics.
+- ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs. Initial certbot/webroot startup issuance, HTTP-01 challenge serving from certbot webroots, a companion HTTP redirect/ACME listener for port 80, and periodic `certbot renew` scheduling are implemented, with admin cert visibility and renewal metrics.
 - HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade. Initial h2 route parity now covers static routes, redirects, health/metrics, reverse proxy routes, inherited response headers, FastCGI PHP routes, bounded DATA request bodies, content-length validation, and WINDOW_UPDATE for consumed body bytes; richer flow-control behavior and GOAWAY policy remain next.
 - HTTP/3 full routing: route all app responses over QUIC, not just the default page; QPACK dynamic table policy; stream lifecycle; connection migration stance; anti-amplification limits.
 - Protocol conformance tests using external clients and captured packet tests.
@@ -116,7 +116,7 @@ Sources:
 8. HTTP/3 full routing.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
 10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; reload and mutating upstream/cert controls remain.
-11. Deployment packaging. Initial systemd, launchd, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
-12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
+11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
+12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
 The next engineering milestone should be HTTP/2 GOAWAY/connection policy, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

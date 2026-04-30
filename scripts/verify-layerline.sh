@@ -5,6 +5,8 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ZIG=${ZIG:-}
 PORT=${LAYERLINE_VERIFY_PORT:-18145}
 HOST=${LAYERLINE_VERIFY_HOST:-127.0.0.1}
+REDIRECT_PORT=${LAYERLINE_VERIFY_REDIRECT_PORT:-$((PORT + 1))}
+REDIRECT_TLS_PORT=${LAYERLINE_VERIFY_REDIRECT_TLS_PORT:-$((PORT + 2))}
 
 if [[ -z $ZIG ]]; then
   if [[ -x /opt/homebrew/bin/zig ]]; then
@@ -222,5 +224,65 @@ if [[ -e $SOCKET ]]; then
   die "admin socket was not removed after shutdown"
 fi
 ok "admin socket cleanup"
+
+REDIRECT_WEBROOT="$TMP_DIR/acme-webroot"
+mkdir -p "$REDIRECT_WEBROOT/.well-known/acme-challenge"
+printf 'redirect-acme-token\n' >"$REDIRECT_WEBROOT/.well-known/acme-challenge/token-123"
+
+cat >"$CONFIG" <<CONF
+host = $HOST
+port = $REDIRECT_TLS_PORT
+dir = public
+tls = true
+http_redirect = true
+http_redirect_port = $REDIRECT_PORT
+http_redirect_https_port = $REDIRECT_TLS_PORT
+letsencrypt_webroot = $REDIRECT_WEBROOT
+access_log = $ACCESS_LOG
+CONF
+
+log "starting temporary TLS server with HTTP redirect listener on http://$HOST:$REDIRECT_PORT"
+(
+  cd "$ROOT_DIR"
+  ./zig-out/bin/layerline --config "$CONFIG"
+) >"$LOG" 2>&1 &
+PID=$!
+
+wait_for_http "http://$HOST:$REDIRECT_PORT/.well-known/acme-challenge/token-123" || die "HTTP redirect listener did not serve ACME challenge"
+ACME_BODY="$TMP_DIR/acme.body"
+curl -fsS "http://$HOST:$REDIRECT_PORT/.well-known/acme-challenge/token-123" -o "$ACME_BODY"
+grep -Fq 'redirect-acme-token' "$ACME_BODY" || die "ACME challenge body was unexpected"
+ok "HTTP redirect listener serves ACME challenge"
+
+REDIRECT_HEADERS="$TMP_DIR/redirect.headers"
+REDIRECT_BODY="$TMP_DIR/redirect.body"
+curl -fsS -D "$REDIRECT_HEADERS" -o "$REDIRECT_BODY" "http://$HOST:$REDIRECT_PORT/some/path?x=1"
+header_has "$REDIRECT_HEADERS" "^Location: https://$HOST:$REDIRECT_TLS_PORT/some/path?x=1" || die "HTTP redirect Location header was wrong"
+grep -Fq "https://$HOST:$REDIRECT_TLS_PORT/some/path?x=1" "$REDIRECT_BODY" || die "HTTP redirect body was wrong"
+ok "HTTP to HTTPS redirect preserves host, path, and query"
+
+LARGE_POST="$TMP_DIR/large-post.bin"
+dd if=/dev/zero of="$LARGE_POST" bs=1024 count=2048 >/dev/null 2>&1
+POST_REDIRECT_HEADERS="$TMP_DIR/post-redirect.headers"
+curl -fsS --max-time 5 -D "$POST_REDIRECT_HEADERS" -o /dev/null \
+  --data-binary @"$LARGE_POST" \
+  "http://$HOST:$REDIRECT_PORT/oversized-upload" || die "HTTP redirect listener failed to answer an oversized POST without reading the body"
+header_has "$POST_REDIRECT_HEADERS" "^Location: https://$HOST:$REDIRECT_TLS_PORT/oversized-upload" || die "POST redirect Location header was wrong"
+ok "HTTP redirect listener does not read request bodies"
+
+HEAD_REDIRECT_RAW="$TMP_DIR/head-redirect.raw"
+printf 'HEAD /head-redirect?ok=1 HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$HOST" "$REDIRECT_PORT" | nc "$HOST" "$REDIRECT_PORT" >"$HEAD_REDIRECT_RAW"
+grep -Fq '308 Permanent Redirect' "$HEAD_REDIRECT_RAW" || die "HEAD redirect did not return 308"
+grep -Fq "Location: https://$HOST:$REDIRECT_TLS_PORT/head-redirect?ok=1" "$HEAD_REDIRECT_RAW" || die "HEAD redirect Location header was wrong"
+perl -0ne 'exit(/\r\n\r\n\z/ ? 0 : 1)' "$HEAD_REDIRECT_RAW" || die "HEAD redirect response included a body"
+ok "HEAD redirect has no body"
+
+grep -Fq '"handler":"http_to_https_redirect"' "$ACCESS_LOG" || die "access log missing HTTP redirect handler"
+grep -Fq '"handler":"acme_challenge"' "$ACCESS_LOG" || die "access log missing ACME challenge handler"
+ok "redirect listener access log"
+
+kill "$PID" 2>/dev/null || true
+wait "$PID" 2>/dev/null || true
+PID=
 
 log "Layerline verification passed"

@@ -121,7 +121,7 @@ sudo launchctl kickstart -k system/dev.layerline.layerline
 
 ## TLS and ACME
 
-Layerline can serve ACME HTTP-01 challenge files from `letsencrypt_webroot`. For a certbot-managed deployment:
+Layerline can serve ACME HTTP-01 challenge files from `letsencrypt_webroot`. Use certbot webroot semantics: point the config at the public root, and Layerline serves `<webroot>/.well-known/acme-challenge/<token>`. Older configs that point directly at the challenge directory are still accepted.
 
 ```bash
 sudo certbot certonly --webroot -w /var/www/layerline/public -d example.com -d www.example.com
@@ -129,15 +129,19 @@ sudo certbot certonly --webroot -w /var/www/layerline/public -d example.com -d w
 
 When replacing an existing reverse proxy, you can usually issue the first cert while the proxy still owns ports 80/443 as long as it forwards `/.well-known/acme-challenge/` to Layerline and `letsencrypt_webroot` points at the same webroot used by certbot. Do not stop the old edge until the new cert files exist and `layerline --validate-config` can load them.
 
-Layerline serves the challenge directory directly, so keep the runtime config pointed at certbot's challenge output and point the domain config at the issued certs:
+Once Layerline owns the edge, enable the plaintext redirect listener. It binds `http_redirect_port`, serves ACME HTTP-01 challenges from `letsencrypt_webroot`, and redirects every other request to HTTPS while preserving host, path, and query.
 
 ```conf
-letsencrypt_webroot = /var/www/layerline/public/.well-known/acme-challenge
+letsencrypt_webroot = /var/www/layerline/public
 letsencrypt_renew = true
 letsencrypt_renew_interval_ms = 43200000
 tls = true
 tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
+http_redirect = true
+http_redirect_port = 80
+http_redirect_https_port = 443
+http_redirect_status = 308
 ```
 
 With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --webroot` loop. For production, prefer the systemd `layerline-cert-renew.timer` because its certbot deploy hook restarts Layerline only after a renewed certificate is deployed. Renewal updates the certificate files on disk; until hot reload lands, the running process must restart to pick up new TLS material.

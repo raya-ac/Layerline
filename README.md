@@ -10,7 +10,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
 - Configured redirects and inherited global/domain/route response headers, using familiar Caddy/nginx-style primitives.
-- Edge-friendly deployment notes for HTTPS/TLS (proxy-terminated by default).
+- Native TLS listener support plus an optional plaintext HTTP listener for ACME HTTP-01 and HTTP-to-HTTPS redirects.
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
@@ -22,7 +22,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, request bodies, and FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
-- Auto Let’s Encrypt (certbot) bootstrap, ACME challenge serving, and periodic renewal loop.
+- Auto Let’s Encrypt (certbot) bootstrap, ACME challenge serving from certbot webroots, periodic renewal loop, and systemd renewal timer assets.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
 - High-load knobs (`--max-requests-per-connection`, `--max-php-output-bytes`, `--worker-stack-size`) to tune behavior under sustained pressure.
@@ -30,7 +30,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GOAWAY behavior, route-local stale/cache-status policy, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -44,7 +44,7 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, gzip, admin socket, static files, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, gzip, admin socket/UI, static files, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -169,11 +169,15 @@ tls = false
 #tls_auto = true
 #letsencrypt_email = admin@example.com
 #letsencrypt_domains = example.com,www.example.com
-#letsencrypt_webroot = public/.well-known/acme-challenge
+#letsencrypt_webroot = public
 #letsencrypt_certbot = /usr/bin/certbot
 #letsencrypt_staging = false
 #letsencrypt_renew = true
 #letsencrypt_renew_interval_ms = 43200000
+#http_redirect = false
+#http_redirect_port = 80
+#http_redirect_https_port = 443
+#http_redirect_status = 308
 #cf_auto_deploy = false
 #cf_api_base = https://api.cloudflare.com/client/v4
 #cf_token = your-api-token
@@ -429,14 +433,16 @@ zig build run -- \
   --tls-auto true \
   --letsencrypt-email admin@example.com \
   --letsencrypt-domains example.com,www.example.com \
-  --letsencrypt-webroot public/.well-known/acme-challenge \
+  --letsencrypt-webroot public \
   --letsencrypt-renew true \
+  --http-redirect true \
+  --http-redirect-port 80 \
   --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/example.com/privkey.pem \
   --dir public
 ```
 
-Keep the challenge root reachable at `/.well-known/acme-challenge/<token>` for successful issuance.
+`letsencrypt_webroot` follows certbot webroot semantics: point it at the public root, and Layerline serves files from `<webroot>/.well-known/acme-challenge/<token>`. Older configs that point directly at `.well-known/acme-challenge` still work, but new production configs should use the public root. Enable `http_redirect = true` when Layerline owns both ports: the plaintext listener serves ACME challenges and redirects every other request to HTTPS with the original host, path, and query.
 
 Renewal updates the certificate files on disk. Until hot reload lands, the running process must restart to pick up new TLS material. For production systemd hosts, install `deploy/systemd/layerline-cert-renew.timer`; its certbot deploy hook restarts Layerline only after a renewed certificate is deployed.
 
