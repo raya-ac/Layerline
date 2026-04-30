@@ -17,6 +17,7 @@ fi
 TMP_DIR=$(mktemp -d)
 SOCKET="$TMP_DIR/layerline-admin.sock"
 ADMIN_CREDS="$TMP_DIR/layerline-admin.creds"
+ACCESS_LOG="$TMP_DIR/access.log"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -81,6 +82,7 @@ admin_socket = $SOCKET
 admin_ui = true
 admin_ui_path = /_layerline/admin
 admin_credentials_path = $ADMIN_CREDS
+access_log = $ACCESS_LOG
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
@@ -184,6 +186,15 @@ curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
 grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "admin UI dashboard was not served with setup cookie"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 ok "admin UI authenticated dashboard"
+
+[[ -s $ACCESS_LOG ]] || die "access log was not written"
+grep -Fq '"method":"GET"' "$ACCESS_LOG" || die "access log missing method"
+grep -Fq '"path":"/"' "$ACCESS_LOG" || die "access log missing root path"
+grep -Fq '"protocol":"HTTP/1.1"' "$ACCESS_LOG" || die "access log missing protocol"
+grep -Fq '"status":200' "$ACCESS_LOG" || die "access log missing status"
+grep -Fq '"duration_ms":' "$ACCESS_LOG" || die "access log missing duration"
+grep -Fq '"handler":"admin_ui"' "$ACCESS_LOG" || die "access log missing admin UI handler"
+ok "structured access log"
 
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true

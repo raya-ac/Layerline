@@ -56,6 +56,7 @@ const DEFAULT_CONFIG_PATH = "server.conf";
 const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
 const DEFAULT_ADMIN_UI_PATH = "/_layerline/admin";
 const DEFAULT_ADMIN_CREDENTIALS_PATH = ".layerline-admin";
+const DEFAULT_ACCESS_LOG_PATH = "stderr";
 const ADMIN_COOKIE_NAME = "layerline_admin";
 const ADMIN_CREDENTIALS_VERSION = "layerline-admin-v1";
 const ADMIN_CREDENTIALS_MAX_BYTES = 8 * 1024;
@@ -117,8 +118,25 @@ threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 threadlocal var current_request_headers: []const u8 = "";
 threadlocal var current_compression_policy: CompressionPolicy = .disabled;
+threadlocal var current_access_log: ?*AccessLogContext = null;
+var access_log_mutex: std.Io.Mutex = .init;
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
+
+const AccessLogContext = struct {
+    enabled: bool,
+    sink: []const u8,
+    method: []const u8,
+    path: []const u8,
+    query: []const u8,
+    protocol: []const u8,
+    host: []const u8,
+    start_ms: i64,
+    handler: []const u8 = "routing",
+    upstream: ?[]const u8 = null,
+    error_name: ?[]const u8 = null,
+    logged: bool = false,
+};
 
 // Zig 0.16 moved sockets behind std.Io, so detached worker threads need their
 // own bound handle before they touch a stream.
@@ -509,6 +527,8 @@ const ServerConfig = struct {
     admin_ui_enabled: bool,
     admin_ui_path: []const u8,
     admin_credentials_path: []const u8,
+    access_log_enabled: bool,
+    access_log_path: []const u8,
     compression_enabled: bool,
     gzip_enabled: bool,
     compression_min_bytes: usize,
@@ -1683,6 +1703,7 @@ const ServerMetrics = struct {
             5 => ServerMetrics.inc(&self.response_5xx_total),
             else => {},
         }
+        emitAccessLog(status_code, body_bytes);
     }
 
     fn staticBodySent(self: *ServerMetrics, body_bytes: usize, transfer_mode: StaticTransferMode) void {
@@ -2444,6 +2465,20 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
     } else if (std.mem.eql(u8, k, "admin_credentials_path") or std.mem.eql(u8, k, "admin_state_path")) {
         if (v.len == 0) return error.InvalidConfigValue;
         cfg.admin_credentials_path = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "access_log")) {
+        if (disablesOptionalUrl(v)) {
+            cfg.access_log_enabled = false;
+        } else if (std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "on") or std.ascii.eqlIgnoreCase(v, "yes") or std.mem.eql(u8, v, "1")) {
+            cfg.access_log_enabled = true;
+        } else {
+            if (v.len == 0) return error.InvalidConfigValue;
+            cfg.access_log_enabled = true;
+            cfg.access_log_path = try allocator.dupe(u8, v);
+        }
+    } else if (std.mem.eql(u8, k, "access_log_path")) {
+        if (v.len == 0) return error.InvalidConfigValue;
+        cfg.access_log_enabled = true;
+        cfg.access_log_path = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "compression") or std.mem.eql(u8, k, "compress") or std.mem.eql(u8, k, "encode")) {
         cfg.compression_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "gzip") or std.mem.eql(u8, k, "gzip_enabled")) {
@@ -3152,6 +3187,10 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         try validateAdminUiPath(cfg.admin_ui_path);
         if (cfg.admin_credentials_path.len == 0) return error.InvalidConfigValue;
         if (std.mem.indexOfAny(u8, cfg.admin_credentials_path, "\r\n\x00") != null) return error.InvalidConfigValue;
+    }
+    if (cfg.access_log_enabled) {
+        if (cfg.access_log_path.len == 0) return error.InvalidConfigValue;
+        if (std.mem.indexOfAny(u8, cfg.access_log_path, "\r\n\x00") != null) return error.InvalidConfigValue;
     }
     if (cfg.compression_enabled) {
         if (!cfg.gzip_enabled) return error.InvalidConfigValue;
@@ -4014,7 +4053,7 @@ fn loadAdminCredentials(io: std.Io, allocator: std.mem.Allocator, path: []const 
     return try parseAdminCredentialFile(allocator, content);
 }
 
-fn ensureCredentialParentDir(io: std.Io, path: []const u8) !void {
+fn ensureParentDir(io: std.Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
     if (std.Io.Dir.cwd().statFile(io, parent, .{})) |_| {
@@ -4051,7 +4090,7 @@ fn createAdminCredentials(io: std.Io, allocator: std.mem.Allocator, cfg: *const 
     );
     defer allocator.free(content);
 
-    try ensureCredentialParentDir(io, cfg.admin_credentials_path);
+    try ensureParentDir(io, cfg.admin_credentials_path);
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = cfg.admin_credentials_path,
         .data = content,
@@ -4335,6 +4374,120 @@ fn sendAdminDashboardPage(stream: std.Io.net.Stream, allocator: std.mem.Allocato
     try sendAdminPage(stream, allocator, 200, "OK", body, close_connection, is_head);
 }
 
+fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    try out.append(allocator, '"');
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0...8, 11...12, 14...0x1f => try out.print(allocator, "\\u{x:0>4}", .{byte}),
+            else => try out.append(allocator, byte),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn appendJsonStringField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: []const u8, comma: bool) !void {
+    if (comma) try out.append(allocator, ',');
+    try appendJsonString(out, allocator, name);
+    try out.append(allocator, ':');
+    try appendJsonString(out, allocator, value);
+}
+
+fn appendJsonNumberField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: anytype, comma: bool) !void {
+    if (comma) try out.append(allocator, ',');
+    try appendJsonString(out, allocator, name);
+    try out.print(allocator, ":{d}", .{value});
+}
+
+fn accessLogSetHandler(handler: []const u8) void {
+    if (current_access_log) |ctx| ctx.handler = handler;
+}
+
+fn accessLogSetUpstream(upstream: []const u8) void {
+    if (current_access_log) |ctx| ctx.upstream = upstream;
+}
+
+fn accessLogSetError(error_name: []const u8) void {
+    if (current_access_log) |ctx| ctx.error_name = error_name;
+}
+
+fn accessLogUsesStderr(sink: []const u8) bool {
+    return sink.len == 0 or std.mem.eql(u8, sink, "-") or std.ascii.eqlIgnoreCase(sink, "stderr");
+}
+
+fn accessLogUsesStdout(sink: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(sink, "stdout");
+}
+
+fn writeAccessLogLine(io: std.Io, sink: []const u8, line: []const u8) !void {
+    if (accessLogUsesStderr(sink)) {
+        std.debug.print("{s}", .{line});
+        return;
+    }
+    if (accessLogUsesStdout(sink)) {
+        try std.Io.File.stdout().writeStreamingAll(io, line);
+        return;
+    }
+
+    try ensureParentDir(io, sink);
+    access_log_mutex.lockUncancelable(io);
+    defer access_log_mutex.unlock(io);
+
+    var file = std.Io.Dir.cwd().openFile(io, sink, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.cwd().createFile(io, sink, .{ .truncate = false, .permissions = @enumFromInt(0o640) }),
+        else => return err,
+    };
+    defer file.close(io);
+
+    const stat = std.Io.Dir.cwd().statFile(io, sink, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    try file.writePositionalAll(io, line, stat.size);
+}
+
+fn emitAccessLog(status_code: u16, body_bytes: usize) void {
+    const ctx = current_access_log orelse return;
+    if (!ctx.enabled or ctx.logged) return;
+    ctx.logged = true;
+
+    var out = std.ArrayList(u8).empty;
+    const allocator = std.heap.page_allocator;
+    defer out.deinit(allocator);
+
+    const now_real_ms = std.Io.Timestamp.now(activeIo(), .real).toMilliseconds();
+    const now_awake_ms = std.Io.Timestamp.now(activeIo(), .awake).toMilliseconds();
+    const duration_ms = @max(@as(i64, 0), now_awake_ms - ctx.start_ms);
+
+    out.append(allocator, '{') catch return;
+    appendJsonNumberField(&out, allocator, "ts_ms", now_real_ms, false) catch return;
+    appendJsonStringField(&out, allocator, "server", SERVER_NAME, true) catch return;
+    appendJsonStringField(&out, allocator, "method", ctx.method, true) catch return;
+    appendJsonStringField(&out, allocator, "path", ctx.path, true) catch return;
+    appendJsonStringField(&out, allocator, "query", ctx.query, true) catch return;
+    appendJsonStringField(&out, allocator, "host", ctx.host, true) catch return;
+    appendJsonStringField(&out, allocator, "protocol", ctx.protocol, true) catch return;
+    appendJsonNumberField(&out, allocator, "status", status_code, true) catch return;
+    appendJsonNumberField(&out, allocator, "bytes", body_bytes, true) catch return;
+    appendJsonNumberField(&out, allocator, "duration_ms", duration_ms, true) catch return;
+    appendJsonStringField(&out, allocator, "handler", ctx.handler, true) catch return;
+    if (ctx.upstream) |upstream| {
+        appendJsonStringField(&out, allocator, "upstream", upstream, true) catch return;
+    }
+    if (ctx.error_name) |error_name| {
+        appendJsonStringField(&out, allocator, "error", error_name, true) catch return;
+    }
+    out.appendSlice(allocator, "}\n") catch return;
+
+    writeAccessLogLine(activeIo(), ctx.sink, out.items) catch |err| {
+        std.debug.print("Access log write failed: {}\n", .{err});
+    };
+}
+
 fn handleAdminSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool) !void {
     var fields = parseUrlEncodedForm(allocator, req.body) catch {
         try sendAdminSetupPage(stream, allocator, cfg, "The setup form could not be parsed.", 400, "Bad Request", close_connection, false);
@@ -4389,6 +4542,7 @@ fn handleAdminUi(
     close_connection: bool,
     is_head: bool,
 ) !void {
+    accessLogSetHandler("admin_ui");
     const method = req.method;
     if (std.mem.eql(u8, method, "OPTIONS")) {
         const allow_header = "Allow: GET,HEAD,POST,OPTIONS\r\nCache-Control: no-store\r\n";
@@ -7533,6 +7687,12 @@ fn forwardToUpstreamPool(
         if (attempts > 0) server_metrics.upstreamRetried();
         attempts += 1;
         server_metrics.upstreamRequestStarted();
+        const upstream_label = try std.fmt.allocPrint(
+            allocator,
+            "{s}://{s}:{d}{s}",
+            .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
+        );
+        accessLogSetUpstream(upstream_label);
         forwardToUpstream(stream, allocator, upstream, req, cfg, timeout_ms) catch |err| switch (err) {
             error.CloseConnection => {
                 upstreamEndAttempt(upstream, lease);
@@ -8643,6 +8803,7 @@ fn handleNamedRoute(
 
     switch (route.handler) {
         .static => {
+            accessLogSetHandler("route_static");
             if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
                 try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection);
                 return;
@@ -8655,6 +8816,7 @@ fn handleNamedRoute(
             return;
         },
         .php => {
+            accessLogSetHandler("route_php");
             if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
                 try sendNotFoundWithConnection(allocator, stream, close_connection);
                 return;
@@ -8672,6 +8834,7 @@ fn handleNamedRoute(
             return;
         },
         .proxy => {
+            accessLogSetHandler("route_proxy");
             const pool = if (route.upstream) |*route_pool|
                 route_pool
             else
@@ -8724,6 +8887,8 @@ test "named routes prefer exact and longest prefix matches" {
         .admin_ui_enabled = false,
         .admin_ui_path = DEFAULT_ADMIN_UI_PATH,
         .admin_credentials_path = DEFAULT_ADMIN_CREDENTIALS_PATH,
+        .access_log_enabled = false,
+        .access_log_path = DEFAULT_ACCESS_LOG_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -8798,6 +8963,7 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "admin_ui", "true");
     try applyConfigLine(&cfg, allocator, "admin_ui_path", "/_test/admin");
     try applyConfigLine(&cfg, allocator, "admin_credentials_path", "/tmp/layerline-test-admin.creds");
+    try applyConfigLine(&cfg, allocator, "access_log", "/tmp/layerline-access.log");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew", "false");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew_interval_ms", "7200000");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
@@ -8837,6 +9003,8 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(cfg.admin_ui_enabled);
     try std.testing.expectEqualStrings("/_test/admin", cfg.admin_ui_path);
     try std.testing.expectEqualStrings("/tmp/layerline-test-admin.creds", cfg.admin_credentials_path);
+    try std.testing.expect(cfg.access_log_enabled);
+    try std.testing.expectEqualStrings("/tmp/layerline-access.log", cfg.access_log_path);
     try std.testing.expect(!cfg.letsencrypt_renew);
     try std.testing.expectEqual(@as(u32, 7200000), cfg.letsencrypt_renew_interval_ms);
     normalizeConfig(&cfg);
@@ -9214,11 +9382,13 @@ fn routeRequest(
     }
 
     if (findDomainRedirectRule(domain, req.path)) |redirect| {
+        accessLogSetHandler("domain_redirect");
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
         return;
     }
 
     if (findRedirectRule(cfg, req.path)) |redirect| {
+        accessLogSetHandler("redirect");
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
         return;
     }
@@ -9240,6 +9410,7 @@ fn routeRequest(
     }
 
     if ((std.mem.eql(u8, method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
+        accessLogSetHandler("acme_challenge");
         const token = req.path["/.well-known/acme-challenge/".len..];
         try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, should_close, is_head);
         return;
@@ -9249,6 +9420,7 @@ fn routeRequest(
     // built-in Layerline pages for direct/default hosts, not for proxied apps.
     if (domain != null) {
         if (domainUpstreamMutable(cfg, domain)) |pool| {
+            accessLogSetHandler("domain_proxy");
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
@@ -9256,16 +9428,19 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "GET") or is_head) {
         if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
+            accessLogSetHandler("builtin_asset");
             try sendServerIcon(stream, should_close, is_head);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/") and domainPhpFrontController(cfg, domain)) {
+            accessLogSetHandler("php_front_controller");
             try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/")) {
+            accessLogSetHandler("builtin_root");
             const body =
                 \\<!doctype html>
                 \\<html lang="en">
@@ -9641,16 +9816,19 @@ fn routeRequest(
         }
 
         if (std.mem.eql(u8, req.path, "/health")) {
+            accessLogSetHandler("health");
             try sendResponseForMethod(stream, 200, "OK", "text/plain; charset=utf-8", "ok\n", should_close, is_head);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/metrics")) {
+            accessLogSetHandler("metrics");
             try sendMetrics(stream, allocator, should_close, is_head);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/time")) {
+            accessLogSetHandler("time");
             var ts_buf: [64]u8 = undefined;
             const ts = try std.fmt.bufPrint(&ts_buf, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()});
             try sendResponseForMethod(stream, 200, "OK", "application/json; charset=utf-8", ts, should_close, is_head);
@@ -9658,6 +9836,7 @@ fn routeRequest(
         }
 
         if (std.mem.eql(u8, req.path, "/api/echo")) {
+            accessLogSetHandler("api_echo");
             if (findQueryValue(req.query, "msg")) |msg| {
                 const payload = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg});
                 defer allocator.free(payload);
@@ -9674,12 +9853,14 @@ fn routeRequest(
         }
 
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
+            accessLogSetHandler("php");
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
             try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
             return;
         }
 
         if (std.mem.startsWith(u8, req.path, "/static/")) {
+            accessLogSetHandler("static");
             const rel = req.path["/static/".len..];
             try serveStatic(io, stream, allocator, domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
             return;
@@ -9707,21 +9888,25 @@ fn routeRequest(
             } else |_| {}
 
             if (file_exists) {
+                accessLogSetHandler("static_root");
                 try serveStatic(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
                 return;
             }
         }
 
         if (domainPhpFrontController(cfg, domain)) {
+            accessLogSetHandler("php_front_controller");
             try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
+            accessLogSetHandler("domain_proxy");
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
 
+        accessLogSetHandler("not_found");
         try sendNotFoundWithConnection(allocator, stream, should_close);
         return;
     }
@@ -9733,31 +9918,37 @@ fn routeRequest(
         }
 
         if (std.mem.endsWith(u8, req.path, ".php")) {
+            accessLogSetHandler("php");
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
             try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
             return;
         }
 
         if (std.mem.eql(u8, req.path, "/api/echo")) {
+            accessLogSetHandler("api_echo");
             try sendResponseWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", req.body, should_close);
             return;
         }
 
         if (domainPhpFrontController(cfg, domain)) {
+            accessLogSetHandler("php_front_controller");
             try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
+            accessLogSetHandler("domain_proxy");
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
 
+        accessLogSetHandler("not_found");
         try sendNotFoundWithConnection(allocator, stream, should_close);
         return;
     }
 
     if (std.mem.eql(u8, method, "OPTIONS")) {
+        accessLogSetHandler("options");
         const allow = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS";
         const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allow});
         defer allocator.free(allow_header);
@@ -9767,18 +9958,22 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
         if (domainPhpFrontController(cfg, domain)) {
+            accessLogSetHandler("php_front_controller");
             try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
+            accessLogSetHandler("domain_proxy");
             try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
+        accessLogSetHandler("method_not_allowed");
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
         return;
     }
 
+    accessLogSetHandler("not_implemented");
     try sendNotImplemented(stream, allocator, should_close);
 }
 
@@ -9973,23 +10168,42 @@ fn handleConnection(
         handled_requests += 1;
         server_metrics.requestStarted();
 
-        if (req.h2c_upgrade_tail.len > 0 or isH2cUpgradeHeaders(req.headers)) {
-            try handleHttp2Upgrade(io, stream, req_alloc, cfg, req, process_env);
-            return;
-        }
+        {
+            var access_ctx = AccessLogContext{
+                .enabled = cfg.access_log_enabled,
+                .sink = cfg.access_log_path,
+                .method = req.method,
+                .path = req.path,
+                .query = req.query,
+                .protocol = req.version,
+                .host = findHeaderValue(req.headers, "Host") orelse "",
+                .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+            };
+            current_access_log = &access_ctx;
+            defer current_access_log = null;
 
-        if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
-            req.close_connection = true;
-        }
+            if (req.h2c_upgrade_tail.len > 0 or isH2cUpgradeHeaders(req.headers)) {
+                accessLogSetHandler("h2c_upgrade");
+                try handleHttp2Upgrade(io, stream, req_alloc, cfg, req, process_env);
+                return;
+            }
 
-        std.debug.print("{s} {s}\n", .{ req.method, req.path });
-        routeRequest(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
-            error.CloseConnection => break,
-            else => {
-                server_metrics.routeError();
-                return err;
-            },
-        };
+            if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
+                req.close_connection = true;
+            }
+
+            routeRequest(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
+                error.CloseConnection => break,
+                else => {
+                    accessLogSetError(@errorName(err));
+                    emitAccessLog(0, 0);
+                    server_metrics.routeError();
+                    return err;
+                },
+            };
+
+            if (!access_ctx.logged) emitAccessLog(0, 0);
+        }
 
         if (req.close_connection) break;
     }
@@ -11146,7 +11360,7 @@ fn usage() void {
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
@@ -11160,7 +11374,7 @@ fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, access_log, access_log_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
@@ -11189,6 +11403,7 @@ fn usage() void {
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-circuit-breaker true --upstream-slow-start-ms 10000\n" ++
             "  zig build run -- --proxy off\n" ++
             "  zig build run -- --admin-ui true --admin-ui-path /_layerline/admin\n" ++
+            "  zig build run -- --access-log /var/log/layerline/access.log\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
             "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
@@ -11254,6 +11469,8 @@ pub fn main(init: std.process.Init) !void {
         .admin_ui_enabled = false,
         .admin_ui_path = DEFAULT_ADMIN_UI_PATH,
         .admin_credentials_path = DEFAULT_ADMIN_CREDENTIALS_PATH,
+        .access_log_enabled = false,
+        .access_log_path = DEFAULT_ACCESS_LOG_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -11548,6 +11765,25 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, arg, "--admin-credentials-path") or std.mem.eql(u8, arg, "--admin-state-path")) {
             cfg.admin_credentials_path = args.next() orelse {
+                usage();
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--access-log")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            if (disablesOptionalUrl(value)) {
+                cfg.access_log_enabled = false;
+            } else if (std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "yes") or std.mem.eql(u8, value, "1")) {
+                cfg.access_log_enabled = true;
+            } else {
+                cfg.access_log_enabled = true;
+                cfg.access_log_path = value;
+            }
+        } else if (std.mem.eql(u8, arg, "--access-log-path")) {
+            cfg.access_log_enabled = true;
+            cfg.access_log_path = args.next() orelse {
                 usage();
                 return;
             };

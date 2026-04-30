@@ -15,7 +15,7 @@ Layerline can replace Caddy for `layerline.dev` or similar sites only after thes
 - Config validation catches bad domain, route, TLS, PHP, and upstream policy before startup or reload.
 - Reload can validate and swap config without dropping existing connections. The read-only admin socket now exposes status, current config validation, routes, and metrics, and the opt-in browser admin UI has first-launch setup plus an authenticated status/routes/certs/metrics dashboard; reload remains blocked on safe config snapshot ownership.
 - Compression, cache policy, redirects, headers, health, and metrics have route/domain controls. Response header inheritance and cache shortcuts are implemented for global, domain, and route scopes; dynamic gzip is implemented globally for buffered HTTP/1.1 and HTTP/2 responses, while route/domain compression presets still need richer controls.
-- Logs identify request path, status, latency, upstream, protocol, and failure reason.
+- Logs identify request path, status, latency, upstream, protocol, and failure reason. Initial opt-in JSON access logs now cover HTTP/1 request handling; TLS fields, request IDs, and h2/h3 parity remain.
 - There is a deployment runbook for Linux service management, limits, certs, logs, and rollback. Initial systemd, launchd, runtime Dockerfile, and deployment runbook assets are implemented.
 
 ## Build Sections
@@ -37,4 +37,4 @@ Commit each section independently after tests and at least one live smoke where 
 
 ## Not Ready Means Not Ready
 
-Until those gates pass, Layerline can replace Caddy only for narrow controlled services. It should not be described as a full Caddy replacement while HTTP/3 full routing, hot reload, WebSocket proxying, renewal automation, and mutating operational admin controls are incomplete.
+Until those gates pass, Layerline can replace Caddy only for narrow controlled services. It should not be described as a full Caddy replacement while HTTP/3 full routing, hot reload, complete protocol logging, WebSocket proxying, renewal automation, and mutating operational admin controls are incomplete.

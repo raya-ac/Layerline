@@ -28,7 +28,7 @@ Sources:
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control.
-- Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields.
+- Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields. Initial opt-in JSON access logs are implemented for HTTP/1 request handling with method, path, query, host, protocol, status, bytes, latency, handler, route error, and upstream target fields; request IDs, TLS fields, and broader h2/h3 logging remain.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
 - Expand the admin control UI beyond the implemented first-launch setup/login dashboard into reload, upstream drain/eject, cert renewal, config diff, and redacted config inspection.
 

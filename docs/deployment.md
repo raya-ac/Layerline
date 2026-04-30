@@ -54,6 +54,22 @@ sudo journalctl -u layerline -f
 
 The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Keep `LimitNOFILE=1048576` unless the host has a lower global cap.
 
+## Logs
+
+For journald-only deployments, keep access logs on stderr:
+
+```conf
+access_log = stderr
+```
+
+For file-based collection, write JSON lines to `/var/log/layerline/access.log` and keep `/var/log/layerline` owned by the `layerline` user:
+
+```conf
+access_log = /var/log/layerline/access.log
+```
+
+Use `journalctl -u layerline` for startup, parse, and renewal errors. Use the access log for request-level fields such as method, path, protocol, status, bytes, latency, handler, and upstream target.
+
 ## Kernel and Limits
 
 For busy hosts, put the local equivalent of this in `/etc/sysctl.d/90-layerline.conf`:

@@ -17,6 +17,7 @@ This is a practical build that blends local serving with edge-style deployment:
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
 - Optional read-only Unix-socket admin surface for status, config validation, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
+- Opt-in structured JSON access logs with method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, and GET/HEAD FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
@@ -29,7 +30,7 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is HTTP/2 request-body/flow-control hardening and richer cache behavior: route-local stale/cache-status policy, GOAWAY behavior, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -156,6 +157,8 @@ proxy = off
 #admin_ui = false
 #admin_ui_path = /_layerline/admin
 #admin_credentials_path = .layerline-admin
+# Structured JSON access logs are off by default.
+#access_log = off
 # Opt-in dynamic gzip for buffered text responses.
 #compression = false
 #compression_min_bytes = 512
@@ -289,6 +292,17 @@ admin_credentials_path = /etc/layerline/admin.credentials
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
 The first dashboard is intentionally conservative: status, routes, certificate posture, and metrics are visible from the same process that is serving traffic. Mutating controls like reload still need the safe config snapshot work from the roadmap.
+
+## Access Logs
+
+Access logs are disabled by default. Enable structured JSON logs to stderr for systemd/journald, or point them at a file:
+
+```conf
+access_log = stderr
+access_log = /var/log/layerline/access.log
+```
+
+Each line includes `ts_ms`, `server`, `method`, `path`, `query`, `host`, `protocol`, `status`, `bytes`, `duration_ms`, `handler`, and, for proxied requests, `upstream`. Route errors include an `error` field. File logs are appended under a process-wide lock so concurrent workers do not interleave JSON lines.
 
 ## Header and Redirect Rules
 
