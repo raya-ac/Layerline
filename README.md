@@ -1,11 +1,27 @@
-# Layerline
+<div align="center">
+  <img src="public/layerline-mark.svg" alt="Layerline logo" width="104" height="104">
+  <h1>Layerline</h1>
+  <p><strong>Origin-surface Zig web server for static sites, PHP/FastCGI, reverse proxying, TLS, admin controls, HTTP/2, and in-tree HTTP/3 work.</strong></p>
+  <p>
+    <a href="https://layerline.dev">Website</a> ·
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#admin-web-ui">Admin UI</a> ·
+    <a href="docs/deployment.md">Deployment</a> ·
+    <a href="docs/caddy-replacement-plan.md">Caddy replacement plan</a>
+  </p>
+  <p>
+    <img alt="Language: Zig" src="https://img.shields.io/badge/Zig-0.16-f7a41d?style=flat-square">
+    <img alt="Runtime: HTTP/1.1 and HTTP/2" src="https://img.shields.io/badge/runtime-HTTP%2F1.1%20%2B%20HTTP%2F2-101310?style=flat-square">
+    <img alt="HTTP/3: in tree" src="https://img.shields.io/badge/HTTP%2F3-in--tree-2fbf71?style=flat-square">
+    <img alt="Hosted by Layerline" src="https://img.shields.io/badge/layerline.dev-served%20by%20Layerline-4e96d8?style=flat-square">
+  </p>
+</div>
 
-Modern Zig web server for direct edge serving: static sites, PHP, reverse proxying, virtual hosts, TLS, metrics, admin controls, and native HTTP/2/HTTP/3 work.
+Layerline is a single-binary web server that can sit at the public edge without hiding behind Caddy or nginx. It serves the live [layerline.dev](https://layerline.dev) site today, while the roadmap keeps the remaining production gaps explicit instead of pretending they are solved.
 
-- Website: [layerline.dev](https://layerline.dev)
-- Repository: [github.com/raya-ac/Layerline](https://github.com/raya-ac/Layerline)
+## At A Glance
 
-This is a practical build that blends local serving with edge-style deployment:
+Layerline blends local serving with edge-style deployment:
 
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
@@ -33,6 +49,10 @@ This is a practical build that blends local serving with edge-style deployment:
 - High-load knobs (`--max-requests-per-connection`, `--max-php-output-bytes`, `--worker-stack-size`) to tune behavior under sustained pressure.
 - Branded HTML error responses for common 4xx/5xx paths, including HEAD-safe behavior.
 
+## What It Replaces
+
+Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, and admin controls in one Zig binary. It is already usable for controlled services and the project website; full Caddy replacement still depends on the remaining hot-reload, HTTP/3 route-dispatch, and soak-test work tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
+
 ## Current status
 
 Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
@@ -44,6 +64,7 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 - `src/main.zig` – server implementation.
 - `build.zig` – Zig build script.
 - `public/index.html` and `public/site.css` – the Layerline website served when `serve_static_root = true`.
+- `public/layerline-mark.svg` – the repo/logo mark used by this README and served branding.
 - `public/laina.png` – Laina, the Layerline route-operator mascot used by the website.
 - `public/hello.txt` – sample static file.
 - `public/index.php` – sample php endpoint (if PHP binary is installed and configured).
@@ -60,6 +81,9 @@ The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GO
 - `Dockerfile` – runtime image template for an already built `zig-out/bin/layerline`.
 - HTTP/2/HTTP/3 deployment notes in this README.
 
+## Quick Start
+
+Build and run locally:
 
 ```bash
 zig build run
@@ -309,6 +333,16 @@ The dashboard is now an actual control surface: it lists active virtual hosts, s
 ## Website and branding
 
 The default repository website lives in `public/index.html` and `public/site.css`. With `serve_static_root = true`, Layerline serves it at `/` before falling back to the built-in diagnostic homepage. The site presents Layerline as a production web server project, links to GitHub and docs, shows setup snippets, explains the main-config plus per-domain-file model, compares the current feature surface with Caddy and nginx, and uses the Laina mascot asset from `public/laina.png`.
+
+Brand assets:
+
+- `public/layerline-mark.svg` is the canonical Layerline mark for README/repo branding.
+- `public/laina.png` is Laina, the route-operator mascot used on the public site.
+- `/favicon.svg` and `/icon.svg` are served directly by the binary from the same Layerline mark shape.
+
+<p align="center">
+  <img src="public/laina.png" alt="Laina, Layerline's route operator mascot" width="220">
+</p>
 
 For a site config:
 
