@@ -25,7 +25,7 @@ Sources:
 ## Phase 1: Core Server Correctness
 
 - Harden HTTP/1 parsing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, and strict keep-alive semantics.
-- Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config and SIGINT/SIGTERM drain are implemented; route-local timeout policy remains next.
+- Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and local admin command.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields.
@@ -52,7 +52,7 @@ Sources:
 
 ## Phase 4: PHP and Dynamic Apps
 
-- Add FastCGI support alongside current CGI: Unix socket and TCP FastCGI, request multiplex safety, stderr capture, and timeout controls. Initial direct FastCGI transport is implemented for TCP and Unix-socket php-fpm targets with bounded stdout/stderr capture and one request per connection; pooling, route-local timeout policy, and multiplex refusal handling remain next.
+- Add FastCGI support alongside current CGI: Unix socket and TCP FastCGI, request multiplex safety, stderr capture, and timeout controls. Initial direct FastCGI transport is implemented for TCP and Unix-socket php-fpm targets with bounded stdout/stderr capture, route/domain timeout overrides, and one request per connection; pooling and multiplex refusal handling remain next.
 - PHP front-controller support: `try_files`, split PATH_INFO, index.php fallback, framework-friendly rewrites, and per-route env vars. Initial opt-in CGI front-controller routing is implemented globally, per-domain, and per-route with `php_index`, `php_front_controller`, SCRIPT_NAME, SCRIPT_FILENAME, PATH_INFO, PATH_TRANSLATED, and REQUEST_URI handling; richer `try_files` chains and per-route env vars remain next.
 - Per-route dynamic handlers: CGI, FastCGI, proxy, static, redirect, and internal response.
 - Worker process pools for CGI-like execution where useful, with max process count and kill timeouts.
@@ -106,14 +106,14 @@ Sources:
 ## Immediate Build Order
 
 1. Config validation and route gates.
-2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, and proxy settings is implemented. Host-based domain configs with per-domain routes and `domain_config_dir` file loading are implemented; route-local TLS/cache/security policy remains next.
+2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, proxy, and backend timeout settings is implemented. Host-based domain configs with per-domain routes and `domain_config_dir` file loading are implemented; route-local TLS/cache/security policy remains next.
 3. Timeouts and graceful shutdown.
 4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection/connect-reuse metrics, bounded retry budgets, passive cooldown, circuit breaker half-open probes, weighted slow start, opt-in active HTTP probes, and upstream keep-alive sockets are implemented; sticky sessions and route-local health policy remain next.
-5. FastCGI and PHP front-controller. Initial FastCGI transport and CGI front-controller fallback are implemented; FastCGI pooling, route-local timeouts, and richer framework rewrites remain next.
+5. FastCGI and PHP front-controller. Initial FastCGI transport, route/domain backend timeouts, and CGI front-controller fallback are implemented; FastCGI pooling and richer framework rewrites remain next.
 6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented; flow control, GOAWAY policy, prioritization stance, and broader conformance tests remain next.
 8. HTTP/3 full routing.
 9. Cache and compression.
 10. Admin API and hot reload.
 
-The next engineering milestone should be route-local FastCGI pooling/timeouts, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
+The next engineering milestone should be FastCGI pooling, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

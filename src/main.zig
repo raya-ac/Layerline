@@ -349,6 +349,10 @@ const RouteBoolProperty = enum {
     strip_prefix,
 };
 
+const RouteU32Property = enum {
+    upstream_timeout_ms,
+};
+
 const DomainStringProperty = enum {
     static_dir,
     index_file,
@@ -364,6 +368,10 @@ const DomainBoolProperty = enum {
     serve_static_root,
     php_info_page,
     php_front_controller,
+};
+
+const DomainU32Property = enum {
+    upstream_timeout_ms,
 };
 
 const RouteConfig = struct {
@@ -382,6 +390,7 @@ const RouteConfig = struct {
     php_front_controller: ?bool,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
+    upstream_timeout_ms: ?u32,
 };
 
 const DomainConfig = struct {
@@ -401,6 +410,7 @@ const DomainConfig = struct {
     tls_material: ?tls_pem.ConfiguredTlsMaterial,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
+    upstream_timeout_ms: ?u32,
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
 };
@@ -1732,6 +1742,7 @@ fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Alloc
         .php_front_controller = null,
         .upstream = null,
         .upstream_policy = null,
+        .upstream_timeout_ms = null,
     });
 }
 
@@ -1771,6 +1782,15 @@ fn setRouteProxyProperty(routes: *std.ArrayList(RouteConfig), allocator: std.mem
 fn setRouteUpstreamPolicyProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8) !void {
     const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     route.upstream_policy = try parseOptionalUpstreamPoolPolicy(value);
+}
+
+fn setRouteU32Property(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: RouteU32Property) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .upstream_timeout_ms => route.upstream_timeout_ms = parsed,
+    }
 }
 
 fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: RouteBoolProperty) !void {
@@ -1813,6 +1833,7 @@ fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainConfi
         .tls_material = null,
         .upstream = null,
         .upstream_policy = null,
+        .upstream_timeout_ms = null,
         .redirects = .empty,
         .routes = .empty,
     };
@@ -1891,6 +1912,15 @@ fn setDomainUpstreamPolicyProperty(cfg: *ServerConfig, domain_name: []const u8, 
     domain.upstream_policy = try parseOptionalUpstreamPoolPolicy(value);
 }
 
+fn setDomainU32Property(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: DomainU32Property) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .upstream_timeout_ms => domain.upstream_timeout_ms = parsed,
+    }
+}
+
 fn setDomainRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
     const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
     try setRouteLineFor(&domain.routes, allocator, value);
@@ -1924,6 +1954,12 @@ fn setDomainRouteUpstreamPolicyProperty(cfg: *ServerConfig, property_name: []con
     const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
     const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
     try setRouteUpstreamPolicyProperty(&domain.routes, split.route, value);
+}
+
+fn setDomainRouteU32Property(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: RouteU32Property) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteU32Property(&domain.routes, split.route, value, field);
 }
 
 // Map one config file line to fields. Config files are strict so typos do not
@@ -2076,6 +2112,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainUpstreamPolicyProperty(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_load_balance.")) |name| {
         try setDomainUpstreamPolicyProperty(cfg, name, v);
+    } else if (findRoutePropertyName(k, "server_upstream_timeout_ms.")) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_proxy_timeout_ms.")) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_php_timeout_ms.")) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_fastcgi_timeout_ms.")) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_redirect.")) |name| {
         const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
         if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
@@ -2121,6 +2165,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setDomainRouteUpstreamPolicyProperty(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_route_load_balance.")) |name| {
         try setDomainRouteUpstreamPolicyProperty(cfg, name, v);
+    } else if (findRoutePropertyName(k, "server_route_upstream_timeout_ms.")) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_route_proxy_timeout_ms.")) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_route_php_timeout_ms.")) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_route_fastcgi_timeout_ms.")) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_route_strip_prefix.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .strip_prefix);
     } else if (std.mem.eql(u8, k, "route")) {
@@ -2165,6 +2217,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
         try setRouteUpstreamPolicyProperty(&cfg.routes, name, v);
     } else if (findRoutePropertyName(k, "route_load_balance.")) |name| {
         try setRouteUpstreamPolicyProperty(&cfg.routes, name, v);
+    } else if (findRoutePropertyName(k, "route_upstream_timeout_ms.")) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_proxy_timeout_ms.")) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_php_timeout_ms.")) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_fastcgi_timeout_ms.")) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .strip_prefix);
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
@@ -2371,6 +2431,14 @@ fn setDomainUpstreamPolicyPropertyDirect(domain: *DomainConfig, value: []const u
     domain.upstream_policy = try parseOptionalUpstreamPoolPolicy(value);
 }
 
+fn setDomainU32PropertyDirect(domain: *DomainConfig, value: []const u8, field: DomainU32Property) !void {
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .upstream_timeout_ms => domain.upstream_timeout_ms = parsed,
+    }
+}
+
 fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     const k = std.mem.trim(u8, key, " \t\r\n");
     const v = trimValue(value);
@@ -2406,6 +2474,8 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setDomainProxyPropertyDirect(allocator, domain, v);
     } else if (std.mem.eql(u8, k, "upstream_policy") or std.mem.eql(u8, k, "proxy_policy") or std.mem.eql(u8, k, "load_balance")) {
         try setDomainUpstreamPolicyPropertyDirect(domain, v);
+    } else if (std.mem.eql(u8, k, "upstream_timeout_ms") or std.mem.eql(u8, k, "proxy_timeout_ms") or std.mem.eql(u8, k, "php_timeout_ms") or std.mem.eql(u8, k, "fastcgi_timeout_ms")) {
+        try setDomainU32PropertyDirect(domain, v, .upstream_timeout_ms);
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "route")) {
@@ -2450,6 +2520,14 @@ fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, ke
         try setRouteUpstreamPolicyProperty(&domain.routes, name, v);
     } else if (findRoutePropertyName(k, "route_load_balance.")) |name| {
         try setRouteUpstreamPolicyProperty(&domain.routes, name, v);
+    } else if (findRoutePropertyName(k, "route_upstream_timeout_ms.")) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_proxy_timeout_ms.")) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_php_timeout_ms.")) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_fastcgi_timeout_ms.")) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .strip_prefix);
     } else {
@@ -2583,6 +2661,9 @@ fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPo
     if (route.handler == .proxy and route.upstream == null and fallback_upstream == null) {
         return error.InvalidConfigValue;
     }
+    if (route.upstream_timeout_ms) |timeout_ms| {
+        if (timeout_ms == 0) return error.InvalidConfigValue;
+    }
 }
 
 fn validateConfig(cfg: *const ServerConfig) !void {
@@ -2657,6 +2738,9 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if ((domain.tls_cert == null) != (domain.tls_key == null)) return error.InvalidConfigValue;
         if (domain.upstream) |pool| {
             try validateUpstreamPool(pool);
+        }
+        if (domain.upstream_timeout_ms) |timeout_ms| {
+            if (timeout_ms == 0) return error.InvalidConfigValue;
         }
 
         const fallback_upstream = if (domain.upstream) |upstream| upstream else cfg.upstream;
@@ -5604,7 +5688,7 @@ fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.
     return .{ .reusable = false };
 }
 
-fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig) !void {
+fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32) !void {
     if (upstream.https) {
         return error.UnsupportedUpstreamScheme;
     }
@@ -5616,7 +5700,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         streamClose(lease.stream);
         server_metrics.upstreamConnectionDiscarded();
     };
-    try setStreamTimeouts(lease.stream, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
+    try setStreamTimeouts(lease.stream, timeout_ms, timeout_ms);
 
     const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
     defer allocator.free(proxy_path);
@@ -5849,6 +5933,7 @@ fn forwardToUpstreamPool(
     allocator: std.mem.Allocator,
     pool: *UpstreamPoolConfig,
     policy: UpstreamPoolPolicy,
+    timeout_ms: u32,
     req: HttpRequest,
     cfg: *const ServerConfig,
 ) !void {
@@ -5876,7 +5961,7 @@ fn forwardToUpstreamPool(
         if (attempts > 0) server_metrics.upstreamRetried();
         attempts += 1;
         server_metrics.upstreamRequestStarted();
-        forwardToUpstream(stream, allocator, upstream, req, cfg) catch |err| switch (err) {
+        forwardToUpstream(stream, allocator, upstream, req, cfg, timeout_ms) catch |err| switch (err) {
             error.CloseConnection => {
                 upstreamEndAttempt(upstream, lease);
                 upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
@@ -5932,7 +6017,7 @@ fn handlePhp(
     process_env: *const std.process.Environ.Map,
 ) !void {
     const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, cfg.php_fastcgi, rel_path, req.path, "", close_connection, is_head, process_env);
+    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, cfg.php_fastcgi, cfg.upstream_timeout_ms, rel_path, req.path, "", close_connection, is_head, process_env);
 }
 
 const PhpFrontControllerTarget = struct {
@@ -6016,6 +6101,7 @@ fn handlePhpFrontController(
     php_root: []const u8,
     php_binary: []const u8,
     php_fastcgi: ?[]const u8,
+    timeout_ms: u32,
     php_index: []const u8,
     close_connection: bool,
     is_head: bool,
@@ -6023,7 +6109,7 @@ fn handlePhpFrontController(
 ) !void {
     const target = try makePhpFrontControllerTarget(allocator, route, req.path, php_index);
     defer target.deinit(allocator);
-    try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, target.script_rel_path, target.script_name, target.path_info, close_connection, is_head, process_env);
+    try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, timeout_ms, target.script_rel_path, target.script_name, target.path_info, close_connection, is_head, process_env);
 }
 
 fn appendFastcgiLength(out: *std.ArrayList(u8), allocator: std.mem.Allocator, len: usize) !void {
@@ -6306,6 +6392,7 @@ fn handlePhpFastcgi(
     script_path: []const u8,
     script_name: []const u8,
     path_info: []const u8,
+    timeout_ms: u32,
     close_connection: bool,
     is_head: bool,
 ) !void {
@@ -6320,7 +6407,7 @@ fn handlePhpFastcgi(
         return;
     };
     defer streamClose(conn);
-    try setStreamTimeouts(conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
+    try setStreamTimeouts(conn, timeout_ms, timeout_ms);
 
     const request_id: u16 = 1;
     const begin_body = [_]u8{ 0, @intCast(FASTCGI_RESPONDER), 0, 0, 0, 0, 0, 0 };
@@ -6367,6 +6454,7 @@ fn handlePhpScript(
     php_root: []const u8,
     php_binary: []const u8,
     php_fastcgi: ?[]const u8,
+    timeout_ms: u32,
     script_rel_path: []const u8,
     script_name: []const u8,
     path_info: []const u8,
@@ -6394,7 +6482,7 @@ fn handlePhpScript(
 
     if (php_fastcgi) |endpoint| {
         if (!disablesOptionalUrl(endpoint)) {
-            try handlePhpFastcgi(stream, allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, close_connection, is_head);
+            try handlePhpFastcgi(stream, allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, timeout_ms, close_connection, is_head);
             return;
         }
     }
@@ -6794,6 +6882,18 @@ fn routeUpstreamPolicy(cfg: *const ServerConfig, domain: ?*const DomainConfig, r
     return domainUpstreamPolicy(cfg, domain);
 }
 
+fn domainUpstreamTimeoutMs(cfg: *const ServerConfig, domain: ?*const DomainConfig) u32 {
+    if (domain) |d| {
+        if (d.upstream_timeout_ms) |value| return value;
+    }
+    return cfg.upstream_timeout_ms;
+}
+
+fn routeUpstreamTimeoutMs(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: *const RouteConfig) u32 {
+    if (route.upstream_timeout_ms) |value| return value;
+    return domainUpstreamTimeoutMs(cfg, domain);
+}
+
 fn findDomainRedirectRule(domain: ?*const DomainConfig, path: []const u8) ?RedirectRule {
     if (domain) |d| {
         if (findRedirectRuleIn(d.redirects.items, path)) |rule| return rule;
@@ -6875,12 +6975,12 @@ fn handleNamedRoute(
             const php_binary = route.php_binary orelse domainPhpBinary(cfg, domain);
             const php_fastcgi = routePhpFastcgi(cfg, domain, route);
             if (routePhpFrontController(cfg, domain, route)) {
-                try handlePhpFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, routePhpIndex(cfg, domain, route), close_connection, is_head, process_env);
+                try handlePhpFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, routeUpstreamTimeoutMs(cfg, domain, route), routePhpIndex(cfg, domain, route), close_connection, is_head, process_env);
                 return;
             }
             const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
             defer allocator.free(script_rel);
-            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, script_rel, req.path, "", close_connection, is_head, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, routeUpstreamTimeoutMs(cfg, domain, route), script_rel, req.path, "", close_connection, is_head, process_env);
             return;
         },
         .proxy => {
@@ -6891,7 +6991,7 @@ fn handleNamedRoute(
                     try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, false, null);
                     return;
                 };
-            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg);
+            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), routeUpstreamTimeoutMs(cfg, domain, route), req, cfg);
             return;
         },
     }
@@ -6991,6 +7091,7 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "upstream_circuit_half_open_max", "2");
     try applyConfigLine(&cfg, allocator, "upstream_slow_start_ms", "6000");
     try applyConfigLine(&cfg, allocator, "route_proxy_policy.health", "round-robin");
+    try applyConfigLine(&cfg, allocator, "route_proxy_timeout_ms.health", "1250");
 
     try std.testing.expectEqualStrings("health", findNamedRoute(&cfg, "/health").?.name);
     try std.testing.expectEqualStrings("private", findNamedRoute(&cfg, "/assets/private/a.txt").?.name);
@@ -7011,6 +7112,7 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 2), cfg.upstream_circuit_half_open_max);
     try std.testing.expectEqual(@as(u32, 6000), cfg.upstream_slow_start_ms);
     try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
+    try std.testing.expectEqual(@as(u32, 1250), routeUpstreamTimeoutMs(&cfg, null, findNamedRoute(&cfg, "/health").?));
 
     cfg.upstream = try parseUpstreamPool(allocator, "http://127.0.0.1:9100");
     const fallback_pool = domainUpstreamMutable(&cfg, null).?;
@@ -7058,7 +7160,9 @@ test "named routes prefer exact and longest prefix matches" {
     try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
     try setDomainRouteLine(&cfg, allocator, "site", "site-api /api/* proxy");
     try applyConfigLine(&cfg, allocator, "server_proxy_policy.site", "random");
+    try applyConfigLine(&cfg, allocator, "server_proxy_timeout_ms.site", "4200");
     try applyConfigLine(&cfg, allocator, "server_route_proxy_policy.site.site-api", "inherit");
+    try applyConfigLine(&cfg, allocator, "server_route_proxy_timeout_ms.site.site-api", "900");
 
     try setDomainLine(&cfg, allocator, "fallback");
     try appendServerNames(allocator, findDomainConfigMutable(&cfg, "fallback").?, "_");
@@ -7071,6 +7175,8 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("site-assets", findDomainRoute(findDomainForHost(&cfg, "example.test"), "/assets/domain.txt").?.name);
     try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/global.txt").?.name);
     try std.testing.expectEqual(UpstreamPoolPolicy.random, routeUpstreamPolicy(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
+    try std.testing.expectEqual(@as(u32, 900), routeUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
+    try std.testing.expectEqual(@as(u32, 4200), domainUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test")));
 
     var file_domain = try initDomainConfig(allocator, "file-site");
     try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate", "/certs/file/fullchain.pem");
@@ -7332,7 +7438,7 @@ fn routeRequest(
     // built-in Layerline pages for direct/default hosts, not for proxied apps.
     if (domain != null) {
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
     }
@@ -7344,7 +7450,7 @@ fn routeRequest(
         }
 
         if (std.mem.eql(u8, req.path, "/") and domainPhpFrontController(cfg, domain)) {
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
             return;
         }
 
@@ -7758,7 +7864,7 @@ fn routeRequest(
 
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
             return;
         }
 
@@ -7796,12 +7902,12 @@ fn routeRequest(
         }
 
         if (domainPhpFrontController(cfg, domain)) {
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
 
@@ -7817,7 +7923,7 @@ fn routeRequest(
 
         if (std.mem.endsWith(u8, req.path, ".php")) {
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
+            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
             return;
         }
 
@@ -7827,12 +7933,12 @@ fn routeRequest(
         }
 
         if (domainPhpFrontController(cfg, domain)) {
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
 
@@ -7850,12 +7956,12 @@ fn routeRequest(
 
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
         if (domainPhpFrontController(cfg, domain)) {
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
+            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
             return;
         }
 
         if (domainUpstreamMutable(cfg, domain)) |pool| {
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
+            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
             return;
         }
         try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close);
@@ -9139,6 +9245,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
             .php => {
                 std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary, route.php_index orelse cfg.php_index });
                 if (routePhpFastcgi(cfg, null, &route)) |endpoint| std.debug.print(" fastcgi={s}", .{endpoint});
+                if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
                 if (route.php_front_controller orelse cfg.php_front_controller) std.debug.print(" front_controller=true", .{});
             },
             .proxy => {
@@ -9148,6 +9255,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                 } else {
                     std.debug.print(" upstream=<unset>", .{});
                 }
+                if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
             },
         }
         if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
@@ -9165,6 +9273,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
         std.debug.print(" root={s} index={s}", .{ domainStaticDir(cfg, domain), domainIndexFile(cfg, domain) });
         if (domainServeStaticRoot(cfg, domain)) std.debug.print(" serve_static_root=true", .{});
         if (domain.upstream) |pool| printUpstreamPool(domainUpstreamPolicy(cfg, domain), pool);
+        if (domain.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
         std.debug.print("\n", .{});
 
         for (domain.routes.items) |route| {
@@ -9179,6 +9288,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                 .php => {
                     std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain), routePhpIndex(cfg, domain, &route) });
                     if (routePhpFastcgi(cfg, domain, &route)) |endpoint| std.debug.print(" fastcgi={s}", .{endpoint});
+                    if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
                     if (routePhpFrontController(cfg, domain, &route)) std.debug.print(" front_controller=true", .{});
                 },
                 .proxy => {
@@ -9188,6 +9298,7 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
                     } else {
                         std.debug.print(" upstream=<unset>", .{});
                     }
+                    if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
                 },
             }
             if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
@@ -9240,9 +9351,9 @@ fn usage() void {
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
             "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
+            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, server/domain/vhost, " ++
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE\n" ++
+            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++

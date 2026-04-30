@@ -25,9 +25,9 @@ This is a practical build that blends local serving with edge-style deployment:
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport, PHP front-controller fallback, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, PHP CGI execution, php-fpm/FastCGI transport, PHP front-controller fallback, route-local backend timeout overrides, response headers, redirects, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, named routes, and host-based domain configs. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is dynamic application support and cache/compression behavior: route-local FastCGI pooling/timeouts, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is dynamic application support and cache/compression behavior: FastCGI pooling, route-local cache policy, and response compression. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -126,8 +126,10 @@ proxy = off
 #route_php_fastcgi.app = 127.0.0.1:9000
 #route_php_index.app = index.php
 #route_php_front_controller.app = true
+#route_php_timeout_ms.app = 10000
 #route = api /api/* proxy
 #route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
+#route_proxy_timeout_ms.api = 15000
 # Nginx-style per-domain files live outside this main runtime config.
 # Put .conf files in domains-enabled/ and enable this:
 #domain_config_dir = domains-enabled
@@ -284,9 +286,11 @@ route_php_bin.app = php-cgi
 route_php_fastcgi.app = off
 route_php_index.app = index.php
 route_php_front_controller.app = true
+route_php_timeout_ms.app = 10000
 
 proxy = http://127.0.0.1:9000, http://127.0.0.1:9001
 upstream_policy = random
+proxy_timeout_ms = 15000
 ```
 
 `server_name` accepts exact names, wildcard names like `*.example.com`, and `_` as a catch-all default. Exact names win over wildcards, and domain-local redirects/routes are checked before the global redirect and route table. Domain settings inherit from global config unless the domain or route overrides them, including upstream pool policy and TLS material. Domain-local `tls_cert`/`tls_key` pairs are selected by SNI before Layerline falls back to the global certificate. The older inline form (`server = main`, `server_name.main = ...`, `server_tls_cert.main = ...`) still works, but domain files are the intended layout.
@@ -467,6 +471,14 @@ php_fastcgi = unix:/run/php/php-fpm.sock
 ```
 
 Route and domain config can override or disable FastCGI with `route_php_fastcgi.NAME`, `server_php_fastcgi.NAME`, and `server_route_php_fastcgi.DOMAIN.ROUTE`. When `php_fastcgi` is set, Layerline speaks FastCGI directly and only falls back to CGI if FastCGI is disabled with `off`/`false`/`none`.
+
+Use `php_timeout_ms`, `fastcgi_timeout_ms`, `proxy_timeout_ms`, or `upstream_timeout_ms` on a domain or route when one app needs a tighter backend limit than the global default:
+
+```text
+route = app /app/* php
+route_php_fastcgi.app = 127.0.0.1:9000
+route_php_timeout_ms.app = 10000
+```
 
 If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
 
