@@ -54,6 +54,18 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
 const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
+const DEFAULT_ADMIN_UI_PATH = "/_layerline/admin";
+const DEFAULT_ADMIN_CREDENTIALS_PATH = ".layerline-admin";
+const ADMIN_COOKIE_NAME = "layerline_admin";
+const ADMIN_CREDENTIALS_VERSION = "layerline-admin-v1";
+const ADMIN_CREDENTIALS_MAX_BYTES = 8 * 1024;
+const ADMIN_USERNAME_MIN_BYTES = 2;
+const ADMIN_USERNAME_MAX_BYTES = 64;
+const ADMIN_PASSWORD_MIN_BYTES = 8;
+const ADMIN_PBKDF2_ROUNDS: u32 = 100_000;
+const ADMIN_SALT_BYTES = 16;
+const ADMIN_HASH_BYTES = 32;
+const ADMIN_SESSION_BYTES = 32;
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
@@ -494,6 +506,9 @@ const ServerConfig = struct {
     http3_port: u16,
     admin_enabled: bool,
     admin_socket_path: ?[]const u8,
+    admin_ui_enabled: bool,
+    admin_ui_path: []const u8,
+    admin_credentials_path: []const u8,
     compression_enabled: bool,
     gzip_enabled: bool,
     compression_min_bytes: usize,
@@ -2421,6 +2436,14 @@ fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []cons
             cfg.admin_enabled = true;
             cfg.admin_socket_path = try allocator.dupe(u8, v);
         }
+    } else if (std.mem.eql(u8, k, "admin_ui") or std.mem.eql(u8, k, "admin_ui_enabled")) {
+        cfg.admin_ui_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "admin_ui_path")) {
+        if (v.len == 0) return error.InvalidConfigValue;
+        cfg.admin_ui_path = try allocator.dupe(u8, v);
+    } else if (std.mem.eql(u8, k, "admin_credentials_path") or std.mem.eql(u8, k, "admin_state_path")) {
+        if (v.len == 0) return error.InvalidConfigValue;
+        cfg.admin_credentials_path = try allocator.dupe(u8, v);
     } else if (std.mem.eql(u8, k, "compression") or std.mem.eql(u8, k, "compress") or std.mem.eql(u8, k, "encode")) {
         cfg.compression_enabled = try parseConfigBool(v);
     } else if (std.mem.eql(u8, k, "gzip") or std.mem.eql(u8, k, "gzip_enabled")) {
@@ -3125,6 +3148,11 @@ fn validateConfig(cfg: *const ServerConfig) !void {
         if (socket_path.len == 0) return error.InvalidConfigValue;
         _ = std.Io.net.UnixAddress.init(socket_path) catch return error.InvalidConfigValue;
     }
+    if (cfg.admin_ui_enabled) {
+        try validateAdminUiPath(cfg.admin_ui_path);
+        if (cfg.admin_credentials_path.len == 0) return error.InvalidConfigValue;
+        if (std.mem.indexOfAny(u8, cfg.admin_credentials_path, "\r\n\x00") != null) return error.InvalidConfigValue;
+    }
     if (cfg.compression_enabled) {
         if (!cfg.gzip_enabled) return error.InvalidConfigValue;
         if (cfg.compression_min_bytes == 0) return error.InvalidConfigValue;
@@ -3684,7 +3712,7 @@ fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_co
 fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
+        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"admin_ui\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
         .{
             SERVER_NAME,
             cfg.host,
@@ -3692,6 +3720,7 @@ fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]
             cfg.http3_enabled,
             cfg.compression_enabled,
             cfg.admin_enabled,
+            cfg.admin_ui_enabled,
             cfg.tls_enabled,
             cfg.tls_auto,
             cfg.letsencrypt_renew,
@@ -3780,6 +3809,639 @@ fn renderAdminCerts(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]c
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+const AdminCredentials = struct {
+    username: []const u8,
+    rounds: u32,
+    salt: [ADMIN_SALT_BYTES]u8,
+    hash: [ADMIN_HASH_BYTES]u8,
+    session: [ADMIN_SESSION_BYTES]u8,
+};
+
+const FormField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn isAdminUiPathByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '_' or byte == '-' or byte == '.' or byte == '~';
+}
+
+fn validateAdminUiPath(path: []const u8) !void {
+    if (path.len < 2 or path[0] != '/') return error.InvalidConfigValue;
+    if (std.mem.indexOf(u8, path, "..") != null) return error.InvalidConfigValue;
+    if (std.mem.endsWith(u8, path, "/")) return error.InvalidConfigValue;
+    for (path) |byte| {
+        if (!isAdminUiPathByte(byte)) return error.InvalidConfigValue;
+    }
+}
+
+fn adminPathMatches(base_path: []const u8, request_path: []const u8) bool {
+    if (std.mem.eql(u8, base_path, request_path)) return true;
+    return std.mem.startsWith(u8, request_path, base_path) and request_path.len > base_path.len and request_path[base_path.len] == '/';
+}
+
+fn adminSubPath(base_path: []const u8, request_path: []const u8) []const u8 {
+    if (std.mem.eql(u8, base_path, request_path)) return "";
+    return request_path[base_path.len..];
+}
+
+fn isValidAdminUsername(username: []const u8) bool {
+    if (username.len < ADMIN_USERNAME_MIN_BYTES or username.len > ADMIN_USERNAME_MAX_BYTES) return false;
+    for (username) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-' or byte == '@')) return false;
+    }
+    return true;
+}
+
+fn appendHtmlEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |byte| {
+        switch (byte) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            '\'' => try out.appendSlice(allocator, "&#39;"),
+            else => try out.append(allocator, byte),
+        }
+    }
+}
+
+fn percentDecodeFormComponent(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < input.len) {
+        const byte = input[index];
+        if (byte == '+') {
+            try out.append(allocator, ' ');
+            index += 1;
+        } else if (byte == '%') {
+            if (index + 2 >= input.len) return error.InvalidFormEncoding;
+            const hi = std.fmt.charToDigit(input[index + 1], 16) catch return error.InvalidFormEncoding;
+            const lo = std.fmt.charToDigit(input[index + 2], 16) catch return error.InvalidFormEncoding;
+            try out.append(allocator, @as(u8, @intCast((hi << 4) | lo)));
+            index += 3;
+        } else {
+            try out.append(allocator, byte);
+            index += 1;
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseUrlEncodedForm(allocator: std.mem.Allocator, body: []const u8) !std.ArrayList(FormField) {
+    var fields = std.ArrayList(FormField).empty;
+    errdefer freeFormFields(allocator, &fields);
+
+    if (body.len == 0) return fields;
+
+    var parts = std.mem.splitScalar(u8, body, '&');
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse part.len;
+        const raw_name = part[0..eq];
+        const raw_value = if (eq < part.len) part[eq + 1 ..] else "";
+        const name = try percentDecodeFormComponent(allocator, raw_name);
+        errdefer allocator.free(name);
+        const value = try percentDecodeFormComponent(allocator, raw_value);
+        errdefer allocator.free(value);
+        try fields.append(allocator, .{ .name = name, .value = value });
+    }
+
+    return fields;
+}
+
+fn freeFormFields(allocator: std.mem.Allocator, fields: *std.ArrayList(FormField)) void {
+    for (fields.items) |field| {
+        allocator.free(field.name);
+        allocator.free(field.value);
+    }
+    fields.deinit(allocator);
+}
+
+fn formValue(fields: []const FormField, name: []const u8) ?[]const u8 {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field.value;
+    }
+    return null;
+}
+
+test "admin form parser decodes url encoded setup fields" {
+    var fields = try parseUrlEncodedForm(std.testing.allocator, "username=ari%40layerline&password=hello+world&empty=");
+    defer freeFormFields(std.testing.allocator, &fields);
+
+    try std.testing.expectEqualStrings("ari@layerline", formValue(fields.items, "username").?);
+    try std.testing.expectEqualStrings("hello world", formValue(fields.items, "password").?);
+    try std.testing.expectEqualStrings("", formValue(fields.items, "empty").?);
+}
+
+test "admin UI path matching stays under the configured prefix" {
+    try validateAdminUiPath("/_layerline/admin");
+    try std.testing.expect(adminPathMatches("/_layerline/admin", "/_layerline/admin"));
+    try std.testing.expect(adminPathMatches("/_layerline/admin", "/_layerline/admin/setup"));
+    try std.testing.expect(!adminPathMatches("/_layerline/admin", "/_layerline/administrator"));
+    try std.testing.expectError(error.InvalidConfigValue, validateAdminUiPath("/_layerline/admin/"));
+}
+
+fn deriveAdminPasswordHash(password: []const u8, salt: [ADMIN_SALT_BYTES]u8, rounds: u32) ![ADMIN_HASH_BYTES]u8 {
+    var hash: [ADMIN_HASH_BYTES]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(hash[0..], password, salt[0..], rounds, std.crypto.auth.hmac.sha2.HmacSha256);
+    return hash;
+}
+
+fn parseAdminCredentialFile(allocator: std.mem.Allocator, content: []const u8) !AdminCredentials {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    const version = trimValue(lines.next() orelse return error.InvalidAdminCredentials);
+    if (!std.mem.eql(u8, version, ADMIN_CREDENTIALS_VERSION)) return error.InvalidAdminCredentials;
+
+    var username_raw: ?[]const u8 = null;
+    var rounds_raw: ?[]const u8 = null;
+    var salt_raw: ?[]const u8 = null;
+    var hash_raw: ?[]const u8 = null;
+    var session_raw: ?[]const u8 = null;
+
+    while (lines.next()) |line_raw| {
+        const line = trimValue(line_raw);
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidAdminCredentials;
+        const key = trimValue(line[0..eq]);
+        const value = trimValue(line[eq + 1 ..]);
+        if (std.mem.eql(u8, key, "username")) {
+            username_raw = value;
+        } else if (std.mem.eql(u8, key, "rounds")) {
+            rounds_raw = value;
+        } else if (std.mem.eql(u8, key, "salt")) {
+            salt_raw = value;
+        } else if (std.mem.eql(u8, key, "hash")) {
+            hash_raw = value;
+        } else if (std.mem.eql(u8, key, "session")) {
+            session_raw = value;
+        }
+    }
+
+    const username_value = username_raw orelse return error.InvalidAdminCredentials;
+    if (!isValidAdminUsername(username_value)) return error.InvalidAdminCredentials;
+    const rounds = std.fmt.parseInt(u32, rounds_raw orelse return error.InvalidAdminCredentials, 10) catch return error.InvalidAdminCredentials;
+    if (rounds == 0) return error.InvalidAdminCredentials;
+
+    var salt: [ADMIN_SALT_BYTES]u8 = undefined;
+    if ((std.fmt.hexToBytes(salt[0..], salt_raw orelse return error.InvalidAdminCredentials) catch return error.InvalidAdminCredentials).len != ADMIN_SALT_BYTES) return error.InvalidAdminCredentials;
+    var hash: [ADMIN_HASH_BYTES]u8 = undefined;
+    if ((std.fmt.hexToBytes(hash[0..], hash_raw orelse return error.InvalidAdminCredentials) catch return error.InvalidAdminCredentials).len != ADMIN_HASH_BYTES) return error.InvalidAdminCredentials;
+    var session: [ADMIN_SESSION_BYTES]u8 = undefined;
+    if ((std.fmt.hexToBytes(session[0..], session_raw orelse return error.InvalidAdminCredentials) catch return error.InvalidAdminCredentials).len != ADMIN_SESSION_BYTES) return error.InvalidAdminCredentials;
+
+    return .{
+        .username = try allocator.dupe(u8, username_value),
+        .rounds = rounds,
+        .salt = salt,
+        .hash = hash,
+        .session = session,
+    };
+}
+
+fn loadAdminCredentials(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?AdminCredentials {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(ADMIN_CREDENTIALS_MAX_BYTES)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    return try parseAdminCredentialFile(allocator, content);
+}
+
+fn ensureCredentialParentDir(io: std.Io, path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
+    if (std.Io.Dir.cwd().statFile(io, parent, .{})) |_| {
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    std.Io.Dir.cwd().createDirPath(io, parent) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn createAdminCredentials(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, username_raw: []const u8, password: []const u8, password_confirm: []const u8) !AdminCredentials {
+    const username = trimValue(username_raw);
+    if (!isValidAdminUsername(username)) return error.InvalidAdminUsername;
+    if (password.len < ADMIN_PASSWORD_MIN_BYTES) return error.AdminPasswordTooShort;
+    if (!std.mem.eql(u8, password, password_confirm)) return error.AdminPasswordMismatch;
+
+    var salt: [ADMIN_SALT_BYTES]u8 = undefined;
+    var session: [ADMIN_SESSION_BYTES]u8 = undefined;
+    io.random(salt[0..]);
+    io.random(session[0..]);
+    const hash = try deriveAdminPasswordHash(password, salt, ADMIN_PBKDF2_ROUNDS);
+
+    const salt_hex = std.fmt.bytesToHex(salt, .lower);
+    const hash_hex = std.fmt.bytesToHex(hash, .lower);
+    const session_hex = std.fmt.bytesToHex(session, .lower);
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "{s}\nusername={s}\nrounds={d}\nsalt={s}\nhash={s}\nsession={s}\n",
+        .{ ADMIN_CREDENTIALS_VERSION, username, ADMIN_PBKDF2_ROUNDS, salt_hex[0..], hash_hex[0..], session_hex[0..] },
+    );
+    defer allocator.free(content);
+
+    try ensureCredentialParentDir(io, cfg.admin_credentials_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = cfg.admin_credentials_path,
+        .data = content,
+        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
+    });
+
+    return .{
+        .username = try allocator.dupe(u8, username),
+        .rounds = ADMIN_PBKDF2_ROUNDS,
+        .salt = salt,
+        .hash = hash,
+        .session = session,
+    };
+}
+
+fn verifyAdminPassword(credentials: AdminCredentials, password: []const u8) !bool {
+    const candidate = try deriveAdminPasswordHash(password, credentials.salt, credentials.rounds);
+    return std.crypto.timing_safe.eql([ADMIN_HASH_BYTES]u8, candidate, credentials.hash);
+}
+
+fn findCookieValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    const cookie_header = findHeaderValue(headers, "Cookie") orelse return null;
+    var parts = std.mem.splitScalar(u8, cookie_header, ';');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const cookie_name = std.mem.trim(u8, part[0..eq], " \t");
+        const cookie_value = std.mem.trim(u8, part[eq + 1 ..], " \t");
+        if (std.mem.eql(u8, cookie_name, name)) return cookie_value;
+    }
+    return null;
+}
+
+fn adminSessionCookieValid(headers: []const u8, credentials: AdminCredentials) bool {
+    const value = findCookieValue(headers, ADMIN_COOKIE_NAME) orelse return false;
+    const expected = std.fmt.bytesToHex(credentials.session, .lower);
+    if (value.len != expected.len) return false;
+    var actual: [ADMIN_SESSION_BYTES * 2]u8 = undefined;
+    @memcpy(actual[0..], value);
+    return std.crypto.timing_safe.eql([ADMIN_SESSION_BYTES * 2]u8, expected, actual);
+}
+
+fn makeAdminSessionCookie(allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials) ![]const u8 {
+    const session_hex = std.fmt.bytesToHex(credentials.session, .lower);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}={s}; HttpOnly; SameSite=Strict; Path={s}",
+        .{ ADMIN_COOKIE_NAME, session_hex[0..], cfg.admin_ui_path },
+    );
+}
+
+fn makeAdminClearCookie(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}=; Max-Age=0; HttpOnly; SameSite=Strict; Path={s}",
+        .{ ADMIN_COOKIE_NAME, cfg.admin_ui_path },
+    );
+}
+
+fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool) !void {
+    const extra_headers = if (cookie) |cookie_value|
+        try std.fmt.allocPrint(allocator, "Location: {s}\r\nSet-Cookie: {s}\r\nCache-Control: no-store\r\n", .{ cfg.admin_ui_path, cookie_value })
+    else
+        try std.fmt.allocPrint(allocator, "Location: {s}\r\nCache-Control: no-store\r\n", .{cfg.admin_ui_path});
+    defer allocator.free(extra_headers);
+
+    const body = "Redirecting to Layerline Admin.\n";
+    if (is_head) {
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, 303, "See Other", "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
+    } else {
+        try sendResponseWithConnectionAndHeaders(stream, 303, "See Other", "text/plain; charset=utf-8", body, close_connection, extra_headers);
+    }
+}
+
+fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig, title: []const u8) !void {
+    try out.print(
+        allocator,
+        \\<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>{s} - Layerline Admin</title>
+        \\<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+        \\<style>
+        \\  * {{ box-sizing: border-box; }}
+        \\  body {{
+        \\    margin: 0;
+        \\    min-height: 100vh;
+        \\    color: #11110f;
+        \\    background:
+        \\      linear-gradient(rgba(17,17,15,.045) 1px, transparent 1px),
+        \\      linear-gradient(90deg, rgba(17,17,15,.045) 1px, transparent 1px),
+        \\      linear-gradient(180deg, #f7f4ed 0%, #f0ece2 54%, #e9e3d6 100%);
+        \\    background-size: 52px 52px, 52px 52px, auto;
+        \\    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        \\  }}
+        \\  main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 42px; }}
+        \\  header {{ display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 0 22px; border-bottom: 1px solid rgba(17,17,15,.14); }}
+        \\  .brand {{ display: inline-flex; align-items: center; gap: 12px; color: inherit; text-decoration: none; }}
+        \\  .brand img {{ width: 42px; height: 42px; border-radius: 8px; box-shadow: 0 16px 30px rgba(17,17,15,.12); }}
+        \\  .brand strong {{ display: block; font-size: 18px; line-height: 1.1; }}
+        \\  .brand span span {{ display: block; color: #66675f; font-size: 12px; }}
+        \\  nav {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+        \\  a, button {{ color: #11110f; }}
+        \\  .navlink, button {{ min-height: 36px; border: 1px solid rgba(17,17,15,.18); border-radius: 8px; background: rgba(251,250,246,.72); padding: 7px 10px; text-decoration: none; font: inherit; cursor: pointer; }}
+        \\  button.primary {{ background: #11110f; color: #fbfaf6; border-color: #11110f; }}
+        \\  h1 {{ margin: 32px 0 8px; font-size: clamp(34px, 5vw, 64px); line-height: .95; letter-spacing: 0; }}
+        \\  .lede {{ margin: 0 0 24px; max-width: 62ch; color: #5d5e58; font-size: 16px; }}
+        \\  .panel {{ border: 1px solid rgba(17,17,15,.16); border-radius: 8px; background: rgba(251,250,246,.78); box-shadow: 0 28px 70px rgba(38,34,24,.12); }}
+        \\  .panel-inner {{ padding: clamp(18px, 3vw, 28px); }}
+        \\  .dashboard {{ margin-top: 24px; }}
+        \\  .grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 26px 0; }}
+        \\  .metric {{ min-height: 86px; padding: 14px; border: 1px solid rgba(17,17,15,.14); border-radius: 8px; background: rgba(255,255,255,.38); }}
+        \\  .metric span {{ display: block; color: #696a63; font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }}
+        \\  .metric strong {{ display: block; margin-top: 8px; font-size: 24px; line-height: 1; }}
+        \\  form.stack {{ display: grid; gap: 14px; max-width: 440px; }}
+        \\  label {{ display: grid; gap: 6px; color: #4f504a; font-size: 13px; }}
+        \\  input {{ min-height: 42px; border: 1px solid rgba(17,17,15,.2); border-radius: 8px; padding: 9px 11px; background: rgba(255,255,255,.72); color: #11110f; font: inherit; }}
+        \\  .notice {{ margin: 0 0 18px; padding: 12px 14px; border-left: 3px solid #11110f; background: rgba(255,255,255,.5); color: #454640; }}
+        \\  .error {{ border-left-color: #a13b2f; color: #6f2118; }}
+        \\  section.block {{ margin-top: 18px; }}
+        \\  section.block h2 {{ margin: 0 0 8px; font-size: 16px; }}
+        \\  pre {{ overflow: auto; max-height: 360px; margin: 0; padding: 14px; border: 1px solid rgba(17,17,15,.13); border-radius: 8px; background: #11110f; color: #f6f0e5; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }}
+        \\  .actions {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 18px; }}
+        \\  @media (max-width: 760px) {{ header {{ align-items: flex-start; flex-direction: column; }} .grid {{ grid-template-columns: 1fr; }} main {{ width: min(100vw - 24px, 1120px); }} }}
+        \\</style>
+        \\</head>
+        \\<body>
+        \\<main>
+        \\<header>
+        \\  <a class="brand" href="{s}">
+        \\    <img src="/favicon.svg" alt="">
+        \\    <span><strong>Layerline Admin</strong><span>disabled unless explicitly enabled</span></span>
+        \\  </a>
+        \\  <nav>
+        \\    <a class="navlink" href="/">Site</a>
+        \\    <a class="navlink" href="{s}">Dashboard</a>
+        \\  </nav>
+        \\</header>
+        \\
+        ,
+        .{ title, cfg.admin_ui_path, cfg.admin_ui_path },
+    );
+}
+
+fn appendAdminShellEnd(out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try out.appendSlice(allocator,
+        \\</main>
+        \\</body>
+        \\</html>
+        \\
+    );
+}
+
+fn appendAdminNotice(out: *std.ArrayList(u8), allocator: std.mem.Allocator, class_name: []const u8, message: []const u8) !void {
+    try out.print(allocator, "<p class=\"notice {s}\">", .{class_name});
+    try appendHtmlEscaped(out, allocator, message);
+    try out.appendSlice(allocator, "</p>\n");
+}
+
+fn renderAdminSetupPage(allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendAdminShellStart(&out, allocator, cfg, "First Launch Setup");
+    try out.appendSlice(allocator,
+        \\<h1>First launch setup</h1>
+        \\<p class="lede">Create the first local admin account. Layerline writes the password hash and session seed to the configured credentials file, then locks this setup screen.</p>
+        \\<div class="panel"><div class="panel-inner">
+        \\
+    );
+    if (maybe_error) |message| try appendAdminNotice(&out, allocator, "error", message);
+    try out.print(
+        allocator,
+        \\<form class="stack" method="post" action="{s}/setup">
+        \\  <label>Username<input name="username" autocomplete="username" required minlength="2" maxlength="64"></label>
+        \\  <label>Password<input type="password" name="password" autocomplete="new-password" required minlength="8"></label>
+        \\  <label>Confirm password<input type="password" name="password_confirm" autocomplete="new-password" required minlength="8"></label>
+        \\  <div class="actions"><button class="primary" type="submit">Create admin access</button></div>
+        \\</form>
+        \\</div></div>
+        \\
+        ,
+        .{cfg.admin_ui_path},
+    );
+    try appendAdminShellEnd(&out, allocator);
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderAdminLoginPage(allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendAdminShellStart(&out, allocator, cfg, "Login");
+    try out.appendSlice(allocator,
+        \\<h1>Admin login</h1>
+        \\<p class="lede">Use the local admin account created during first launch. The dashboard is served by Layerline itself, under the configured admin path.</p>
+        \\<div class="panel"><div class="panel-inner">
+        \\
+    );
+    if (maybe_error) |message| try appendAdminNotice(&out, allocator, "error", message);
+    try out.print(
+        allocator,
+        \\<form class="stack" method="post" action="{s}/login">
+        \\  <label>Username<input name="username" autocomplete="username" required></label>
+        \\  <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+        \\  <div class="actions"><button class="primary" type="submit">Sign in</button></div>
+        \\</form>
+        \\</div></div>
+        \\
+        ,
+        .{cfg.admin_ui_path},
+    );
+    try appendAdminShellEnd(&out, allocator);
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderAdminDashboardPage(allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials) ![]const u8 {
+    const status = try renderAdminStatus(allocator, cfg);
+    defer allocator.free(status);
+    const routes = try renderAdminRoutes(allocator, cfg);
+    defer allocator.free(routes);
+    const certs = try renderAdminCerts(allocator, cfg);
+    defer allocator.free(certs);
+    const metrics = try renderMetrics(allocator);
+    defer allocator.free(metrics);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendAdminShellStart(&out, allocator, cfg, "Dashboard");
+    try out.appendSlice(allocator, "<h1>Control surface</h1>\n<p class=\"lede\">Runtime status, route inventory, certificate posture, and metrics from the same Layerline process handling traffic.</p>\n");
+    try out.appendSlice(allocator, "<div class=\"dashboard\">\n");
+    try out.appendSlice(allocator, "<div class=\"actions\"><form method=\"post\" action=\"");
+    try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
+    try out.appendSlice(allocator, "/logout\"><button type=\"submit\">Log out</button></form></div>\n");
+    try out.appendSlice(allocator, "<div class=\"grid\">\n");
+    try out.print(allocator, "<div class=\"metric\"><span>admin user</span><strong>", .{});
+    try appendHtmlEscaped(&out, allocator, credentials.username);
+    try out.appendSlice(allocator, "</strong></div>\n");
+    try out.print(allocator, "<div class=\"metric\"><span>listener</span><strong>{s}:{d}</strong></div>\n", .{ cfg.host, cfg.port });
+    try out.print(allocator, "<div class=\"metric\"><span>requests</span><strong>{d}</strong></div>\n", .{ServerMetrics.load(&server_metrics.requests_total)});
+    try out.appendSlice(allocator, "</div>\n");
+
+    try out.appendSlice(allocator, "<section class=\"block\" id=\"status\"><h2>Status</h2><pre>");
+    try appendHtmlEscaped(&out, allocator, status);
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"routes\"><h2>Routes</h2><pre>");
+    try appendHtmlEscaped(&out, allocator, routes);
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><h2>Certificates</h2><pre>");
+    try appendHtmlEscaped(&out, allocator, certs);
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"metrics\"><h2>Metrics</h2><pre>");
+    try appendHtmlEscaped(&out, allocator, metrics);
+    try out.appendSlice(allocator, "</pre></section>\n</div>\n");
+    try appendAdminShellEnd(&out, allocator);
+    return out.toOwnedSlice(allocator);
+}
+
+fn sendAdminPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
+    _ = allocator;
+    const headers = "Cache-Control: no-store\r\n";
+    if (is_head) {
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body.len, close_connection, headers);
+    } else {
+        try sendResponseWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body, close_connection, headers);
+    }
+}
+
+fn sendAdminSetupPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
+    const body = try renderAdminSetupPage(allocator, cfg, maybe_error);
+    defer allocator.free(body);
+    try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
+}
+
+fn sendAdminLoginPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
+    const body = try renderAdminLoginPage(allocator, cfg, maybe_error);
+    defer allocator.free(body);
+    try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
+}
+
+fn sendAdminDashboardPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, is_head: bool) !void {
+    const body = try renderAdminDashboardPage(allocator, cfg, credentials);
+    defer allocator.free(body);
+    try sendAdminPage(stream, allocator, 200, "OK", body, close_connection, is_head);
+}
+
+fn handleAdminSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool) !void {
+    var fields = parseUrlEncodedForm(allocator, req.body) catch {
+        try sendAdminSetupPage(stream, allocator, cfg, "The setup form could not be parsed.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer freeFormFields(allocator, &fields);
+
+    const username = formValue(fields.items, "username") orelse "";
+    const password = formValue(fields.items, "password") orelse "";
+    const password_confirm = formValue(fields.items, "password_confirm") orelse "";
+    const credentials = createAdminCredentials(io, allocator, cfg, username, password, password_confirm) catch |err| {
+        const message = switch (err) {
+            error.InvalidAdminUsername => "Use 2-64 characters: letters, numbers, dot, underscore, dash, or @.",
+            error.AdminPasswordTooShort => "Use a password with at least 8 characters.",
+            error.AdminPasswordMismatch => "The password confirmation did not match.",
+            error.PathAlreadyExists => "Admin access is already configured. Sign in instead.",
+            else => "Layerline could not create the admin credentials file.",
+        };
+        try sendAdminSetupPage(stream, allocator, cfg, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+    const cookie = try makeAdminSessionCookie(allocator, cfg, credentials);
+    defer allocator.free(cookie);
+    try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
+}
+
+fn handleAdminLoginPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
+    var fields = parseUrlEncodedForm(allocator, req.body) catch {
+        try sendAdminLoginPage(stream, allocator, cfg, "The login form could not be parsed.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer freeFormFields(allocator, &fields);
+
+    const username = formValue(fields.items, "username") orelse "";
+    const password = formValue(fields.items, "password") orelse "";
+    if (!std.mem.eql(u8, username, credentials.username) or !(try verifyAdminPassword(credentials, password))) {
+        try sendAdminLoginPage(stream, allocator, cfg, "The username or password was not accepted.", 401, "Unauthorized", close_connection, false);
+        return;
+    }
+
+    const cookie = try makeAdminSessionCookie(allocator, cfg, credentials);
+    defer allocator.free(cookie);
+    try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
+}
+
+fn handleAdminUi(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    req: HttpRequest,
+    close_connection: bool,
+    is_head: bool,
+) !void {
+    const method = req.method;
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        const allow_header = "Allow: GET,HEAD,POST,OPTIONS\r\nCache-Control: no-store\r\n";
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, 204, "No Content", "text/plain; charset=utf-8", 0, close_connection, allow_header);
+        return;
+    }
+    if (!(std.mem.eql(u8, method, "GET") or is_head or std.mem.eql(u8, method, "POST"))) {
+        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
+        return;
+    }
+
+    const sub_path = adminSubPath(cfg.admin_ui_path, req.path);
+    const maybe_credentials = try loadAdminCredentials(io, allocator, cfg.admin_credentials_path);
+    if (maybe_credentials == null) {
+        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/setup")) {
+            try handleAdminSetupPost(io, stream, allocator, cfg, req, close_connection);
+            return;
+        }
+        if (std.mem.eql(u8, method, "GET") or is_head) {
+            try sendAdminSetupPage(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
+            return;
+        }
+        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
+        return;
+    }
+
+    const credentials = maybe_credentials.?;
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/login")) {
+        try handleAdminLoginPost(stream, allocator, cfg, credentials, req, close_connection);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/logout")) {
+        const cookie = try makeAdminClearCookie(allocator, cfg);
+        defer allocator.free(cookie);
+        try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
+        return;
+    }
+
+    if (!adminSessionCookieValid(req.headers, credentials)) {
+        if (std.mem.eql(u8, method, "GET") or is_head) {
+            try sendAdminLoginPage(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
+            return;
+        }
+        try sendAdminLoginPage(stream, allocator, cfg, "Sign in before using the admin dashboard.", 401, "Unauthorized", close_connection, false);
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "GET") or is_head) {
+        try sendAdminDashboardPage(stream, allocator, cfg, credentials, close_connection, is_head);
+        return;
+    }
+
+    try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection);
 }
 
 fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
@@ -8059,6 +8721,9 @@ test "named routes prefer exact and longest prefix matches" {
         .http3_port = 8443,
         .admin_enabled = false,
         .admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
+        .admin_ui_enabled = false,
+        .admin_ui_path = DEFAULT_ADMIN_UI_PATH,
+        .admin_credentials_path = DEFAULT_ADMIN_CREDENTIALS_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -8130,6 +8795,9 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
     try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
     try applyConfigLine(&cfg, allocator, "admin_socket", "/tmp/layerline-test-admin.sock");
+    try applyConfigLine(&cfg, allocator, "admin_ui", "true");
+    try applyConfigLine(&cfg, allocator, "admin_ui_path", "/_test/admin");
+    try applyConfigLine(&cfg, allocator, "admin_credentials_path", "/tmp/layerline-test-admin.creds");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew", "false");
     try applyConfigLine(&cfg, allocator, "letsencrypt_renew_interval_ms", "7200000");
     try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
@@ -8166,6 +8834,9 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
     try std.testing.expect(cfg.admin_enabled);
     try std.testing.expectEqualStrings("/tmp/layerline-test-admin.sock", cfg.admin_socket_path.?);
+    try std.testing.expect(cfg.admin_ui_enabled);
+    try std.testing.expectEqualStrings("/_test/admin", cfg.admin_ui_path);
+    try std.testing.expectEqualStrings("/tmp/layerline-test-admin.creds", cfg.admin_credentials_path);
     try std.testing.expect(!cfg.letsencrypt_renew);
     try std.testing.expectEqual(@as(u32, 7200000), cfg.letsencrypt_renew_interval_ms);
     normalizeConfig(&cfg);
@@ -8536,6 +9207,11 @@ fn routeRequest(
     defer base_header_context.deinit(allocator);
     current_response_headers = base_header_context.items;
     defer current_response_headers = &.{};
+
+    if (cfg.admin_ui_enabled and adminPathMatches(cfg.admin_ui_path, req.path)) {
+        try handleAdminUi(io, stream, allocator, cfg, req, should_close, is_head);
+        return;
+    }
 
     if (findDomainRedirectRule(domain, req.path)) |redirect| {
         try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
@@ -10470,7 +11146,7 @@ fn usage() void {
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
             "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
@@ -10484,7 +11160,7 @@ fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
@@ -10512,6 +11188,7 @@ fn usage() void {
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-health-check true\n" ++
             "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-circuit-breaker true --upstream-slow-start-ms 10000\n" ++
             "  zig build run -- --proxy off\n" ++
+            "  zig build run -- --admin-ui true --admin-ui-path /_layerline/admin\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
             "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
             "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
@@ -10574,6 +11251,9 @@ pub fn main(init: std.process.Init) !void {
         .http3_port = 8443,
         .admin_enabled = false,
         .admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
+        .admin_ui_enabled = false,
+        .admin_ui_path = DEFAULT_ADMIN_UI_PATH,
+        .admin_credentials_path = DEFAULT_ADMIN_CREDENTIALS_PATH,
         .compression_enabled = false,
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
@@ -10855,6 +11535,22 @@ pub fn main(init: std.process.Init) !void {
                 cfg.admin_enabled = true;
                 cfg.admin_socket_path = value;
             }
+        } else if (std.mem.eql(u8, arg, "--admin-ui") or std.mem.eql(u8, arg, "--admin-ui-enabled")) {
+            const value = args.next() orelse {
+                usage();
+                return;
+            };
+            cfg.admin_ui_enabled = parseBool(value) orelse cfg.admin_ui_enabled;
+        } else if (std.mem.eql(u8, arg, "--admin-ui-path")) {
+            cfg.admin_ui_path = args.next() orelse {
+                usage();
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--admin-credentials-path") or std.mem.eql(u8, arg, "--admin-state-path")) {
+            cfg.admin_credentials_path = args.next() orelse {
+                usage();
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "--compress") or std.mem.eql(u8, arg, "--encode")) {
             const value = args.next() orelse {
                 usage();

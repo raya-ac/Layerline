@@ -19,7 +19,7 @@ Sources:
 - Keep the binary dependency-light. Optional integrations can exist, but the core runtime should stay Zig-owned.
 - Make config declarative, reloadable, and testable before expanding the directive set heavily.
 - Prefer measured behavior over feature claims. Every major feature needs a conformance test or a live smoke check.
-- Do not expose diagnostic surfaces by default. `/test.php` and future admin tools must require explicit config.
+- Do not expose diagnostic surfaces by default. `/test.php`, the Unix admin socket, and the browser admin UI all require explicit config.
 - Split features into stable modules internally even if they ship as one binary.
 
 ## Phase 1: Core Server Correctness
@@ -27,9 +27,10 @@ Sources:
 - Harden HTTP/1 parsing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, and strict keep-alive semantics.
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
-- Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and local admin command.
+- Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
+- Expand the admin control UI beyond the implemented first-launch setup/login dashboard into reload, upstream drain/eject, cert renewal, config diff, and redacted config inspection.
 
 ## Phase 2: Static Files and Content Handling
 

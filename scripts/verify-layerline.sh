@@ -16,6 +16,7 @@ fi
 
 TMP_DIR=$(mktemp -d)
 SOCKET="$TMP_DIR/layerline-admin.sock"
+ADMIN_CREDS="$TMP_DIR/layerline-admin.creds"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -77,6 +78,9 @@ port = $PORT
 dir = public
 serve_static_root = true
 admin_socket = $SOCKET
+admin_ui = true
+admin_ui_path = /_layerline/admin
+admin_credentials_path = $ADMIN_CREDS
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
@@ -155,6 +159,31 @@ case "$ADMIN_METRICS" in
   *'layerline_requests_total'*'layerline_acme_renewals_total'*) ok "admin metrics" ;;
   *) die "admin metrics response was unexpected" ;;
 esac
+
+ADMIN_URL="http://$HOST:$PORT/_layerline/admin"
+ADMIN_SETUP_BODY="$TMP_DIR/admin-setup.body"
+curl -fsS "$ADMIN_URL" -o "$ADMIN_SETUP_BODY"
+grep -Fq 'First launch setup' "$ADMIN_SETUP_BODY" || die "admin UI did not show first-launch setup"
+ok "admin UI first-launch setup"
+
+COOKIE_JAR="$TMP_DIR/admin.cookies"
+curl -fsS -c "$COOKIE_JAR" -o /dev/null \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'username=admin&password=layerline-test-pass&password_confirm=layerline-test-pass' \
+  "$ADMIN_URL/setup"
+[[ -s $ADMIN_CREDS ]] || die "admin credentials file was not created"
+ok "admin UI setup created credentials"
+
+ADMIN_LOGIN_BODY="$TMP_DIR/admin-login.body"
+curl -fsS "$ADMIN_URL" -o "$ADMIN_LOGIN_BODY"
+grep -Fq 'Admin login' "$ADMIN_LOGIN_BODY" || die "admin UI did not require login after setup"
+ok "admin UI requires login"
+
+ADMIN_DASH_BODY="$TMP_DIR/admin-dashboard.body"
+curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
+grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "admin UI dashboard was not served with setup cookie"
+grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
+ok "admin UI authenticated dashboard"
 
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true
