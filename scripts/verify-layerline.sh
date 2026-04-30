@@ -108,7 +108,9 @@ curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
 grep -Fq 'Layerline' "$ROOT_BODY" || die "root page did not contain Layerline"
 ok "HTTP/1 root page"
 
-curl -fsS "http://$HOST:$PORT/static/hello.txt" >/dev/null
+STATIC_HEADERS="$TMP_DIR/static.headers"
+curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
+header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="static-file"' || die "static Cache-Status header missing"
 ok "static file route"
 
 GZIP_HEADERS="$TMP_DIR/gzip.headers"
@@ -166,7 +168,7 @@ esac
 
 ADMIN_VALIDATE=$(printf 'validate\n' | nc -U "$SOCKET")
 case "$ADMIN_VALIDATE" in
-  'OK config'*) ok "admin validate" ;;
+  'OK activation config'*) ok "admin validate" ;;
   *) die "admin validate response was unexpected: $ADMIN_VALIDATE" ;;
 esac
 

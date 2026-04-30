@@ -44,15 +44,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now layerline
 ```
 
-Validate and restart after config edits:
+Validate and apply config edits:
 
 ```bash
 sudo -u layerline /usr/local/bin/layerline --validate-config --config /etc/layerline/server.conf
-sudo systemctl restart layerline
+sudo systemctl reload layerline
 sudo journalctl -u layerline -f
 ```
 
-The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Keep `LimitNOFILE=1048576` unless the host has a lower global cap.
+The packaged unit validates the config file first, then asks the running process to shut down gracefully so systemd can replace it. That is the safe bridge until Layerline has in-memory config snapshot reload. The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Keep `LimitNOFILE=1048576` unless the host has a lower global cap.
 
 If Layerline is replacing the host's TLS edge, also install the renewal timer after `certbot certonly` has created certificates:
 
@@ -155,6 +155,7 @@ Run these before moving traffic:
 curl -fsS http://127.0.0.1:8080/health
 curl -fsSI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/ | grep -i '^Content-Encoding: gzip'
 printf 'status\n' | nc -U /run/layerline/admin.sock
+printf 'validate\n' | nc -U /run/layerline/admin.sock
 printf 'certs\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
 ```

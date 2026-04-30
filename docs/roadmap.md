@@ -27,16 +27,16 @@ Sources:
 - Harden HTTP/1 parsing and response framing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, HEAD/error response body suppression, and strict keep-alive semantics.
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
-- Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control.
+- Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control. Activation preflight plus managed graceful restart are implemented as the safe intermediate step; in-memory snapshot swap remains next.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields. Initial opt-in JSON access logs are implemented for HTTP/1 and HTTP/2 request handling with method, path, query, host, protocol, status, bytes, latency, handler, route error, and upstream target fields; request IDs, TLS fields, and h3 logging remain.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
-- Expand the admin control UI beyond the implemented first-launch setup/login dashboard and site-file controls into hot reload, upstream drain/eject, cert renewal, config diff, and redacted config inspection.
+- Expand the admin control UI beyond the implemented first-launch setup/login dashboard, activation preflight, managed graceful restart, and site-file controls into in-memory hot reload, upstream drain/eject, cert renewal, config diff, and richer redacted config inspection.
 
 ## Phase 2: Static Files and Content Handling
 
 - Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
 - MIME database and override config.
-- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, and `server_route_cache_control.DOMAIN.ROUTE` shortcuts are implemented on top of inherited response-header policy.
+- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, and static Cache-Status headers are implemented on top of inherited response-header policy.
 - Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses; brotli/zstd and route/domain presets remain.
 - Static transforms: safe template mode, include variables, generated headers, and route-local error pages.
 - Large-file performance: sendfile on supported targets, fallback streaming, mmap evaluation, rate limiting, and backpressure tests.
@@ -63,7 +63,7 @@ Sources:
 
 - Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 and RSA configured certificate loading, RSA-PSS CertificateVerify, SNI certificate selection for domain configs, and self-signed local fallback; session resumption, OCSP stapling, live certificate reload, and mTLS remain next.
 - ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs. Initial certbot/webroot startup issuance, HTTP-01 challenge serving from certbot webroots, a companion HTTP redirect/ACME listener for port 80, and periodic `certbot renew` scheduling are implemented, with admin cert visibility and renewal metrics.
-- HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade. Initial h2 route parity now covers static routes, redirects, health/metrics, reverse proxy routes, inherited response headers, FastCGI PHP routes, bounded DATA request bodies, content-length validation, and WINDOW_UPDATE for consumed body bytes; richer flow-control behavior and GOAWAY policy remain next.
+- HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade. Initial h2 route parity now covers static routes, redirects, health/metrics, reverse proxy routes, inherited response headers, FastCGI PHP routes, bounded DATA request bodies, content-length validation, WINDOW_UPDATE for consumed body bytes, and graceful GOAWAY on request caps/shutdown; richer flow-control behavior and prioritization stance remain next.
 - HTTP/3 full routing: route all app responses over QUIC, not just the default page; QPACK dynamic table policy; stream lifecycle; connection migration stance; anti-amplification limits.
 - Protocol conformance tests using external clients and captured packet tests.
 
@@ -86,7 +86,7 @@ Sources:
 
 ## Phase 8: Admin, Operations, and Developer Experience
 
-- Local admin API over Unix socket by default: status, config validate, reload, metrics, route dump, upstream health, and cert status.
+- Local admin API over Unix socket by default: status, activation config validate, runtime validate, managed restart, metrics, route dump, upstream health, and cert status.
 - CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`.
 - Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based domain configs are implemented, including nginx-style per-domain files loaded from `domain_config_dir`.
 - Prometheus metrics plus optional OpenTelemetry traces.
@@ -112,11 +112,11 @@ Sources:
 4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection/connect-reuse metrics, bounded retry budgets, passive cooldown, circuit breaker half-open probes, weighted slow start, opt-in active HTTP probes, and upstream keep-alive sockets are implemented; sticky sessions and route-local health policy remain next.
 5. FastCGI and PHP front-controller. FastCGI transport, route/domain backend timeouts, FCGI_KEEP_CONN pooling, and CGI front-controller fallback are implemented; richer framework rewrites and multiplex refusal handling remain next.
 6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
-7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, and consumed-body WINDOW_UPDATE; GOAWAY policy, prioritization stance, and broader conformance tests remain next.
+7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, consumed-body WINDOW_UPDATE, and graceful GOAWAY on request caps/shutdown; prioritization stance and broader conformance tests remain next.
 8. HTTP/3 full routing.
-9. Cache and compression. Initial inherited Cache-Control policy shortcuts and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer cache-status/stale policy and route/domain compression presets remain next.
-10. Admin API and hot reload. Initial read-only Unix socket commands cover status, validate, routes, certs, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, enabled domain files, runtime validation, and new site-file creation. Hot reload plus live upstream/cert controls remain.
+9. Cache and compression. Initial inherited Cache-Control policy shortcuts, static Cache-Status detail, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer stale policy and route/domain compression presets remain next.
+10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, managed restart, routes, certs, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, enabled domain files, activation preflight, managed restart, and new site-file creation. In-memory hot reload plus live upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, gzip negotiation, native h2c, h2 request bodies, admin socket commands, admin site-file creation, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone should be HTTP/2 GOAWAY/connection policy, then route-local cache/security/upstream policy and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
+The next engineering milestone should be in-memory config snapshot reload, then HTTP/3 route dispatch, route-local cache/security/upstream policy, and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

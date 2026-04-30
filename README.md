@@ -36,7 +36,7 @@ Layerline blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
-- Optional read-only Unix-socket admin surface for status, config validation, routes, cert visibility, and metrics.
+- Optional local Unix-socket admin surface for status, activation config validation, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
@@ -55,9 +55,9 @@ Layerline is being built toward the Caddy/nginx class: direct TLS termination, v
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a read-only Unix admin socket, an opt-in first-launch browser admin UI, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is richer HTTP/2 connection policy and cache behavior: GOAWAY behavior, route-local stale/cache-status policy, and broader h2 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper reload/protocol parity: in-memory config snapshot swaps, HTTP/3 route dispatch, route-local stale/cache policy, and broader h2/h3 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -183,7 +183,7 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
-# Read-only local admin socket: status, validate, routes, certs, metrics.
+# Local admin socket: status, validate activation config, restart, routes, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Browser admin UI is disabled by default and creates access on first launch.
 #admin_ui = false
@@ -305,7 +305,7 @@ Set `admin_socket` to enable a local Unix socket for read-only operations:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `routes`, `certs`, `metrics`, and `help`.
+Commands are one line each: `status`, `validate`, `validate-runtime`, `restart`, `routes`, `certs`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart; `validate-runtime` checks the already-loaded in-memory config.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
@@ -328,7 +328,7 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the runtime config, exposes status/routes/certs/metrics, and can create new nginx-style site files under `domain_config_dir`. Main-setting and site-file writes are deliberately staged: restart Layerline for those changes to become active until the hot-reload config snapshot work lands.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: restart Layerline for those changes to become active until the hot-reload config snapshot work lands.
 
 ## Website and branding
 
