@@ -3670,6 +3670,56 @@ fn sendNotFoundForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream
     try sendCoolErrorWithConnection(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.", close_connection, is_head, null);
 }
 
+fn customErrorDocumentName(status_code: u16) ?[]const u8 {
+    return switch (status_code) {
+        404 => "404.html",
+        else => null,
+    };
+}
+
+fn readDomainCustomErrorDocument(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
+    status_code: u16,
+) !?[]u8 {
+    const name = customErrorDocumentName(status_code) orelse return null;
+    if (domain == null) return null;
+
+    const file_path = try std.fs.path.join(allocator, &.{ domainStaticDir(cfg, domain), name });
+    defer allocator.free(file_path);
+
+    const stat = statRegularFile(io, file_path) catch |err| {
+        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
+        return err;
+    };
+    if (stat.size > cfg.max_static_file_bytes) return null;
+
+    return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(cfg.max_static_file_bytes)) catch |err| {
+        if (err == error.StreamTooLong or err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
+        return err;
+    };
+}
+
+fn sendDomainCustomNotFoundForMethod(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
+    close_connection: bool,
+    is_head: bool,
+) !void {
+    if (try readDomainCustomErrorDocument(io, allocator, cfg, domain, 404)) |body| {
+        defer allocator.free(body);
+        try sendResponseForMethod(stream, 404, "Not Found", "text/html; charset=utf-8", body, close_connection, is_head);
+        return;
+    }
+
+    try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
+}
+
 fn sendBadRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8) !void {
     try sendCoolError(stream, allocator, 400, "Bad Request", reason);
 }
@@ -7322,6 +7372,18 @@ fn h2CoolErrorResponse(allocator: std.mem.Allocator, status_code: u16, status_te
     return .{ .status_code = status_code, .content_type = "text/html; charset=utf-8", .body = body };
 }
 
+fn h2DomainCustomNotFoundResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
+) !?H2BufferedResponse {
+    if (try readDomainCustomErrorDocument(io, allocator, cfg, domain, 404)) |body| {
+        return .{ .status_code = 404, .content_type = "text/html; charset=utf-8", .body = body };
+    }
+    return null;
+}
+
 fn h2TextResponse(status_code: u16, content_type: []const u8, body: []const u8) H2BufferedResponse {
     return .{ .status_code = status_code, .content_type = content_type, .body = body };
 }
@@ -7699,13 +7761,18 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
         {
             const rel = try makeStaticPathFromRequest(allocator, req.path, domainIndexFile(cfg, domain));
             accessLogSetHandler("static_root");
-            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
+            const response = try readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
+            if (response.status_code == 404) {
+                if (try h2DomainCustomNotFoundResponse(io, allocator, cfg, domain)) |custom| return custom;
+            }
+            return response;
         }
         if (domainUpstreamMutable(cfg, domain)) |pool| {
             accessLogSetHandler("domain_proxy");
             return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
         }
         accessLogSetHandler("not_found");
+        if (try h2DomainCustomNotFoundResponse(io, allocator, cfg, domain)) |custom| return custom;
         return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
     }
 
@@ -11625,7 +11692,7 @@ fn routeRequest(
         }
 
         accessLogSetHandler("not_found");
-        try sendNotFoundForMethod(allocator, stream, should_close, is_head);
+        try sendDomainCustomNotFoundForMethod(io, stream, allocator, cfg, domain, should_close, is_head);
         return;
     }
 
