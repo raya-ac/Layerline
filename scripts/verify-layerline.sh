@@ -21,6 +21,7 @@ SOCKET="$TMP_DIR/layerline-admin.sock"
 ADMIN_CREDS="$TMP_DIR/layerline-admin.creds"
 ACCESS_LOG="$TMP_DIR/access.log"
 SITE_DIR="$TMP_DIR/domains-enabled"
+CUSTOM_ROOT="$TMP_DIR/custom-root"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -92,7 +93,21 @@ compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
 CONF
-mkdir -p "$SITE_DIR"
+mkdir -p "$SITE_DIR" "$CUSTOM_ROOT"
+cat >"$CUSTOM_ROOT/index.html" <<'HTML'
+custom domain root
+HTML
+cat >"$CUSTOM_ROOT/404.html" <<'HTML'
+custom domain 404 page
+HTML
+cat >"$SITE_DIR/custom404.conf" <<CONF
+name = custom404
+server_name = custom404.test
+root = $CUSTOM_ROOT
+index = index.html
+serve_static_root = true
+php_info_page = false
+CONF
 
 log "starting temporary server on http://$HOST:$PORT"
 (
@@ -107,6 +122,14 @@ ROOT_BODY="$TMP_DIR/root.body"
 curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
 grep -Fq 'Layerline' "$ROOT_BODY" || die "root page did not contain Layerline"
 ok "HTTP/1 root page"
+
+REQUEST_ID_HEADERS="$TMP_DIR/request-id.headers"
+curl -fsS -D "$REQUEST_ID_HEADERS" -H 'X-Request-Id: verify-request-123' "http://$HOST:$PORT/health" >/dev/null
+header_has "$REQUEST_ID_HEADERS" '^X-Request-Id: verify-request-123' || die "HTTP/1 response did not preserve inbound X-Request-Id"
+GENERATED_REQUEST_ID_HEADERS="$TMP_DIR/generated-request-id.headers"
+curl -fsS -D "$GENERATED_REQUEST_ID_HEADERS" "http://$HOST:$PORT/health" >/dev/null
+header_has "$GENERATED_REQUEST_ID_HEADERS" '^X-Request-Id: ll-' || die "HTTP/1 response did not generate X-Request-Id"
+ok "HTTP/1 request id header"
 
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
@@ -140,6 +163,11 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="static-file"' || die "h2 static Cache-Status header missing"
   ok "h2c static cache status"
 
+  H2_REQUEST_ID_HEADERS="$TMP_DIR/h2-request-id.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_REQUEST_ID_HEADERS" -H 'X-Request-Id: verify-h2-request-123' "http://$HOST:$PORT/health" >/dev/null
+  header_has "$H2_REQUEST_ID_HEADERS" '^x-request-id: verify-h2-request-123' || die "h2 response did not preserve inbound X-Request-Id"
+  ok "h2c request id header"
+
   H2_HEADERS="$TMP_DIR/h2.headers"
   H2_BODY="$TMP_DIR/h2.body"
   curl -fsS --http2-prior-knowledge --raw -D "$H2_HEADERS" -o "$H2_BODY" -H 'Accept-Encoding: gzip' "$GZIP_URL"
@@ -164,6 +192,14 @@ printf 'HEAD /missing-head-check HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\
 grep -Fq '404 Not Found' "$HEAD_404_RAW" || die "HEAD 404 did not return 404"
 perl -0ne 'exit(/\r\n\r\n\z/ ? 0 : 1)' "$HEAD_404_RAW" || die "HEAD 404 response included a body"
 ok "HEAD 404 has no body"
+
+CUSTOM_404_BODY="$TMP_DIR/custom-404.body"
+CUSTOM_404_HEADERS="$TMP_DIR/custom-404.headers"
+CUSTOM_404_CODE=$(curl -sS -D "$CUSTOM_404_HEADERS" -o "$CUSTOM_404_BODY" -w '%{http_code}' -H 'Host: custom404.test' "http://$HOST:$PORT/missing-custom-page")
+[[ $CUSTOM_404_CODE == 404 ]] || die "domain custom 404 returned HTTP $CUSTOM_404_CODE"
+grep -Fq 'custom domain 404 page' "$CUSTOM_404_BODY" || die "domain custom 404 body was not served"
+header_has "$CUSTOM_404_HEADERS" '^X-Request-Id: ll-' || die "domain custom 404 did not include generated request id"
+ok "domain custom 404 document"
 
 ADMIN_STATUS=$(printf 'status\n' | nc -U "$SOCKET")
 case "$ADMIN_STATUS" in
@@ -255,6 +291,7 @@ ok "admin UI creates site configs"
 grep -Fq '"method":"GET"' "$ACCESS_LOG" || die "access log missing method"
 grep -Fq '"path":"/"' "$ACCESS_LOG" || die "access log missing root path"
 grep -Fq '"protocol":"HTTP/1.1"' "$ACCESS_LOG" || die "access log missing protocol"
+grep -Fq '"request_id":"verify-request-123"' "$ACCESS_LOG" || die "access log missing request id"
 grep -Fq '"status":200' "$ACCESS_LOG" || die "access log missing status"
 grep -Fq '"duration_ms":' "$ACCESS_LOG" || die "access log missing duration"
 grep -Fq '"handler":"admin_ui"' "$ACCESS_LOG" || die "access log missing admin UI handler"

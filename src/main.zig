@@ -126,9 +126,11 @@ threadlocal var current_io: ?std.Io = null;
 threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 threadlocal var current_request_headers: []const u8 = "";
+threadlocal var current_request_id: []const u8 = "";
 threadlocal var current_compression_policy: CompressionPolicy = .disabled;
 threadlocal var current_access_log: ?*AccessLogContext = null;
 var access_log_mutex: std.Io.Mutex = .init;
+var request_id_counter = std.atomic.Value(u64).init(0);
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
 
@@ -140,6 +142,7 @@ const AccessLogContext = struct {
     query: []const u8,
     protocol: []const u8,
     host: []const u8,
+    request_id: []const u8,
     start_ms: i64,
     handler: []const u8 = "routing",
     upstream: ?[]const u8 = null,
@@ -272,8 +275,15 @@ fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
     }
 }
 
+fn streamWriteRequestIdHeader(stream: std.Io.net.Stream) !void {
+    if (current_request_id.len == 0) return;
+    try streamWriteFmt(stream, "X-Request-Id: {s}\r\n", .{current_request_id});
+}
+
 fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
+    try streamWriteRequestIdHeader(stream);
     for (current_response_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "X-Request-Id")) continue;
         try streamWriteFmt(stream, "{s}: {s}\r\n", .{ header.name, header.value });
     }
 }
@@ -931,6 +941,37 @@ fn findHeaderValue(headers: []const u8, target_name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn isValidRequestId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        const valid = std.ascii.isAlphanumeric(byte) or
+            byte == '-' or
+            byte == '_' or
+            byte == '.' or
+            byte == ':' or
+            byte == '/' or
+            byte == '@';
+        if (!valid) return false;
+    }
+    return true;
+}
+
+fn requestIdFromHeaders(headers: []const u8) ?[]const u8 {
+    const raw = findHeaderValue(headers, "X-Request-Id") orelse return null;
+    const value = trimValue(raw);
+    if (!isValidRequestId(value)) return null;
+    return value;
+}
+
+fn resolveRequestId(allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {
+    if (requestIdFromHeaders(headers)) |request_id| return request_id;
+
+    const now_ms_raw = std.Io.Timestamp.now(activeIo(), .real).toMilliseconds();
+    const now_ms: u64 = if (now_ms_raw > 0) @intCast(now_ms_raw) else 0;
+    const sequence = request_id_counter.fetchAdd(1, .monotonic) + 1;
+    return try std.fmt.allocPrint(allocator, "ll-{x:0>16}-{x:0>16}", .{ now_ms, sequence });
+}
+
 fn http2SettingsDecodedLength(value: []const u8) ?usize {
     var len: usize = 0;
     for (value) |byte| {
@@ -1088,7 +1129,8 @@ fn isSkippedCgiResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Trailers") or
         std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
         std.ascii.eqlIgnoreCase(name, "Upgrade") or
-        std.ascii.eqlIgnoreCase(name, "Server");
+        std.ascii.eqlIgnoreCase(name, "Server") or
+        std.ascii.eqlIgnoreCase(name, "X-Request-Id");
 }
 
 fn buildCgiExtraHeaders(allocator: std.mem.Allocator, headers: []const u8) !?[]u8 {
@@ -1130,6 +1172,7 @@ fn putCgiRequestHeaders(
             const value = trimValue(line[colon + 1 ..]);
             if (name.len == 0) continue;
             if (std.ascii.eqlIgnoreCase(name, "Content-Type") or std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+            if (std.ascii.eqlIgnoreCase(name, "X-Request-Id")) continue;
 
             var env_name = std.ArrayList(u8).empty;
             defer env_name.deinit(allocator);
@@ -5584,6 +5627,7 @@ fn emitAccessLog(status_code: u16, body_bytes: usize) void {
     appendJsonStringField(&out, allocator, "query", ctx.query, true) catch return;
     appendJsonStringField(&out, allocator, "host", ctx.host, true) catch return;
     appendJsonStringField(&out, allocator, "protocol", ctx.protocol, true) catch return;
+    appendJsonStringField(&out, allocator, "request_id", ctx.request_id, true) catch return;
     appendJsonNumberField(&out, allocator, "status", status_code, true) catch return;
     appendJsonNumberField(&out, allocator, "bytes", body_bytes, true) catch return;
     appendJsonNumberField(&out, allocator, "duration_ms", duration_ms, true) catch return;
@@ -7294,7 +7338,8 @@ fn isSkippedHttp2ResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "te") or
         std.ascii.eqlIgnoreCase(name, "trailer") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "upgrade");
+        std.ascii.eqlIgnoreCase(name, "upgrade") or
+        std.ascii.eqlIgnoreCase(name, "x-request-id");
 }
 
 fn lowerHeaderName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
@@ -7337,6 +7382,9 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
     const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
     const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{body_len});
     try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
+    if (current_request_id.len > 0) {
+        try appendHttp2Header(allocator, &header_block, "x-request-id", current_request_id);
+    }
 
     for (response.headers) |header| {
         if (isSkippedHttp2ResponseHeader(header.name)) continue;
@@ -7348,6 +7396,7 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
     }
     for (current_response_headers) |header| {
         if (isSkippedHttp2ResponseHeader(header.name)) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "x-request-id")) continue;
         try appendHttp2Header(allocator, &header_block, header.name, header.value);
     }
 
@@ -7519,6 +7568,7 @@ fn appendForwardedRequestHeaders(allocator: std.mem.Allocator, out: *std.ArrayLi
     }
     if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{trimValue(forwarded_host)});
     if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
+    if (current_request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{current_request_id});
 }
 
 fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, max_bytes: usize) ![]u8 {
@@ -7927,9 +7977,12 @@ fn sendCompletedHttp2Request(
     current_compression_policy = compressionPolicyFromConfig(cfg);
     defer {
         current_request_headers = "";
+        current_request_id = "";
         current_compression_policy = .disabled;
         current_response_headers = &.{};
     }
+    const request_id = try resolveRequestId(allocator, req.headers);
+    current_request_id = request_id;
 
     var access_ctx = AccessLogContext{
         .enabled = cfg.access_log_enabled,
@@ -7939,6 +7992,7 @@ fn sendCompletedHttp2Request(
         .query = req.query,
         .protocol = req.version,
         .host = findHeaderValue(req.headers, "Host") orelse "",
+        .request_id = request_id,
         .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
     };
     current_access_log = &access_ctx;
@@ -8219,9 +8273,10 @@ fn handleHttp2Upgrade(
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Server: " ++ SERVER_HEADER ++ "\r\n" ++
             "Connection: Upgrade\r\n" ++
-            "Upgrade: h2c\r\n" ++
-            "\r\n",
+            "Upgrade: h2c\r\n",
     );
+    try streamWriteRequestIdHeader(stream);
+    try streamWriteAll(stream, "\r\n");
     server_metrics.responseSent(101, 0);
 
     try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
@@ -8674,7 +8729,8 @@ fn isSkippedProxyHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Trailers") or
         std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
         std.ascii.eqlIgnoreCase(name, "Upgrade") or
-        std.ascii.eqlIgnoreCase(name, "Host");
+        std.ascii.eqlIgnoreCase(name, "Host") or
+        std.ascii.eqlIgnoreCase(name, "X-Request-Id");
 }
 
 fn isHttpUpgradeRequest(req: HttpRequest) bool {
@@ -8690,7 +8746,8 @@ fn isSkippedProxyResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Proxy-Authorization") or
         std.ascii.eqlIgnoreCase(name, "TE") or
         std.ascii.eqlIgnoreCase(name, "Trailers") or
-        std.ascii.eqlIgnoreCase(name, "Upgrade");
+        std.ascii.eqlIgnoreCase(name, "Upgrade") or
+        std.ascii.eqlIgnoreCase(name, "X-Request-Id");
 }
 
 const UpstreamConnectionLease = struct {
@@ -9199,6 +9256,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     // values when a trusted frontend has already set them.
     if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{forwarded_host});
     if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
+    if (current_request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{current_request_id});
 
     if (upgrade_request and req.body.len == 0) {
         try out.appendSlice(allocator, "\r\n");
@@ -9599,6 +9657,7 @@ fn appendFastcgiRequestHeaders(allocator: std.mem.Allocator, params: *std.ArrayL
             const value = trimValue(line[colon + 1 ..]);
             if (name.len == 0) continue;
             if (std.ascii.eqlIgnoreCase(name, "Content-Type") or std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+            if (std.ascii.eqlIgnoreCase(name, "X-Request-Id")) continue;
 
             var env_name = std.ArrayList(u8).empty;
             defer env_name.deinit(allocator);
@@ -9668,6 +9727,7 @@ fn buildPhpFastcgiParams(
     try appendFastcgiParam(&params, allocator, "CONTENT_TYPE", findHeaderValue(req.headers, "Content-Type") orelse "");
     try appendFastcgiParam(&params, allocator, "FCGI_ROLE", "RESPONDER");
     try appendFastcgiRequestHeaders(allocator, &params, req.headers);
+    if (current_request_id.len > 0) try appendFastcgiParam(&params, allocator, "HTTP_X_REQUEST_ID", current_request_id);
 
     return params.toOwnedSlice(allocator);
 }
@@ -10117,6 +10177,7 @@ fn handlePhpScript(
     try child_env.put("CONTENT_LENGTH", content_length);
     try child_env.put("CONTENT_TYPE", findHeaderValue(req.headers, "Content-Type") orelse "");
     try putCgiRequestHeaders(allocator, &child_env, req.headers);
+    if (current_request_id.len > 0) try child_env.put("HTTP_X_REQUEST_ID", current_request_id);
 
     // PHP-CGI wants the script in the CGI environment. Plain `php` gets a
     // script argument as a fallback for local development setups.
@@ -11088,6 +11149,15 @@ test "static cache headers include cache status detail" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n") != null);
 }
 
+test "request id validation preserves safe inbound ids" {
+    try std.testing.expect(isValidRequestId("client-123_abc.DEF:/@"));
+    try std.testing.expect(!isValidRequestId(""));
+    try std.testing.expect(!isValidRequestId("bad id"));
+    try std.testing.expect(!isValidRequestId("bad\r\nid"));
+    try std.testing.expectEqualStrings("client-123", requestIdFromHeaders("Host: example.test\r\nX-Request-Id: client-123\r\n").?);
+    try std.testing.expect(requestIdFromHeaders("X-Request-Id: invalid value\r\n") == null);
+}
+
 test "chunked upstream body scanner detects trailers and terminator" {
     var scanner = ChunkedBodyScanner{};
     var completed = false;
@@ -11897,6 +11967,7 @@ fn handleHttpRedirectConnection(
     };
     req.close_connection = true;
     server_metrics.requestStarted();
+    const request_id = try resolveRequestId(req_alloc, req.headers);
 
     var access_ctx = AccessLogContext{
         .enabled = cfg.access_log_enabled,
@@ -11906,10 +11977,15 @@ fn handleHttpRedirectConnection(
         .query = req.query,
         .protocol = req.version,
         .host = findHeaderValue(req.headers, "Host") orelse "",
+        .request_id = request_id,
         .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
     };
+    current_request_id = request_id;
     current_access_log = &access_ctx;
-    defer current_access_log = null;
+    defer {
+        current_access_log = null;
+        current_request_id = "";
+    }
 
     routeHttpRedirectRequest(io, stream, req_alloc, cfg, req) catch |err| {
         accessLogSetError(@errorName(err));
@@ -12180,6 +12256,7 @@ fn handleConnection(
         server_metrics.requestStarted();
 
         {
+            const request_id = try resolveRequestId(req_alloc, req.headers);
             var access_ctx = AccessLogContext{
                 .enabled = cfg.access_log_enabled,
                 .sink = cfg.access_log_path,
@@ -12188,10 +12265,15 @@ fn handleConnection(
                 .query = req.query,
                 .protocol = req.version,
                 .host = findHeaderValue(req.headers, "Host") orelse "",
+                .request_id = request_id,
                 .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
             };
+            current_request_id = request_id;
             current_access_log = &access_ctx;
-            defer current_access_log = null;
+            defer {
+                current_access_log = null;
+                current_request_id = "";
+            }
 
             if (req.h2c_upgrade_tail.len > 0 or isH2cUpgradeHeaders(req.headers)) {
                 accessLogSetHandler("h2c_upgrade");

@@ -79,7 +79,7 @@ For file-based collection, write JSON lines to `/var/log/layerline/access.log` a
 access_log = /var/log/layerline/access.log
 ```
 
-Use `journalctl -u layerline` for startup, parse, and renewal errors. Use the access log for request-level fields such as method, path, protocol, status, bytes, latency, handler, and upstream target.
+Use `journalctl -u layerline` for startup, parse, and renewal errors. Use the access log for request-level fields such as request ID, method, path, protocol, status, bytes, latency, handler, and upstream target.
 
 ## Kernel and Limits
 
