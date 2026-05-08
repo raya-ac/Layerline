@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const access_log_mod = @import("access_log.zig");
+const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
 const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
@@ -65,22 +66,11 @@ const isSkippedCgiResponseHeader = cgi_headers.isSkippedResponseHeader;
 const parseCgiStatus = cgi_headers.parseStatus;
 const putCgiRequestHeaders = cgi_headers.putRequestHeaders;
 const splitCgiHeaderBlock = cgi_headers.splitHeaderBlock;
-const appendAdminShellStart = admin_ui_mod.appendAdminShellStart;
-const appendAdminShellEnd = admin_ui_mod.appendAdminShellEnd;
-const appendAdminNotice = admin_ui_mod.appendAdminNotice;
 const renderAdminSetupPage = admin_ui_mod.renderAdminSetupPage;
 const renderAdminLoginPage = admin_ui_mod.renderAdminLoginPage;
-const appendAdminActiveSites = admin_ui_mod.appendAdminActiveSites;
-const appendAdminDomainFiles = admin_ui_mod.appendAdminDomainFiles;
-const appendAdminSettingsForm = admin_ui_mod.appendAdminSettingsForm;
-const appendAdminAddSiteForm = admin_ui_mod.appendAdminAddSiteForm;
 const AdminConfigSetting = admin_support.AdminConfigSetting;
 const AdminCredentials = admin_support.AdminCredentials;
 const FormField = admin_support.FormField;
-const ADMIN_SITE_CONFIG_MAX_BYTES = admin_support.ADMIN_SITE_CONFIG_MAX_BYTES;
-const ADMIN_MAIN_CONFIG_MAX_BYTES = admin_support.ADMIN_MAIN_CONFIG_MAX_BYTES;
-const appendHtmlEscaped = admin_support.appendHtmlEscaped;
-const appendRedactedConfigEscaped = admin_support.appendRedactedConfigEscaped;
 const adminTrimmedField = admin_support.adminTrimmedField;
 const adminCheckboxEnabled = admin_support.adminCheckboxEnabled;
 const validateAdminSettingsPatch = admin_support.validateAdminSettingsPatch;
@@ -1200,112 +1190,8 @@ fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_co
     try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
 }
 
-fn renderAdminStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"server\":\"{s}\",\"host\":\"{s}\",\"port\":{d},\"http_redirect\":{},\"http_redirect_port\":{d},\"http_redirect_https_port\":{d},\"http3\":{},\"compression\":{},\"admin\":{},\"admin_ui\":{},\"tls\":{},\"tls_auto\":{},\"acme_renew\":{},\"active_connections\":{d},\"requests_total\":{d},\"responses_total\":{d}}}\n",
-        .{
-            SERVER_NAME,
-            cfg.host,
-            cfg.port,
-            cfg.http_redirect_enabled,
-            cfg.http_redirect_port,
-            cfg.http_redirect_https_port,
-            cfg.http3_enabled,
-            cfg.compression_enabled,
-            cfg.admin_enabled,
-            cfg.admin_ui_enabled,
-            cfg.tls_enabled,
-            cfg.tls_auto,
-            cfg.letsencrypt_renew,
-            ServerMetrics.load(&server_metrics.active_connections),
-            ServerMetrics.load(&server_metrics.requests_total),
-            ServerMetrics.load(&server_metrics.responses_total),
-        },
-    );
-}
-
-fn renderAdminRoutes(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    try out.print(allocator, "global host={s} port={d} static_dir={s} index={s}\n", .{ cfg.host, cfg.port, cfg.static_dir, cfg.index_file });
-    if (cfg.http_redirect_enabled) {
-        try out.print(allocator, "http_redirect port={d} https_port={d} status={d} webroot={s}\n", .{ cfg.http_redirect_port, cfg.http_redirect_https_port, cfg.http_redirect_status, cfg.letsencrypt_webroot });
-    }
-    for (cfg.routes.items) |route| {
-        try out.print(allocator, "route {s}: {s} {s} -> {s}\n", .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) });
-    }
-    for (cfg.domains.items) |domain| {
-        try out.print(allocator, "server {s} names=", .{domain.name});
-        for (domain.server_names.items, 0..) |name, index| {
-            if (index > 0) try out.append(allocator, ',');
-            try out.appendSlice(allocator, name);
-        }
-        try out.print(allocator, " root={s} index={s}\n", .{ domainStaticDir(cfg, &domain), domainIndexFile(cfg, &domain) });
-        for (domain.routes.items) |route| {
-            try out.print(allocator, "  route {s}: {s} {s} -> {s}\n", .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) });
-        }
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn boolText(value: bool) []const u8 {
-    return if (value) "true" else "false";
-}
-
-fn optionalPath(value: ?[]const u8) []const u8 {
-    return value orelse "<none>";
-}
-
-fn renderAdminCerts(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    try out.print(
-        allocator,
-        "global tls={s} tls_auto={s} renew={s} renew_interval_ms={d} cert={s} key={s}\n",
-        .{
-            boolText(cfg.tls_enabled),
-            boolText(cfg.tls_auto),
-            boolText(cfg.letsencrypt_renew),
-            cfg.letsencrypt_renew_interval_ms,
-            optionalPath(cfg.tls_cert),
-            if (cfg.tls_key != null) "<configured>" else "<none>",
-        },
-    );
-    try out.print(
-        allocator,
-        "acme renewals={d} successes={d} failures={d} certbot={s} webroot={s} staging={s}\n",
-        .{
-            ServerMetrics.load(&server_metrics.acme_renewals_total),
-            ServerMetrics.load(&server_metrics.acme_renewal_successes_total),
-            ServerMetrics.load(&server_metrics.acme_renewal_failures_total),
-            cfg.letsencrypt_certbot,
-            cfg.letsencrypt_webroot,
-            boolText(cfg.letsencrypt_staging),
-        },
-    );
-
-    for (cfg.domains.items) |domain| {
-        try out.print(
-            allocator,
-            "server {s} cert={s} key={s} names=",
-            .{
-                domain.name,
-                optionalPath(domain.tls_cert),
-                if (domain.tls_key != null) "<configured>" else "<none>",
-            },
-        );
-        for (domain.server_names.items, 0..) |name, index| {
-            if (index > 0) try out.append(allocator, ',');
-            try out.appendSlice(allocator, name);
-        }
-        try out.append(allocator, '\n');
-    }
-
-    return out.toOwnedSlice(allocator);
+fn adminRuntimeView() admin_pages.RuntimeView {
+    return .{ .server_name = SERVER_NAME, .metrics = &server_metrics };
 }
 
 fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool) !void {
@@ -1321,107 +1207,6 @@ fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cf
     } else {
         try sendResponseWithConnectionAndHeaders(stream, 303, "See Other", "text/plain; charset=utf-8", body, close_connection, extra_headers);
     }
-}
-
-fn appendAdminMainConfigPreview(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
-    try out.appendSlice(allocator,
-        \\<section class="block span-all" id="config">
-        \\  <div class="section-head"><div><h2>Config management</h2><p>Activation preflight plus redacted previews of the main config and enabled site files.</p></div><span class="pill">managed restart applies writes</span></div>
-        \\
-    );
-    try out.appendSlice(allocator, "<pre>");
-    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "ERROR activation config invalid: {}\n", .{err});
-        defer allocator.free(message);
-        try appendHtmlEscaped(out, allocator, message);
-        try out.appendSlice(allocator, "</pre></section>\n");
-        return;
-    };
-    try appendHtmlEscaped(out, allocator, "OK activation config\n");
-    try appendHtmlEscaped(out, allocator, "main_config = ");
-    try appendHtmlEscaped(out, allocator, cfg.config_path);
-    try appendHtmlEscaped(out, allocator, "\n");
-    if (cfg.domain_config_dir) |dir| {
-        try appendHtmlEscaped(out, allocator, "domain_config_dir = ");
-        try appendHtmlEscaped(out, allocator, dir);
-        try appendHtmlEscaped(out, allocator, "\n");
-    } else {
-        try appendHtmlEscaped(out, allocator, "domain_config_dir is not configured\n");
-    }
-    try out.appendSlice(allocator, "</pre>\n");
-
-    const content = std.Io.Dir.cwd().readFileAlloc(io, cfg.config_path, allocator, .limited(ADMIN_MAIN_CONFIG_MAX_BYTES)) catch |err| switch (err) {
-        error.FileNotFound => {
-            try out.appendSlice(allocator, "<p class=\"notice\">The main config file does not exist yet. Saving settings will create it.</p></section>\n");
-            return;
-        },
-        error.FileTooBig => {
-            try out.appendSlice(allocator, "<p class=\"notice error\">The main config is too large to preview safely.</p></section>\n");
-            return;
-        },
-        else => return err,
-    };
-    defer allocator.free(content);
-
-    try out.appendSlice(allocator, "<details class=\"config-file\" open><summary><code>");
-    try appendHtmlEscaped(out, allocator, cfg.config_path);
-    try out.appendSlice(allocator, "</code><span class=\"muted\">redacted preview</span></summary><pre>");
-    try appendRedactedConfigEscaped(out, allocator, content);
-    try out.appendSlice(allocator, "</pre></details></section>\n");
-}
-
-fn renderAdminDashboardPage(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, maybe_notice: ?[]const u8, maybe_error: ?[]const u8) ![]const u8 {
-    const status = try renderAdminStatus(allocator, cfg);
-    defer allocator.free(status);
-    const routes = try renderAdminRoutes(allocator, cfg);
-    defer allocator.free(routes);
-    const certs = try renderAdminCerts(allocator, cfg);
-    defer allocator.free(certs);
-    const metrics = try metrics_mod.render(allocator, &server_metrics);
-    defer allocator.free(metrics);
-
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendAdminShellStart(&out, allocator, cfg, "Dashboard");
-    try out.appendSlice(allocator, "<h1>Control surface</h1>\n<p class=\"lede\">Manage site files, inspect the live route table, validate config, and see the runtime state from the same Layerline process handling traffic.</p>\n");
-    try out.appendSlice(allocator, "<div class=\"dashboard\">\n");
-    try out.appendSlice(allocator, "<div class=\"actions\"><form method=\"post\" action=\"");
-    try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
-    try out.appendSlice(allocator, "/validate\"><button type=\"submit\">Validate config</button></form><form method=\"post\" action=\"");
-    try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
-    try out.appendSlice(allocator, "/restart\"><button type=\"submit\">Graceful restart</button></form><form method=\"post\" action=\"");
-    try appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
-    try out.appendSlice(allocator, "/logout\"><button type=\"submit\">Log out</button></form></div>\n");
-    if (maybe_notice) |message| try appendAdminNotice(&out, allocator, "", message);
-    if (maybe_error) |message| try appendAdminNotice(&out, allocator, "error", message);
-    try out.appendSlice(allocator, "<div class=\"grid\">\n");
-    try out.print(allocator, "<div class=\"metric\"><span>admin user</span><strong>", .{});
-    try appendHtmlEscaped(&out, allocator, credentials.username);
-    try out.appendSlice(allocator, "</strong></div>\n");
-    try out.print(allocator, "<div class=\"metric\"><span>listener</span><strong>{s}:{d}</strong></div>\n", .{ cfg.host, cfg.port });
-    try out.print(allocator, "<div class=\"metric\"><span>http redirect</span><strong>{s}</strong></div>\n", .{if (cfg.http_redirect_enabled) "on" else "off"});
-    try out.print(allocator, "<div class=\"metric\"><span>sites active</span><strong>{d}</strong></div>\n", .{cfg.domains.items.len});
-    try out.print(allocator, "<div class=\"metric\"><span>requests</span><strong>{d}</strong></div>\n", .{ServerMetrics.load(&server_metrics.requests_total)});
-    try out.appendSlice(allocator, "</div>\n");
-
-    try out.appendSlice(allocator, "<div class=\"workspace\">\n");
-    try appendAdminActiveSites(&out, allocator, cfg);
-    try appendAdminSettingsForm(&out, allocator, cfg);
-    try appendAdminAddSiteForm(&out, allocator, cfg);
-    try appendAdminMainConfigPreview(io, &out, allocator, cfg);
-    try appendAdminDomainFiles(io, &out, allocator, cfg);
-
-    try out.appendSlice(allocator, "<section class=\"block\" id=\"status\"><h2>Status</h2><pre>");
-    try appendHtmlEscaped(&out, allocator, status);
-    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"routes\"><h2>Routes</h2><pre>");
-    try appendHtmlEscaped(&out, allocator, routes);
-    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><h2>Certificates</h2><pre>");
-    try appendHtmlEscaped(&out, allocator, certs);
-    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"metrics\"><h2>Metrics</h2><pre>");
-    try appendHtmlEscaped(&out, allocator, metrics);
-    try out.appendSlice(allocator, "</pre></section>\n</div>\n</div>\n");
-    try appendAdminShellEnd(&out, allocator);
-    return out.toOwnedSlice(allocator);
 }
 
 fn sendAdminPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
@@ -1459,7 +1244,7 @@ fn sendAdminDashboardPage(
     close_connection: bool,
     is_head: bool,
 ) !void {
-    const body = try renderAdminDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error);
+    const body = try admin_pages.renderDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error, adminRuntimeView(), validateConfigFileForActivation);
     defer allocator.free(body);
     try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
 }
@@ -1820,7 +1605,7 @@ fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
     }
 
     if (std.mem.eql(u8, command, "status")) {
-        const body = try renderAdminStatus(allocator, cfg);
+        const body = try admin_pages.renderStatus(allocator, cfg, adminRuntimeView());
         defer allocator.free(body);
         try sendAdminText(stream, body);
         return;
@@ -1861,14 +1646,14 @@ fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
     }
 
     if (std.mem.eql(u8, command, "routes")) {
-        const body = try renderAdminRoutes(allocator, cfg);
+        const body = try admin_pages.renderRoutes(allocator, cfg);
         defer allocator.free(body);
         try sendAdminText(stream, body);
         return;
     }
 
     if (std.mem.eql(u8, command, "certs") or std.mem.eql(u8, command, "certificates")) {
-        const body = try renderAdminCerts(allocator, cfg);
+        const body = try admin_pages.renderCerts(allocator, cfg, adminRuntimeView());
         defer allocator.free(body);
         try sendAdminText(stream, body);
         return;
