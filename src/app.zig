@@ -1,6 +1,7 @@
 const std = @import("std");
 const admin_http = @import("admin_http.zig");
 const access_log_mod = @import("access_log.zig");
+const acme_renewal = @import("acme_renewal.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
@@ -36,7 +37,7 @@ const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const tls_accept = @import("tls_accept.zig");
-const tls_pem = @import("tls_pem.zig");
+const tls_material = @import("tls_material.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
 
@@ -230,73 +231,12 @@ fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
     try http1_responses.writeConfiguredResponseHeaders(stream, http1ResponseContext());
 }
 
-const LetsEncryptRenewalContext = struct {
-    io: std.Io,
-    cfg: *const ServerConfig,
-};
-
-fn sleepUntilShutdown(io: std.Io, total_ms: u32) bool {
-    var remaining = total_ms;
-    while (remaining > 0 and !shutdown_requested.load(.acquire)) {
-        const step_ms: u32 = @min(@as(u32, 1_000), remaining);
-        io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
-        remaining -= step_ms;
-    }
-    return shutdown_requested.load(.acquire);
-}
-
-fn letsEncryptRenewalTask(ctx: LetsEncryptRenewalContext) void {
-    bindThreadIo(ctx.io);
-    std.debug.print("Let's Encrypt renewal loop: interval={d}ms webroot={s}\n", .{ ctx.cfg.letsencrypt_renew_interval_ms, ctx.cfg.letsencrypt_webroot });
-
-    while (!shutdown_requested.load(.acquire)) {
-        if (sleepUntilShutdown(ctx.io, ctx.cfg.letsencrypt_renew_interval_ms)) break;
-        acme_mod.runLetsEncryptRenewal(ctx.io, std.heap.page_allocator, ctx.cfg, &server_metrics) catch |err| {
-            std.debug.print("Let's Encrypt renewal failed: {}\n", .{err});
-        };
-    }
-}
-
-fn loadConfiguredTlsMaterial(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    cert_path: []const u8,
-    key_path: []const u8,
-) !tls_pem.ConfiguredTlsMaterial {
-    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cert_path, allocator, .limited(512 * 1024));
-    defer allocator.free(cert_pem);
-    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(128 * 1024));
-    defer allocator.free(key_pem);
-    return tls_pem.loadMaterialFromPem(allocator, cert_pem, key_pem);
-}
-
 fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
-    if (cfg.tls_enabled) {
-        if (cfg.tls_cert == null and cfg.tls_key == null) {
-            std.debug.print("TLS enabled without cert/key; native TLS will use an ephemeral self-signed certificate.\n", .{});
-        } else if (cfg.tls_cert == null or cfg.tls_key == null) {
-            return error.InvalidTlsConfig;
-        } else {
-            cfg.tls_material = try loadConfiguredTlsMaterial(io, allocator, cfg.tls_cert.?, cfg.tls_key.?);
-            std.debug.print("Native TLS certificate loaded from {s}\n", .{cfg.tls_cert.?});
-        }
-    }
-
-    for (cfg.domains.items) |*domain| {
-        if (domain.tls_cert == null and domain.tls_key == null) continue;
-        if (domain.tls_cert == null or domain.tls_key == null) return error.InvalidTlsConfig;
-        domain.tls_material = try loadConfiguredTlsMaterial(io, allocator, domain.tls_cert.?, domain.tls_key.?);
-        std.debug.print("Native TLS certificate loaded for {s} from {s}\n", .{ domain.name, domain.tls_cert.? });
-    }
+    return tls_material.loadAll(io, allocator, cfg);
 }
 
 fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
-    if (cfg.tls_material) |*material| material.deinit(allocator);
-    cfg.tls_material = null;
-    for (cfg.domains.items) |*domain| {
-        if (domain.tls_material) |*material| material.deinit(allocator);
-        domain.tls_material = null;
-    }
+    tls_material.deinitAll(allocator, cfg);
 }
 
 var server_metrics = ServerMetrics.init();
@@ -1360,7 +1300,13 @@ pub fn main(init: std.process.Init) !void {
         admin_worker.detach();
     }
     if (cfg.tls_auto and cfg.letsencrypt_renew) {
-        const acme_worker = std.Thread.spawn(.{}, letsEncryptRenewalTask, .{LetsEncryptRenewalContext{ .io = init.io, .cfg = &cfg }}) catch |err| {
+        const acme_worker = std.Thread.spawn(.{}, acme_renewal.renewalTask, .{acme_renewal.Context{
+            .io = init.io,
+            .cfg = &cfg,
+            .metrics = &server_metrics,
+            .shutdown_requested = &shutdown_requested,
+            .bind_thread_io = bindThreadIo,
+        }}) catch |err| {
             std.debug.print("Failed to start Let's Encrypt renewal loop: {}\n", .{err});
             return;
         };
