@@ -9,11 +9,11 @@ const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
-const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
 const http2_content = @import("http2_content.zig");
+const http2_router = @import("http2_router.zig");
 const http2_upstream = @import("http2_upstream.zig");
 const http1_router = @import("http1_router.zig");
 const http1_responses = @import("http1_responses.zig");
@@ -39,10 +39,7 @@ const tls_pem = @import("tls_pem.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
 
-const findRedirectRule = routing_mod.findRedirectRule;
-const makeStaticPathFromRequest = routing_mod.makeStaticPathFromRequest;
 const findNamedRoute = routing_mod.findNamedRoute;
-const findNamedRouteMutable = routing_mod.findNamedRouteMutable;
 const findDomainForHost = routing_mod.findDomainForHost;
 const findDomainForHostMutable = routing_mod.findDomainForHostMutable;
 const findDomainForRequest = routing_mod.findDomainForRequest;
@@ -64,9 +61,7 @@ const domainUpstreamPolicy = routing_mod.domainUpstreamPolicy;
 const routeUpstreamPolicy = routing_mod.routeUpstreamPolicy;
 const domainUpstreamTimeoutMs = routing_mod.domainUpstreamTimeoutMs;
 const routeUpstreamTimeoutMs = routing_mod.routeUpstreamTimeoutMs;
-const findDomainRedirectRule = routing_mod.findDomainRedirectRule;
 const findDomainRoute = routing_mod.findDomainRoute;
-const findDomainRouteMutable = routing_mod.findDomainRouteMutable;
 const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
@@ -79,7 +74,6 @@ const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
 const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
 const ServerMetrics = metrics_mod.ServerMetrics;
 const isSkippedProxyResponseHeader = proxy_utils.isSkippedProxyResponseHeader;
-const makePhpFrontControllerTarget = fastcgi.makePhpFrontControllerTarget;
 const ByteRange = static_files.ByteRange;
 const acceptsContentCoding = static_files.acceptsContentCoding;
 const etagMatches = static_files.etagMatches;
@@ -118,7 +112,6 @@ const DomainConfig = config_mod.DomainConfig;
 const ServerConfig = config_mod.ServerConfig;
 const ResponseHeaderContext = config_mod.ResponseHeaderContext;
 const defaultServerConfig = config_mod.defaultServerConfig;
-const buildResponseHeaderContext = config_mod.buildResponseHeaderContext;
 const compressionPolicyFromConfig = config_mod.compressionPolicyFromConfig;
 const responseHeaderRulesContain = config_mod.responseHeaderRulesContain;
 const parseBool = config_mod.parseBool;
@@ -851,170 +844,7 @@ fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamP
 }
 
 fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
-    _ = process_env;
-    const is_head = std.mem.eql(u8, req.method, "HEAD");
-    const domain = findDomainForRequestMutable(cfg, req.headers);
-    const base_header_context = try buildResponseHeaderContext(allocator, cfg, domain, null);
-    current_response_headers = base_header_context.items;
-
-    if (findDomainRedirectRule(domain, req.path)) |redirect| {
-        accessLogSetHandler("domain_redirect");
-        return buildHttp2RedirectResponse(allocator, redirect, req);
-    }
-    if (findRedirectRule(cfg, req.path)) |redirect| {
-        accessLogSetHandler("redirect");
-        return buildHttp2RedirectResponse(allocator, redirect, req);
-    }
-
-    if (findDomainRouteMutable(domain, req.path)) |route| {
-        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
-        current_response_headers = route_header_context.items;
-        return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
-    }
-    if (findNamedRouteMutable(cfg, req.path)) |route| {
-        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
-        current_response_headers = route_header_context.items;
-        return buildHttp2RouteResponse(io, allocator, cfg, domain, route, req);
-    }
-
-    if ((std.mem.eql(u8, req.method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
-        accessLogSetHandler("acme_challenge");
-        return readAcmeChallengeForHttp2(io, allocator, cfg, req.path["/.well-known/acme-challenge/".len..]);
-    }
-
-    if (domain != null) {
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
-        }
-    }
-
-    if (std.mem.eql(u8, req.method, "GET") or is_head) {
-        if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
-            accessLogSetHandler("builtin_asset");
-            return h2_support.textResponse(200, "image/svg+xml", server_assets.SERVER_ICON_SVG);
-        }
-        if (std.mem.eql(u8, req.path, "/") and domainServeStaticRoot(cfg, domain)) {
-            accessLogSetHandler("static_root");
-            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), domainIndexFile(cfg, domain), cfg.max_static_file_bytes);
-        }
-        if (std.mem.eql(u8, req.path, "/")) {
-            accessLogSetHandler("builtin_root");
-            return h2_support.textResponse(200, "text/html; charset=utf-8", server_assets.H2_DEFAULT_PAGE);
-        }
-        if (std.mem.eql(u8, req.path, "/health")) {
-            accessLogSetHandler("health");
-            return h2_support.textResponse(200, "text/plain; charset=utf-8", "ok\n");
-        }
-        if (std.mem.eql(u8, req.path, "/metrics")) {
-            accessLogSetHandler("metrics");
-            return .{ .status_code = 200, .content_type = "text/plain; version=0.0.4; charset=utf-8", .body = try metrics_mod.render(allocator, &server_metrics) };
-        }
-        if (std.mem.eql(u8, req.path, "/time")) {
-            accessLogSetHandler("time");
-            return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()}) };
-        }
-        if (std.mem.eql(u8, req.path, "/api/echo")) {
-            accessLogSetHandler("api_echo");
-            if (request_mod.findQueryValue(req.query, "msg")) |msg| {
-                return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg}) };
-            }
-            return h2_support.textResponse(200, "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n");
-        }
-        if (std.mem.startsWith(u8, req.path, "/static/")) {
-            accessLogSetHandler("static");
-            return readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), req.path["/static/".len..], cfg.max_static_file_bytes);
-        }
-        if (domainServeStaticRoot(cfg, domain) and
-            !std.mem.startsWith(u8, req.path, "/api/") and
-            !std.mem.startsWith(u8, req.path, "/php/") and
-            !std.mem.eql(u8, req.path, "/health") and
-            !std.mem.eql(u8, req.path, "/time") and
-            !std.mem.eql(u8, req.path, "/"))
-        {
-            const rel = try makeStaticPathFromRequest(allocator, req.path, domainIndexFile(cfg, domain));
-            accessLogSetHandler("static_root");
-            const response = try readStaticFileForHttp2(io, allocator, domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
-            if (response.status_code == 404) {
-                if (try h2DomainCustomNotFoundResponse(io, allocator, cfg, domain)) |custom| return custom;
-            }
-            return response;
-        }
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
-        }
-        accessLogSetHandler("not_found");
-        if (try h2DomainCustomNotFoundResponse(io, allocator, cfg, domain)) |custom| return custom;
-        return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
-    }
-
-    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/api/echo")) {
-        accessLogSetHandler("api_echo");
-        return .{ .status_code = 200, .content_type = "text/plain; charset=utf-8", .body = req.body };
-    }
-    if (std.mem.eql(u8, req.method, "OPTIONS")) {
-        accessLogSetHandler("options");
-        const headers = try allocator.alloc(h2_native.Header, 1);
-        headers[0] = .{ .name = "allow", .value = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS" };
-        return .{ .status_code = 204, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headers };
-    }
-    if (domainUpstreamMutable(cfg, domain)) |pool| {
-        accessLogSetHandler("domain_proxy");
-        return fetchHttp2UpstreamPoolResponse(allocator, pool, domainUpstreamPolicy(cfg, domain), req, cfg);
-    }
-    accessLogSetHandler("not_implemented");
-    return h2CoolErrorResponse(allocator, 501, "Not Implemented", "This server has not implemented that HTTP/2 behavior yet.");
-}
-
-fn buildHttp2RouteResponse(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, domain: ?*DomainConfig, route: *RouteConfig, req: HttpRequest) !H2BufferedResponse {
-    const is_head = std.mem.eql(u8, req.method, "HEAD");
-    switch (route.handler) {
-        .static => {
-            accessLogSetHandler("route_static");
-            if (std.mem.eql(u8, req.method, "OPTIONS")) {
-                const headers = try allocator.alloc(h2_native.Header, 1);
-                headers[0] = .{ .name = "allow", .value = "GET,HEAD,OPTIONS" };
-                return .{ .status_code = 204, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headers };
-            }
-            if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
-                const headers = try allocator.alloc(h2_native.Header, 1);
-                headers[0] = .{ .name = "allow", .value = "GET,HEAD,OPTIONS" };
-                var response = try h2CoolErrorResponse(allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.");
-                response.headers = headers;
-                return response;
-            }
-            const rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
-            return readStaticFileForHttp2(io, allocator, route.static_dir orelse domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes);
-        },
-        .proxy => {
-            accessLogSetHandler("route_proxy");
-            const pool = if (route.upstream) |*route_pool|
-                route_pool
-            else
-                domainUpstreamMutable(cfg, domain) orelse return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
-            return fetchHttp2UpstreamPoolResponse(allocator, pool, routeUpstreamPolicy(cfg, domain, route), req, cfg);
-        },
-        .php => {
-            accessLogSetHandler("route_php");
-            if (std.mem.eql(u8, req.method, "OPTIONS")) {
-                const headers = try allocator.alloc(h2_native.Header, 1);
-                headers[0] = .{ .name = "allow", .value = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS" };
-                return .{ .status_code = 204, .content_type = "text/plain; charset=utf-8", .body = "", .headers = headers };
-            }
-            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
-                return h2CoolErrorResponse(allocator, 404, "Not Found", "The requested resource was not found on this server.");
-            }
-            if (routePhpFrontController(cfg, domain, route)) {
-                const target = try makePhpFrontControllerTarget(allocator, route, req.path, routePhpIndex(cfg, domain, route));
-                defer target.deinit(allocator);
-                return buildHttp2PhpFastcgiResponse(io, allocator, cfg, req, route.php_root orelse domainPhpRoot(cfg, domain), routePhpFastcgi(cfg, domain, route), target.script_rel_path, target.script_name, target.path_info, routeUpstreamTimeoutMs(cfg, domain, route));
-            }
-            const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
-            defer allocator.free(script_rel);
-            return buildHttp2PhpFastcgiResponse(io, allocator, cfg, req, route.php_root orelse domainPhpRoot(cfg, domain), routePhpFastcgi(cfg, domain, route), script_rel, req.path, "", routeUpstreamTimeoutMs(cfg, domain, route));
-        },
-    }
+    return http2_router.buildResponseForRequest(io, allocator, cfg, req, process_env, http2RouterCallbacks());
 }
 
 fn sendCompletedHttp2Request(
@@ -1071,6 +901,21 @@ fn http2Callbacks() h2_server.Callbacks {
         .complete_request = sendCompletedHttp2Request,
         .write_all = streamWriteAll,
         .shutdown_requested = &shutdown_requested,
+    };
+}
+
+fn http2RouterCallbacks() http2_router.Callbacks {
+    return .{
+        .access_log_set_handler = accessLogSetHandler,
+        .build_php_fastcgi_response = buildHttp2PhpFastcgiResponse,
+        .custom_not_found_response = h2DomainCustomNotFoundResponse,
+        .error_response = h2CoolErrorResponse,
+        .fetch_upstream_pool_response = fetchHttp2UpstreamPoolResponse,
+        .metrics = &server_metrics,
+        .read_acme_challenge = readAcmeChallengeForHttp2,
+        .read_static_file = readStaticFileForHttp2,
+        .redirect_response = buildHttp2RedirectResponse,
+        .set_response_headers = setHttp1ResponseHeaders,
     };
 }
 
