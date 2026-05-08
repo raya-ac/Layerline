@@ -34,7 +34,7 @@ const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
 const stream_runtime = @import("stream_runtime.zig");
-const tls_client_hello = @import("tls_client_hello.zig");
+const tls_accept = @import("tls_accept.zig");
 const tls_pem = @import("tls_pem.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
@@ -725,6 +725,28 @@ fn proxyRawBidirectional(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_pay
     try raw_proxy.proxyBidirectional(a, b, initial_payload, rawProxyCallbacks());
 }
 
+fn handleHttp1ConnectionFromTls(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    process_env: *const std.process.Environ.Map,
+) !void {
+    try http1_runtime.handleConnection(io, stream, cfg, allocator, process_env, http1RuntimeCallbacks());
+}
+
+fn tlsAcceptCallbacks() tls_accept.Callbacks {
+    return .{
+        .active_io = activeIo,
+        .clear_tls_channel = clearTlsChannel,
+        .handle_http1_connection = handleHttp1ConnectionFromTls,
+        .handle_http2_preface = handleHttp2Preface,
+        .raw_stream_read = rawStreamRead,
+        .raw_stream_write_all = rawStreamWriteAll,
+        .set_tls_channel = setTlsChannel,
+    };
+}
+
 fn handleTlsClientHelloProbe(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -733,58 +755,7 @@ fn handleTlsClientHelloProbe(
     prefill: []const u8,
     process_env: *const std.process.Environ.Map,
 ) anyerror!void {
-    const record = try native_tls.readClientHelloRecord(stream, allocator, prefill, rawStreamRead);
-    defer allocator.free(record);
-    var info = tls_client_hello.parse(allocator, record) catch |err| {
-        std.debug.print("TLS ClientHello parse failed before native TLS termination: {}\n", .{err});
-        try native_tls.sendFatalAlert(stream, native_tls.ALERT_HANDSHAKE_FAILURE, rawStreamWriteAll);
-        return;
-    };
-    defer info.deinit(allocator);
-
-    std.debug.print(
-        "TLS ClientHello sni={s} alpn={s} tls13={} aes128gcm={} ecdsa_p256={} rsa_pss={} ed25519={} h2={} http11={} tls_configured={}\n",
-        .{
-            info.sni orelse "(none)",
-            info.alpn orelse "(none)",
-            info.supports_tls13,
-            info.offers_aes_128_gcm_sha256,
-            info.offers_ecdsa_secp256r1_sha256,
-            info.offers_rsa_pss_rsae_sha256,
-            info.offers_ed25519,
-            info.offers_h2,
-            info.offers_http11,
-            cfg.tls_enabled,
-        },
-    );
-
-    var established = native_tls.establishTls13(stream, allocator, cfg, record, info, activeIo(), rawStreamRead, rawStreamWriteAll) catch |err| {
-        std.debug.print("Native TLS 1.3 handshake failed: {}\n", .{err});
-        const alert = switch (err) {
-            error.NoApplicationProtocol => native_tls.ALERT_NO_APPLICATION_PROTOCOL,
-            else => native_tls.ALERT_HANDSHAKE_FAILURE,
-        };
-        try native_tls.sendFatalAlert(stream, alert, rawStreamWriteAll);
-        return;
-    };
-    defer established.channel.deinit();
-
-    stream_runtime.setTlsChannel(&established.channel);
-    defer stream_runtime.clearTlsChannel();
-
-    std.debug.print(
-        "TLS 1.3 native connection accepted sni={s} alpn={s}\n",
-        .{ info.sni orelse "(none)", established.alpn orelse "(none)" },
-    );
-
-    if (established.alpn) |alpn| {
-        if (std.mem.eql(u8, alpn, "h2")) {
-            try handleHttp2Preface(io, stream, allocator, cfg, "", process_env);
-            return;
-        }
-    }
-
-    try http1_runtime.handleConnection(io, stream, cfg, allocator, process_env, http1RuntimeCallbacks());
+    try tls_accept.handleClientHelloProbe(io, stream, allocator, cfg, prefill, process_env, tlsAcceptCallbacks());
 }
 
 fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, response: H2BufferedResponse, is_head: bool) !void {
