@@ -26,6 +26,7 @@ const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const php_runtime = @import("php_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
+const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
 const response_body = @import("response_body.zig");
@@ -696,46 +697,32 @@ fn serveAcmeChallenge(
     try http1_static.serveAcmeChallenge(io, stream, allocator, webroot, token, close_connection, is_head, http1StaticCallbacks());
 }
 
-const RawProxyContext = struct {
-    io: std.Io,
-    src: std.Io.net.Stream,
-    dst: std.Io.net.Stream,
-    tls_channel: ?*native_tls.Channel = null,
-};
+fn setTlsChannel(channel: ?*native_tls.Channel) void {
+    stream_runtime.setTlsChannel(channel);
+}
 
-fn proxyRawStream(ctx: RawProxyContext) void {
-    bindThreadIo(ctx.io);
-    stream_runtime.setTlsChannel(ctx.tls_channel);
-    defer stream_runtime.clearTlsChannel();
+fn clearTlsChannel() void {
+    stream_runtime.clearTlsChannel();
+}
 
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = streamRead(ctx.src, &buf) catch break;
-        if (n == 0) break;
-        streamWriteAll(ctx.dst, buf[0..n]) catch break;
-    }
-    ctx.dst.shutdown(activeIo(), .send) catch {};
+fn currentTlsChannel() ?*native_tls.Channel {
+    return stream_runtime.currentTlsChannel();
+}
+
+fn rawProxyCallbacks() raw_proxy.Callbacks {
+    return .{
+        .active_io = activeIo,
+        .bind_thread_io = bindThreadIo,
+        .clear_tls_channel = clearTlsChannel,
+        .current_tls_channel = currentTlsChannel,
+        .set_tls_channel = setTlsChannel,
+        .stream_read = streamRead,
+        .stream_write_all = streamWriteAll,
+    };
 }
 
 fn proxyRawBidirectional(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_payload: []const u8) !void {
-    if (initial_payload.len > 0) {
-        try streamWriteAll(b, initial_payload);
-    }
-
-    const io = activeIo();
-    const tls_channel = stream_runtime.currentTlsChannel();
-    const t1 = try std.Thread.spawn(
-        .{},
-        proxyRawStream,
-        .{RawProxyContext{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel }},
-    );
-    const t2 = try std.Thread.spawn(
-        .{},
-        proxyRawStream,
-        .{RawProxyContext{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel }},
-    );
-    t1.join();
-    t2.join();
+    try raw_proxy.proxyBidirectional(a, b, initial_payload, rawProxyCallbacks());
 }
 
 fn handleTlsClientHelloProbe(
