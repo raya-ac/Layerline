@@ -1,14 +1,12 @@
 const std = @import("std");
 const admin_http = @import("admin_http.zig");
 const access_log_mod = @import("access_log.zig");
-const acme_renewal = @import("acme_renewal.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
 const acme_mod = @import("acme.zig");
 const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
-const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
 const custom_errors = @import("custom_errors.zig");
 const h2_server = @import("http2_server.zig");
@@ -22,7 +20,6 @@ const http1_router = @import("http1_router.zig");
 const http1_responses = @import("http1_responses.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
-const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
@@ -31,12 +28,12 @@ const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
+const server_runtime = @import("server_runtime.zig");
 const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const tls_accept = @import("tls_accept.zig");
 const tls_material = @import("tls_material.zig");
-const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
 
 const hasConnectionToken = http_headers.hasConnectionToken;
@@ -57,7 +54,6 @@ const activeIo = stream_runtime.activeIo;
 const bindThreadIo = stream_runtime.bindThreadIo;
 const connectFastcgiEndpoint = stream_runtime.connectFastcgiEndpoint;
 const connectTcpHost = stream_runtime.connectTcpHost;
-const listenerWakeHost = stream_runtime.listenerWakeHost;
 const rawStreamRead = stream_runtime.rawStreamRead;
 const rawStreamWriteAll = stream_runtime.rawStreamWriteAll;
 const setStreamReadTimeout = stream_runtime.setStreamReadTimeout;
@@ -66,9 +62,7 @@ const setStreamWriteTimeout = stream_runtime.setStreamWriteTimeout;
 const streamClose = stream_runtime.streamClose;
 const streamRead = stream_runtime.streamRead;
 const streamWriteAll = stream_runtime.streamWriteAll;
-const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
-const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
 const UpstreamConfig = config_mod.UpstreamConfig;
 const PhpFastcgiTcpEndpoint = config_mod.PhpFastcgiTcpEndpoint;
@@ -93,7 +87,6 @@ const parseUpstream = config_mod.parseUpstream;
 const parseUpstreamPool = config_mod.parseUpstreamPool;
 const parseUpstreamPoolPolicy = config_mod.parseUpstreamPoolPolicy;
 const parseOptionalUpstreamPoolPolicy = config_mod.parseOptionalUpstreamPoolPolicy;
-const upstreamPoolPolicyName = config_mod.upstreamPoolPolicyName;
 const applyConfigLine = config_mod.applyConfigLine;
 const loadConfig = config_mod.loadConfig;
 const loadConfiguredDomainConfigs = config_mod.loadConfiguredDomainConfigs;
@@ -136,7 +129,6 @@ threadlocal var current_access_log: ?*access_log_mod.Context = null;
 var access_log_writer = access_log_mod.Writer{};
 var request_id_generator = request_trace.Generator{};
 var shutdown_requested = std.atomic.Value(bool).init(false);
-var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
 
 fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
@@ -151,32 +143,6 @@ fn installShutdownSignalHandlers() void {
     };
     std.posix.sigaction(.INT, &action, null);
     std.posix.sigaction(.TERM, &action, null);
-}
-
-const ShutdownWatcherContext = struct {
-    io: std.Io,
-    server: *std.Io.net.Server,
-    closed: *std.atomic.Value(bool),
-    wake_host: ?[]const u8 = null,
-    wake_port: u16 = 0,
-};
-
-fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
-    bindThreadIo(ctx.io);
-    while (!shutdown_requested.load(.acquire)) {
-        ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
-    }
-
-    if (ctx.wake_host) |host| {
-        if (ctx.wake_port != 0) {
-            if (connectTcpHost(std.heap.page_allocator, host, ctx.wake_port)) |wake| {
-                streamClose(wake);
-            } else |_| {}
-        }
-    }
-    if (!ctx.closed.swap(true, .acq_rel)) {
-        ctx.server.socket.close(ctx.io);
-    }
 }
 
 fn http1ResponseContext() http1_responses.Context {
@@ -939,7 +905,6 @@ pub fn main(init: std.process.Init) !void {
     bindThreadIo(init.io);
     installShutdownSignalHandlers();
     shutdown_requested.store(false, .release);
-    listener_closed_by_shutdown.store(false, .release);
 
     var cfg = defaultServerConfig();
 
@@ -965,186 +930,21 @@ pub fn main(init: std.process.Init) !void {
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
 
-    var concurrency = ConcurrencyState.init(&server_metrics);
-
-    var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
-    var server = try address.listen(init.io, .{ .reuse_address = true });
-    var redirect_listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
-    var redirect_server: ?std.Io.net.Server = null;
-    if (cfg.http_redirect_enabled) {
-        const redirect_address = try std.Io.net.IpAddress.parse(cfg.host, cfg.http_redirect_port);
-        redirect_server = try redirect_address.listen(init.io, .{ .reuse_address = true });
-    }
-    defer {
-        if (!listener_closed_by_shutdown.load(.acquire)) {
-            server.deinit(init.io);
-        }
-    }
-    defer {
-        if (redirect_server) |*http_server| {
-            if (!redirect_listener_closed_by_shutdown.load(.acquire)) {
-                http_server.deinit(init.io);
-            }
-        }
-    }
-    const shutdown_watcher = std.Thread.spawn(
-        .{},
-        shutdownWatcherTask,
-        .{ShutdownWatcherContext{ .io = init.io, .server = &server, .closed = &listener_closed_by_shutdown, .wake_host = listenerWakeHost(cfg.host), .wake_port = cfg.port }},
-    ) catch |err| {
-        std.debug.print("Failed to start shutdown watcher: {}\n", .{err});
-        return;
-    };
-    shutdown_watcher.detach();
-
-    if (redirect_server) |*http_server| {
-        const http_shutdown_watcher = std.Thread.spawn(
-            .{},
-            shutdownWatcherTask,
-            .{ShutdownWatcherContext{ .io = init.io, .server = http_server, .closed = &redirect_listener_closed_by_shutdown, .wake_host = listenerWakeHost(cfg.host), .wake_port = cfg.http_redirect_port }},
-        ) catch |err| {
-            std.debug.print("Failed to start HTTP redirect shutdown watcher: {}\n", .{err});
-            return;
-        };
-        http_shutdown_watcher.detach();
-
-        const http_redirect_worker = std.Thread.spawn(
-            .{},
-            http1_runtime.serveHttpRedirectListenerTask,
-            .{http1_runtime.HttpRedirectListenerContext{ .io = init.io, .server = http_server, .cfg = &cfg, .allocator = std.heap.page_allocator, .state = &concurrency, .callbacks = http1RuntimeCallbacks() }},
-        ) catch |err| {
-            std.debug.print("Failed to start HTTP redirect listener: {}\n", .{err});
-            return;
-        };
-        http_redirect_worker.detach();
-        std.debug.print("HTTP redirect listener on http://{s}:{d} -> https port {d} status {d}\n", .{ cfg.host, cfg.http_redirect_port, cfg.http_redirect_https_port, cfg.http_redirect_status });
-    }
-
-    std.debug.print("Serving on {s}://{s}:{d}\n", .{ if (cfg.tls_enabled) "https" else "http", cfg.host, cfg.port });
-    std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
-    if (cfg.upstream != null) {
-        const pool = cfg.upstream.?;
-        std.debug.print(
-            "Reverse proxy pool: {s} over {d} target(s), retries={d}, max_failures={d}, fail_timeout={d}ms, circuit={s} half_open={d}, slow_start={d}ms, keepalive={s} max_idle={d}\n",
-            .{
-                upstreamPoolPolicyName(cfg.upstream_policy),
-                upstreamPoolTargetCount(pool),
-                cfg.upstream_retries,
-                cfg.upstream_max_failures,
-                cfg.upstream_fail_timeout_ms,
-                if (cfg.upstream_circuit_breaker_enabled) "on" else "off",
-                cfg.upstream_circuit_half_open_max,
-                cfg.upstream_slow_start_ms,
-                if (cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0) "on" else "off",
-                cfg.upstream_keepalive_max_idle,
-            },
-        );
-    }
-    if (cfg.h2_upstream != null) {
-        const hup = cfg.h2_upstream.?;
-        std.debug.print("HTTP/2 cleartext passthrough to: {s}:{d} (base {s})\n", .{ hup.host, hup.port, hup.base_path });
-    }
-    std.debug.print(
-        "Timeouts: header={d}ms body={d}ms idle={d}ms write={d}ms upstream={d}ms upstream_retries={d} graceful_shutdown={d}ms\n",
-        .{
-            cfg.read_header_timeout_ms,
-            cfg.read_body_timeout_ms,
-            cfg.idle_timeout_ms,
-            cfg.write_timeout_ms,
-            cfg.upstream_timeout_ms,
-            cfg.upstream_retries,
-            cfg.graceful_shutdown_timeout_ms,
-        },
-    );
-    if (cfg.upstream_health_check_enabled) {
-        const health_worker = std.Thread.spawn(.{}, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = init.io, .cfg = &cfg, .callbacks = upstreamRuntimeCallbacks() }}) catch |err| {
-            std.debug.print("Failed to start upstream health checker: {}\n", .{err});
-            return;
-        };
-        health_worker.detach();
-        std.debug.print("Active upstream health checks: path={s} interval={d}ms timeout={d}ms\n", .{ cfg.upstream_health_check_path, cfg.upstream_health_check_interval_ms, cfg.upstream_health_check_timeout_ms });
-    }
-    if (cfg.http3_enabled) {
-        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ init.io, &cfg, &server_metrics, SERVER_HEADER }) catch |err| {
-            std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
-            return;
-        };
-        h3_worker.detach();
-    }
-    if (cfg.admin_enabled) {
-        const admin_socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
-        const admin_worker = std.Thread.spawn(.{}, admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = init.io, .cfg = &cfg, .socket_path = admin_socket_path, .callbacks = adminCallbacks() }}) catch |err| {
-            std.debug.print("Failed to start admin socket: {}\n", .{err});
-            return;
-        };
-        admin_worker.detach();
-    }
-    if (cfg.tls_auto and cfg.letsencrypt_renew) {
-        const acme_worker = std.Thread.spawn(.{}, acme_renewal.renewalTask, .{acme_renewal.Context{
-            .io = init.io,
-            .cfg = &cfg,
-            .metrics = &server_metrics,
-            .shutdown_requested = &shutdown_requested,
+    try server_runtime.run(.{
+        .io = init.io,
+        .allocator = std.heap.page_allocator,
+        .cfg = &cfg,
+        .process_env = init.environ_map,
+        .metrics = &server_metrics,
+        .shutdown_requested = &shutdown_requested,
+        .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
+        .server_header = SERVER_HEADER,
+        .callbacks = .{
+            .admin = adminCallbacks(),
             .bind_thread_io = bindThreadIo,
-        }}) catch |err| {
-            std.debug.print("Failed to start Let's Encrypt renewal loop: {}\n", .{err});
-            return;
-        };
-        acme_worker.detach();
-    }
-
-    while (!shutdown_requested.load(.acquire)) {
-        const conn = server.accept(init.io) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
-            std.debug.print("Accept failed: {}. Continuing to accept.\n", .{err});
-            init.io.sleep(.fromMilliseconds(25), .awake) catch {};
-            continue;
-        };
-        if (shutdown_requested.load(.acquire)) {
-            streamClose(conn);
-            break;
-        }
-
-        if (!concurrency.tryAcquire(cfg.max_concurrent_connections)) {
-            server_metrics.connectionRejected();
-            std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{cfg.max_concurrent_connections});
-            sendCoolError(
-                conn,
-                std.heap.page_allocator,
-                503,
-                "Service Unavailable",
-                "Maximum concurrent connections reached. Try again in a moment.",
-            ) catch {};
-            streamClose(conn);
-            continue;
-        }
-
-        const worker = std.Thread.spawn(
-            .{
-                .stack_size = cfg.worker_stack_size,
-            },
-            http1_runtime.serveConnectionTask,
-            .{
-                init.io,
-                conn,
-                &cfg,
-                std.heap.page_allocator,
-                &concurrency,
-                init.environ_map,
-                http1RuntimeCallbacks(),
-            },
-        ) catch |err| {
-            std.debug.print("Failed to start connection worker: {}\n", .{err});
-            concurrency.release();
-            streamClose(conn);
-            continue;
-        };
-        worker.detach();
-    }
-
-    std.debug.print("Shutdown requested; draining active connections for up to {d}ms.\n", .{cfg.graceful_shutdown_timeout_ms});
-    concurrency_mod.waitForDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
-    if (cfg.admin_enabled) {
-        admin_runtime.unlinkUnixSocket(cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH, adminCallbacks());
-    }
+            .http1 = http1RuntimeCallbacks(),
+            .send_cool_error = sendCoolError,
+            .upstream = upstreamRuntimeCallbacks(),
+        },
+    });
 }
