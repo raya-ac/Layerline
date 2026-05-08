@@ -14,6 +14,7 @@ const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
+const http2_upstream = @import("http2_upstream.zig");
 const http1_router = @import("http1_router.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
@@ -68,7 +69,6 @@ const findDomainRouteMutable = routing_mod.findDomainRouteMutable;
 const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
-const trimValue = http_headers.trimValue;
 const renderAdminSetupPage = admin_ui_mod.renderAdminSetupPage;
 const renderAdminLoginPage = admin_ui_mod.renderAdminLoginPage;
 const AdminCredentials = admin_support.AdminCredentials;
@@ -78,16 +78,7 @@ const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
 const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
 const ServerMetrics = metrics_mod.ServerMetrics;
-const UpstreamResponseForwardResult = proxy_utils.UpstreamResponseForwardResult;
-const UpstreamResponseFraming = proxy_utils.UpstreamResponseFraming;
-const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
-const buildProxyPath = proxy_utils.buildProxyPath;
-const isSkippedProxyHeader = proxy_utils.isSkippedProxyHeader;
 const isSkippedProxyResponseHeader = proxy_utils.isSkippedProxyResponseHeader;
-const parseOptionalContentLength = proxy_utils.parseOptionalContentLength;
-const parseUpstreamResponseFraming = proxy_utils.parseUpstreamResponseFraming;
-const responseHasNoBody = proxy_utils.responseHasNoBody;
-const parseHttpStatusCode = proxy_utils.parseHttpStatusCode;
 const makePhpFrontControllerTarget = fastcgi.makePhpFrontControllerTarget;
 const ByteRange = static_files.ByteRange;
 const acceptsContentCoding = static_files.acceptsContentCoding;
@@ -115,20 +106,7 @@ const streamWriteFmt = stream_runtime.streamWriteFmt;
 const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const H2PendingReader = h2_support.PendingReader;
-const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
-const upstreamInSlowStart = upstream_mod.upstreamInSlowStart;
-const upstreamEffectiveWeight = upstream_mod.upstreamEffectiveWeight;
-const upstreamIsSelectable = upstream_mod.upstreamIsSelectable;
-const selectUpstream = upstream_mod.selectUpstream;
-const upstreamIsEjected = upstream_mod.upstreamIsEjected;
-const upstreamRecordSuccess = upstream_mod.upstreamRecordSuccess;
-const upstreamRecordFailure = upstream_mod.upstreamRecordFailure;
-const upstreamBeginAttempt = upstream_mod.upstreamBeginAttempt;
-const upstreamEndAttempt = upstream_mod.upstreamEndAttempt;
-const upstreamAttemptLimit = upstream_mod.upstreamAttemptLimit;
-const upstreamAtAttempt = upstream_mod.upstreamAtAttempt;
-const upstreamStartTicket = upstream_mod.upstreamStartTicket;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
 const UpstreamConfig = config_mod.UpstreamConfig;
 const PhpFastcgiTcpEndpoint = config_mod.PhpFastcgiTcpEndpoint;
@@ -182,7 +160,6 @@ const setDomainU32PropertyDirect = config_mod.setDomainU32PropertyDirect;
 const applyDomainConfigLine = config_mod.applyDomainConfigLine;
 const validateRouteConfig = config_mod.validateRouteConfig;
 
-const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024;
 const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = 64 * 1024;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
 const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
@@ -1051,146 +1028,8 @@ fn buildHttp2RedirectResponse(allocator: std.mem.Allocator, rule: RedirectRule, 
     return .{ .status_code = rule.status_code, .content_type = "text/plain; charset=utf-8", .body = body, .headers = headers };
 }
 
-fn appendForwardedRequestHeaders(allocator: std.mem.Allocator, out: *std.ArrayList(u8), req: HttpRequest, upstream: *const UpstreamConfig, cfg: *const ServerConfig) !void {
-    const forwarded_host = findHeaderValue(req.headers, "Host") orelse upstream.host;
-    const forwarded_proto = if (findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
-        trimValue(proto)
-    else if (cfg.tls_enabled)
-        "https"
-    else
-        "http";
-
-    try out.print(allocator, "Host: {s}\r\nConnection: close\r\n", .{trimValue(forwarded_host)});
-
-    var saw_forwarded_host = false;
-    var saw_forwarded_proto = false;
-    var headers = std.mem.splitSequence(u8, req.headers, "\r\n");
-    while (headers.next()) |line| {
-        const trimmed = trimValue(line);
-        if (trimmed.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-            const name = trimValue(trimmed[0..colon]);
-            if (isSkippedProxyHeader(name)) continue;
-            const value = trimValue(trimmed[colon + 1 ..]);
-            if (value.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
-            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
-            try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
-        }
-    }
-    if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{trimValue(forwarded_host)});
-    if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
-    if (current_request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{current_request_id});
-}
-
-fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, max_bytes: usize) ![]u8 {
-    var raw = std.ArrayList(u8).empty;
-    errdefer raw.deinit(allocator);
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try streamRead(upstream_conn, &buf);
-        if (n == 0) break;
-        if (raw.items.len + n > max_bytes) return error.PayloadTooLarge;
-        try raw.appendSlice(allocator, buf[0..n]);
-    }
-    return raw.toOwnedSlice(allocator);
-}
-
-fn fetchHttp2UpstreamResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
-    if (upstream.https) return error.UnsupportedUpstreamScheme;
-
-    const upstream_label = try std.fmt.allocPrint(
-        allocator,
-        "{s}://{s}:{d}{s}",
-        .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
-    );
-    accessLogSetUpstream(upstream_label);
-
-    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
-    defer streamClose(upstream_conn);
-    try setStreamTimeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
-
-    const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
-    var request = std.ArrayList(u8).empty;
-    defer request.deinit(allocator);
-    try request.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, proxy_path });
-    try appendForwardedRequestHeaders(allocator, &request, req, upstream, cfg);
-    try request.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
-    try request.appendSlice(allocator, req.body);
-    try streamWriteAll(upstream_conn, request.items);
-
-    const raw = try readHttp1ResponseToBuffer(allocator, upstream_conn, cfg.max_static_file_bytes + DEFAULT_MAX_REQUEST_BYTES);
-    const header_end = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = raw[0..header_end];
-    const body_tail = raw[header_end..];
-    const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
-    const response_headers = header_bytes[status_line_end + 2 .. header_end - 4];
-    const framing = try parseUpstreamResponseFraming(header_bytes, response_headers);
-    const status_code = framing.status_code orelse 502;
-
-    const body = if (responseHasNoBody(req.method, status_code))
-        try allocator.dupe(u8, "")
-    else if (framing.transfer_chunked)
-        try h2_support.decodeChunkedBuffer(allocator, body_tail)
-    else if (framing.content_length) |content_length| blk: {
-        if (body_tail.len < content_length) return error.BadGateway;
-        break :blk try allocator.dupe(u8, body_tail[0..content_length]);
-    } else try allocator.dupe(u8, body_tail);
-
-    const content_type = if (findHeaderValue(response_headers, "Content-Type")) |ctype|
-        try allocator.dupe(u8, trimValue(ctype))
-    else
-        "application/octet-stream";
-    const headers = try h2_support.collectUpstreamHeaders(allocator, response_headers);
-    return .{ .status_code = status_code, .content_type = content_type, .body = body, .headers = headers };
-}
-
 fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
-    if (pool.targets.items.len == 0) return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.");
-
-    const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
-    const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), cfg);
-    var considered: usize = 0;
-    var attempts: usize = 0;
-    var skipped_ejected: usize = 0;
-    var last_error: ?anyerror = null;
-
-    while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
-        const upstream = upstreamAtAttempt(pool, start_ticket, considered);
-        const lease = upstreamBeginAttempt(upstream, now_ms, cfg) orelse {
-            skipped_ejected += 1;
-            server_metrics.upstreamEjectedSkip();
-            continue;
-        };
-
-        if (attempts > 0) server_metrics.upstreamRetried();
-        attempts += 1;
-        server_metrics.upstreamRequestStarted();
-        const response = fetchHttp2UpstreamResponse(allocator, upstream, req, cfg) catch |err| {
-            upstreamEndAttempt(upstream, lease);
-            last_error = err;
-            server_metrics.upstreamRequestFailed();
-            if (upstreamRecordFailure(upstream, upstreamNowMs(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
-                server_metrics.upstreamEjected();
-            }
-            continue;
-        };
-        upstreamEndAttempt(upstream, lease);
-        upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
-        return response;
-    }
-
-    if (attempts == 0 and skipped_ejected > 0) {
-        return h2CoolErrorResponse(allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.");
-    }
-    if (last_error) |err| switch (err) {
-        error.RequestTimeout => return h2CoolErrorResponse(allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out."),
-        error.UnsupportedUpstreamScheme => return h2CoolErrorResponse(allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this server path."),
-        error.PayloadTooLarge => return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "Upstream response exceeds configured response buffer."),
-        else => {},
-    };
-    return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "All configured upstream attempts failed.");
+    return http2_upstream.fetchPoolResponse(allocator, pool, policy, req, cfg, http2UpstreamCallbacks());
 }
 
 fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
@@ -1414,6 +1253,21 @@ fn http2Callbacks() h2_server.Callbacks {
         .complete_request = sendCompletedHttp2Request,
         .write_all = streamWriteAll,
         .shutdown_requested = &shutdown_requested,
+    };
+}
+
+fn http2UpstreamCallbacks() http2_upstream.Callbacks {
+    return .{
+        .access_log_set_upstream = accessLogSetUpstream,
+        .connect_tcp_host = connectTcpHost,
+        .current_request_id = currentRequestId,
+        .error_response = h2CoolErrorResponse,
+        .metrics = &server_metrics,
+        .set_stream_timeouts = setStreamTimeouts,
+        .stream_close = streamClose,
+        .stream_read = streamRead,
+        .stream_write_all = streamWriteAll,
+        .upstream_now_ms = upstreamNowMs,
     };
 }
 
