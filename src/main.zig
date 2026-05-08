@@ -1,13 +1,33 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const access_log_mod = @import("access_log.zig");
+const cgi_headers = @import("cgi_headers.zig");
 const h2_native = @import("h2_native.zig");
 const h3_native = @import("h3_native.zig");
 const h3_state = @import("h3_state.zig");
+const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
 const quic_native = @import("quic_native.zig");
+const request_trace = @import("request_trace.zig");
 const tls13_native = @import("tls13_native.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
+
+const findHeaderValue = http_headers.findHeaderValue;
+const hasConnectionToken = http_headers.hasConnectionToken;
+const hasHeaderToken = http_headers.hasHeaderToken;
+const parseConnectionClose = http_headers.parseConnectionClose;
+const parseContentLength = http_headers.parseContentLength;
+const transferEncodingIsChunkedOnly = http_headers.transferEncodingIsChunkedOnly;
+const trimValue = http_headers.trimValue;
+const buildCgiExtraHeaders = cgi_headers.buildExtraHeaders;
+const findCgiHeaderValue = cgi_headers.findHeaderValue;
+const isCgiHeaderNameChar = cgi_headers.isHeaderNameChar;
+const isPhpCgiBinary = cgi_headers.isPhpCgiBinary;
+const isSkippedCgiResponseHeader = cgi_headers.isSkippedResponseHeader;
+const parseCgiStatus = cgi_headers.parseStatus;
+const putCgiRequestHeaders = cgi_headers.putRequestHeaders;
+const splitCgiHeaderBlock = cgi_headers.splitHeaderBlock;
 
 // Boring defaults on purpose: enough room for local dev, with caps before
 // anything can turn into an accidental memory sink.
@@ -128,27 +148,11 @@ threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 threadlocal var current_request_headers: []const u8 = "";
 threadlocal var current_request_id: []const u8 = "";
 threadlocal var current_compression_policy: CompressionPolicy = .disabled;
-threadlocal var current_access_log: ?*AccessLogContext = null;
-var access_log_mutex: std.Io.Mutex = .init;
-var request_id_counter = std.atomic.Value(u64).init(0);
+threadlocal var current_access_log: ?*access_log_mod.Context = null;
+var access_log_writer = access_log_mod.Writer{};
+var request_id_generator = request_trace.Generator{};
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
-
-const AccessLogContext = struct {
-    enabled: bool,
-    sink: []const u8,
-    method: []const u8,
-    path: []const u8,
-    query: []const u8,
-    protocol: []const u8,
-    host: []const u8,
-    request_id: []const u8,
-    start_ms: i64,
-    handler: []const u8 = "routing",
-    upstream: ?[]const u8 = null,
-    error_name: ?[]const u8 = null,
-    logged: bool = false,
-};
 
 // Zig 0.16 moved sockets behind std.Io, so detached worker threads need their
 // own bound handle before they touch a stream.
@@ -855,123 +859,6 @@ fn prepareResponseBody(
     return .{ .body = compressed, .encoding = "gzip", .owned = compressed };
 }
 
-fn parseContentLength(headers: []const u8) !usize {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const key = std.mem.trim(u8, line[0..colon], " \t");
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            if (std.ascii.eqlIgnoreCase(key, "Content-Length")) {
-                return std.fmt.parseInt(usize, value, 10) catch return error.InvalidContentLength;
-            }
-        }
-    }
-
-    return 0;
-}
-
-fn hasHeaderToken(headers: []const u8, name: []const u8, token: []const u8) bool {
-    const value = findHeaderValue(headers, name) orelse return false;
-    return hasConnectionToken(value, token);
-}
-
-fn hasConnectionToken(connection: []const u8, token: []const u8) bool {
-    var cursor = connection;
-    while (cursor.len > 0) {
-        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
-        const item = if (comma_pos > 0) trimValue(cursor[0..comma_pos]) else cursor;
-        if (item.len > 0 and std.ascii.eqlIgnoreCase(item, token)) return true;
-        if (comma_pos >= cursor.len) break;
-        cursor = cursor[comma_pos + 1 ..];
-    }
-    return false;
-}
-
-fn parseConnectionClose(version: []const u8, headers: []const u8) bool {
-    const connection = findHeaderValue(headers, "Connection") orelse "";
-    const wants_close = hasConnectionToken(connection, "close");
-    const wants_keep_alive = hasConnectionToken(connection, "keep-alive");
-
-    const is_http11 = std.mem.startsWith(u8, version, "HTTP/1.1");
-    const is_http10 = std.mem.startsWith(u8, version, "HTTP/1.0");
-
-    if (wants_close) return true;
-    if (is_http10) {
-        return !wants_keep_alive;
-    }
-    if (is_http11) return false;
-    return true;
-}
-
-fn transferEncodingIsChunkedOnly(headers: []const u8) !bool {
-    const value = findHeaderValue(headers, "Transfer-Encoding") orelse return false;
-
-    // This server understands normal fixed-length bodies and chunked bodies.
-    // Anything stacked on top of chunked needs a real decoder, not optimism.
-    var saw_chunked = false;
-    var cursor = value;
-    while (cursor.len > 0) {
-        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
-        const item = if (comma_pos > 0) trimValue(cursor[0..comma_pos]) else cursor;
-        if (item.len > 0) {
-            if (std.ascii.eqlIgnoreCase(item, "chunked")) {
-                saw_chunked = true;
-            } else {
-                return error.UnsupportedTransferEncoding;
-            }
-        }
-        if (comma_pos >= cursor.len) break;
-        cursor = cursor[comma_pos + 1 ..];
-    }
-
-    return saw_chunked;
-}
-
-fn findHeaderValue(headers: []const u8, target_name: []const u8) ?[]const u8 {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const key = std.mem.trim(u8, line[0..colon], " \t");
-            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-            if (std.ascii.eqlIgnoreCase(key, target_name)) return value;
-        }
-    }
-
-    return null;
-}
-
-fn isValidRequestId(value: []const u8) bool {
-    if (value.len == 0 or value.len > 128) return false;
-    for (value) |byte| {
-        const valid = std.ascii.isAlphanumeric(byte) or
-            byte == '-' or
-            byte == '_' or
-            byte == '.' or
-            byte == ':' or
-            byte == '/' or
-            byte == '@';
-        if (!valid) return false;
-    }
-    return true;
-}
-
-fn requestIdFromHeaders(headers: []const u8) ?[]const u8 {
-    const raw = findHeaderValue(headers, "X-Request-Id") orelse return null;
-    const value = trimValue(raw);
-    if (!isValidRequestId(value)) return null;
-    return value;
-}
-
-fn resolveRequestId(allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {
-    if (requestIdFromHeaders(headers)) |request_id| return request_id;
-
-    const now_ms_raw = std.Io.Timestamp.now(activeIo(), .real).toMilliseconds();
-    const now_ms: u64 = if (now_ms_raw > 0) @intCast(now_ms_raw) else 0;
-    const sequence = request_id_counter.fetchAdd(1, .monotonic) + 1;
-    return try std.fmt.allocPrint(allocator, "ll-{x:0>16}-{x:0>16}", .{ now_ms, sequence });
-}
-
 fn http2SettingsDecodedLength(value: []const u8) ?usize {
     var len: usize = 0;
     for (value) |byte| {
@@ -1029,190 +916,6 @@ fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
     }
 
     return null;
-}
-
-fn trimValue(value: []const u8) []const u8 {
-    return std.mem.trim(u8, value, " \t\r\n");
-}
-
-const CgiHeaderSplit = struct {
-    headers: []const u8,
-    body: []const u8,
-};
-
-const CgiStatus = struct {
-    code: u16,
-    text: []const u8,
-};
-
-fn splitCgiHeaderBlock(output: []const u8) ?CgiHeaderSplit {
-    if (std.mem.indexOf(u8, output, "\r\n\r\n")) |idx| {
-        return .{ .headers = output[0..idx], .body = output[idx + 4 ..] };
-    }
-    if (std.mem.indexOf(u8, output, "\n\n")) |idx| {
-        return .{ .headers = output[0..idx], .body = output[idx + 2 ..] };
-    }
-    return null;
-}
-
-fn findCgiHeaderValue(headers: []const u8, target_name: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, headers, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const key = trimValue(line[0..colon]);
-            const value = trimValue(line[colon + 1 ..]);
-            if (std.ascii.eqlIgnoreCase(key, target_name)) return value;
-        }
-    }
-    return null;
-}
-
-fn statusTextForCode(status_code: u16) []const u8 {
-    return switch (status_code) {
-        100 => "Continue",
-        101 => "Switching Protocols",
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        206 => "Partial Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        413 => "Payload Too Large",
-        416 => "Range Not Satisfiable",
-        417 => "Expectation Failed",
-        426 => "Upgrade Required",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        505 => "HTTP Version Not Supported",
-        else => if (status_code >= 500) "Internal Server Error" else if (status_code >= 400) "Bad Request" else "OK",
-    };
-}
-
-fn parseCgiStatus(headers: []const u8) CgiStatus {
-    const raw_status = findCgiHeaderValue(headers, "Status") orelse return .{ .code = 200, .text = "OK" };
-    const status_line = trimValue(raw_status);
-    if (status_line.len < 3) return .{ .code = 200, .text = "OK" };
-
-    const code = std.fmt.parseInt(u16, status_line[0..@min(3, status_line.len)], 10) catch 200;
-    if (code < 100 or code > 599) return .{ .code = 200, .text = "OK" };
-
-    if (status_line.len > 3) {
-        const reason = trimValue(status_line[3..]);
-        if (reason.len > 0) return .{ .code = code, .text = reason };
-    }
-
-    return .{ .code = code, .text = statusTextForCode(code) };
-}
-
-fn isSkippedCgiResponseHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "Status") or
-        std.ascii.eqlIgnoreCase(name, "Content-Type") or
-        std.ascii.eqlIgnoreCase(name, "Content-Length") or
-        std.ascii.eqlIgnoreCase(name, "Connection") or
-        std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
-        std.ascii.eqlIgnoreCase(name, "Proxy-Authenticate") or
-        std.ascii.eqlIgnoreCase(name, "Proxy-Authorization") or
-        std.ascii.eqlIgnoreCase(name, "TE") or
-        std.ascii.eqlIgnoreCase(name, "Trailer") or
-        std.ascii.eqlIgnoreCase(name, "Trailers") or
-        std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
-        std.ascii.eqlIgnoreCase(name, "Upgrade") or
-        std.ascii.eqlIgnoreCase(name, "Server") or
-        std.ascii.eqlIgnoreCase(name, "X-Request-Id");
-}
-
-fn buildCgiExtraHeaders(allocator: std.mem.Allocator, headers: []const u8) !?[]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-
-    var lines = std.mem.splitScalar(u8, headers, '\n');
-    while (lines.next()) |line| {
-        const trimmed = trimValue(line);
-        if (trimmed.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-            const name = trimValue(trimmed[0..colon]);
-            const value = trimValue(trimmed[colon + 1 ..]);
-            if (name.len == 0 or value.len == 0 or isSkippedCgiResponseHeader(name)) continue;
-            try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
-        }
-    }
-
-    if (out.items.len == 0) {
-        out.deinit(allocator);
-        return null;
-    }
-    return try out.toOwnedSlice(allocator);
-}
-
-fn isCgiHeaderNameChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
-}
-
-fn putCgiRequestHeaders(
-    allocator: std.mem.Allocator,
-    env: *std.process.Environ.Map,
-    request_headers: []const u8,
-) !void {
-    var lines = std.mem.splitSequence(u8, request_headers, "\r\n");
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const name = trimValue(line[0..colon]);
-            const value = trimValue(line[colon + 1 ..]);
-            if (name.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(name, "Content-Type") or std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
-            if (std.ascii.eqlIgnoreCase(name, "X-Request-Id")) continue;
-
-            var env_name = std.ArrayList(u8).empty;
-            defer env_name.deinit(allocator);
-            try env_name.appendSlice(allocator, "HTTP_");
-            for (name) |c| {
-                if (!isCgiHeaderNameChar(c)) {
-                    env_name.clearRetainingCapacity();
-                    break;
-                }
-                try env_name.append(allocator, if (c == '-') '_' else std.ascii.toUpper(c));
-            }
-            if (env_name.items.len <= "HTTP_".len) continue;
-            try env.put(env_name.items, value);
-        }
-    }
-}
-
-fn isPhpCgiBinary(path: []const u8) bool {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return std.mem.indexOf(u8, path, "php-cgi") != null;
-    return std.mem.indexOf(u8, path[slash + 1 ..], "php-cgi") != null;
-}
-
-test "splits CGI output with CRLF or LF separators" {
-    const crlf = splitCgiHeaderBlock("Content-Type: text/plain\r\n\r\nbody").?;
-    try std.testing.expectEqualStrings("Content-Type: text/plain", crlf.headers);
-    try std.testing.expectEqualStrings("body", crlf.body);
-
-    const lf = splitCgiHeaderBlock("Content-Type: text/plain\n\nbody").?;
-    try std.testing.expectEqualStrings("Content-Type: text/plain", lf.headers);
-    try std.testing.expectEqualStrings("body", lf.body);
-}
-
-test "parses CGI status headers with reason text" {
-    const status = parseCgiStatus("Status: 404 Not Found\nContent-Type: text/plain");
-    try std.testing.expectEqual(@as(u16, 404), status.code);
-    try std.testing.expectEqualStrings("Not Found", status.text);
-
-    const default_status = parseCgiStatus("Content-Type: text/plain");
-    try std.testing.expectEqual(@as(u16, 200), default_status.code);
-    try std.testing.expectEqualStrings("OK", default_status.text);
 }
 
 test "parses FastCGI tcp and unix endpoints" {
@@ -5530,119 +5233,20 @@ fn sendAdminDashboardPage(
     try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
 }
 
-fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    try out.append(allocator, '"');
-    for (text) |byte| {
-        switch (byte) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            0...8, 11...12, 14...0x1f => try out.print(allocator, "\\u{x:0>4}", .{byte}),
-            else => try out.append(allocator, byte),
-        }
-    }
-    try out.append(allocator, '"');
-}
-
-fn appendJsonStringField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: []const u8, comma: bool) !void {
-    if (comma) try out.append(allocator, ',');
-    try appendJsonString(out, allocator, name);
-    try out.append(allocator, ':');
-    try appendJsonString(out, allocator, value);
-}
-
-fn appendJsonNumberField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: anytype, comma: bool) !void {
-    if (comma) try out.append(allocator, ',');
-    try appendJsonString(out, allocator, name);
-    try out.print(allocator, ":{d}", .{value});
-}
-
 fn accessLogSetHandler(handler: []const u8) void {
-    if (current_access_log) |ctx| ctx.handler = handler;
+    access_log_mod.setHandler(current_access_log, handler);
 }
 
 fn accessLogSetUpstream(upstream: []const u8) void {
-    if (current_access_log) |ctx| ctx.upstream = upstream;
+    access_log_mod.setUpstream(current_access_log, upstream);
 }
 
 fn accessLogSetError(error_name: []const u8) void {
-    if (current_access_log) |ctx| ctx.error_name = error_name;
-}
-
-fn accessLogUsesStderr(sink: []const u8) bool {
-    return sink.len == 0 or std.mem.eql(u8, sink, "-") or std.ascii.eqlIgnoreCase(sink, "stderr");
-}
-
-fn accessLogUsesStdout(sink: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(sink, "stdout");
-}
-
-fn writeAccessLogLine(io: std.Io, sink: []const u8, line: []const u8) !void {
-    if (accessLogUsesStderr(sink)) {
-        std.debug.print("{s}", .{line});
-        return;
-    }
-    if (accessLogUsesStdout(sink)) {
-        try std.Io.File.stdout().writeStreamingAll(io, line);
-        return;
-    }
-
-    try ensureParentDir(io, sink);
-    access_log_mutex.lockUncancelable(io);
-    defer access_log_mutex.unlock(io);
-
-    var file = std.Io.Dir.cwd().openFile(io, sink, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.cwd().createFile(io, sink, .{ .truncate = false, .permissions = @enumFromInt(0o640) }),
-        else => return err,
-    };
-    defer file.close(io);
-
-    const stat = std.Io.Dir.cwd().statFile(io, sink, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        else => return err,
-    };
-    try file.writePositionalAll(io, line, stat.size);
+    access_log_mod.setError(current_access_log, error_name);
 }
 
 fn emitAccessLog(status_code: u16, body_bytes: usize) void {
-    const ctx = current_access_log orelse return;
-    if (!ctx.enabled or ctx.logged) return;
-    ctx.logged = true;
-
-    var out = std.ArrayList(u8).empty;
-    const allocator = std.heap.page_allocator;
-    defer out.deinit(allocator);
-
-    const now_real_ms = std.Io.Timestamp.now(activeIo(), .real).toMilliseconds();
-    const now_awake_ms = std.Io.Timestamp.now(activeIo(), .awake).toMilliseconds();
-    const duration_ms = @max(@as(i64, 0), now_awake_ms - ctx.start_ms);
-
-    out.append(allocator, '{') catch return;
-    appendJsonNumberField(&out, allocator, "ts_ms", now_real_ms, false) catch return;
-    appendJsonStringField(&out, allocator, "server", SERVER_NAME, true) catch return;
-    appendJsonStringField(&out, allocator, "method", ctx.method, true) catch return;
-    appendJsonStringField(&out, allocator, "path", ctx.path, true) catch return;
-    appendJsonStringField(&out, allocator, "query", ctx.query, true) catch return;
-    appendJsonStringField(&out, allocator, "host", ctx.host, true) catch return;
-    appendJsonStringField(&out, allocator, "protocol", ctx.protocol, true) catch return;
-    appendJsonStringField(&out, allocator, "request_id", ctx.request_id, true) catch return;
-    appendJsonNumberField(&out, allocator, "status", status_code, true) catch return;
-    appendJsonNumberField(&out, allocator, "bytes", body_bytes, true) catch return;
-    appendJsonNumberField(&out, allocator, "duration_ms", duration_ms, true) catch return;
-    appendJsonStringField(&out, allocator, "handler", ctx.handler, true) catch return;
-    if (ctx.upstream) |upstream| {
-        appendJsonStringField(&out, allocator, "upstream", upstream, true) catch return;
-    }
-    if (ctx.error_name) |error_name| {
-        appendJsonStringField(&out, allocator, "error", error_name, true) catch return;
-    }
-    out.appendSlice(allocator, "}\n") catch return;
-
-    writeAccessLogLine(activeIo(), ctx.sink, out.items) catch |err| {
-        std.debug.print("Access log write failed: {}\n", .{err});
-    };
+    access_log_writer.emit(activeIo(), current_access_log, SERVER_NAME, status_code, body_bytes);
 }
 
 fn handleAdminSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool) !void {
@@ -7981,10 +7585,10 @@ fn sendCompletedHttp2Request(
         current_compression_policy = .disabled;
         current_response_headers = &.{};
     }
-    const request_id = try resolveRequestId(allocator, req.headers);
+    const request_id = try request_id_generator.resolve(io, allocator, req.headers);
     current_request_id = request_id;
 
-    var access_ctx = AccessLogContext{
+    var access_ctx = access_log_mod.Context{
         .enabled = cfg.access_log_enabled,
         .sink = cfg.access_log_path,
         .method = req.method,
@@ -11149,15 +10753,6 @@ test "static cache headers include cache status detail" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n") != null);
 }
 
-test "request id validation preserves safe inbound ids" {
-    try std.testing.expect(isValidRequestId("client-123_abc.DEF:/@"));
-    try std.testing.expect(!isValidRequestId(""));
-    try std.testing.expect(!isValidRequestId("bad id"));
-    try std.testing.expect(!isValidRequestId("bad\r\nid"));
-    try std.testing.expectEqualStrings("client-123", requestIdFromHeaders("Host: example.test\r\nX-Request-Id: client-123\r\n").?);
-    try std.testing.expect(requestIdFromHeaders("X-Request-Id: invalid value\r\n") == null);
-}
-
 test "chunked upstream body scanner detects trailers and terminator" {
     var scanner = ChunkedBodyScanner{};
     var completed = false;
@@ -11967,9 +11562,9 @@ fn handleHttpRedirectConnection(
     };
     req.close_connection = true;
     server_metrics.requestStarted();
-    const request_id = try resolveRequestId(req_alloc, req.headers);
+    const request_id = try request_id_generator.resolve(io, req_alloc, req.headers);
 
-    var access_ctx = AccessLogContext{
+    var access_ctx = access_log_mod.Context{
         .enabled = cfg.access_log_enabled,
         .sink = cfg.access_log_path,
         .method = req.method,
@@ -12256,8 +11851,8 @@ fn handleConnection(
         server_metrics.requestStarted();
 
         {
-            const request_id = try resolveRequestId(req_alloc, req.headers);
-            var access_ctx = AccessLogContext{
+            const request_id = try request_id_generator.resolve(io, req_alloc, req.headers);
+            var access_ctx = access_log_mod.Context{
                 .enabled = cfg.access_log_enabled,
                 .sink = cfg.access_log_path,
                 .method = req.method,
