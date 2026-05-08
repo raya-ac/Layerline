@@ -94,6 +94,7 @@ compression_min_bytes = 1
 compression_max_bytes = 1048576
 route = nogzip /nogzip/* static
 route_compression.nogzip = false
+route_stale_if_error.nogzip = 30
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
@@ -110,6 +111,7 @@ index = index.html
 serve_static_root = true
 php_info_page = false
 compression = false
+stale_while_revalidate = 45
 CONF
 
 log "starting temporary server on http://$HOST:$PORT"
@@ -161,6 +163,7 @@ ROUTE_NOGZIP_CODE=$(curl -sS --raw -D "$ROUTE_NOGZIP_HEADERS" -o /dev/null -w '%
 if header_has "$ROUTE_NOGZIP_HEADERS" '^Content-Encoding: gzip'; then
   die "route compression override still compressed the route-local 405"
 fi
+header_has "$ROUTE_NOGZIP_HEADERS" '^Cache-Control: stale-if-error=30' || die "route stale-if-error Cache-Control header missing"
 ok "HTTP/1 route compression override"
 
 if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
@@ -192,6 +195,7 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   if header_has "$H2_ROUTE_NOGZIP_HEADERS" '^content-encoding: gzip'; then
     die "h2 route compression override still compressed the route-local 405"
   fi
+  header_has "$H2_ROUTE_NOGZIP_HEADERS" '^cache-control: stale-if-error=30' || die "h2 route stale-if-error Cache-Control header missing"
   ok "h2c route compression override"
 
   H2_POST_BODY="$TMP_DIR/h2-post.body"
@@ -218,6 +222,7 @@ CUSTOM_404_CODE=$(curl -sS -D "$CUSTOM_404_HEADERS" -o "$CUSTOM_404_BODY" -w '%{
 [[ $CUSTOM_404_CODE == 404 ]] || die "domain custom 404 returned HTTP $CUSTOM_404_CODE"
 grep -Fq 'custom domain 404 page' "$CUSTOM_404_BODY" || die "domain custom 404 body was not served"
 header_has "$CUSTOM_404_HEADERS" '^X-Request-Id: ll-' || die "domain custom 404 did not include generated request id"
+header_has "$CUSTOM_404_HEADERS" '^Cache-Control: stale-while-revalidate=45' || die "domain stale-while-revalidate Cache-Control header missing"
 ok "domain custom 404 document"
 
 CUSTOM_404_GZIP_HEADERS="$TMP_DIR/custom-404-gzip.headers"

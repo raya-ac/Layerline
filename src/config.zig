@@ -184,6 +184,11 @@ pub const CompressionSizeProperty = enum {
     max_bytes,
 };
 
+pub const CacheStaleProperty = enum {
+    stale_while_revalidate,
+    stale_if_error,
+};
+
 pub const DomainStringProperty = enum {
     static_dir,
     index_file,
@@ -1030,6 +1035,27 @@ pub fn appendRouteCacheControl(routes: *std.ArrayList(RouteConfig), allocator: s
     if (value.len > 0) try route.response_headers.append(allocator, try makeResponseHeaderRule(allocator, "Cache-Control", value));
 }
 
+fn cacheStaleDirectiveName(field: CacheStaleProperty) []const u8 {
+    return switch (field) {
+        .stale_while_revalidate => "stale-while-revalidate",
+        .stale_if_error => "stale-if-error",
+    };
+}
+
+pub fn appendCacheStaleDirective(headers: *std.ArrayList(ResponseHeaderRule), allocator: std.mem.Allocator, value: []const u8, field: CacheStaleProperty) !void {
+    const seconds = try parseConfigU32(value);
+    if (seconds == 0) return error.InvalidConfigValue;
+    try headers.append(allocator, .{
+        .name = try allocator.dupe(u8, "Cache-Control"),
+        .value = try std.fmt.allocPrint(allocator, "{s}={d}", .{ cacheStaleDirectiveName(field), seconds }),
+    });
+}
+
+pub fn appendRouteCacheStaleDirective(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, route_name: []const u8, value: []const u8, field: CacheStaleProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    try appendCacheStaleDirective(&route.response_headers, allocator, value, field);
+}
+
 pub fn isDomainConfigNameValid(name: []const u8) bool {
     return isRouteNameValid(name);
 }
@@ -1182,6 +1208,11 @@ pub fn appendDomainCacheControl(cfg: *ServerConfig, allocator: std.mem.Allocator
     if (value.len > 0) try domain.response_headers.append(allocator, try makeResponseHeaderRule(allocator, "Cache-Control", value));
 }
 
+pub fn appendDomainCacheStaleDirective(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8, field: CacheStaleProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    try appendCacheStaleDirective(&domain.response_headers, allocator, value, field);
+}
+
 pub fn setDomainRouteLine(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
     const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
     try setRouteLineFor(&domain.routes, allocator, value);
@@ -1245,6 +1276,12 @@ pub fn appendDomainRouteCacheControl(cfg: *ServerConfig, allocator: std.mem.Allo
     const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
     const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
     try appendRouteCacheControl(&domain.routes, allocator, split.route, value);
+}
+
+pub fn appendDomainRouteCacheStaleDirective(cfg: *ServerConfig, allocator: std.mem.Allocator, property_name: []const u8, value: []const u8, field: CacheStaleProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try appendRouteCacheStaleDirective(&domain.routes, allocator, split.route, value, field);
 }
 
 // Map one config file line to fields. Config files are strict so typos do not
@@ -1390,6 +1427,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try makeResponseHeaderRule(allocator, "Cache-Control", v));
+    } else if (std.mem.eql(u8, k, "stale_while_revalidate") or std.mem.eql(u8, k, "cache_stale_while_revalidate")) {
+        try appendCacheStaleDirective(&cfg.response_headers, allocator, v, .stale_while_revalidate);
+    } else if (std.mem.eql(u8, k, "stale_if_error") or std.mem.eql(u8, k, "cache_stale_if_error")) {
+        try appendCacheStaleDirective(&cfg.response_headers, allocator, v, .stale_if_error);
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try cfg.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "domain_config_dir") or std.mem.eql(u8, k, "domains_dir") or std.mem.eql(u8, k, "sites_enabled") or std.mem.eql(u8, k, "sites_dir")) {
@@ -1420,6 +1461,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try appendDomainCacheControl(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_cache-control.")) |name| {
         try appendDomainCacheControl(cfg, allocator, name, v);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_stale_while_revalidate.", "server_cache_stale_while_revalidate." })) |name| {
+        try appendDomainCacheStaleDirective(cfg, allocator, name, v, .stale_while_revalidate);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_stale_if_error.", "server_cache_stale_if_error." })) |name| {
+        try appendDomainCacheStaleDirective(cfg, allocator, name, v, .stale_if_error);
     } else if (findRoutePropertyName(k, "server_root.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "server_dir.")) |name| {
@@ -1551,6 +1596,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try appendDomainRouteCacheControl(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_route_cache-control.")) |name| {
         try appendDomainRouteCacheControl(cfg, allocator, name, v);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_stale_while_revalidate.", "server_route_cache_stale_while_revalidate." })) |name| {
+        try appendDomainRouteCacheStaleDirective(cfg, allocator, name, v, .stale_while_revalidate);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_stale_if_error.", "server_route_cache_stale_if_error." })) |name| {
+        try appendDomainRouteCacheStaleDirective(cfg, allocator, name, v, .stale_if_error);
     } else if (std.mem.eql(u8, k, "route")) {
         try setRouteLine(cfg, allocator, v);
     } else if (findRoutePropertyName(k, "route_dir.")) |name| {
@@ -1621,6 +1670,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try appendRouteCacheControl(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_cache-control.")) |name| {
         try appendRouteCacheControl(&cfg.routes, allocator, name, v);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_stale_while_revalidate.", "route_cache_stale_while_revalidate." })) |name| {
+        try appendRouteCacheStaleDirective(&cfg.routes, allocator, name, v, .stale_while_revalidate);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_stale_if_error.", "route_cache_stale_if_error." })) |name| {
+        try appendRouteCacheStaleDirective(&cfg.routes, allocator, name, v, .stale_if_error);
     } else if (std.mem.eql(u8, k, "max_request_bytes")) {
         cfg.max_request_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "max_body_bytes")) {
@@ -1907,6 +1960,10 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         if (v.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
         if (v.len > 0) try domain.response_headers.append(allocator, try makeResponseHeaderRule(allocator, "Cache-Control", v));
+    } else if (std.mem.eql(u8, k, "stale_while_revalidate") or std.mem.eql(u8, k, "cache_stale_while_revalidate")) {
+        try appendCacheStaleDirective(&domain.response_headers, allocator, v, .stale_while_revalidate);
+    } else if (std.mem.eql(u8, k, "stale_if_error") or std.mem.eql(u8, k, "cache_stale_if_error")) {
+        try appendCacheStaleDirective(&domain.response_headers, allocator, v, .stale_if_error);
     } else if (std.mem.eql(u8, k, "redirect") or std.mem.eql(u8, k, "redir")) {
         if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
     } else if (std.mem.eql(u8, k, "route")) {
@@ -1979,6 +2036,10 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try appendRouteCacheControl(&domain.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_cache-control.")) |name| {
         try appendRouteCacheControl(&domain.routes, allocator, name, v);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_stale_while_revalidate.", "route_cache_stale_while_revalidate." })) |name| {
+        try appendRouteCacheStaleDirective(&domain.routes, allocator, name, v, .stale_while_revalidate);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_stale_if_error.", "route_cache_stale_if_error." })) |name| {
+        try appendRouteCacheStaleDirective(&domain.routes, allocator, name, v, .stale_if_error);
     } else {
         return error.UnknownConfigKey;
     }

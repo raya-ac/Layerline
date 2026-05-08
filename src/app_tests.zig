@@ -333,6 +333,45 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(!file_domain.routes.items[0].compression_enabled.?);
 }
 
+fn headersContainRule(headers: []const config_mod.ResponseHeaderRule, name: []const u8, value: []const u8) bool {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name) and std.mem.eql(u8, header.value, value)) return true;
+    }
+    return false;
+}
+
+test "cache stale shortcuts inherit through domain and route scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = defaultServerConfig();
+    try applyConfigLine(&cfg, allocator, "stale_while_revalidate", "30");
+    try applyConfigLine(&cfg, allocator, "route", "assets /assets/* static");
+    try applyConfigLine(&cfg, allocator, "route_stale_if_error.assets", "600");
+
+    try setDomainLine(&cfg, allocator, "site");
+    try appendServerNames(allocator, findDomainConfigMutable(&cfg, "site").?, "example.test");
+    try applyConfigLine(&cfg, allocator, "server_stale_if_error.site", "120");
+    try setDomainRouteLine(&cfg, allocator, "site", "app /app/* proxy");
+    try applyConfigLine(&cfg, allocator, "server_route_stale_while_revalidate.site.app", "15");
+
+    const route_context = try buildResponseHeaderContext(allocator, &cfg, null, findNamedRoute(&cfg, "/assets/app.css").?);
+    defer route_context.deinit(allocator);
+    try std.testing.expect(headersContainRule(route_context.items, "Cache-Control", "stale-while-revalidate=30"));
+    try std.testing.expect(headersContainRule(route_context.items, "Cache-Control", "stale-if-error=600"));
+
+    const site = findDomainForHost(&cfg, "example.test").?;
+    const app_route = findDomainRoute(site, "/app/status").?;
+    const domain_route_context = try buildResponseHeaderContext(allocator, &cfg, site, app_route);
+    defer domain_route_context.deinit(allocator);
+    try std.testing.expect(headersContainRule(domain_route_context.items, "Cache-Control", "stale-while-revalidate=30"));
+    try std.testing.expect(headersContainRule(domain_route_context.items, "Cache-Control", "stale-if-error=120"));
+    try std.testing.expect(headersContainRule(domain_route_context.items, "Cache-Control", "stale-while-revalidate=15"));
+
+    try std.testing.expectError(error.InvalidConfigValue, applyConfigLine(&cfg, allocator, "route_stale_if_error.assets", "0"));
+}
+
 test "php front controller target keeps script and path info separate" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

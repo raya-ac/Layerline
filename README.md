@@ -55,9 +55,9 @@ Layerline is being built toward the Caddy/nginx class: direct TLS termination, v
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper reload/protocol parity: in-memory config snapshot swaps, HTTP/3 route dispatch, route-local stale/cache policy, and broader h2/h3 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is deeper reload/protocol parity: in-memory config snapshot swaps, HTTP/3 route dispatch, real response-cache work, and broader h2/h3 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -399,7 +399,13 @@ cache_control = public, max-age=60
 server_cache_control.main = private, max-age=30
 route_cache_control.app = no-store
 server_route_cache_control.main.assets = public, max-age=31536000, immutable
+stale_while_revalidate = 30
+server_stale_if_error.main = 300
+route_stale_if_error.app = 60
+server_route_stale_while_revalidate.main.assets = 600
 ```
+
+The stale shortcuts append `Cache-Control` directives with seconds values. They follow the same inheritance model as normal headers, so a route sees global stale policy, matching domain stale policy, and route-local stale policy in that order.
 
 Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
 
