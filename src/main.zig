@@ -15,7 +15,7 @@ const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
-const request_body = @import("request_body.zig");
+const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
 const routing_mod = @import("routing.zig");
 const static_files = @import("static_files.zig");
@@ -55,8 +55,6 @@ const findDomainRouteMutable = routing_mod.findDomainRouteMutable;
 const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
-const hasHeaderToken = http_headers.hasHeaderToken;
-const parseConnectionClose = http_headers.parseConnectionClose;
 const trimValue = http_headers.trimValue;
 const buildCgiExtraHeaders = cgi_headers.buildExtraHeaders;
 const findCgiHeaderValue = cgi_headers.findHeaderValue;
@@ -124,7 +122,7 @@ const makeStaticEtag = static_files.makeStaticEtag;
 const parseByteRange = static_files.parseByteRange;
 const statRegularFile = static_files.statRegularFile;
 const TlsChannel = native_tls.Channel;
-const RequestHashInput = upstream_mod.RequestHashInput;
+const HttpRequest = request_mod.HttpRequest;
 const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
 const upstreamInSlowStart = upstream_mod.upstreamInSlowStart;
@@ -459,23 +457,6 @@ fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgiEndp
     };
 }
 
-// Slices in here point into the per-request arena. Keep that arena alive until
-// routing finishes or the request quietly turns into garbage.
-const HttpRequest = struct {
-    method: []const u8,
-    path: []const u8,
-    query: []const u8,
-    headers: []const u8,
-    version: []const u8,
-    body: []const u8,
-    close_connection: bool,
-    h2c_upgrade_tail: []const u8 = "",
-};
-
-fn upstreamRequestHashInput(req: HttpRequest) RequestHashInput {
-    return .{ .path = req.path, .query = req.query, .headers = req.headers };
-}
-
 fn headerBlockContainsHeader(headers: ?[]const u8, name: []const u8) bool {
     const raw_headers = headers orelse return false;
     var lines = std.mem.splitSequence(u8, raw_headers, "\r\n");
@@ -566,42 +547,6 @@ fn prepareResponseBody(
 
     server_metrics.compressedResponseSent(compressed.len);
     return .{ .body = compressed, .encoding = "gzip", .owned = compressed };
-}
-
-fn http2SettingsDecodedLength(value: []const u8) ?usize {
-    var len: usize = 0;
-    for (value) |byte| {
-        const valid = (byte >= 'A' and byte <= 'Z') or
-            (byte >= 'a' and byte <= 'z') or
-            (byte >= '0' and byte <= '9') or
-            byte == '-' or
-            byte == '_';
-        if (!valid) return null;
-        len += 1;
-    }
-
-    const rem = len % 4;
-    if (rem == 1) return null;
-    return (len / 4) * 3 + switch (rem) {
-        0 => @as(usize, 0),
-        2 => @as(usize, 1),
-        3 => @as(usize, 2),
-        else => unreachable,
-    };
-}
-
-fn isValidHttp2SettingsHeader(value: []const u8) bool {
-    const decoded_len = http2SettingsDecodedLength(trimValue(value)) orelse return false;
-    return decoded_len % 6 == 0;
-}
-
-fn isH2cUpgradeHeaders(headers: []const u8) bool {
-    const upgrade = findHeaderValue(headers, "Upgrade") orelse return false;
-    const settings = findHeaderValue(headers, "HTTP2-Settings") orelse return false;
-    return hasConnectionToken(upgrade, "h2c") and
-        hasHeaderToken(headers, "Connection", "Upgrade") and
-        hasHeaderToken(headers, "Connection", "HTTP2-Settings") and
-        isValidHttp2SettingsHeader(settings);
 }
 
 fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
@@ -2064,150 +2009,6 @@ fn handleTlsClientHelloProbe(
     try handleConnection(io, stream, cfg, allocator, process_env);
 }
 
-// Read the whole request envelope while the backing buffer is still alive.
-// Method/path/header slices all point into it.
-fn parseRequest(
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    max_request_bytes: usize,
-    max_body_bytes: usize,
-    read_body_timeout_ms: u32,
-    prefill: []const u8,
-) !HttpRequest {
-    const request_buffer = try allocator.alloc(u8, max_request_bytes);
-    var used: usize = 0;
-
-    const prefill_len = @min(prefill.len, request_buffer.len);
-    if (prefill_len > 0) {
-        @memcpy(request_buffer[0..prefill_len], prefill[0..prefill_len]);
-        used = prefill_len;
-    }
-
-    while (used < request_buffer.len) {
-        const n = try streamRead(stream, request_buffer[used..]);
-        if (n == 0) return error.ConnectionClosed;
-        used += n;
-
-        if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") != null) break;
-        if (used == request_buffer.len) return error.RequestTooLarge;
-    }
-
-    const header_end = (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") orelse return error.MalformedRequest) + 4;
-    const header_bytes = request_buffer[0..header_end];
-    const body_tail = request_buffer[header_end..used];
-
-    const request_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.MalformedRequest;
-    const request_line = header_bytes[0..request_line_end];
-    var request_parts = std.mem.splitSequence(u8, request_line, " ");
-
-    const method = request_parts.next() orelse return error.MalformedRequest;
-    const path_and_query = request_parts.next() orelse return error.MalformedRequest;
-    const version = request_parts.next() orelse return error.MalformedRequest;
-
-    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
-    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
-    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
-
-    const headers_start = request_line_end + 2;
-    const headers_end = if (header_end >= 4) header_end - 4 else 0;
-    const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
-
-    if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
-    if (std.mem.startsWith(u8, version, "HTTP/1.1") and findHeaderValue(headers, "Host") == null) {
-        return error.MissingHostHeader;
-    }
-
-    if (isH2cUpgradeHeaders(headers)) {
-        return HttpRequest{
-            .method = method,
-            .path = path,
-            .query = query,
-            .headers = headers,
-            .version = version,
-            .body = "",
-            .close_connection = true,
-            .h2c_upgrade_tail = body_tail,
-        };
-    }
-
-    if (findHeaderValue(headers, "Expect")) |expect| {
-        if (!hasConnectionToken(expect, "100-continue")) return error.ExpectationFailed;
-        try streamWriteAll(stream, "HTTP/1.1 100 Continue\r\n\r\n");
-    }
-
-    // Parse body only after headers are validated, and enforce limits immediately.
-    try setStreamReadTimeout(stream, read_body_timeout_ms);
-    const body_read = try request_body.readBody(stream, allocator, headers, body_tail, max_body_bytes, MAX_CHUNK_LINE_BYTES, streamRead);
-    const close_connection = parseConnectionClose(version, headers) or body_read.discarded_pipeline_bytes;
-
-    return HttpRequest{
-        .method = method,
-        .path = path,
-        .query = query,
-        .headers = headers,
-        .version = version,
-        .body = body_read.body,
-        .close_connection = close_connection,
-    };
-}
-
-fn parseRequestHeadersOnly(
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    max_request_bytes: usize,
-    prefill: []const u8,
-) !HttpRequest {
-    const request_buffer = try allocator.alloc(u8, max_request_bytes);
-    var used: usize = 0;
-
-    const prefill_len = @min(prefill.len, request_buffer.len);
-    if (prefill_len > 0) {
-        @memcpy(request_buffer[0..prefill_len], prefill[0..prefill_len]);
-        used = prefill_len;
-    }
-
-    while (used < request_buffer.len) {
-        if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") != null) break;
-        const n = try streamRead(stream, request_buffer[used..]);
-        if (n == 0) return error.ConnectionClosed;
-        used += n;
-    }
-    if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") == null) return error.RequestTooLarge;
-
-    const header_end = (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") orelse return error.MalformedRequest) + 4;
-    const header_bytes = request_buffer[0..header_end];
-    const request_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.MalformedRequest;
-    const request_line = header_bytes[0..request_line_end];
-    var request_parts = std.mem.splitSequence(u8, request_line, " ");
-
-    const method = request_parts.next() orelse return error.MalformedRequest;
-    const path_and_query = request_parts.next() orelse return error.MalformedRequest;
-    const version = request_parts.next() orelse return error.MalformedRequest;
-
-    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
-    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
-    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
-
-    const headers_start = request_line_end + 2;
-    const headers_end = if (header_end >= 4) header_end - 4 else 0;
-    const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
-
-    if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
-    if (std.mem.startsWith(u8, version, "HTTP/1.1") and findHeaderValue(headers, "Host") == null) {
-        return error.MissingHostHeader;
-    }
-
-    return HttpRequest{
-        .method = method,
-        .path = path,
-        .query = query,
-        .headers = headers,
-        .version = version,
-        .body = "",
-        .close_connection = true,
-    };
-}
-
 const H2BufferedResponse = struct {
     status_code: u16,
     content_type: []const u8,
@@ -2644,7 +2445,7 @@ fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamP
 
     const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
     const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, upstreamRequestHashInput(req), cfg);
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), cfg);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -3833,7 +3634,7 @@ fn forwardToUpstreamPool(
 
     const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
     const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, upstreamRequestHashInput(req), cfg);
+    const start_ticket = upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), cfg);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -4847,11 +4648,11 @@ test "consistent hash policy keeps a stable healthy target" {
         .close_connection = false,
     };
 
-    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, upstreamRequestHashInput(req), null);
-    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, upstreamRequestHashInput(req), null));
+    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null);
+    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null));
 
     pool.targets.items[first].ejected_until_ms.store(2_000, .monotonic);
-    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, upstreamRequestHashInput(req), null);
+    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null);
     try std.testing.expect(replacement != first);
     try std.testing.expect(replacement < pool.targets.items.len);
 }
@@ -5685,7 +5486,11 @@ fn handleHttpRedirectConnection(
         return;
     }
 
-    var req = parseRequestHeadersOnly(stream, req_alloc, cfg.max_request_bytes, prefill) catch |err| {
+    var req = request_mod.parseHeadersOnly(stream, req_alloc, cfg.max_request_bytes, prefill, .{
+        .read = streamRead,
+        .write_all = streamWriteAll,
+        .set_read_timeout = setStreamReadTimeout,
+    }) catch |err| {
         if (err != error.ConnectionClosed) server_metrics.requestParseError();
         switch (err) {
             error.ConnectionClosed => return,
@@ -5909,7 +5714,11 @@ fn handleConnection(
         setStreamReadTimeout(stream, cfg.read_header_timeout_ms) catch |err| {
             std.debug.print("Socket header timeout setup failed: {}\n", .{err});
         };
-        var req = parseRequest(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, cfg.read_body_timeout_ms, prefill) catch |err| {
+        var req = request_mod.parse(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, cfg.read_body_timeout_ms, MAX_CHUNK_LINE_BYTES, prefill, .{
+            .read = streamRead,
+            .write_all = streamWriteAll,
+            .set_read_timeout = setStreamReadTimeout,
+        }) catch |err| {
             if (err != error.ConnectionClosed) server_metrics.requestParseError();
             switch (err) {
                 error.ConnectionClosed => return,
@@ -6045,7 +5854,7 @@ fn handleConnection(
                 current_request_id = "";
             }
 
-            if (req.h2c_upgrade_tail.len > 0 or isH2cUpgradeHeaders(req.headers)) {
+            if (req.h2c_upgrade_tail.len > 0 or request_mod.isH2cUpgradeHeaders(req.headers)) {
                 accessLogSetHandler("h2c_upgrade");
                 try handleHttp2Upgrade(io, stream, req_alloc, cfg, req, process_env);
                 return;
