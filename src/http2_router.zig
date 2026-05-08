@@ -10,6 +10,7 @@ const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 
+const CompressionPolicy = config_mod.CompressionPolicy;
 const DomainConfig = config_mod.DomainConfig;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const HttpRequest = request_mod.HttpRequest;
@@ -29,6 +30,7 @@ pub const Callbacks = struct {
     read_acme_challenge: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!H2BufferedResponse,
     read_static_file: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, usize) anyerror!H2BufferedResponse,
     redirect_response: *const fn (std.mem.Allocator, config_mod.RedirectRule, HttpRequest) anyerror!H2BufferedResponse,
+    set_compression_policy: *const fn (CompressionPolicy) void,
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
 };
 
@@ -43,6 +45,7 @@ pub fn buildResponseForRequest(
     _ = process_env;
     const is_head = std.mem.eql(u8, req.method, "HEAD");
     const domain = routing_mod.findDomainForRequestMutable(cfg, req.headers);
+    callbacks.set_compression_policy(config_mod.compressionPolicyFor(cfg, domain, null));
     const base_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, null);
     callbacks.set_response_headers(base_header_context.items);
 
@@ -58,11 +61,13 @@ pub fn buildResponseForRequest(
     if (routing_mod.findDomainRouteMutable(domain, req.path)) |route| {
         const route_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, route);
         callbacks.set_response_headers(route_header_context.items);
+        callbacks.set_compression_policy(config_mod.compressionPolicyFor(cfg, domain, route));
         return buildRouteResponse(io, allocator, cfg, domain, route, req, callbacks);
     }
     if (routing_mod.findNamedRouteMutable(cfg, req.path)) |route| {
         const route_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, route);
         callbacks.set_response_headers(route_header_context.items);
+        callbacks.set_compression_policy(config_mod.compressionPolicyFor(cfg, domain, route));
         return buildRouteResponse(io, allocator, cfg, domain, route, req, callbacks);
     }
 

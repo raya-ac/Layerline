@@ -23,6 +23,7 @@ const buildAcmeChallengeFilePath = acme_mod.buildAcmeChallengeFilePath;
 const buildResponseHeaderContext = config_mod.buildResponseHeaderContext;
 const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
 const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
+const compressionPolicyFor = config_mod.compressionPolicyFor;
 const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = config_mod.DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
 const DEFAULT_PHP_INDEX = config_mod.DEFAULT_PHP_INDEX;
 const defaultServerConfig = config_mod.defaultServerConfig;
@@ -125,6 +126,9 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "compression", "true");
     try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
     try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
+    try applyConfigLine(&cfg, allocator, "route_compression.assets", "false");
+    try applyConfigLine(&cfg, allocator, "route_gzip_min_bytes.assets", "256");
+    try applyConfigLine(&cfg, allocator, "route_gzip_max_bytes.assets", "8192");
     try applyConfigLine(&cfg, allocator, "admin_socket", "/tmp/layerline-test-admin.sock");
     try applyConfigLine(&cfg, allocator, "admin_ui", "true");
     try applyConfigLine(&cfg, allocator, "admin_ui_path", "/_test/admin");
@@ -168,6 +172,10 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(cfg.gzip_enabled);
     try std.testing.expectEqual(@as(usize, 128), cfg.compression_min_bytes);
     try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
+    const assets_compression = compressionPolicyFor(&cfg, null, findNamedRoute(&cfg, "/assets/hello.txt").?);
+    try std.testing.expect(!assets_compression.enabled);
+    try std.testing.expectEqual(@as(usize, 256), assets_compression.min_bytes);
+    try std.testing.expectEqual(@as(usize, 8192), assets_compression.max_bytes);
     try std.testing.expect(cfg.admin_enabled);
     try std.testing.expectEqualStrings("/tmp/layerline-test-admin.sock", cfg.admin_socket_path.?);
     try std.testing.expect(cfg.admin_ui_enabled);
@@ -264,10 +272,14 @@ test "named routes prefer exact and longest prefix matches" {
     try applyConfigLine(&cfg, allocator, "server_tls_key.site", "/certs/site/privkey.pem");
     try applyConfigLine(&cfg, allocator, "server_header.site", "X-Site-Policy: site");
     try applyConfigLine(&cfg, allocator, "server_cache_control.site", "private, max-age=30");
+    try applyConfigLine(&cfg, allocator, "server_compression.site", "false");
     try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
     try setDomainRouteLine(&cfg, allocator, "site", "site-api /api/* proxy");
     try applyConfigLine(&cfg, allocator, "server_route_header.site.site-api", "X-Api-Policy: route");
     try applyConfigLine(&cfg, allocator, "server_route_cache_control.site.site-api", "no-store");
+    try applyConfigLine(&cfg, allocator, "server_route_compression.site.site-api", "true");
+    try applyConfigLine(&cfg, allocator, "server_route_gzip_min_bytes.site.site-api", "64");
+    try applyConfigLine(&cfg, allocator, "server_route_gzip_max_bytes.site.site-api", "2048");
     try applyConfigLine(&cfg, allocator, "server_proxy_policy.site", "random");
     try applyConfigLine(&cfg, allocator, "server_proxy_timeout_ms.site", "4200");
     try applyConfigLine(&cfg, allocator, "server_route_proxy_policy.site.site-api", "inherit");
@@ -288,6 +300,12 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(u32, 4200), domainUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test")));
     const site_domain = findDomainForHost(&cfg, "example.test").?;
     const site_api_route = findDomainRoute(site_domain, "/api/status").?;
+    const site_compression = compressionPolicyFor(&cfg, site_domain, null);
+    try std.testing.expect(!site_compression.enabled);
+    const site_api_compression = compressionPolicyFor(&cfg, site_domain, site_api_route);
+    try std.testing.expect(site_api_compression.enabled);
+    try std.testing.expectEqual(@as(usize, 64), site_api_compression.min_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), site_api_compression.max_bytes);
     const response_header_context = try buildResponseHeaderContext(allocator, &cfg, site_domain, site_api_route);
     defer response_header_context.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 6), response_header_context.items.len);
@@ -299,6 +317,10 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("Cache-Control", response_header_context.items[5].name);
 
     var file_domain = try initDomainConfig(allocator, "file-site");
+    try applyDomainConfigLine(&file_domain, allocator, "compression", "true");
+    try applyDomainConfigLine(&file_domain, allocator, "gzip_min_bytes", "32");
+    try applyDomainConfigLine(&file_domain, allocator, "route", "file-assets /assets/* static");
+    try applyDomainConfigLine(&file_domain, allocator, "route_compression.file-assets", "false");
     try applyDomainConfigLine(&file_domain, allocator, "add_header", "X-File-Policy: file");
     try applyDomainConfigLine(&file_domain, allocator, "cache_control", "public, max-age=120");
     try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate", "/certs/file/fullchain.pem");
@@ -306,6 +328,9 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqual(@as(usize, 2), file_domain.response_headers.items.len);
     try std.testing.expectEqualStrings("/certs/file/fullchain.pem", file_domain.tls_cert.?);
     try std.testing.expectEqualStrings("/certs/file/privkey.pem", file_domain.tls_key.?);
+    try std.testing.expect(file_domain.compression_enabled.?);
+    try std.testing.expectEqual(@as(usize, 32), file_domain.compression_min_bytes.?);
+    try std.testing.expect(!file_domain.routes.items[0].compression_enabled.?);
 }
 
 test "php front controller target keeps script and path info separate" {

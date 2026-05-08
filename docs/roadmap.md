@@ -37,7 +37,7 @@ Sources:
 - Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
 - MIME database and override config.
 - Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, and static Cache-Status headers are implemented on top of inherited response-header policy.
-- Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses; brotli/zstd and route/domain presets remain.
+- Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses with inherited global/domain/route policy overrides; brotli/zstd remain.
 - Static transforms: safe template mode, include variables, generated headers, and route-local error pages.
 - Large-file performance: sendfile on supported targets, fallback streaming, mmap evaluation, rate limiting, and backpressure tests.
 
@@ -114,7 +114,7 @@ Sources:
 6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, consumed-body WINDOW_UPDATE, and graceful GOAWAY on request caps/shutdown; prioritization stance and broader conformance tests remain next.
 8. HTTP/3 full routing.
-9. Cache and compression. Initial inherited Cache-Control policy shortcuts, static Cache-Status detail, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented; richer stale policy and route/domain compression presets remain next.
+9. Cache and compression. Initial inherited Cache-Control policy shortcuts, static Cache-Status detail, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; richer stale policy and brotli/zstd remain next.
 10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, managed restart, routes, certs, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, enabled domain files, activation preflight, managed restart, and new site-file creation. In-memory hot reload plus live upstream/cert controls remain.
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.

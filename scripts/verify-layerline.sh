@@ -92,6 +92,8 @@ access_log = $ACCESS_LOG
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
+route = nogzip /nogzip/* static
+route_compression.nogzip = false
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
@@ -107,6 +109,7 @@ root = $CUSTOM_ROOT
 index = index.html
 serve_static_root = true
 php_info_page = false
+compression = false
 CONF
 
 log "starting temporary server on http://$HOST:$PORT"
@@ -152,6 +155,14 @@ if header_has "$IDENTITY_HEADERS" '^Content-Encoding: gzip'; then
 fi
 ok "gzip q=0 negotiation"
 
+ROUTE_NOGZIP_HEADERS="$TMP_DIR/route-nogzip.headers"
+ROUTE_NOGZIP_CODE=$(curl -sS --raw -D "$ROUTE_NOGZIP_HEADERS" -o /dev/null -w '%{http_code}' -X POST -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/nogzip/blocked")
+[[ $ROUTE_NOGZIP_CODE == 405 ]] || die "route compression override returned HTTP $ROUTE_NOGZIP_CODE instead of 405"
+if header_has "$ROUTE_NOGZIP_HEADERS" '^Content-Encoding: gzip'; then
+  die "route compression override still compressed the route-local 405"
+fi
+ok "HTTP/1 route compression override"
+
 if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_ROOT_BODY="$TMP_DIR/h2-root.body"
   curl -fsS --http2-prior-knowledge "http://$HOST:$PORT/" -o "$H2_ROOT_BODY"
@@ -174,6 +185,14 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   header_has "$H2_HEADERS" '^content-encoding: gzip' || die "h2 gzip response header missing"
   [[ $(od -An -tx1 -N2 "$H2_BODY" | tr -d ' \n') == 1f8b ]] || die "h2 gzip response did not start with gzip magic"
   ok "h2c gzip response"
+
+  H2_ROUTE_NOGZIP_HEADERS="$TMP_DIR/h2-route-nogzip.headers"
+  H2_ROUTE_NOGZIP_CODE=$(curl -sS --http2-prior-knowledge --raw -D "$H2_ROUTE_NOGZIP_HEADERS" -o /dev/null -w '%{http_code}' -X POST -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/nogzip/blocked")
+  [[ $H2_ROUTE_NOGZIP_CODE == 405 ]] || die "h2 route compression override returned HTTP $H2_ROUTE_NOGZIP_CODE instead of 405"
+  if header_has "$H2_ROUTE_NOGZIP_HEADERS" '^content-encoding: gzip'; then
+    die "h2 route compression override still compressed the route-local 405"
+  fi
+  ok "h2c route compression override"
 
   H2_POST_BODY="$TMP_DIR/h2-post.body"
   curl -fsS --http2-prior-knowledge --data 'layerline-h2-body' "http://$HOST:$PORT/api/echo" -o "$H2_POST_BODY"
@@ -200,6 +219,14 @@ CUSTOM_404_CODE=$(curl -sS -D "$CUSTOM_404_HEADERS" -o "$CUSTOM_404_BODY" -w '%{
 grep -Fq 'custom domain 404 page' "$CUSTOM_404_BODY" || die "domain custom 404 body was not served"
 header_has "$CUSTOM_404_HEADERS" '^X-Request-Id: ll-' || die "domain custom 404 did not include generated request id"
 ok "domain custom 404 document"
+
+CUSTOM_404_GZIP_HEADERS="$TMP_DIR/custom-404-gzip.headers"
+CUSTOM_404_GZIP_CODE=$(curl -sS --raw -D "$CUSTOM_404_GZIP_HEADERS" -o /dev/null -w '%{http_code}' -H 'Host: custom404.test' -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/missing-custom-page")
+[[ $CUSTOM_404_GZIP_CODE == 404 ]] || die "domain compression override returned HTTP $CUSTOM_404_GZIP_CODE instead of 404"
+if header_has "$CUSTOM_404_GZIP_HEADERS" '^Content-Encoding: gzip'; then
+  die "domain compression override still compressed the custom 404"
+fi
+ok "domain compression override"
 
 ADMIN_STATUS=$(printf 'status\n' | nc -U "$SOCKET")
 case "$ADMIN_STATUS" in

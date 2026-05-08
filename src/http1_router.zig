@@ -87,7 +87,7 @@ pub fn route(
     const method = req.method;
     const is_head = std.mem.eql(u8, method, "HEAD");
     const domain = routing_mod.findDomainForRequestMutable(cfg, req.headers);
-    callbacks.set_request_context(req.headers, config_mod.compressionPolicyFromConfig(cfg));
+    callbacks.set_request_context(req.headers, config_mod.compressionPolicyFor(cfg, domain, null));
     defer callbacks.clear_request_context();
 
     const base_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, null);
@@ -117,6 +117,7 @@ pub fn route(
         const route_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, route_config);
         defer route_header_context.deinit(allocator);
         callbacks.set_response_headers(route_header_context.items);
+        callbacks.set_request_context(req.headers, config_mod.compressionPolicyFor(cfg, domain, route_config));
         try callbacks.handle_named_route(io, stream, allocator, cfg, domain, route_config, req, should_close, is_head, process_env);
         return;
     }
@@ -125,6 +126,7 @@ pub fn route(
         const route_header_context = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, route_config);
         defer route_header_context.deinit(allocator);
         callbacks.set_response_headers(route_header_context.items);
+        callbacks.set_request_context(req.headers, config_mod.compressionPolicyFor(cfg, domain, route_config));
         try callbacks.handle_named_route(io, stream, allocator, cfg, domain, route_config, req, should_close, is_head, process_env);
         return;
     }

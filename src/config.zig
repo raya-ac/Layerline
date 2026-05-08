@@ -174,6 +174,16 @@ pub const RouteU32Property = enum {
     upstream_timeout_ms,
 };
 
+pub const CompressionBoolProperty = enum {
+    enabled,
+    gzip_enabled,
+};
+
+pub const CompressionSizeProperty = enum {
+    min_bytes,
+    max_bytes,
+};
+
 pub const DomainStringProperty = enum {
     static_dir,
     index_file,
@@ -212,6 +222,10 @@ pub const RouteConfig = struct {
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
     upstream_timeout_ms: ?u32,
+    compression_enabled: ?bool,
+    gzip_enabled: ?bool,
+    compression_min_bytes: ?usize,
+    compression_max_bytes: ?usize,
     response_headers: std.ArrayList(ResponseHeaderRule),
 };
 
@@ -233,6 +247,10 @@ pub const DomainConfig = struct {
     upstream: ?UpstreamPoolConfig,
     upstream_policy: ?UpstreamPoolPolicy,
     upstream_timeout_ms: ?u32,
+    compression_enabled: ?bool,
+    gzip_enabled: ?bool,
+    compression_min_bytes: ?usize,
+    compression_max_bytes: ?usize,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
@@ -465,6 +483,41 @@ pub fn compressionPolicyFromConfig(cfg: *const ServerConfig) CompressionPolicy {
         .min_bytes = cfg.compression_min_bytes,
         .max_bytes = cfg.compression_max_bytes,
     };
+}
+
+fn applyDomainCompressionOverrides(policy: *CompressionPolicy, domain: *const DomainConfig) void {
+    if (domain.compression_enabled) |value| policy.enabled = value;
+    if (domain.gzip_enabled) |value| policy.gzip_enabled = value;
+    if (domain.compression_min_bytes) |value| policy.min_bytes = value;
+    if (domain.compression_max_bytes) |value| policy.max_bytes = value;
+}
+
+fn applyRouteCompressionOverrides(policy: *CompressionPolicy, route: *const RouteConfig) void {
+    if (route.compression_enabled) |value| policy.enabled = value;
+    if (route.gzip_enabled) |value| policy.gzip_enabled = value;
+    if (route.compression_min_bytes) |value| policy.min_bytes = value;
+    if (route.compression_max_bytes) |value| policy.max_bytes = value;
+}
+
+pub fn compressionPolicyFor(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) CompressionPolicy {
+    var policy = compressionPolicyFromConfig(cfg);
+    if (domain) |d| applyDomainCompressionOverrides(&policy, d);
+    if (route) |r| applyRouteCompressionOverrides(&policy, r);
+    return policy;
+}
+
+pub fn configCanEnableCompression(cfg: *const ServerConfig) bool {
+    if (cfg.compression_enabled) return true;
+    for (cfg.routes.items) |route| {
+        if (route.compression_enabled orelse false) return true;
+    }
+    for (cfg.domains.items) |domain| {
+        if (domain.compression_enabled orelse false) return true;
+        for (domain.routes.items) |route| {
+            if (route.compression_enabled orelse false) return true;
+        }
+    }
+    return false;
 }
 
 pub fn responseHeaderRulesContain(headers: []const ResponseHeaderRule, name: []const u8) bool {
@@ -824,6 +877,34 @@ pub fn findRoutePropertyName(key: []const u8, prefix: []const u8) ?[]const u8 {
     return name;
 }
 
+pub fn findAnyRoutePropertyName(key: []const u8, comptime prefixes: []const []const u8) ?[]const u8 {
+    inline for (prefixes) |prefix| {
+        if (findRoutePropertyName(key, prefix)) |name| return name;
+    }
+    return null;
+}
+
+fn isCompressionEnabledKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "compression") or
+        std.mem.eql(u8, key, "compress") or
+        std.mem.eql(u8, key, "encode");
+}
+
+fn isGzipEnabledKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "gzip") or
+        std.mem.eql(u8, key, "gzip_enabled");
+}
+
+fn isCompressionMinBytesKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "compression_min_bytes") or
+        std.mem.eql(u8, key, "gzip_min_bytes");
+}
+
+fn isCompressionMaxBytesKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "compression_max_bytes") or
+        std.mem.eql(u8, key, "gzip_max_bytes");
+}
+
 pub fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, raw: []const u8) !void {
     var parts = std.mem.tokenizeAny(u8, raw, " \t");
     const name = parts.next() orelse return error.InvalidConfigValue;
@@ -855,6 +936,10 @@ pub fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.A
         .upstream = null,
         .upstream_policy = null,
         .upstream_timeout_ms = null,
+        .compression_enabled = null,
+        .gzip_enabled = null,
+        .compression_min_bytes = null,
+        .compression_max_bytes = null,
         .response_headers = .empty,
     });
 }
@@ -916,6 +1001,25 @@ pub fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []c
     }
 }
 
+pub fn setRouteCompressionBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: CompressionBoolProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => route.compression_enabled = parsed,
+        .gzip_enabled => route.gzip_enabled = parsed,
+    }
+}
+
+pub fn setRouteCompressionSizeProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: CompressionSizeProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .min_bytes => route.compression_min_bytes = parsed,
+        .max_bytes => route.compression_max_bytes = parsed,
+    }
+}
+
 pub fn appendRouteResponseHeader(routes: *std.ArrayList(RouteConfig), allocator: std.mem.Allocator, route_name: []const u8, value: []const u8) !void {
     const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     if (value.len > 0) try route.response_headers.append(allocator, try parseResponseHeaderRule(allocator, value));
@@ -957,6 +1061,10 @@ pub fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainC
         .upstream = null,
         .upstream_policy = null,
         .upstream_timeout_ms = null,
+        .compression_enabled = null,
+        .gzip_enabled = null,
+        .compression_min_bytes = null,
+        .compression_max_bytes = null,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -1045,6 +1153,25 @@ pub fn setDomainU32Property(cfg: *ServerConfig, domain_name: []const u8, value: 
     }
 }
 
+pub fn setDomainCompressionBoolProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: CompressionBoolProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => domain.compression_enabled = parsed,
+        .gzip_enabled => domain.gzip_enabled = parsed,
+    }
+}
+
+pub fn setDomainCompressionSizeProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: CompressionSizeProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .min_bytes => domain.compression_min_bytes = parsed,
+        .max_bytes => domain.compression_max_bytes = parsed,
+    }
+}
+
 pub fn appendDomainResponseHeader(cfg: *ServerConfig, allocator: std.mem.Allocator, domain_name: []const u8, value: []const u8) !void {
     const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
     if (value.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, value));
@@ -1094,6 +1221,18 @@ pub fn setDomainRouteU32Property(cfg: *ServerConfig, property_name: []const u8, 
     const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
     const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
     try setRouteU32Property(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteCompressionBoolProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: CompressionBoolProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteCompressionBoolProperty(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteCompressionSizeProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: CompressionSizeProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteCompressionSizeProperty(&domain.routes, split.route, value, field);
 }
 
 pub fn appendDomainRouteResponseHeader(cfg: *ServerConfig, allocator: std.mem.Allocator, property_name: []const u8, value: []const u8) !void {
@@ -1239,13 +1378,13 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         if (v.len == 0) return error.InvalidConfigValue;
         cfg.access_log_enabled = true;
         cfg.access_log_path = try allocator.dupe(u8, v);
-    } else if (std.mem.eql(u8, k, "compression") or std.mem.eql(u8, k, "compress") or std.mem.eql(u8, k, "encode")) {
+    } else if (isCompressionEnabledKey(k)) {
         cfg.compression_enabled = try parseConfigBool(v);
-    } else if (std.mem.eql(u8, k, "gzip") or std.mem.eql(u8, k, "gzip_enabled")) {
+    } else if (isGzipEnabledKey(k)) {
         cfg.gzip_enabled = try parseConfigBool(v);
-    } else if (std.mem.eql(u8, k, "compression_min_bytes") or std.mem.eql(u8, k, "gzip_min_bytes")) {
+    } else if (isCompressionMinBytesKey(k)) {
         cfg.compression_min_bytes = try parseConfigUsize(v);
-    } else if (std.mem.eql(u8, k, "compression_max_bytes") or std.mem.eql(u8, k, "gzip_max_bytes")) {
+    } else if (isCompressionMaxBytesKey(k)) {
         cfg.compression_max_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
@@ -1263,6 +1402,14 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
     } else if (findRoutePropertyName(k, "server_names.")) |name| {
         const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
         try appendServerNames(allocator, domain, v);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_compression.", "server_compress.", "server_encode." })) |name| {
+        try setDomainCompressionBoolProperty(cfg, name, v, .enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_gzip.", "server_gzip_enabled." })) |name| {
+        try setDomainCompressionBoolProperty(cfg, name, v, .gzip_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_compression_min_bytes.", "server_gzip_min_bytes." })) |name| {
+        try setDomainCompressionSizeProperty(cfg, name, v, .min_bytes);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_compression_max_bytes.", "server_gzip_max_bytes." })) |name| {
+        try setDomainCompressionSizeProperty(cfg, name, v, .max_bytes);
     } else if (findRoutePropertyName(k, "server_header.")) |name| {
         try appendDomainResponseHeader(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_response_header.")) |name| {
@@ -1386,6 +1533,14 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_route_strip_prefix.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .strip_prefix);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_compression.", "server_route_compress.", "server_route_encode." })) |name| {
+        try setDomainRouteCompressionBoolProperty(cfg, name, v, .enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_gzip.", "server_route_gzip_enabled." })) |name| {
+        try setDomainRouteCompressionBoolProperty(cfg, name, v, .gzip_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_compression_min_bytes.", "server_route_gzip_min_bytes." })) |name| {
+        try setDomainRouteCompressionSizeProperty(cfg, name, v, .min_bytes);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_compression_max_bytes.", "server_route_gzip_max_bytes." })) |name| {
+        try setDomainRouteCompressionSizeProperty(cfg, name, v, .max_bytes);
     } else if (findRoutePropertyName(k, "server_route_header.")) |name| {
         try appendDomainRouteResponseHeader(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_route_response_header.")) |name| {
@@ -1448,6 +1603,14 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .strip_prefix);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression.", "route_compress.", "route_encode." })) |name| {
+        try setRouteCompressionBoolProperty(&cfg.routes, name, v, .enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_gzip.", "route_gzip_enabled." })) |name| {
+        try setRouteCompressionBoolProperty(&cfg.routes, name, v, .gzip_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression_min_bytes.", "route_gzip_min_bytes." })) |name| {
+        try setRouteCompressionSizeProperty(&cfg.routes, name, v, .min_bytes);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression_max_bytes.", "route_gzip_max_bytes." })) |name| {
+        try setRouteCompressionSizeProperty(&cfg.routes, name, v, .max_bytes);
     } else if (findRoutePropertyName(k, "route_header.")) |name| {
         try appendRouteResponseHeader(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
@@ -1678,6 +1841,23 @@ pub fn setDomainU32PropertyDirect(domain: *DomainConfig, value: []const u8, fiel
     }
 }
 
+pub fn setDomainCompressionBoolPropertyDirect(domain: *DomainConfig, value: []const u8, field: CompressionBoolProperty) !void {
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => domain.compression_enabled = parsed,
+        .gzip_enabled => domain.gzip_enabled = parsed,
+    }
+}
+
+pub fn setDomainCompressionSizePropertyDirect(domain: *DomainConfig, value: []const u8, field: CompressionSizeProperty) !void {
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .min_bytes => domain.compression_min_bytes = parsed,
+        .max_bytes => domain.compression_max_bytes = parsed,
+    }
+}
+
 pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     const k = std.mem.trim(u8, key, " \t\r\n");
     const v = trimValue(value);
@@ -1715,6 +1895,14 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setDomainUpstreamPolicyPropertyDirect(domain, v);
     } else if (std.mem.eql(u8, k, "upstream_timeout_ms") or std.mem.eql(u8, k, "proxy_timeout_ms") or std.mem.eql(u8, k, "php_timeout_ms") or std.mem.eql(u8, k, "fastcgi_timeout_ms")) {
         try setDomainU32PropertyDirect(domain, v, .upstream_timeout_ms);
+    } else if (isCompressionEnabledKey(k)) {
+        try setDomainCompressionBoolPropertyDirect(domain, v, .enabled);
+    } else if (isGzipEnabledKey(k)) {
+        try setDomainCompressionBoolPropertyDirect(domain, v, .gzip_enabled);
+    } else if (isCompressionMinBytesKey(k)) {
+        try setDomainCompressionSizePropertyDirect(domain, v, .min_bytes);
+    } else if (isCompressionMaxBytesKey(k)) {
+        try setDomainCompressionSizePropertyDirect(domain, v, .max_bytes);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
@@ -1773,6 +1961,14 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .strip_prefix);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression.", "route_compress.", "route_encode." })) |name| {
+        try setRouteCompressionBoolProperty(&domain.routes, name, v, .enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_gzip.", "route_gzip_enabled." })) |name| {
+        try setRouteCompressionBoolProperty(&domain.routes, name, v, .gzip_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression_min_bytes.", "route_gzip_min_bytes." })) |name| {
+        try setRouteCompressionSizeProperty(&domain.routes, name, v, .min_bytes);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_compression_max_bytes.", "route_gzip_max_bytes." })) |name| {
+        try setRouteCompressionSizeProperty(&domain.routes, name, v, .max_bytes);
     } else if (findRoutePropertyName(k, "route_header.")) |name| {
         try appendRouteResponseHeader(&domain.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
@@ -1875,7 +2071,7 @@ pub fn normalizeConfig(cfg: *ServerConfig) void {
     if (cfg.worker_stack_size < 16 * 1024) {
         cfg.worker_stack_size = 16 * 1024;
     }
-    if (cfg.compression_enabled and cfg.worker_stack_size < DEFAULT_COMPRESSION_WORKER_STACK_BYTES) {
+    if (configCanEnableCompression(cfg) and cfg.worker_stack_size < DEFAULT_COMPRESSION_WORKER_STACK_BYTES) {
         cfg.worker_stack_size = DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
     }
 }
@@ -1894,6 +2090,41 @@ pub fn isSafeRelativeScriptPath(path: []const u8) bool {
         path[0] != '/' and
         std.mem.indexOf(u8, path, "..") == null and
         std.mem.indexOfScalar(u8, path, '\x00') == null;
+}
+
+fn validateCompressionPolicy(policy: CompressionPolicy) !void {
+    if (!policy.enabled) return;
+    if (!policy.gzip_enabled) return error.InvalidConfigValue;
+    if (policy.min_bytes == 0) return error.InvalidConfigValue;
+    if (policy.max_bytes < policy.min_bytes) return error.InvalidConfigValue;
+}
+
+fn validateRouteCompressionOverrides(route: *const RouteConfig) !void {
+    if (route.compression_min_bytes) |min_bytes| {
+        if (min_bytes == 0) return error.InvalidConfigValue;
+    }
+    if (route.compression_max_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidConfigValue;
+    }
+    if (route.compression_min_bytes != null and route.compression_max_bytes != null and
+        route.compression_max_bytes.? < route.compression_min_bytes.?)
+    {
+        return error.InvalidConfigValue;
+    }
+}
+
+fn validateDomainCompressionOverrides(domain: *const DomainConfig) !void {
+    if (domain.compression_min_bytes) |min_bytes| {
+        if (min_bytes == 0) return error.InvalidConfigValue;
+    }
+    if (domain.compression_max_bytes) |max_bytes| {
+        if (max_bytes == 0) return error.InvalidConfigValue;
+    }
+    if (domain.compression_min_bytes != null and domain.compression_max_bytes != null and
+        domain.compression_max_bytes.? < domain.compression_min_bytes.?)
+    {
+        return error.InvalidConfigValue;
+    }
 }
 
 pub fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPoolConfig) !void {
@@ -1926,6 +2157,7 @@ pub fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?Upstre
     if (route.upstream_timeout_ms) |timeout_ms| {
         if (timeout_ms == 0) return error.InvalidConfigValue;
     }
+    try validateRouteCompressionOverrides(route);
 }
 
 pub fn validateConfig(cfg: *const ServerConfig) !void {
@@ -1952,11 +2184,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         if (cfg.access_log_path.len == 0) return error.InvalidConfigValue;
         if (std.mem.indexOfAny(u8, cfg.access_log_path, "\r\n\x00") != null) return error.InvalidConfigValue;
     }
-    if (cfg.compression_enabled) {
-        if (!cfg.gzip_enabled) return error.InvalidConfigValue;
-        if (cfg.compression_min_bytes == 0) return error.InvalidConfigValue;
-        if (cfg.compression_max_bytes < cfg.compression_min_bytes) return error.InvalidConfigValue;
-    }
+    try validateCompressionPolicy(compressionPolicyFromConfig(cfg));
     if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
     if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
@@ -2000,6 +2228,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
 
     for (cfg.routes.items) |*route| {
         try validateRouteConfig(route, cfg.upstream);
+        try validateCompressionPolicy(compressionPolicyFor(cfg, null, route));
     }
 
     for (cfg.domains.items) |*domain| {
@@ -2033,10 +2262,13 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         if (domain.upstream_timeout_ms) |timeout_ms| {
             if (timeout_ms == 0) return error.InvalidConfigValue;
         }
+        try validateDomainCompressionOverrides(domain);
+        try validateCompressionPolicy(compressionPolicyFor(cfg, domain, null));
 
         const fallback_upstream = if (domain.upstream) |upstream| upstream else cfg.upstream;
         for (domain.routes.items) |*route| {
             try validateRouteConfig(route, fallback_upstream);
+            try validateCompressionPolicy(compressionPolicyFor(cfg, domain, route));
         }
     }
 }

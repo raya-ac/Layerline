@@ -459,6 +459,7 @@ fn http2RouterCallbacks() http2_router.Callbacks {
         .read_acme_challenge = readAcmeChallengeForHttp2,
         .read_static_file = readStaticFileForHttp2,
         .redirect_response = buildHttp2RedirectResponse,
+        .set_compression_policy = runtime_state.setCompressionPolicy,
         .set_response_headers = runtime_state.setResponseHeaders,
     };
 }

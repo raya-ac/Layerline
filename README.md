@@ -35,7 +35,7 @@ Layerline blends local serving with edge-style deployment:
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
-- Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2.
+- Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2, with global, domain, and route overrides.
 - Optional local Unix-socket admin surface for status, activation config validation, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
@@ -55,7 +55,7 @@ Layerline is being built toward the Caddy/nginx class: direct TLS termination, v
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and currently serves the built-in default page over QUIC/TLS 1.3; full route dispatch over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is deeper reload/protocol parity: in-memory config snapshot swaps, HTTP/3 route dispatch, route-local stale/cache policy, and broader h2/h3 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -195,6 +195,9 @@ proxy = off
 #compression = false
 #compression_min_bytes = 512
 #compression_max_bytes = 1048576
+#server_compression.main = true
+#route_compression.app = false
+#server_route_compression.main.assets = true
 tls = false
 # Let's Encrypt auto TLS bootstrap (webroot mode)
 #tls_auto = true
@@ -291,9 +294,13 @@ Dynamic gzip is opt-in and applies to buffered text-like responses on HTTP/1.1 a
 compression = true
 compression_min_bytes = 512
 compression_max_bytes = 1048576
+server_compression.main = false
+route_compression.api = true
+route_gzip_min_bytes.api = 256
+server_route_compression.main.assets = true
 ```
 
-Layerline skips bodies that are too small, too large, already encoded, or not a compressible content type. Static files should still prefer `.br`/`.gz` sidecars when possible so large assets stay on the sendfile/precompressed path.
+Layerline skips bodies that are too small, too large, already encoded, or not a compressible content type. Scoped keys inherit in this order: global, domain, route. Use `server_compression.NAME`, `server_gzip_min_bytes.NAME`, `route_compression.NAME`, `route_gzip_min_bytes.NAME`, and `server_route_compression.DOMAIN.ROUTE` when one site or one route needs a different policy from the listener default. Static files should still prefer `.br`/`.gz` sidecars when possible so large assets stay on the sendfile/precompressed path.
 
 When dynamic compression is enabled, Layerline raises worker stack size to at least 512 KiB unless `worker_stack_size` is already higher. That keeps Zig's gzip encoder off the tiny default worker stack while leaving compression disabled deployments at the smaller default.
 
