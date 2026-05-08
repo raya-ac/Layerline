@@ -16,7 +16,7 @@ const http2_runtime = @import("http2_runtime.zig");
 const http2_upstream = @import("http2_upstream.zig");
 const http1_route_handlers = @import("http1_route_handlers.zig");
 const http1_router = @import("http1_router.zig");
-const http1_responses = @import("http1_responses.zig");
+const http1_response_bridge = @import("http1_response_bridge.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
 const metrics_mod = @import("metrics.zig");
@@ -27,7 +27,7 @@ const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const runtime_state = @import("runtime_state.zig");
 const server_runtime = @import("server_runtime.zig");
-const server_assets = @import("server_assets.zig");
+const server_identity = @import("server_identity.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const tls_accept = @import("tls_accept.zig");
 const tls_material = @import("tls_material.zig");
@@ -62,12 +62,35 @@ const loadConfiguredDomainConfigs = config_mod.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const validateConfig = config_mod.validateConfig;
 
-const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = 64 * 1024;
-const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
-const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
-const SERVER_NAME = "Layerline";
-const SERVER_TAGLINE = "Modern web server";
-const SERVER_HEADER = "Layerline";
+const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = server_identity.max_php_fastcgi_stderr_bytes;
+const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = http1_response_bridge.compression_work_buffer_bytes;
+const DEFAULT_ADMIN_SOCKET_PATH = server_identity.default_admin_socket_path;
+const SERVER_NAME = server_identity.name;
+const SERVER_TAGLINE = server_identity.tagline;
+const SERVER_HEADER = server_identity.header;
+
+const streamWriteRequestIdHeader = http1_response_bridge.streamWriteRequestIdHeader;
+const streamWriteConfiguredResponseHeaders = http1_response_bridge.streamWriteConfiguredResponseHeaders;
+const sendCoolErrorWithConnection = http1_response_bridge.sendCoolErrorWithConnection;
+const sendCoolError = http1_response_bridge.sendCoolError;
+const sendResponseWithConnectionAndHeaders = http1_response_bridge.sendResponseWithConnectionAndHeaders;
+const sendResponseWithConnection = http1_response_bridge.sendResponseWithConnection;
+const sendResponse = http1_response_bridge.sendResponse;
+const sendResponseNoBodyWithConnectionAndHeaders = http1_response_bridge.sendResponseNoBodyWithConnectionAndHeaders;
+const sendResponseNoBodyWithConnection = http1_response_bridge.sendResponseNoBodyWithConnection;
+const sendNotFoundWithConnection = http1_response_bridge.sendNotFoundWithConnection;
+const sendNotFoundForMethod = http1_response_bridge.sendNotFoundForMethod;
+const sendDomainCustomNotFoundForMethod = http1_response_bridge.sendDomainCustomNotFoundForMethod;
+const sendBadRequest = http1_response_bridge.sendBadRequest;
+const sendBadRequestForMethod = http1_response_bridge.sendBadRequestForMethod;
+const sendNotImplemented = http1_response_bridge.sendNotImplemented;
+const sendResponseForMethod = http1_response_bridge.sendResponseForMethod;
+const sendConfiguredRedirect = http1_response_bridge.sendConfiguredRedirect;
+const sendHttpsRedirect = http1_response_bridge.sendHttpsRedirect;
+const sendServerIcon = http1_response_bridge.sendServerIcon;
+const recordResponseSent = http1_response_bridge.recordResponseSent;
+const sendMetrics = http1_response_bridge.sendMetrics;
+const emitAccessLog = http1_response_bridge.emitAccessLog;
 
 fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     runtime_state.shutdown_requested.store(true, .release);
@@ -82,30 +105,6 @@ fn installShutdownSignalHandlers() void {
     };
     std.posix.sigaction(.INT, &action, null);
     std.posix.sigaction(.TERM, &action, null);
-}
-
-fn http1ResponseContext() http1_responses.Context {
-    return .{
-        .server_name = SERVER_NAME,
-        .server_tagline = SERVER_TAGLINE,
-        .server_header = SERVER_HEADER,
-        .request_headers = runtime_state.current_request_headers,
-        .request_id = runtime_state.current_request_id,
-        .response_headers = runtime_state.current_response_headers,
-        .compression_policy = runtime_state.current_compression_policy,
-        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
-        .metrics = &runtime_state.server_metrics,
-        .emit_access_log = emitAccessLog,
-        .stream_write_all = streamWriteAll,
-    };
-}
-
-fn streamWriteRequestIdHeader(stream: std.Io.net.Stream) !void {
-    try http1_responses.writeRequestIdHeader(stream, http1ResponseContext());
-}
-
-fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
-    try http1_responses.writeConfiguredResponseHeaders(stream, http1ResponseContext());
 }
 
 fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
@@ -135,137 +134,6 @@ fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg
     // Catch bad certificate paths before an operator asks a supervisor to
     // restart into them. The arena drops the temporary material afterwards.
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
-}
-
-fn sendCoolErrorWithConnection(
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    status_code: u16,
-    status_text: []const u8,
-    detail: []const u8,
-    close_connection: bool,
-    is_head: bool,
-    extra_headers: ?[]const u8,
-) !void {
-    try http1_responses.sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, close_connection, is_head, extra_headers, http1ResponseContext());
-}
-
-fn sendCoolError(stream: std.Io.net.Stream, allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !void {
-    return http1_responses.sendCoolError(stream, allocator, status_code, status_text, detail, http1ResponseContext());
-}
-
-fn sendCoolErrorWithConnectionOnly(
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    status_code: u16,
-    status_text: []const u8,
-    detail: []const u8,
-    close_connection: bool,
-) !void {
-    return http1_responses.sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, close_connection, false, null, http1ResponseContext());
-}
-
-fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, extra_headers: ?[]const u8) !void {
-    try http1_responses.sendResponseWithConnectionAndHeaders(stream, status_code, status_text, content_type, body, close_connection, extra_headers, http1ResponseContext());
-}
-
-fn sendResponseWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool) !void {
-    try http1_responses.sendResponseWithConnection(stream, status_code, status_text, content_type, body, close_connection, http1ResponseContext());
-}
-
-fn sendResponse(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8) !void {
-    try http1_responses.sendResponse(stream, status_code, status_text, content_type, body, http1ResponseContext());
-}
-
-fn sendResponseNoBody(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize) !void {
-    try http1_responses.sendResponseNoBody(stream, status_code, status_text, content_type, body_len, http1ResponseContext());
-}
-
-fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool, extra_headers: ?[]const u8) !void {
-    try http1_responses.sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, content_type, body_len, close_connection, extra_headers, http1ResponseContext());
-}
-
-fn sendResponseNoBodyWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool) !void {
-    try http1_responses.sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, body_len, close_connection, http1ResponseContext());
-}
-
-fn sendNotFound(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
-    try sendCoolError(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.");
-}
-
-fn sendNotFoundWithConnection(allocator: std.mem.Allocator, stream: std.Io.net.Stream, close_connection: bool) !void {
-    try sendNotFoundForMethod(allocator, stream, close_connection, false);
-}
-
-fn sendNotFoundForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
-    try sendCoolErrorWithConnection(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.", close_connection, is_head, null);
-}
-
-fn sendDomainCustomNotFoundForMethod(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    domain: ?*const DomainConfig,
-    close_connection: bool,
-    is_head: bool,
-) !void {
-    try custom_errors.sendHttp1DomainNotFound(io, stream, allocator, cfg, domain, close_connection, is_head, .{
-        .send_not_found_for_method = sendNotFoundForMethod,
-        .send_response_for_method = sendResponseForMethod,
-    });
-}
-
-fn sendBadRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8) !void {
-    try sendCoolError(stream, allocator, 400, "Bad Request", reason);
-}
-
-fn sendBadRequestWithConnection(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8, close_connection: bool) !void {
-    try sendBadRequestForMethod(allocator, stream, reason, close_connection, false);
-}
-
-fn sendBadRequestForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8, close_connection: bool, is_head: bool) !void {
-    try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", reason, close_connection, is_head, null);
-}
-
-fn sendMethodNotAllowed(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
-    try sendCoolError(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.");
-}
-
-fn sendMethodNotAllowedWithConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool) !void {
-    const headers = "Allow: GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS\r\n";
-    try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, false, headers);
-}
-
-fn sendNotImplemented(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool) !void {
-    try sendCoolErrorWithConnection(stream, allocator, 501, "Not Implemented", "This server has not implemented that behavior.", close_connection, false, null);
-}
-
-fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
-    try http1_responses.sendResponseForMethod(stream, status_code, status_text, content_type, body, close_connection, is_head, http1ResponseContext());
-}
-
-fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    try http1_responses.sendConfiguredRedirect(stream, allocator, rule, req, close_connection, is_head, http1ResponseContext());
-}
-
-fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    try http1_responses.sendHttpsRedirect(stream, allocator, cfg, req, close_connection, is_head, http1ResponseContext());
-}
-
-fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
-    try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", server_assets.SERVER_ICON_SVG, close_connection, is_head);
-}
-
-fn recordResponseSent(status_code: u16, body_bytes: usize) void {
-    runtime_state.server_metrics.responseSent(status_code, body_bytes);
-    emitAccessLog(status_code, body_bytes);
-}
-
-fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
-    const body = try metrics_mod.render(allocator, &runtime_state.server_metrics);
-    defer allocator.free(body);
-    try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
 }
 
 fn adminRuntimeView() admin_pages.RuntimeView {
@@ -298,10 +166,6 @@ fn sendAdminDashboardPage(
     is_head: bool,
 ) !void {
     try admin_http.sendDashboardPage(io, stream, allocator, cfg, credentials, maybe_notice, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
-}
-
-fn emitAccessLog(status_code: u16, body_bytes: usize) void {
-    runtime_state.emitAccessLog(activeIo(), SERVER_NAME, status_code, body_bytes);
 }
 
 fn adminRenderMetrics(allocator: std.mem.Allocator) ![]const u8 {
