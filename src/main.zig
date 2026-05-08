@@ -8,6 +8,7 @@ const h3_native = @import("h3_native.zig");
 const h3_state = @import("h3_state.zig");
 const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
+const metrics_mod = @import("metrics.zig");
 const quic_native = @import("quic_native.zig");
 const request_trace = @import("request_trace.zig");
 const tls13_native = @import("tls13_native.zig");
@@ -29,6 +30,8 @@ const isSkippedCgiResponseHeader = cgi_headers.isSkippedResponseHeader;
 const parseCgiStatus = cgi_headers.parseStatus;
 const putCgiRequestHeaders = cgi_headers.putRequestHeaders;
 const splitCgiHeaderBlock = cgi_headers.splitHeaderBlock;
+const ServerMetrics = metrics_mod.ServerMetrics;
+const StaticTransferMode = metrics_mod.StaticTransferMode;
 const UpstreamIdleConnection = config_mod.UpstreamIdleConnection;
 const UpstreamKeepAlivePool = config_mod.UpstreamKeepAlivePool;
 const FastcgiIdleConnection = config_mod.FastcgiIdleConnection;
@@ -1105,246 +1108,10 @@ const ConcurrencyState = struct {
     }
 };
 
-const ServerMetrics = struct {
-    active_connections: std.atomic.Value(usize),
-    connections_total: std.atomic.Value(usize),
-    connections_rejected_total: std.atomic.Value(usize),
-    requests_total: std.atomic.Value(usize),
-    request_parse_errors_total: std.atomic.Value(usize),
-    route_errors_total: std.atomic.Value(usize),
-    responses_total: std.atomic.Value(usize),
-    response_2xx_total: std.atomic.Value(usize),
-    response_3xx_total: std.atomic.Value(usize),
-    response_4xx_total: std.atomic.Value(usize),
-    response_5xx_total: std.atomic.Value(usize),
-    response_body_bytes_total: std.atomic.Value(usize),
-    static_responses_total: std.atomic.Value(usize),
-    static_sendfile_responses_total: std.atomic.Value(usize),
-    static_buffered_responses_total: std.atomic.Value(usize),
-    static_body_bytes_total: std.atomic.Value(usize),
-    compressed_responses_total: std.atomic.Value(usize),
-    compressed_body_bytes_total: std.atomic.Value(usize),
-    upstream_requests_total: std.atomic.Value(usize),
-    upstream_failures_total: std.atomic.Value(usize),
-    upstream_retries_total: std.atomic.Value(usize),
-    upstream_ejections_total: std.atomic.Value(usize),
-    upstream_ejected_skips_total: std.atomic.Value(usize),
-    upstream_connections_opened_total: std.atomic.Value(usize),
-    upstream_connections_reused_total: std.atomic.Value(usize),
-    upstream_connections_pooled_total: std.atomic.Value(usize),
-    upstream_connections_discarded_total: std.atomic.Value(usize),
-    fastcgi_connections_opened_total: std.atomic.Value(usize),
-    fastcgi_connections_reused_total: std.atomic.Value(usize),
-    fastcgi_connections_pooled_total: std.atomic.Value(usize),
-    fastcgi_connections_discarded_total: std.atomic.Value(usize),
-    upstream_health_checks_total: std.atomic.Value(usize),
-    upstream_health_check_failures_total: std.atomic.Value(usize),
-    upstream_health_check_recoveries_total: std.atomic.Value(usize),
-    acme_renewals_total: std.atomic.Value(usize),
-    acme_renewal_successes_total: std.atomic.Value(usize),
-    acme_renewal_failures_total: std.atomic.Value(usize),
-    h3_responses_total: std.atomic.Value(usize),
-    h3_packets_sent_total: std.atomic.Value(usize),
-
-    fn init() ServerMetrics {
-        return .{
-            .active_connections = std.atomic.Value(usize).init(0),
-            .connections_total = std.atomic.Value(usize).init(0),
-            .connections_rejected_total = std.atomic.Value(usize).init(0),
-            .requests_total = std.atomic.Value(usize).init(0),
-            .request_parse_errors_total = std.atomic.Value(usize).init(0),
-            .route_errors_total = std.atomic.Value(usize).init(0),
-            .responses_total = std.atomic.Value(usize).init(0),
-            .response_2xx_total = std.atomic.Value(usize).init(0),
-            .response_3xx_total = std.atomic.Value(usize).init(0),
-            .response_4xx_total = std.atomic.Value(usize).init(0),
-            .response_5xx_total = std.atomic.Value(usize).init(0),
-            .response_body_bytes_total = std.atomic.Value(usize).init(0),
-            .static_responses_total = std.atomic.Value(usize).init(0),
-            .static_sendfile_responses_total = std.atomic.Value(usize).init(0),
-            .static_buffered_responses_total = std.atomic.Value(usize).init(0),
-            .static_body_bytes_total = std.atomic.Value(usize).init(0),
-            .compressed_responses_total = std.atomic.Value(usize).init(0),
-            .compressed_body_bytes_total = std.atomic.Value(usize).init(0),
-            .upstream_requests_total = std.atomic.Value(usize).init(0),
-            .upstream_failures_total = std.atomic.Value(usize).init(0),
-            .upstream_retries_total = std.atomic.Value(usize).init(0),
-            .upstream_ejections_total = std.atomic.Value(usize).init(0),
-            .upstream_ejected_skips_total = std.atomic.Value(usize).init(0),
-            .upstream_connections_opened_total = std.atomic.Value(usize).init(0),
-            .upstream_connections_reused_total = std.atomic.Value(usize).init(0),
-            .upstream_connections_pooled_total = std.atomic.Value(usize).init(0),
-            .upstream_connections_discarded_total = std.atomic.Value(usize).init(0),
-            .fastcgi_connections_opened_total = std.atomic.Value(usize).init(0),
-            .fastcgi_connections_reused_total = std.atomic.Value(usize).init(0),
-            .fastcgi_connections_pooled_total = std.atomic.Value(usize).init(0),
-            .fastcgi_connections_discarded_total = std.atomic.Value(usize).init(0),
-            .upstream_health_checks_total = std.atomic.Value(usize).init(0),
-            .upstream_health_check_failures_total = std.atomic.Value(usize).init(0),
-            .upstream_health_check_recoveries_total = std.atomic.Value(usize).init(0),
-            .acme_renewals_total = std.atomic.Value(usize).init(0),
-            .acme_renewal_successes_total = std.atomic.Value(usize).init(0),
-            .acme_renewal_failures_total = std.atomic.Value(usize).init(0),
-            .h3_responses_total = std.atomic.Value(usize).init(0),
-            .h3_packets_sent_total = std.atomic.Value(usize).init(0),
-        };
-    }
-
-    fn load(counter: *const std.atomic.Value(usize)) usize {
-        return counter.load(.monotonic);
-    }
-
-    fn inc(counter: *std.atomic.Value(usize)) void {
-        _ = counter.fetchAdd(1, .monotonic);
-    }
-
-    fn add(counter: *std.atomic.Value(usize), value: usize) void {
-        _ = counter.fetchAdd(value, .monotonic);
-    }
-
-    fn connectionAccepted(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.connections_total);
-        ServerMetrics.inc(&self.active_connections);
-    }
-
-    fn connectionRejected(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.connections_rejected_total);
-    }
-
-    fn connectionClosed(self: *ServerMetrics) void {
-        _ = self.active_connections.fetchSub(1, .monotonic);
-    }
-
-    fn requestStarted(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.requests_total);
-    }
-
-    fn requestParseError(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.request_parse_errors_total);
-    }
-
-    fn routeError(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.route_errors_total);
-    }
-
-    fn responseSent(self: *ServerMetrics, status_code: u16, body_bytes: usize) void {
-        ServerMetrics.inc(&self.responses_total);
-        ServerMetrics.add(&self.response_body_bytes_total, body_bytes);
-        switch (http_response.statusClass(status_code)) {
-            2 => ServerMetrics.inc(&self.response_2xx_total),
-            3 => ServerMetrics.inc(&self.response_3xx_total),
-            4 => ServerMetrics.inc(&self.response_4xx_total),
-            5 => ServerMetrics.inc(&self.response_5xx_total),
-            else => {},
-        }
-        emitAccessLog(status_code, body_bytes);
-    }
-
-    fn staticBodySent(self: *ServerMetrics, body_bytes: usize, transfer_mode: StaticTransferMode) void {
-        ServerMetrics.inc(&self.static_responses_total);
-        switch (transfer_mode) {
-            .sendfile => ServerMetrics.inc(&self.static_sendfile_responses_total),
-            .buffered => ServerMetrics.inc(&self.static_buffered_responses_total),
-        }
-        ServerMetrics.add(&self.static_body_bytes_total, body_bytes);
-    }
-
-    fn compressedResponseSent(self: *ServerMetrics, body_bytes: usize) void {
-        ServerMetrics.inc(&self.compressed_responses_total);
-        ServerMetrics.add(&self.compressed_body_bytes_total, body_bytes);
-    }
-
-    fn upstreamRequestStarted(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_requests_total);
-    }
-
-    fn upstreamRequestFailed(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_failures_total);
-    }
-
-    fn upstreamRetried(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_retries_total);
-    }
-
-    fn upstreamEjected(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_ejections_total);
-    }
-
-    fn upstreamEjectedSkip(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_ejected_skips_total);
-    }
-
-    fn upstreamConnectionOpened(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_connections_opened_total);
-    }
-
-    fn upstreamConnectionReused(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_connections_reused_total);
-    }
-
-    fn upstreamConnectionPooled(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_connections_pooled_total);
-    }
-
-    fn upstreamConnectionDiscarded(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_connections_discarded_total);
-    }
-
-    fn fastcgiConnectionOpened(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.fastcgi_connections_opened_total);
-    }
-
-    fn fastcgiConnectionReused(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.fastcgi_connections_reused_total);
-    }
-
-    fn fastcgiConnectionPooled(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.fastcgi_connections_pooled_total);
-    }
-
-    fn fastcgiConnectionDiscarded(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.fastcgi_connections_discarded_total);
-    }
-
-    fn upstreamHealthCheckRan(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_health_checks_total);
-    }
-
-    fn upstreamHealthCheckFailed(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_health_check_failures_total);
-    }
-
-    fn upstreamHealthCheckRecovered(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.upstream_health_check_recoveries_total);
-    }
-
-    fn acmeRenewalStarted(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.acme_renewals_total);
-    }
-
-    fn acmeRenewalSucceeded(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.acme_renewal_successes_total);
-    }
-
-    fn acmeRenewalFailed(self: *ServerMetrics) void {
-        ServerMetrics.inc(&self.acme_renewal_failures_total);
-    }
-
-    fn h3ResponseSent(self: *ServerMetrics, packet_count: usize) void {
-        ServerMetrics.inc(&self.h3_responses_total);
-        ServerMetrics.add(&self.h3_packets_sent_total, packet_count);
-    }
-};
-
 var server_metrics = ServerMetrics.init();
 var upstream_round_robin_cursor = std.atomic.Value(usize).init(0);
 var upstream_random_cursor = std.atomic.Value(u64).init(0x9e3779b97f4a7c15);
 var fastcgi_keepalive_pool = FastcgiKeepAlivePool.init();
-
-const StaticTransferMode = enum {
-    sendfile,
-    buffered,
-};
 
 fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1520,7 +1287,7 @@ fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: 
     try streamWriteAll(stream, "\r\n");
 
     if (body_len > 0) try streamWriteAll(stream, prepared.body);
-    server_metrics.responseSent(status_code, body_len);
+    recordResponseSent(status_code, body_len);
 }
 
 fn sendResponseWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool) !void {
@@ -1551,7 +1318,7 @@ fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_
     }
     try streamWriteConfiguredResponseHeaders(stream);
     try streamWriteAll(stream, "\r\n");
-    server_metrics.responseSent(status_code, 0);
+    recordResponseSent(status_code, 0);
 }
 
 fn sendResponseNoBodyWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool) !void {
@@ -1786,181 +1553,13 @@ fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bo
     try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", SERVER_ICON_SVG, close_connection, is_head);
 }
 
-fn renderMetrics(allocator: std.mem.Allocator) ![]const u8 {
-    const base_metrics = try std.fmt.allocPrint(
-        allocator,
-        "# HELP layerline_connections_active Active TCP connections currently owned by Layerline workers.\n" ++
-            "# TYPE layerline_connections_active gauge\n" ++
-            "layerline_connections_active {d}\n" ++
-            "# HELP layerline_connections_total Accepted TCP connections.\n" ++
-            "# TYPE layerline_connections_total counter\n" ++
-            "layerline_connections_total {d}\n" ++
-            "# HELP layerline_connections_rejected_total Connections rejected by the concurrency gate.\n" ++
-            "# TYPE layerline_connections_rejected_total counter\n" ++
-            "layerline_connections_rejected_total {d}\n" ++
-            "# HELP layerline_requests_total Parsed HTTP/1 requests.\n" ++
-            "# TYPE layerline_requests_total counter\n" ++
-            "layerline_requests_total {d}\n" ++
-            "# HELP layerline_request_parse_errors_total Requests rejected by the parser.\n" ++
-            "# TYPE layerline_request_parse_errors_total counter\n" ++
-            "layerline_request_parse_errors_total {d}\n" ++
-            "# HELP layerline_route_errors_total Routed requests that failed before a response completed.\n" ++
-            "# TYPE layerline_route_errors_total counter\n" ++
-            "layerline_route_errors_total {d}\n" ++
-            "# HELP layerline_responses_total HTTP/1 responses by status class.\n" ++
-            "# TYPE layerline_responses_total counter\n" ++
-            "layerline_responses_total{{class=\"2xx\"}} {d}\n" ++
-            "layerline_responses_total{{class=\"3xx\"}} {d}\n" ++
-            "layerline_responses_total{{class=\"4xx\"}} {d}\n" ++
-            "layerline_responses_total{{class=\"5xx\"}} {d}\n" ++
-            "layerline_responses_total{{class=\"all\"}} {d}\n" ++
-            "# HELP layerline_response_body_bytes_total HTTP/1 response body bytes written by normal response helpers.\n" ++
-            "# TYPE layerline_response_body_bytes_total counter\n" ++
-            "layerline_response_body_bytes_total {d}\n" ++
-            "# HELP layerline_static_body_bytes_total Static file body bytes streamed from disk.\n" ++
-            "# TYPE layerline_static_body_bytes_total counter\n" ++
-            "layerline_static_body_bytes_total {d}\n" ++
-            "# HELP layerline_static_responses_total Static file responses streamed from disk.\n" ++
-            "# TYPE layerline_static_responses_total counter\n" ++
-            "layerline_static_responses_total {d}\n" ++
-            "# HELP layerline_static_sendfile_responses_total Static file responses transferred with kernel sendfile.\n" ++
-            "# TYPE layerline_static_sendfile_responses_total counter\n" ++
-            "layerline_static_sendfile_responses_total {d}\n" ++
-            "# HELP layerline_static_buffered_responses_total Static file responses transferred through the buffered fallback.\n" ++
-            "# TYPE layerline_static_buffered_responses_total counter\n" ++
-            "layerline_static_buffered_responses_total {d}\n" ++
-            "# HELP layerline_compressed_responses_total Responses compressed by Layerline before write.\n" ++
-            "# TYPE layerline_compressed_responses_total counter\n" ++
-            "layerline_compressed_responses_total {d}\n" ++
-            "# HELP layerline_compressed_body_bytes_total Compressed response body bytes written by Layerline.\n" ++
-            "# TYPE layerline_compressed_body_bytes_total counter\n" ++
-            "layerline_compressed_body_bytes_total {d}\n" ++
-            "# HELP layerline_upstream_requests_total Reverse proxy upstream forwarding attempts.\n" ++
-            "# TYPE layerline_upstream_requests_total counter\n" ++
-            "layerline_upstream_requests_total {d}\n" ++
-            "# HELP layerline_upstream_failures_total Reverse proxy upstream attempts that returned an unexpected transport error.\n" ++
-            "# TYPE layerline_upstream_failures_total counter\n" ++
-            "layerline_upstream_failures_total {d}\n" ++
-            "# HELP layerline_upstream_retries_total Reverse proxy attempts made after an earlier upstream target failed.\n" ++
-            "# TYPE layerline_upstream_retries_total counter\n" ++
-            "layerline_upstream_retries_total {d}\n" ++
-            "# HELP layerline_upstream_ejections_total Upstream targets temporarily ejected by passive health checks.\n" ++
-            "# TYPE layerline_upstream_ejections_total counter\n" ++
-            "layerline_upstream_ejections_total {d}\n" ++
-            "# HELP layerline_upstream_ejected_skips_total Proxy attempts skipped because a target is in passive-health cooldown.\n" ++
-            "# TYPE layerline_upstream_ejected_skips_total counter\n" ++
-            "layerline_upstream_ejected_skips_total {d}\n" ++
-            "# HELP layerline_upstream_connections_opened_total New TCP connections opened to upstream targets.\n" ++
-            "# TYPE layerline_upstream_connections_opened_total counter\n" ++
-            "layerline_upstream_connections_opened_total {d}\n" ++
-            "# HELP layerline_upstream_connections_reused_total Idle upstream TCP connections reused from a keep-alive pool.\n" ++
-            "# TYPE layerline_upstream_connections_reused_total counter\n" ++
-            "layerline_upstream_connections_reused_total {d}\n" ++
-            "# HELP layerline_upstream_connections_pooled_total Upstream TCP connections returned to an idle keep-alive pool.\n" ++
-            "# TYPE layerline_upstream_connections_pooled_total counter\n" ++
-            "layerline_upstream_connections_pooled_total {d}\n" ++
-            "# HELP layerline_upstream_connections_discarded_total Upstream TCP connections closed instead of pooled or reused.\n" ++
-            "# TYPE layerline_upstream_connections_discarded_total counter\n" ++
-            "layerline_upstream_connections_discarded_total {d}\n" ++
-            "# HELP layerline_upstream_health_checks_total Active upstream health probes run.\n" ++
-            "# TYPE layerline_upstream_health_checks_total counter\n" ++
-            "layerline_upstream_health_checks_total {d}\n" ++
-            "# HELP layerline_upstream_health_check_failures_total Active upstream health probes that failed or returned unhealthy status.\n" ++
-            "# TYPE layerline_upstream_health_check_failures_total counter\n" ++
-            "layerline_upstream_health_check_failures_total {d}\n" ++
-            "# HELP layerline_upstream_health_check_recoveries_total Active upstream health probes that restored an unavailable target.\n" ++
-            "# TYPE layerline_upstream_health_check_recoveries_total counter\n" ++
-            "layerline_upstream_health_check_recoveries_total {d}\n" ++
-            "# HELP layerline_h3_responses_total Native HTTP/3 responses sent.\n" ++
-            "# TYPE layerline_h3_responses_total counter\n" ++
-            "layerline_h3_responses_total {d}\n" ++
-            "# HELP layerline_h3_packets_sent_total Protected HTTP/3 1-RTT packets sent for responses.\n" ++
-            "# TYPE layerline_h3_packets_sent_total counter\n" ++
-            "layerline_h3_packets_sent_total {d}\n",
-        .{
-            ServerMetrics.load(&server_metrics.active_connections),
-            ServerMetrics.load(&server_metrics.connections_total),
-            ServerMetrics.load(&server_metrics.connections_rejected_total),
-            ServerMetrics.load(&server_metrics.requests_total),
-            ServerMetrics.load(&server_metrics.request_parse_errors_total),
-            ServerMetrics.load(&server_metrics.route_errors_total),
-            ServerMetrics.load(&server_metrics.response_2xx_total),
-            ServerMetrics.load(&server_metrics.response_3xx_total),
-            ServerMetrics.load(&server_metrics.response_4xx_total),
-            ServerMetrics.load(&server_metrics.response_5xx_total),
-            ServerMetrics.load(&server_metrics.responses_total),
-            ServerMetrics.load(&server_metrics.response_body_bytes_total),
-            ServerMetrics.load(&server_metrics.static_body_bytes_total),
-            ServerMetrics.load(&server_metrics.static_responses_total),
-            ServerMetrics.load(&server_metrics.static_sendfile_responses_total),
-            ServerMetrics.load(&server_metrics.static_buffered_responses_total),
-            ServerMetrics.load(&server_metrics.compressed_responses_total),
-            ServerMetrics.load(&server_metrics.compressed_body_bytes_total),
-            ServerMetrics.load(&server_metrics.upstream_requests_total),
-            ServerMetrics.load(&server_metrics.upstream_failures_total),
-            ServerMetrics.load(&server_metrics.upstream_retries_total),
-            ServerMetrics.load(&server_metrics.upstream_ejections_total),
-            ServerMetrics.load(&server_metrics.upstream_ejected_skips_total),
-            ServerMetrics.load(&server_metrics.upstream_connections_opened_total),
-            ServerMetrics.load(&server_metrics.upstream_connections_reused_total),
-            ServerMetrics.load(&server_metrics.upstream_connections_pooled_total),
-            ServerMetrics.load(&server_metrics.upstream_connections_discarded_total),
-            ServerMetrics.load(&server_metrics.upstream_health_checks_total),
-            ServerMetrics.load(&server_metrics.upstream_health_check_failures_total),
-            ServerMetrics.load(&server_metrics.upstream_health_check_recoveries_total),
-            ServerMetrics.load(&server_metrics.h3_responses_total),
-            ServerMetrics.load(&server_metrics.h3_packets_sent_total),
-        },
-    );
-    defer allocator.free(base_metrics);
-
-    const acme_metrics = try std.fmt.allocPrint(
-        allocator,
-        "# HELP layerline_acme_renewals_total ACME renewal attempts started by the background renewal loop.\n" ++
-            "# TYPE layerline_acme_renewals_total counter\n" ++
-            "layerline_acme_renewals_total {d}\n" ++
-            "# HELP layerline_acme_renewal_successes_total ACME renewal attempts that completed successfully.\n" ++
-            "# TYPE layerline_acme_renewal_successes_total counter\n" ++
-            "layerline_acme_renewal_successes_total {d}\n" ++
-            "# HELP layerline_acme_renewal_failures_total ACME renewal attempts that returned an error.\n" ++
-            "# TYPE layerline_acme_renewal_failures_total counter\n" ++
-            "layerline_acme_renewal_failures_total {d}\n",
-        .{
-            ServerMetrics.load(&server_metrics.acme_renewals_total),
-            ServerMetrics.load(&server_metrics.acme_renewal_successes_total),
-            ServerMetrics.load(&server_metrics.acme_renewal_failures_total),
-        },
-    );
-    defer allocator.free(acme_metrics);
-
-    const fastcgi_metrics = try std.fmt.allocPrint(
-        allocator,
-        "# HELP layerline_fastcgi_connections_opened_total New connections opened to FastCGI workers.\n" ++
-            "# TYPE layerline_fastcgi_connections_opened_total counter\n" ++
-            "layerline_fastcgi_connections_opened_total {d}\n" ++
-            "# HELP layerline_fastcgi_connections_reused_total Idle FastCGI worker connections reused from the keep-alive pool.\n" ++
-            "# TYPE layerline_fastcgi_connections_reused_total counter\n" ++
-            "layerline_fastcgi_connections_reused_total {d}\n" ++
-            "# HELP layerline_fastcgi_connections_pooled_total FastCGI worker connections returned to the idle keep-alive pool.\n" ++
-            "# TYPE layerline_fastcgi_connections_pooled_total counter\n" ++
-            "layerline_fastcgi_connections_pooled_total {d}\n" ++
-            "# HELP layerline_fastcgi_connections_discarded_total FastCGI worker connections closed instead of pooled or reused.\n" ++
-            "# TYPE layerline_fastcgi_connections_discarded_total counter\n" ++
-            "layerline_fastcgi_connections_discarded_total {d}\n",
-        .{
-            ServerMetrics.load(&server_metrics.fastcgi_connections_opened_total),
-            ServerMetrics.load(&server_metrics.fastcgi_connections_reused_total),
-            ServerMetrics.load(&server_metrics.fastcgi_connections_pooled_total),
-            ServerMetrics.load(&server_metrics.fastcgi_connections_discarded_total),
-        },
-    );
-    defer allocator.free(fastcgi_metrics);
-
-    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, fastcgi_metrics });
+fn recordResponseSent(status_code: u16, body_bytes: usize) void {
+    server_metrics.responseSent(status_code, body_bytes);
+    emitAccessLog(status_code, body_bytes);
 }
 
 fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
-    const body = try renderMetrics(allocator);
+    const body = try metrics_mod.render(allocator, &server_metrics);
     defer allocator.free(body);
     try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
 }
@@ -3300,7 +2899,7 @@ fn renderAdminDashboardPage(io: std.Io, allocator: std.mem.Allocator, cfg: *cons
     defer allocator.free(routes);
     const certs = try renderAdminCerts(allocator, cfg);
     defer allocator.free(certs);
-    const metrics = try renderMetrics(allocator);
+    const metrics = try metrics_mod.render(allocator, &server_metrics);
     defer allocator.free(metrics);
 
     var out = std.ArrayList(u8).empty;
@@ -3798,7 +3397,7 @@ fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
     }
 
     if (std.mem.eql(u8, command, "metrics")) {
-        const body = try renderMetrics(allocator);
+        const body = try metrics_mod.render(allocator, &server_metrics);
         defer allocator.free(body);
         try sendAdminText(stream, body);
         return;
@@ -5171,7 +4770,7 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
         }
     }
 
-    server_metrics.responseSent(response.status_code, body_len);
+    recordResponseSent(response.status_code, body_len);
 }
 
 fn h2CoolErrorResponse(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !H2BufferedResponse {
@@ -5543,7 +5142,7 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
         }
         if (std.mem.eql(u8, req.path, "/metrics")) {
             accessLogSetHandler("metrics");
-            return .{ .status_code = 200, .content_type = "text/plain; version=0.0.4; charset=utf-8", .body = try renderMetrics(allocator) };
+            return .{ .status_code = 200, .content_type = "text/plain; version=0.0.4; charset=utf-8", .body = try metrics_mod.render(allocator, &server_metrics) };
         }
         if (std.mem.eql(u8, req.path, "/time")) {
             accessLogSetHandler("time");
@@ -6035,7 +5634,7 @@ fn handleHttp2Upgrade(
     );
     try streamWriteRequestIdHeader(stream);
     try streamWriteAll(stream, "\r\n");
-    server_metrics.responseSent(101, 0);
+    recordResponseSent(101, 0);
 
     try sendHttp2Frame(stream, h2_native.FRAME_SETTINGS, 0, 0, "");
 
