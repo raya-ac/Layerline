@@ -1,12 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const access_log_mod = @import("access_log.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
 const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
-const cgi_headers = @import("cgi_headers.zig");
 const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const concurrency_mod = @import("concurrency.zig");
@@ -17,6 +15,7 @@ const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
 const http1_router = @import("http1_router.zig");
+const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
@@ -32,6 +31,7 @@ const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
+const stream_runtime = @import("stream_runtime.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
 const upstream_mod = @import("upstream.zig");
@@ -69,7 +69,6 @@ const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
 const trimValue = http_headers.trimValue;
-const isCgiHeaderNameChar = cgi_headers.isHeaderNameChar;
 const renderAdminSetupPage = admin_ui_mod.renderAdminSetupPage;
 const renderAdminLoginPage = admin_ui_mod.renderAdminLoginPage;
 const AdminCredentials = admin_support.AdminCredentials;
@@ -89,7 +88,6 @@ const parseOptionalContentLength = proxy_utils.parseOptionalContentLength;
 const parseUpstreamResponseFraming = proxy_utils.parseUpstreamResponseFraming;
 const responseHasNoBody = proxy_utils.responseHasNoBody;
 const parseHttpStatusCode = proxy_utils.parseHttpStatusCode;
-const appendFastcgiParam = fastcgi.appendParam;
 const makePhpFrontControllerTarget = fastcgi.makePhpFrontControllerTarget;
 const ByteRange = static_files.ByteRange;
 const acceptsContentCoding = static_files.acceptsContentCoding;
@@ -99,8 +97,21 @@ const makeStaticBaseHeaders = static_files.makeStaticBaseHeaders;
 const makeStaticEtag = static_files.makeStaticEtag;
 const parseByteRange = static_files.parseByteRange;
 const statRegularFile = static_files.statRegularFile;
-const TlsChannel = native_tls.Channel;
 const HttpRequest = request_mod.HttpRequest;
+const activeIo = stream_runtime.activeIo;
+const bindThreadIo = stream_runtime.bindThreadIo;
+const connectFastcgiEndpoint = stream_runtime.connectFastcgiEndpoint;
+const connectTcpHost = stream_runtime.connectTcpHost;
+const listenerWakeHost = stream_runtime.listenerWakeHost;
+const rawStreamRead = stream_runtime.rawStreamRead;
+const rawStreamWriteAll = stream_runtime.rawStreamWriteAll;
+const setStreamReadTimeout = stream_runtime.setStreamReadTimeout;
+const setStreamTimeouts = stream_runtime.setStreamTimeouts;
+const setStreamWriteTimeout = stream_runtime.setStreamWriteTimeout;
+const streamClose = stream_runtime.streamClose;
+const streamRead = stream_runtime.streamRead;
+const streamWriteAll = stream_runtime.streamWriteAll;
+const streamWriteFmt = stream_runtime.streamWriteFmt;
 const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const H2PendingReader = h2_support.PendingReader;
@@ -171,61 +182,14 @@ const setDomainU32PropertyDirect = config_mod.setDomainU32PropertyDirect;
 const applyDomainConfigLine = config_mod.applyDomainConfigLine;
 const validateRouteConfig = config_mod.validateRouteConfig;
 
-// Boring defaults on purpose: enough room for local dev, with caps before
-// anything can turn into an accidental memory sink.
 const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024;
-const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
-const DEFAULT_MAX_STATIC_FILE_BYTES = 10 * 1024 * 1024;
-// Keep one chatty keep-alive socket from owning a worker forever.
-const DEFAULT_MAX_REQUESTS_PER_CONNECTION = 256;
-// High ceiling, but still a ceiling. Past it we answer 503 instead of drifting.
-const DEFAULT_MAX_CONCURRENT_CONNECTIONS = 1_000_000;
-// Small enough for lots of workers; not so small that PHP/proxy paths fall over.
-const DEFAULT_WORKER_STACK_BYTES = 64 * 1024;
-// PHP can be noisy. Treat child output as untrusted input too.
-const DEFAULT_MAX_PHP_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = 64 * 1024;
-const DEFAULT_PHP_INDEX = "index.php";
-const DEFAULT_READ_HEADER_TIMEOUT_MS = 10_000;
-const DEFAULT_READ_BODY_TIMEOUT_MS = 30_000;
-const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
-const DEFAULT_WRITE_TIMEOUT_MS = 30_000;
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
-const DEFAULT_UPSTREAM_RETRIES = 1;
-const DEFAULT_UPSTREAM_MAX_FAILURES = 2;
-const DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS = 10_000;
-const DEFAULT_UPSTREAM_KEEPALIVE_MAX_IDLE = 16;
-const DEFAULT_UPSTREAM_KEEPALIVE_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_UPSTREAM_KEEPALIVE_MAX_REQUESTS = 100;
-const DEFAULT_FASTCGI_KEEPALIVE_MAX_IDLE = 8;
-const DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_FASTCGI_KEEPALIVE_MAX_REQUESTS = 100;
-const DEFAULT_UPSTREAM_HEALTH_CHECK_INTERVAL_MS = 5_000;
-const DEFAULT_UPSTREAM_HEALTH_CHECK_TIMEOUT_MS = 1_000;
-const DEFAULT_UPSTREAM_HEALTH_CHECK_PATH = "/health";
-const DEFAULT_UPSTREAM_CIRCUIT_HALF_OPEN_MAX = 1;
-const DEFAULT_UPSTREAM_SLOW_START_MS = 10_000;
-const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
-const DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const DEFAULT_COMPRESSION_MIN_BYTES = 512;
-const DEFAULT_COMPRESSION_MAX_BYTES = 1024 * 1024;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
-const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = 512 * 1024;
-const MAX_CONFIG_BYTES = 64 * 1024;
-const MAX_CHUNK_LINE_BYTES = 4096;
-const DEFAULT_CONFIG_PATH = "server.conf";
-const ACME_CHALLENGE_DIR = ".well-known/acme-challenge";
-const ACME_CHALLENGE_PATH_SUFFIX = "/.well-known/acme-challenge";
 const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
-const DEFAULT_ADMIN_UI_PATH = "/_layerline/admin";
-const DEFAULT_ADMIN_CREDENTIALS_PATH = ".layerline-admin";
-const DEFAULT_ACCESS_LOG_PATH = "stderr";
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
 
-threadlocal var current_io: ?std.Io = null;
-threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 threadlocal var current_request_headers: []const u8 = "";
 threadlocal var current_request_id: []const u8 = "";
@@ -235,90 +199,6 @@ var access_log_writer = access_log_mod.Writer{};
 var request_id_generator = request_trace.Generator{};
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
-
-// Zig 0.16 moved sockets behind std.Io, so detached worker threads need their
-// own bound handle before they touch a stream.
-fn bindThreadIo(io: std.Io) void {
-    current_io = io;
-}
-
-fn activeIo() std.Io {
-    return current_io orelse @panic("network stream used before std.Io was bound to this thread");
-}
-
-fn normalizeSocketIoError(err: anyerror) anyerror {
-    return switch (err) {
-        error.WouldBlock, error.TimedOut, error.ConnectionTimedOut, error.Unexpected => error.RequestTimeout,
-        else => err,
-    };
-}
-
-fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
-    const io = activeIo();
-    var data: [1][]u8 = .{out};
-    return io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
-}
-
-fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
-    if (current_tls_channel) |channel| {
-        if (stream.socket.handle == channel.stream.socket.handle) {
-            return native_tls.readApplicationData(channel, out);
-        }
-    }
-    return rawStreamRead(stream, out);
-}
-
-fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
-    const io = activeIo();
-    var written: usize = 0;
-    while (written < bytes.len) {
-        // netWrite expects a real scatter list here. Passing an empty one
-        // looked tidy, then crashed in the vtable path.
-        const empty: [1][]const u8 = .{""};
-        const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| return normalizeSocketIoError(err);
-        if (n == 0) return error.WriteZero;
-        written += n;
-    }
-}
-
-fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
-    if (current_tls_channel) |channel| {
-        if (stream.socket.handle == channel.stream.socket.handle) {
-            return native_tls.writeApplicationData(channel, bytes);
-        }
-    }
-    return rawStreamWriteAll(stream, bytes);
-}
-
-fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args: anytype) !void {
-    var stack_buffer: [4096]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&stack_buffer, fmt, args);
-    try streamWriteAll(stream, rendered);
-}
-
-fn timeoutMsToTimeval(timeout_ms: u32) std.posix.timeval {
-    return .{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-}
-
-fn setStreamReadTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
-    if (builtin.os.tag == .windows) return;
-    var tv = timeoutMsToTimeval(timeout_ms);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
-}
-
-fn setStreamWriteTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
-    if (builtin.os.tag == .windows) return;
-    var tv = timeoutMsToTimeval(timeout_ms);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
-}
-
-fn setStreamTimeouts(stream: std.Io.net.Stream, read_timeout_ms: u32, write_timeout_ms: u32) !void {
-    try setStreamReadTimeout(stream, read_timeout_ms);
-    try setStreamWriteTimeout(stream, write_timeout_ms);
-}
 
 fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
@@ -372,70 +252,6 @@ fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
         if (std.ascii.eqlIgnoreCase(header.name, "X-Request-Id")) continue;
         try streamWriteFmt(stream, "{s}: {s}\r\n", .{ header.name, header.value });
     }
-}
-
-fn streamClose(stream: std.Io.net.Stream) void {
-    stream.close(activeIo());
-}
-
-fn connectTcpHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.Io.net.Stream {
-    _ = allocator;
-    if (std.Io.net.IpAddress.parse(host, port)) |address| {
-        var addr = address;
-        return addr.connect(activeIo(), .{ .mode = .stream });
-    } else |_| {}
-
-    const host_name = try std.Io.net.HostName.init(host);
-    return host_name.connect(activeIo(), port, .{ .mode = .stream });
-}
-
-fn listenerWakeHost(host: []const u8) []const u8 {
-    if (std.mem.eql(u8, host, "0.0.0.0")) return "127.0.0.1";
-    if (std.mem.eql(u8, host, "::")) return "::1";
-    return host;
-}
-
-fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgiEndpoint) !std.Io.net.Stream {
-    return switch (endpoint) {
-        .tcp => |tcp| try connectTcpHost(allocator, tcp.host, tcp.port),
-        .unix => |path| blk: {
-            const unix_addr = try std.Io.net.UnixAddress.init(path);
-            break :blk try unix_addr.connect(activeIo());
-        },
-    };
-}
-
-test "parses FastCGI tcp and unix endpoints" {
-    const tcp = try parseFastcgiEndpoint("tcp://127.0.0.1:9000");
-    try std.testing.expectEqualStrings("127.0.0.1", tcp.tcp.host);
-    try std.testing.expectEqual(@as(u16, 9000), tcp.tcp.port);
-
-    const shorthand = try parseFastcgiEndpoint("localhost:9001");
-    try std.testing.expectEqualStrings("localhost", shorthand.tcp.host);
-    try std.testing.expectEqual(@as(u16, 9001), shorthand.tcp.port);
-
-    const unix_endpoint = try parseFastcgiEndpoint("unix:///tmp/layerline.sock");
-    try std.testing.expectEqualStrings("/tmp/layerline.sock", unix_endpoint.unix);
-
-    try std.testing.expectError(error.InvalidConfigValue, parseFastcgiEndpoint("localhost"));
-    try std.testing.expectError(error.InvalidConfigValue, parseFastcgiEndpoint("false"));
-}
-
-test "encodes FastCGI name value pairs" {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(std.testing.allocator);
-
-    try appendFastcgiParam(&out, std.testing.allocator, "A", "B");
-    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 'A', 'B' }, out.items);
-
-    out.clearRetainingCapacity();
-    const long_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try appendFastcgiParam(&out, std.testing.allocator, long_name, "x");
-    try std.testing.expectEqual(@as(u8, 0x80), out.items[0]);
-    try std.testing.expectEqual(@as(u8, 0x00), out.items[1]);
-    try std.testing.expectEqual(@as(u8, 0x00), out.items[2]);
-    try std.testing.expectEqual(@as(u8, 0x80), out.items[3]);
-    try std.testing.expectEqual(@as(u8, 1), out.items[4]);
 }
 
 const LetsEncryptRenewalContext = struct {
@@ -994,13 +810,13 @@ const RawProxyContext = struct {
     io: std.Io,
     src: std.Io.net.Stream,
     dst: std.Io.net.Stream,
-    tls_channel: ?*TlsChannel = null,
+    tls_channel: ?*native_tls.Channel = null,
 };
 
 fn proxyRawStream(ctx: RawProxyContext) void {
     bindThreadIo(ctx.io);
-    current_tls_channel = ctx.tls_channel;
-    defer current_tls_channel = null;
+    stream_runtime.setTlsChannel(ctx.tls_channel);
+    defer stream_runtime.clearTlsChannel();
 
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -1017,7 +833,7 @@ fn proxyRawBidirectional(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_pay
     }
 
     const io = activeIo();
-    const tls_channel = current_tls_channel;
+    const tls_channel = stream_runtime.currentTlsChannel();
     const t1 = try std.Thread.spawn(
         .{},
         proxyRawStream,
@@ -1076,8 +892,8 @@ fn handleTlsClientHelloProbe(
     };
     defer established.channel.deinit();
 
-    current_tls_channel = &established.channel;
-    defer current_tls_channel = null;
+    stream_runtime.setTlsChannel(&established.channel);
+    defer stream_runtime.clearTlsChannel();
 
     std.debug.print(
         "TLS 1.3 native connection accepted sni={s} alpn={s}\n",
@@ -1091,7 +907,7 @@ fn handleTlsClientHelloProbe(
         }
     }
 
-    try handleConnection(io, stream, cfg, allocator, process_env);
+    try http1_runtime.handleConnection(io, stream, cfg, allocator, process_env, http1RuntimeCallbacks());
 }
 
 fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, response: H2BufferedResponse, is_head: bool) !void {
@@ -1671,9 +1487,6 @@ fn isHttpUpgradeRequest(req: HttpRequest) bool {
     return proxy_utils.isHttpUpgradeHeaders(req.headers);
 }
 
-const UpstreamHealthTransition = upstream_runtime.HealthTransition;
-const upstreamRecordActiveHealthResult = upstream_runtime.recordActiveHealthResult;
-
 fn forwardToUpstreamPool(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
@@ -1825,479 +1638,6 @@ fn handleNamedRoute(
     }
 }
 
-test "named routes prefer exact and longest prefix matches" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var cfg = defaultServerConfig();
-
-    try setRouteLine(&cfg, allocator, "assets /assets/* static");
-    try setRouteLine(&cfg, allocator, "private /assets/private/* static");
-    try setRouteLine(&cfg, allocator, "health /health proxy");
-    try applyConfigLine(&cfg, allocator, "upstream_policy", "random");
-    try applyConfigLine(&cfg, allocator, "upstream_max_failures", "3");
-    try applyConfigLine(&cfg, allocator, "upstream_fail_timeout_ms", "1500");
-    try applyConfigLine(&cfg, allocator, "upstream_keepalive", "true");
-    try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_idle", "24");
-    try applyConfigLine(&cfg, allocator, "upstream_keepalive_idle_timeout_ms", "45000");
-    try applyConfigLine(&cfg, allocator, "upstream_keepalive_max_requests", "250");
-    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive", "true");
-    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_idle", "12");
-    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_idle_timeout_ms", "35000");
-    try applyConfigLine(&cfg, allocator, "fastcgi_keepalive_max_requests", "125");
-    try applyConfigLine(&cfg, allocator, "compression", "true");
-    try applyConfigLine(&cfg, allocator, "compression_min_bytes", "128");
-    try applyConfigLine(&cfg, allocator, "compression_max_bytes", "4096");
-    try applyConfigLine(&cfg, allocator, "admin_socket", "/tmp/layerline-test-admin.sock");
-    try applyConfigLine(&cfg, allocator, "admin_ui", "true");
-    try applyConfigLine(&cfg, allocator, "admin_ui_path", "/_test/admin");
-    try applyConfigLine(&cfg, allocator, "admin_credentials_path", "/tmp/layerline-test-admin.creds");
-    try applyConfigLine(&cfg, allocator, "access_log", "/tmp/layerline-access.log");
-    try applyConfigLine(&cfg, allocator, "letsencrypt_renew", "false");
-    try applyConfigLine(&cfg, allocator, "letsencrypt_renew_interval_ms", "7200000");
-    try applyConfigLine(&cfg, allocator, "http_redirect", "true");
-    try applyConfigLine(&cfg, allocator, "http_redirect_port", "18080");
-    try applyConfigLine(&cfg, allocator, "http_redirect_https_port", "18443");
-    try applyConfigLine(&cfg, allocator, "http_redirect_status", "308");
-    try applyConfigLine(&cfg, allocator, "upstream_health_check", "true");
-    try applyConfigLine(&cfg, allocator, "upstream_health_check_path", "/ready");
-    try applyConfigLine(&cfg, allocator, "upstream_health_check_interval_ms", "2500");
-    try applyConfigLine(&cfg, allocator, "upstream_health_check_timeout_ms", "750");
-    try applyConfigLine(&cfg, allocator, "upstream_circuit_half_open_max", "2");
-    try applyConfigLine(&cfg, allocator, "upstream_slow_start_ms", "6000");
-    try applyConfigLine(&cfg, allocator, "header", "X-Global-Policy: one");
-    try applyConfigLine(&cfg, allocator, "cache_control", "public, max-age=60");
-    try applyConfigLine(&cfg, allocator, "route_header.assets", "X-Route-Policy: assets");
-    try applyConfigLine(&cfg, allocator, "route_cache_control.assets", "public, max-age=31536000, immutable");
-    try applyConfigLine(&cfg, allocator, "route_proxy_policy.health", "round-robin");
-    try applyConfigLine(&cfg, allocator, "route_proxy_timeout_ms.health", "1250");
-
-    try std.testing.expectEqualStrings("health", findNamedRoute(&cfg, "/health").?.name);
-    try std.testing.expectEqualStrings("private", findNamedRoute(&cfg, "/assets/private/a.txt").?.name);
-    try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/hello.txt").?.name);
-    try std.testing.expect(findNamedRoute(&cfg, "/missing") == null);
-    try std.testing.expectEqual(UpstreamPoolPolicy.random, cfg.upstream_policy);
-    try std.testing.expectEqual(@as(usize, 3), cfg.upstream_max_failures);
-    try std.testing.expectEqual(@as(u32, 1500), cfg.upstream_fail_timeout_ms);
-    try std.testing.expect(cfg.upstream_keepalive_enabled);
-    try std.testing.expectEqual(@as(usize, 24), cfg.upstream_keepalive_max_idle);
-    try std.testing.expectEqual(@as(u32, 45000), cfg.upstream_keepalive_idle_timeout_ms);
-    try std.testing.expectEqual(@as(usize, 250), cfg.upstream_keepalive_max_requests);
-    try std.testing.expect(cfg.fastcgi_keepalive_enabled);
-    try std.testing.expectEqual(@as(usize, 12), cfg.fastcgi_keepalive_max_idle);
-    try std.testing.expectEqual(@as(u32, 35000), cfg.fastcgi_keepalive_idle_timeout_ms);
-    try std.testing.expectEqual(@as(usize, 125), cfg.fastcgi_keepalive_max_requests);
-    try std.testing.expect(cfg.compression_enabled);
-    try std.testing.expect(cfg.gzip_enabled);
-    try std.testing.expectEqual(@as(usize, 128), cfg.compression_min_bytes);
-    try std.testing.expectEqual(@as(usize, 4096), cfg.compression_max_bytes);
-    try std.testing.expect(cfg.admin_enabled);
-    try std.testing.expectEqualStrings("/tmp/layerline-test-admin.sock", cfg.admin_socket_path.?);
-    try std.testing.expect(cfg.admin_ui_enabled);
-    try std.testing.expectEqualStrings("/_test/admin", cfg.admin_ui_path);
-    try std.testing.expectEqualStrings("/tmp/layerline-test-admin.creds", cfg.admin_credentials_path);
-    try std.testing.expect(cfg.access_log_enabled);
-    try std.testing.expectEqualStrings("/tmp/layerline-access.log", cfg.access_log_path);
-    try std.testing.expect(!cfg.letsencrypt_renew);
-    try std.testing.expectEqual(@as(u32, 7200000), cfg.letsencrypt_renew_interval_ms);
-    try std.testing.expect(cfg.http_redirect_enabled);
-    try std.testing.expectEqual(@as(u16, 18080), cfg.http_redirect_port);
-    try std.testing.expectEqual(@as(u16, 18443), cfg.http_redirect_https_port);
-    try std.testing.expectEqual(@as(u16, 308), cfg.http_redirect_status);
-    try std.testing.expectEqualStrings("public", certbotWebrootFromAcmeConfig("public/.well-known/acme-challenge"));
-    const acme_path = try buildAcmeChallengeFilePath(allocator, "public", "token-123");
-    try std.testing.expectEqualStrings("public/.well-known/acme-challenge/token-123", acme_path);
-    const redirect_req = HttpRequest{
-        .method = "GET",
-        .path = "/docs",
-        .query = "q=1",
-        .headers = "Host: example.com:18080\r\n",
-        .version = "HTTP/1.1",
-        .body = "",
-        .close_connection = true,
-    };
-    const redirect_location = try redirects.buildHttpsLocation(allocator, &cfg, redirect_req);
-    try std.testing.expectEqualStrings("https://example.com:18443/docs?q=1", redirect_location);
-    const bad_redirect_req = HttpRequest{
-        .method = "GET",
-        .path = "/docs",
-        .query = "",
-        .headers = "Host: example.com:bad\r\n",
-        .version = "HTTP/1.1",
-        .body = "",
-        .close_connection = true,
-    };
-    try std.testing.expectError(error.InvalidRedirectHost, redirects.buildHttpsLocation(allocator, &cfg, bad_redirect_req));
-    normalizeConfig(&cfg);
-    try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
-    try std.testing.expect(cfg.upstream_health_check_enabled);
-    try std.testing.expectEqualStrings("/ready", cfg.upstream_health_check_path);
-    try std.testing.expectEqual(@as(u32, 2500), cfg.upstream_health_check_interval_ms);
-    try std.testing.expectEqual(@as(u32, 750), cfg.upstream_health_check_timeout_ms);
-    try std.testing.expect(cfg.upstream_circuit_breaker_enabled);
-    try std.testing.expectEqual(@as(usize, 2), cfg.upstream_circuit_half_open_max);
-    try std.testing.expectEqual(@as(u32, 6000), cfg.upstream_slow_start_ms);
-    try std.testing.expectEqual(@as(usize, 2), cfg.response_headers.items.len);
-    try std.testing.expectEqual(@as(usize, 2), findNamedRoute(&cfg, "/assets/hello.txt").?.response_headers.items.len);
-    try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, routeUpstreamPolicy(&cfg, null, findNamedRoute(&cfg, "/health").?));
-    try std.testing.expectEqual(@as(u32, 1250), routeUpstreamTimeoutMs(&cfg, null, findNamedRoute(&cfg, "/health").?));
-
-    cfg.upstream = try parseUpstreamPool(allocator, "http://127.0.0.1:9100");
-    const fallback_pool = domainUpstreamMutable(&cfg, null).?;
-    try std.testing.expect(!upstreamRecordFailure(&fallback_pool.targets.items[0], 1_000, 2, 500));
-    try std.testing.expectEqual(@as(usize, 1), domainUpstreamMutable(&cfg, null).?.targets.items[0].passive_failures.load(.monotonic));
-
-    var breaker_target = try parseUpstream(allocator, "http://127.0.0.1:9200");
-    breaker_target.weight = 5;
-    try std.testing.expect(upstreamRecordFailure(&breaker_target, 10_000, 1, 500));
-    try std.testing.expect(upstreamIsEjected(&breaker_target, 10_250));
-    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_250, &cfg) == null);
-    const half_open_1 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
-    const half_open_2 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(half_open_1.half_open);
-    try std.testing.expect(half_open_2.half_open);
-    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_500, &cfg) == null);
-    upstreamEndAttempt(&breaker_target, half_open_2);
-    upstreamEndAttempt(&breaker_target, half_open_1);
-    upstreamRecordSuccess(&breaker_target, 10_550, cfg.upstream_slow_start_ms);
-    try std.testing.expect(!upstreamIsEjected(&breaker_target, 10_551));
-    try std.testing.expect(upstreamInSlowStart(&breaker_target, 10_551, &cfg));
-    try std.testing.expectEqual(@as(usize, 1), upstreamEffectiveWeight(&breaker_target, 10_551, &cfg));
-    try std.testing.expectEqual(@as(usize, 5), upstreamEffectiveWeight(&breaker_target, 16_550, &cfg));
-
-    try applyConfigLine(&cfg, allocator, "route_proxy.health", "http://127.0.0.1:9101");
-    const health_route = findNamedRouteMutable(&cfg, "/health").?;
-    if (health_route.upstream) |*route_pool| {
-        try std.testing.expect(!upstreamRecordFailure(&route_pool.targets.items[0], 1_000, 2, 500));
-    } else {
-        return error.TestUnexpectedResult;
-    }
-    if (findNamedRouteMutable(&cfg, "/health").?.upstream) |*route_pool| {
-        try std.testing.expectEqual(@as(usize, 1), route_pool.targets.items[0].passive_failures.load(.monotonic));
-    } else {
-        return error.TestUnexpectedResult;
-    }
-
-    const rel = try routeFileRelativePath(allocator, findNamedRoute(&cfg, "/assets/hello.txt").?, "/assets/hello.txt", "index.html");
-    try std.testing.expectEqualStrings("hello.txt", rel);
-
-    try setDomainLine(&cfg, allocator, "site");
-    try appendServerNames(allocator, findDomainConfigMutable(&cfg, "site").?, "example.test *.example.test");
-    try applyConfigLine(&cfg, allocator, "server_tls_cert.site", "/certs/site/fullchain.pem");
-    try applyConfigLine(&cfg, allocator, "server_tls_key.site", "/certs/site/privkey.pem");
-    try applyConfigLine(&cfg, allocator, "server_header.site", "X-Site-Policy: site");
-    try applyConfigLine(&cfg, allocator, "server_cache_control.site", "private, max-age=30");
-    try setDomainRouteLine(&cfg, allocator, "site", "site-assets /assets/* static");
-    try setDomainRouteLine(&cfg, allocator, "site", "site-api /api/* proxy");
-    try applyConfigLine(&cfg, allocator, "server_route_header.site.site-api", "X-Api-Policy: route");
-    try applyConfigLine(&cfg, allocator, "server_route_cache_control.site.site-api", "no-store");
-    try applyConfigLine(&cfg, allocator, "server_proxy_policy.site", "random");
-    try applyConfigLine(&cfg, allocator, "server_proxy_timeout_ms.site", "4200");
-    try applyConfigLine(&cfg, allocator, "server_route_proxy_policy.site.site-api", "inherit");
-    try applyConfigLine(&cfg, allocator, "server_route_proxy_timeout_ms.site.site-api", "900");
-
-    try setDomainLine(&cfg, allocator, "fallback");
-    try appendServerNames(allocator, findDomainConfigMutable(&cfg, "fallback").?, "_");
-
-    try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "example.test:8080").?.name);
-    try std.testing.expectEqualStrings("site", findDomainForHost(&cfg, "www.example.test").?.name);
-    try std.testing.expectEqualStrings("fallback", findDomainForHost(&cfg, "other.test").?.name);
-    try std.testing.expectEqualStrings("/certs/site/fullchain.pem", findDomainForHost(&cfg, "example.test").?.tls_cert.?);
-    try std.testing.expectEqualStrings("/certs/site/privkey.pem", findDomainForHost(&cfg, "example.test").?.tls_key.?);
-    try std.testing.expectEqualStrings("site-assets", findDomainRoute(findDomainForHost(&cfg, "example.test"), "/assets/domain.txt").?.name);
-    try std.testing.expectEqualStrings("assets", findNamedRoute(&cfg, "/assets/global.txt").?.name);
-    try std.testing.expectEqual(UpstreamPoolPolicy.random, routeUpstreamPolicy(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
-    try std.testing.expectEqual(@as(u32, 900), routeUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test"), findDomainRoute(findDomainForHost(&cfg, "example.test"), "/api/status").?));
-    try std.testing.expectEqual(@as(u32, 4200), domainUpstreamTimeoutMs(&cfg, findDomainForHost(&cfg, "example.test")));
-    const site_domain = findDomainForHost(&cfg, "example.test").?;
-    const site_api_route = findDomainRoute(site_domain, "/api/status").?;
-    const response_header_context = try buildResponseHeaderContext(allocator, &cfg, site_domain, site_api_route);
-    defer response_header_context.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 6), response_header_context.items.len);
-    try std.testing.expectEqualStrings("X-Global-Policy", response_header_context.items[0].name);
-    try std.testing.expectEqualStrings("Cache-Control", response_header_context.items[1].name);
-    try std.testing.expectEqualStrings("X-Site-Policy", response_header_context.items[2].name);
-    try std.testing.expectEqualStrings("Cache-Control", response_header_context.items[3].name);
-    try std.testing.expectEqualStrings("X-Api-Policy", response_header_context.items[4].name);
-    try std.testing.expectEqualStrings("Cache-Control", response_header_context.items[5].name);
-
-    var file_domain = try initDomainConfig(allocator, "file-site");
-    try applyDomainConfigLine(&file_domain, allocator, "add_header", "X-File-Policy: file");
-    try applyDomainConfigLine(&file_domain, allocator, "cache_control", "public, max-age=120");
-    try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate", "/certs/file/fullchain.pem");
-    try applyDomainConfigLine(&file_domain, allocator, "ssl_certificate_key", "/certs/file/privkey.pem");
-    try std.testing.expectEqual(@as(usize, 2), file_domain.response_headers.items.len);
-    try std.testing.expectEqualStrings("/certs/file/fullchain.pem", file_domain.tls_cert.?);
-    try std.testing.expectEqualStrings("/certs/file/privkey.pem", file_domain.tls_key.?);
-}
-
-test "php front controller target keeps script and path info separate" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var global_target = try makePhpFrontControllerTarget(allocator, null, "/orders/42", DEFAULT_PHP_INDEX);
-    defer global_target.deinit(allocator);
-    try std.testing.expectEqualStrings("index.php", global_target.script_rel_path);
-    try std.testing.expectEqualStrings("/index.php", global_target.script_name);
-    try std.testing.expectEqualStrings("/orders/42", global_target.path_info);
-
-    var routes = std.ArrayList(RouteConfig).empty;
-    try setRouteLineFor(&routes, allocator, "app /app/* php");
-    const route = &routes.items[0];
-    var route_target = try makePhpFrontControllerTarget(allocator, route, "/app/users/7", DEFAULT_PHP_INDEX);
-    defer route_target.deinit(allocator);
-    try std.testing.expectEqualStrings("index.php", route_target.script_rel_path);
-    try std.testing.expectEqualStrings("/app/index.php", route_target.script_name);
-    try std.testing.expectEqualStrings("/users/7", route_target.path_info);
-}
-
-test "upstream pools parse multiple targets and rotate selection" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000/api, http://127.0.0.1:9001");
-
-    try std.testing.expectEqual(@as(usize, 2), pool.targets.items.len);
-    try std.testing.expectEqualStrings("127.0.0.1", pool.targets.items[0].host);
-    try std.testing.expectEqual(@as(u16, 9000), pool.targets.items[0].port);
-    try std.testing.expectEqualStrings("/api", pool.targets.items[0].base_path);
-    try std.testing.expectEqual(@as(u16, 9001), pool.targets.items[1].port);
-
-    const first = selectUpstream(&pool).?;
-    const second = selectUpstream(&pool).?;
-    try std.testing.expect(first.port != second.port);
-}
-
-test "upstream retry budget is capped to configured targets" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
-
-    try std.testing.expectEqual(@as(usize, 1), upstreamAttemptLimit(&pool, 0));
-    try std.testing.expectEqual(@as(usize, 2), upstreamAttemptLimit(&pool, 1));
-    try std.testing.expectEqual(@as(usize, 3), upstreamAttemptLimit(&pool, 99));
-    try std.testing.expectEqual(@as(u16, 9001), upstreamAtAttempt(&pool, 4, 0).port);
-    try std.testing.expectEqual(@as(u16, 9002), upstreamAtAttempt(&pool, 4, 1).port);
-    try std.testing.expectEqual(@as(u16, 9000), upstreamAtAttempt(&pool, 4, 2).port);
-}
-
-test "upstream policy parser accepts configured policy names" {
-    try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, try parseUpstreamPoolPolicy("round_robin"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.round_robin, try parseUpstreamPoolPolicy("round-robin"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.random, try parseUpstreamPoolPolicy("random"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least_connections"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("least-connections"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.least_connections, try parseUpstreamPoolPolicy("leastconn"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("weighted-round-robin"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.weighted, try parseUpstreamPoolPolicy("wrr"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent_hash"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent-hash"));
-    try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("uri_hash"));
-    try std.testing.expectEqual(@as(?UpstreamPoolPolicy, null), try parseOptionalUpstreamPoolPolicy("inherit"));
-}
-
-test "upstream pools parse target weights" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 w=1");
-
-    try std.testing.expectEqual(@as(usize, 2), pool.targets.items.len);
-    try std.testing.expectEqual(@as(usize, 3), pool.targets.items[0].weight);
-    try std.testing.expectEqual(@as(usize, 1), pool.targets.items[1].weight);
-    try std.testing.expectError(error.InvalidUpstream, parseUpstreamPool(allocator, "weight=3 http://127.0.0.1:9000"));
-    try std.testing.expectError(error.InvalidUpstream, parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=0"));
-}
-
-test "least-connections policy chooses the quietest healthy upstream" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
-
-    pool.targets.items[0].active_requests.store(5, .monotonic);
-    pool.targets.items[1].active_requests.store(1, .monotonic);
-    pool.targets.items[2].active_requests.store(3, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .least_connections, 1_000, null, null));
-
-    pool.targets.items[1].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .least_connections, 1_000, null, null));
-}
-
-test "weighted policy honors target weights and passive ejection" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1");
-
-    upstream_mod.round_robin_cursor.store(0, .monotonic);
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
-    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
-
-    upstream_mod.round_robin_cursor.store(0, .monotonic);
-    pool.targets.items[0].ejected_until_ms.store(2_000, .monotonic);
-    try std.testing.expectEqual(@as(usize, 1), upstreamStartTicket(&pool, .weighted, 1_000, null, null));
-}
-
-test "consistent hash policy keeps a stable healthy target" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
-    const req = HttpRequest{
-        .method = "GET",
-        .path = "/api/users",
-        .query = "page=1",
-        .headers = "Host: example.test\r\nX-Forwarded-For: 203.0.113.10, 10.0.0.1\r\n",
-        .version = "HTTP/1.1",
-        .body = "",
-        .close_connection = false,
-    };
-
-    const first = upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null);
-    try std.testing.expectEqual(first, upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null));
-
-    pool.targets.items[first].ejected_until_ms.store(2_000, .monotonic);
-    const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null);
-    try std.testing.expect(replacement != first);
-    try std.testing.expect(replacement < pool.targets.items.len);
-}
-
-test "active health result transitions update upstream availability" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var upstream = try parseUpstream(allocator, "http://127.0.0.1:9000");
-
-    try std.testing.expectEqual(UpstreamHealthTransition.ejected, upstreamRecordActiveHealthResult(&upstream, false, 1_000, 500, 0));
-    try std.testing.expect(upstreamIsEjected(&upstream, 1_250));
-    try std.testing.expectEqual(@as(i64, 1_500), upstream.ejected_until_ms.load(.monotonic));
-    try std.testing.expectEqual(UpstreamHealthTransition.unchanged, upstreamRecordActiveHealthResult(&upstream, false, 1_300, 500, 0));
-    try std.testing.expectEqual(UpstreamHealthTransition.recovered, upstreamRecordActiveHealthResult(&upstream, true, 1_350, 500, 0));
-    try std.testing.expect(!upstreamIsEjected(&upstream, 1_351));
-}
-
-test "health check status parser accepts normal HTTP status lines" {
-    try std.testing.expectEqual(@as(?u16, 200), parseHttpStatusCode("HTTP/1.1 200 OK\r\nServer: test\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, 503), parseHttpStatusCode("HTTP/1.0 503 Service Unavailable\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, null), parseHttpStatusCode("not-http\r\n\r\n"));
-}
-
-test "accept encoding q values control gzip negotiation" {
-    try std.testing.expect(acceptsContentCoding("Accept-Encoding: br, gzip\r\n", "gzip"));
-    try std.testing.expect(acceptsContentCoding("Accept-Encoding: *;q=0.5\r\n", "gzip"));
-    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: gzip;q=0, br\r\n", "gzip"));
-    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: *;q=1, gzip;q=0\r\n", "gzip"));
-    try std.testing.expect(!acceptsContentCoding("Accept-Encoding: gzip;q=0.0\r\n", "gzip"));
-}
-
-test "gzip response preparation compresses eligible text bodies" {
-    var body: [2048]u8 = undefined;
-    @memset(&body, 'a');
-
-    current_request_headers = "Accept-Encoding: gzip\r\n";
-    current_response_headers = &.{};
-    current_compression_policy = .{
-        .enabled = true,
-        .gzip_enabled = true,
-        .min_bytes = 1,
-        .max_bytes = 4096,
-    };
-    defer {
-        current_request_headers = "";
-        current_response_headers = &.{};
-        current_compression_policy = .disabled;
-    }
-
-    const prepared = try response_body.prepare(std.testing.allocator, .{
-        .status_code = 200,
-        .content_type = "text/plain; charset=utf-8",
-        .body = &body,
-        .is_head = false,
-        .request_headers = current_request_headers,
-        .response_headers = current_response_headers,
-        .compression_policy = current_compression_policy,
-        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
-    });
-    defer prepared.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("gzip", prepared.encoding.?);
-    try std.testing.expect(prepared.body.len < body.len);
-    try std.testing.expectEqual(@as(u8, 0x1f), prepared.body[0]);
-    try std.testing.expectEqual(@as(u8, 0x8b), prepared.body[1]);
-}
-
-test "http2 goaway payload masks reserved stream bit" {
-    const payload = h2_support.makeGoawayPayload(0xffff_ffff, h2_server.ERROR_NO_ERROR);
-    try std.testing.expectEqual(@as(u32, 0x7fff_ffff), std.mem.readInt(u32, payload[0..4], .big));
-    try std.testing.expectEqual(@as(u32, h2_server.ERROR_NO_ERROR), std.mem.readInt(u32, payload[4..8], .big));
-}
-
-test "static cache headers include cache status detail" {
-    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", null);
-    defer std.testing.allocator.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n") != null);
-
-    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "br");
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n") != null);
-}
-
-test "chunked upstream body scanner detects trailers and terminator" {
-    var scanner = ChunkedBodyScanner{};
-    var completed = false;
-    for ("4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Upstream: yes\r\n\r\n") |byte| {
-        completed = try scanner.consume(byte);
-    }
-    try std.testing.expect(completed);
-}
-
-test "upstream response framing parser keeps keep-alive candidates explicit" {
-    const head =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Length: 12\r\n" ++
-        "Connection: keep-alive\r\n" ++
-        "\r\n";
-    const headers = head["HTTP/1.1 200 OK\r\n".len .. head.len - 4];
-    const framing = try parseUpstreamResponseFraming(head, headers);
-    try std.testing.expectEqual(@as(?u16, 200), framing.status_code);
-    try std.testing.expectEqual(@as(?usize, 12), framing.content_length);
-    try std.testing.expect(!framing.connection_close);
-    try std.testing.expect(!framing.transfer_chunked);
-}
-
-test "passive upstream health ejects and recovers targets" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var upstream = try parseUpstream(allocator, "http://127.0.0.1:9000");
-    try std.testing.expect(!upstreamIsEjected(&upstream, 1_000));
-    try std.testing.expect(!upstreamRecordFailure(&upstream, 1_000, 2, 250));
-    try std.testing.expect(upstreamRecordFailure(&upstream, 1_010, 2, 250));
-    try std.testing.expect(upstreamIsEjected(&upstream, 1_100));
-    try std.testing.expect(!upstreamIsEjected(&upstream, 1_300));
-    try std.testing.expectEqual(@as(usize, 2), upstream.passive_failures.load(.monotonic));
-    upstreamRecordSuccess(&upstream, 1_301, 0);
-    try std.testing.expectEqual(@as(usize, 0), upstream.passive_failures.load(.monotonic));
-
-    try std.testing.expect(!upstreamRecordFailure(&upstream, 1_400, 0, 250));
-    try std.testing.expect(!upstreamIsEjected(&upstream, 1_401));
-}
-
 fn setHttp1RequestContext(headers: []const u8, policy: CompressionPolicy) void {
     current_request_headers = headers;
     current_compression_policy = policy;
@@ -2359,502 +1699,51 @@ fn routeRequest(
     try http1_router.route(io, stream, allocator, cfg, req, process_env, http1RouterCallbacks());
 }
 
-fn routeHttpRedirectRequest(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
-    req: HttpRequest,
-) !void {
-    const is_head = std.mem.eql(u8, req.method, "HEAD");
-    const close_connection = true;
-
-    current_request_headers = req.headers;
-    current_compression_policy = .disabled;
-    current_response_headers = &.{};
-    defer {
-        current_request_headers = "";
-        current_compression_policy = .disabled;
-        current_response_headers = &.{};
-    }
-
-    if ((std.mem.eql(u8, req.method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
-        accessLogSetHandler("acme_challenge");
-        const token = req.path["/.well-known/acme-challenge/".len..];
-        try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, close_connection, is_head);
-        return;
-    }
-
-    accessLogSetHandler("http_to_https_redirect");
-    sendHttpsRedirect(stream, allocator, cfg, req, close_connection, is_head) catch |err| switch (err) {
-        error.MissingHostHeader => try sendBadRequestForMethod(allocator, stream, "Missing Host header.", close_connection, is_head),
-        error.InvalidRedirectHost => try sendBadRequestForMethod(allocator, stream, "Invalid Host header.", close_connection, is_head),
-        error.InvalidRedirectPath => try sendBadRequestForMethod(allocator, stream, "Invalid request path.", close_connection, is_head),
-        else => return err,
-    };
+fn resolveRequestId(io: std.Io, allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {
+    return request_id_generator.resolve(io, allocator, headers);
 }
 
-fn handleHttpRedirectConnection(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
-    allocator: std.mem.Allocator,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const req_alloc = arena.allocator();
-
-    setStreamTimeouts(stream, cfg.read_header_timeout_ms, cfg.write_timeout_ms) catch |err| {
-        std.debug.print("HTTP redirect socket timeout setup failed: {}\n", .{err});
-    };
-
-    var prefill_buf: [64]u8 = undefined;
-    const prefill_len = streamRead(stream, &prefill_buf) catch |err| switch (err) {
-        error.RequestTimeout => {
-            try sendCoolErrorWithConnection(
-                stream,
-                req_alloc,
-                408,
-                "Request Timeout",
-                "No request bytes arrived before the redirect listener timeout.",
-                true,
-                false,
-                null,
-            );
-            return;
-        },
-        else => |e| return e,
-    };
-    if (prefill_len == 0) return;
-    const prefill = prefill_buf[0..prefill_len];
-
-    if (h2_support.isLikelyPreface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or native_tls.isHttp3OverTcpProbe(prefill)) {
-        try sendCoolErrorWithConnection(
-            stream,
-            req_alloc,
-            426,
-            "Upgrade Required",
-            "Use the HTTPS listener for TLS, HTTP/2, or HTTP/3. This socket only handles ACME HTTP-01 and HTTP-to-HTTPS redirects.",
-            true,
-            false,
-            null,
-        );
-        return;
-    }
-
-    var req = request_mod.parseHeadersOnly(stream, req_alloc, cfg.max_request_bytes, prefill, .{
-        .read = streamRead,
-        .write_all = streamWriteAll,
-        .set_read_timeout = setStreamReadTimeout,
-    }) catch |err| {
-        if (err != error.ConnectionClosed) server_metrics.requestParseError();
-        switch (err) {
-            error.ConnectionClosed => return,
-            error.RequestTimeout => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 408, "Request Timeout", "The request took too long to read.", true, false, null);
-                return;
-            },
-            error.RequestTooLarge => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 413, "Payload Too Large", "Request headers are too large.", true, false, null);
-                return;
-            },
-            error.PayloadTooLarge => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 413, "Payload Too Large", "Request body exceeds configured limit.", true, false, null);
-                return;
-            },
-            error.InvalidContentLength => {
-                try sendBadRequest(req_alloc, stream, "Invalid Content-Length header.");
-                return;
-            },
-            error.UnsupportedTransferEncoding => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 501, "Not Implemented", "Only plain Content-Length and chunked request bodies are supported.", true, false, null);
-                return;
-            },
-            error.ExpectationFailed => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 417, "Expectation Failed", "Only Expect: 100-continue is supported.", true, false, null);
-                return;
-            },
-            error.MalformedRequest => {
-                try sendBadRequest(req_alloc, stream, "Malformed request.");
-                return;
-            },
-            error.BadRequest => {
-                try sendBadRequest(req_alloc, stream, "Bad request.");
-                return;
-            },
-            error.MissingHostHeader => {
-                try sendBadRequest(req_alloc, stream, "Missing Host header.");
-                return;
-            },
-            error.UnsupportedHttpVersion => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 505, "HTTP Version Not Supported", "The redirect listener only accepts HTTP/1.x before sending clients to HTTPS.", true, false, null);
-                return;
-            },
-            else => {
-                try sendCoolErrorWithConnection(stream, req_alloc, 500, "Internal Server Error", "Internal server error while parsing request.", true, false, null);
-                return;
-            },
-        }
-    };
-    req.close_connection = true;
-    server_metrics.requestStarted();
-    const request_id = try request_id_generator.resolve(io, req_alloc, req.headers);
-
-    var access_ctx = access_log_mod.Context{
-        .enabled = cfg.access_log_enabled,
-        .sink = cfg.access_log_path,
-        .method = req.method,
-        .path = req.path,
-        .query = req.query,
-        .protocol = req.version,
-        .host = findHeaderValue(req.headers, "Host") orelse "",
-        .request_id = request_id,
-        .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
-    };
+fn setAccessLogContext(ctx: *access_log_mod.Context, request_id: []const u8) void {
+    current_access_log = ctx;
     current_request_id = request_id;
-    current_access_log = &access_ctx;
-    defer {
-        current_access_log = null;
-        current_request_id = "";
-    }
-
-    routeHttpRedirectRequest(io, stream, req_alloc, cfg, req) catch |err| {
-        accessLogSetError(@errorName(err));
-        emitAccessLog(0, 0);
-        server_metrics.routeError();
-        return err;
-    };
-    if (!access_ctx.logged) emitAccessLog(0, 0);
 }
 
-fn serveHttpRedirectConnectionTask(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
-    allocator: std.mem.Allocator,
-    state: *ConcurrencyState,
-) void {
-    bindThreadIo(io);
-    defer {
-        state.release();
-        streamClose(stream);
-    }
-
-    handleHttpRedirectConnection(io, stream, cfg, allocator) catch |err| {
-        std.debug.print("HTTP redirect handler error: {}\n", .{err});
-    };
+fn clearAccessLogContext() void {
+    current_access_log = null;
+    current_request_id = "";
 }
 
-const HttpRedirectListenerContext = struct {
-    io: std.Io,
-    server: *std.Io.net.Server,
-    cfg: *ServerConfig,
-    allocator: std.mem.Allocator,
-    state: *ConcurrencyState,
-};
-
-fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
-    bindThreadIo(ctx.io);
-
-    while (!shutdown_requested.load(.acquire)) {
-        const conn = ctx.server.accept(ctx.io) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
-            std.debug.print("HTTP redirect accept failed: {}. Continuing to accept.\n", .{err});
-            ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
-            continue;
-        };
-        if (shutdown_requested.load(.acquire)) {
-            streamClose(conn);
-            break;
-        }
-
-        if (!ctx.state.tryAcquire(ctx.cfg.max_concurrent_connections)) {
-            server_metrics.connectionRejected();
-            sendCoolError(
-                conn,
-                ctx.allocator,
-                503,
-                "Service Unavailable",
-                "Maximum concurrent connections reached. Try again in a moment.",
-            ) catch {};
-            streamClose(conn);
-            continue;
-        }
-
-        const worker = std.Thread.spawn(
-            .{ .stack_size = ctx.cfg.worker_stack_size },
-            serveHttpRedirectConnectionTask,
-            .{ ctx.io, conn, ctx.cfg, ctx.allocator, ctx.state },
-        ) catch |err| {
-            std.debug.print("Failed to start HTTP redirect worker: {}\n", .{err});
-            ctx.state.release();
-            streamClose(conn);
-            continue;
-        };
-        worker.detach();
-    }
-}
-
-fn handleConnection(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
-    allocator: std.mem.Allocator,
-    process_env: *const std.process.Environ.Map,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var handled_requests: usize = 0;
-    setStreamWriteTimeout(stream, cfg.write_timeout_ms) catch |err| {
-        std.debug.print("Socket write timeout setup failed: {}\n", .{err});
-    };
-
-    // Keep one connection worker alive across keep-alive requests.
-    // Each request still gets a hard cap before the socket is closed.
-    while (true) {
-        if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
-            return;
-        }
-
-        _ = arena.reset(.retain_capacity);
-        const req_alloc = arena.allocator();
-        const next_read_timeout = if (handled_requests == 0) cfg.read_header_timeout_ms else cfg.idle_timeout_ms;
-        setStreamReadTimeout(stream, next_read_timeout) catch |err| {
-            std.debug.print("Socket read timeout setup failed: {}\n", .{err});
-        };
-        var prefill_buf: [64]u8 = undefined;
-        const prefill_len = streamRead(stream, &prefill_buf) catch |err| switch (err) {
-            error.RequestTimeout => {
-                if (handled_requests > 0) return;
-                try sendCoolErrorWithConnection(
-                    stream,
-                    req_alloc,
-                    408,
-                    "Request Timeout",
-                    "No request bytes arrived before the header timeout.",
-                    true,
-                    false,
-                    null,
-                );
-                return;
-            },
-            else => |e| return e,
-        };
-        if (prefill_len == 0) return;
-        const prefill = prefill_buf[0..prefill_len];
-
-        if (h2_support.isLikelyPreface(prefill)) {
-            try handleHttp2Preface(io, stream, req_alloc, cfg, prefill, process_env);
-            return;
-        }
-
-        if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
-            try handleTlsClientHelloProbe(io, stream, allocator, cfg, prefill, process_env);
-            return;
-        }
-
-        if (native_tls.isHttp3OverTcpProbe(prefill)) {
-            try sendCoolErrorWithConnection(
-                stream,
-                req_alloc,
-                426,
-                "Upgrade Required",
-                "HTTP/3 is a QUIC transport and cannot be served directly over this TCP socket.",
-                true,
-                false,
-                null,
-            );
-            return;
-        }
-
-        setStreamReadTimeout(stream, cfg.read_header_timeout_ms) catch |err| {
-            std.debug.print("Socket header timeout setup failed: {}\n", .{err});
-        };
-        var req = request_mod.parse(stream, req_alloc, cfg.max_request_bytes, cfg.max_body_bytes, cfg.read_body_timeout_ms, MAX_CHUNK_LINE_BYTES, prefill, .{
-            .read = streamRead,
-            .write_all = streamWriteAll,
-            .set_read_timeout = setStreamReadTimeout,
-        }) catch |err| {
-            if (err != error.ConnectionClosed) server_metrics.requestParseError();
-            switch (err) {
-                error.ConnectionClosed => return,
-                error.RequestTimeout => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        408,
-                        "Request Timeout",
-                        "The request took too long to read.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                error.RequestTooLarge => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        413,
-                        "Payload Too Large",
-                        "Request headers are too large.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                error.PayloadTooLarge => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        413,
-                        "Payload Too Large",
-                        "Request body exceeds configured limit.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                error.InvalidContentLength => {
-                    try sendBadRequest(req_alloc, stream, "Invalid Content-Length header.");
-                    return;
-                },
-                error.UnsupportedTransferEncoding => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        501,
-                        "Not Implemented",
-                        "Only plain Content-Length and chunked request bodies are supported.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                error.ExpectationFailed => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        417,
-                        "Expectation Failed",
-                        "Only Expect: 100-continue is supported.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                error.MalformedRequest => {
-                    try sendBadRequest(req_alloc, stream, "Malformed request.");
-                    return;
-                },
-                error.BadRequest => {
-                    try sendBadRequest(req_alloc, stream, "Bad request.");
-                    return;
-                },
-                error.MissingHostHeader => {
-                    try sendBadRequest(req_alloc, stream, "Missing Host header.");
-                    return;
-                },
-                error.UnsupportedHttpVersion => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        505,
-                        "HTTP Version Not Supported",
-                        "This process only serves HTTP/1.x requests directly. Configure TLS reverse proxy fronting for h2/h3 and set --h2-upstream for HTTP/2 cleartext passthrough.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-                else => {
-                    try sendCoolErrorWithConnection(
-                        stream,
-                        req_alloc,
-                        500,
-                        "Internal Server Error",
-                        "Internal server error while parsing request.",
-                        true,
-                        false,
-                        null,
-                    );
-                    return;
-                },
-            }
-        };
-        handled_requests += 1;
-        server_metrics.requestStarted();
-
-        {
-            const request_id = try request_id_generator.resolve(io, req_alloc, req.headers);
-            var access_ctx = access_log_mod.Context{
-                .enabled = cfg.access_log_enabled,
-                .sink = cfg.access_log_path,
-                .method = req.method,
-                .path = req.path,
-                .query = req.query,
-                .protocol = req.version,
-                .host = findHeaderValue(req.headers, "Host") orelse "",
-                .request_id = request_id,
-                .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
-            };
-            current_request_id = request_id;
-            current_access_log = &access_ctx;
-            defer {
-                current_access_log = null;
-                current_request_id = "";
-            }
-
-            if (req.h2c_upgrade_tail.len > 0 or request_mod.isH2cUpgradeHeaders(req.headers)) {
-                accessLogSetHandler("h2c_upgrade");
-                try handleHttp2Upgrade(io, stream, req_alloc, cfg, req, process_env);
-                return;
-            }
-
-            if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
-                req.close_connection = true;
-            }
-
-            routeRequest(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
-                error.CloseConnection => break,
-                else => {
-                    accessLogSetError(@errorName(err));
-                    emitAccessLog(0, 0);
-                    server_metrics.routeError();
-                    return err;
-                },
-            };
-
-            if (!access_ctx.logged) emitAccessLog(0, 0);
-        }
-
-        if (req.close_connection) break;
-    }
-}
-
-fn serveConnectionTask(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
-    allocator: std.mem.Allocator,
-    state: *ConcurrencyState,
-    process_env: *const std.process.Environ.Map,
-) void {
-    bindThreadIo(io);
-
-    // One worker thread owns one stream; always release the slot and close stream.
-    defer {
-        state.release();
-        streamClose(stream);
-    }
-
-    handleConnection(io, stream, cfg, allocator, process_env) catch |err| {
-        std.debug.print("Connection handler error: {}\n", .{err});
+fn http1RuntimeCallbacks() http1_runtime.Callbacks {
+    return .{
+        .access_log_set_error = accessLogSetError,
+        .access_log_set_handler = accessLogSetHandler,
+        .bind_thread_io = bindThreadIo,
+        .clear_access_context = clearAccessLogContext,
+        .clear_request_context = clearHttp1RequestContext,
+        .clear_response_headers = clearHttp1ResponseHeaders,
+        .emit_access_log = emitAccessLog,
+        .handle_http2_preface = handleHttp2Preface,
+        .handle_http2_upgrade = handleHttp2Upgrade,
+        .handle_tls_client_hello_probe = handleTlsClientHelloProbe,
+        .metrics = &server_metrics,
+        .resolve_request_id = resolveRequestId,
+        .route_request = routeRequest,
+        .send_bad_request = sendBadRequest,
+        .send_bad_request_for_method = sendBadRequestForMethod,
+        .send_cool_error = sendCoolError,
+        .send_cool_error_with_connection = sendCoolErrorWithConnection,
+        .send_https_redirect = sendHttpsRedirect,
+        .serve_acme_challenge = serveAcmeChallenge,
+        .set_access_context = setAccessLogContext,
+        .set_request_context = setHttp1RequestContext,
+        .set_response_headers = setHttp1ResponseHeaders,
+        .set_stream_read_timeout = setStreamReadTimeout,
+        .set_stream_timeouts = setStreamTimeouts,
+        .set_stream_write_timeout = setStreamWriteTimeout,
+        .shutdown_requested = &shutdown_requested,
+        .stream_close = streamClose,
+        .stream_read = streamRead,
+        .stream_write_all = streamWriteAll,
     };
 }
 
@@ -2942,8 +1831,8 @@ pub fn main(init: std.process.Init) !void {
 
         const http_redirect_worker = std.Thread.spawn(
             .{},
-            serveHttpRedirectListenerTask,
-            .{HttpRedirectListenerContext{ .io = init.io, .server = http_server, .cfg = &cfg, .allocator = std.heap.page_allocator, .state = &concurrency }},
+            http1_runtime.serveHttpRedirectListenerTask,
+            .{http1_runtime.HttpRedirectListenerContext{ .io = init.io, .server = http_server, .cfg = &cfg, .allocator = std.heap.page_allocator, .state = &concurrency, .callbacks = http1RuntimeCallbacks() }},
         ) catch |err| {
             std.debug.print("Failed to start HTTP redirect listener: {}\n", .{err});
             return;
@@ -3049,7 +1938,7 @@ pub fn main(init: std.process.Init) !void {
             .{
                 .stack_size = cfg.worker_stack_size,
             },
-            serveConnectionTask,
+            http1_runtime.serveConnectionTask,
             .{
                 init.io,
                 conn,
@@ -3057,6 +1946,7 @@ pub fn main(init: std.process.Init) !void {
                 std.heap.page_allocator,
                 &concurrency,
                 init.environ_map,
+                http1RuntimeCallbacks(),
             },
         ) catch |err| {
             std.debug.print("Failed to start connection worker: {}\n", .{err});
