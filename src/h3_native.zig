@@ -7,6 +7,9 @@ pub const Error = error{
     InvalidVarInt,
     InvalidFrame,
     InvalidHeaderBlock,
+    HuffmanUnsupported,
+    DynamicTableUnsupported,
+    UnknownStaticTableIndex,
 };
 
 pub const VarInt = struct {
@@ -119,6 +122,126 @@ pub const Header = struct {
     value: []const u8,
 };
 
+const PrefixedInteger = struct {
+    value: u64,
+    len: usize,
+};
+
+fn decodePrefixedInteger(input: []const u8, prefix_bits: u4) Error!PrefixedInteger {
+    if (input.len == 0) return error.Truncated;
+    const mask: u8 = if (prefix_bits == 8) 0xff else (@as(u8, 1) << @as(u3, @intCast(prefix_bits))) - 1;
+    var value: u64 = input[0] & mask;
+    if (value < mask) return .{ .value = value, .len = 1 };
+
+    var shift: u6 = 0;
+    var offset: usize = 1;
+    while (true) {
+        if (offset >= input.len) return error.Truncated;
+        const byte = input[offset];
+        offset += 1;
+        value += @as(u64, byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) break;
+        if (shift > 56) return error.VarIntTooLarge;
+        shift += 7;
+    }
+    return .{ .value = value, .len = offset };
+}
+
+const StringLiteral = struct {
+    value: []const u8,
+    len: usize,
+};
+
+fn decodeStringLiteral(input: []const u8, prefix_bits: u4) Error!StringLiteral {
+    if (input.len == 0) return error.Truncated;
+    const huffman_bit = @as(u8, 1) << @as(u3, @intCast(prefix_bits));
+    if ((input[0] & huffman_bit) != 0) return error.HuffmanUnsupported;
+    const len_vi = try decodePrefixedInteger(input, prefix_bits);
+    if (len_vi.value > std.math.maxInt(usize)) return error.VarIntTooLarge;
+    const value_len: usize = @intCast(len_vi.value);
+    if (input.len < len_vi.len + value_len) return error.Truncated;
+    return .{
+        .value = input[len_vi.len .. len_vi.len + value_len],
+        .len = len_vi.len + value_len,
+    };
+}
+
+fn staticHeader(index: u64) Error!Header {
+    return switch (index) {
+        0 => .{ .name = ":authority", .value = "" },
+        1 => .{ .name = ":path", .value = "/" },
+        15 => .{ .name = ":method", .value = "CONNECT" },
+        16 => .{ .name = ":method", .value = "DELETE" },
+        17 => .{ .name = ":method", .value = "GET" },
+        18 => .{ .name = ":method", .value = "HEAD" },
+        19 => .{ .name = ":method", .value = "OPTIONS" },
+        20 => .{ .name = ":method", .value = "POST" },
+        21 => .{ .name = ":method", .value = "PUT" },
+        22 => .{ .name = ":scheme", .value = "http" },
+        23 => .{ .name = ":scheme", .value = "https" },
+        29 => .{ .name = "accept", .value = "*/*" },
+        31 => .{ .name = "accept-encoding", .value = "gzip, deflate, br" },
+        84 => .{ .name = "authorization", .value = "" },
+        95 => .{ .name = "user-agent", .value = "" },
+        else => error.UnknownStaticTableIndex,
+    };
+}
+
+fn appendDecodedHeader(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(Header), name: []const u8, value: []const u8) !void {
+    try out.append(allocator, .{ .name = name, .value = value });
+}
+
+pub fn decodeHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]Header {
+    var offset: usize = 0;
+    const required_insert_count = try decodePrefixedInteger(block[offset..], 8);
+    offset += required_insert_count.len;
+    if (required_insert_count.value != 0) return error.DynamicTableUnsupported;
+
+    const delta_base = try decodePrefixedInteger(block[offset..], 7);
+    offset += delta_base.len;
+
+    var out = std.ArrayListUnmanaged(Header).empty;
+    errdefer out.deinit(allocator);
+
+    while (offset < block.len) {
+        const first = block[offset];
+        if ((first & 0x80) != 0) {
+            const uses_static = (first & 0x40) != 0;
+            const index = try decodePrefixedInteger(block[offset..], 6);
+            offset += index.len;
+            if (!uses_static) return error.DynamicTableUnsupported;
+            const header = try staticHeader(index.value);
+            try appendDecodedHeader(allocator, &out, header.name, header.value);
+            continue;
+        }
+
+        if ((first & 0x40) != 0) {
+            const uses_static = (first & 0x10) != 0;
+            const index = try decodePrefixedInteger(block[offset..], 4);
+            offset += index.len;
+            if (!uses_static) return error.DynamicTableUnsupported;
+            const name = (try staticHeader(index.value)).name;
+            const value = try decodeStringLiteral(block[offset..], 7);
+            offset += value.len;
+            try appendDecodedHeader(allocator, &out, name, value.value);
+            continue;
+        }
+
+        if ((first & 0x20) != 0) {
+            const name = try decodeStringLiteral(block[offset..], 3);
+            offset += name.len;
+            const value = try decodeStringLiteral(block[offset..], 7);
+            offset += value.len;
+            try appendDecodedHeader(allocator, &out, name.value, value.value);
+            continue;
+        }
+
+        return error.DynamicTableUnsupported;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 // Minimal QPACK encoder for static responses. It deliberately uses literal
 // field lines only, so it does not depend on dynamic table state.
 pub fn encodeLiteralHeaders(
@@ -224,4 +347,17 @@ test "minimal QPACK literal header block starts with zero base state" {
     try std.testing.expect(encoded.len > 2);
     try std.testing.expectEqual(@as(u8, 0), encoded[0]);
     try std.testing.expectEqual(@as(u8, 0), encoded[1]);
+}
+
+test "minimal QPACK decoder reads static and literal request headers" {
+    const block = "\x00\x00\xd1\x51\x07/health";
+
+    const headers = try decodeHeaderBlock(std.testing.allocator, block);
+    defer std.testing.allocator.free(headers);
+
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings(":method", headers[0].name);
+    try std.testing.expectEqualStrings("GET", headers[0].value);
+    try std.testing.expectEqualStrings(":path", headers[1].name);
+    try std.testing.expectEqualStrings("/health", headers[1].value);
 }
