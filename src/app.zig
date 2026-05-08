@@ -16,6 +16,7 @@ const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
 const http1_router = @import("http1_router.zig");
+const http1_static = @import("http1_static.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
@@ -949,6 +950,19 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
     try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, is_head, allow_header);
 }
 
+fn http1StaticCallbacks() http1_static.Callbacks {
+    return .{
+        .metrics = &server_metrics,
+        .send_bad_request_for_method = sendBadRequestForMethod,
+        .send_cool_error = sendCoolErrorWithConnection,
+        .send_not_found_for_method = sendNotFoundForMethod,
+        .send_response = sendResponseWithConnection,
+        .send_response_no_body = sendResponseNoBodyWithConnection,
+        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
+        .write_all = streamWriteAll,
+    };
+}
+
 fn serveStatic(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -960,120 +974,7 @@ fn serveStatic(
     is_head: bool,
     max_file_bytes: usize,
 ) !void {
-    // Static paths are deliberately boring: no parent hops, no backslashes, no
-    // directory listings. If it is not a plain file, it is not served.
-    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null or std.mem.indexOfScalar(u8, rel_path, '\\') != null) {
-        try sendBadRequestForMethod(allocator, stream, "Invalid static file path.", close_connection, is_head);
-        return;
-    }
-
-    const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
-    defer allocator.free(file_path);
-
-    var stat = statRegularFile(io, file_path) catch |err| {
-        if (err == error.NotDir or err == error.FileNotFound) {
-            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
-            return;
-        }
-        if (err == error.NotFile) {
-            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
-            return;
-        }
-        return err;
-    };
-
-    const range_header = findHeaderValue(request_headers, "Range");
-    var selected_path = file_path;
-    var encoded_path: ?[]const u8 = null;
-    defer if (encoded_path) |path| allocator.free(path);
-    var content_encoding: ?[]const u8 = null;
-
-    // Serve precompressed assets when present. On-the-fly compression belongs
-    // in a worker/offline build step, not on the hot request path.
-    if (range_header == null) {
-        const candidates = [_]struct { coding: []const u8, suffix: []const u8 }{
-            .{ .coding = "br", .suffix = ".br" },
-            .{ .coding = "gzip", .suffix = ".gz" },
-        };
-        for (candidates) |candidate| {
-            if (!acceptsContentCoding(request_headers, candidate.coding)) continue;
-            const candidate_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ file_path, candidate.suffix });
-            if (statRegularFile(io, candidate_path)) |candidate_stat| {
-                selected_path = candidate_path;
-                encoded_path = candidate_path;
-                stat = candidate_stat;
-                content_encoding = candidate.coding;
-                break;
-            } else |_| {
-                allocator.free(candidate_path);
-            }
-        }
-    }
-
-    if (stat.size > max_file_bytes) {
-        try sendCoolErrorWithConnection(
-            stream,
-            allocator,
-            413,
-            "Payload Too Large",
-            "Static file is too large for configured limits.",
-            close_connection,
-            is_head,
-            null,
-        );
-        return;
-    }
-    const file_len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
-
-    const etag = try makeStaticEtag(allocator, stat);
-    defer allocator.free(etag);
-    const base_headers = try makeStaticBaseHeaders(allocator, etag, content_encoding);
-    defer allocator.free(base_headers);
-
-    if (findHeaderValue(request_headers, "If-None-Match")) |if_none_match| {
-        if (etagMatches(if_none_match, etag)) {
-            try sendResponseNoBodyWithConnectionAndHeaders(stream, 304, "Not Modified", contentTypeFromPath(rel_path), 0, close_connection, base_headers);
-            return;
-        }
-    }
-
-    if (range_header) |range_value| {
-        const range = parseByteRange(range_value, file_len) catch |err| switch (err) {
-            error.RangeNotSatisfiable => {
-                const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: bytes */{d}\r\n", .{ base_headers, file_len });
-                defer allocator.free(headers);
-                try sendCoolErrorWithConnection(stream, allocator, 416, "Range Not Satisfiable", "Requested byte range cannot be served.", close_connection, is_head, headers);
-                return;
-            },
-            error.BadRequest => {
-                try sendBadRequestForMethod(allocator, stream, "Invalid Range header.", close_connection, is_head);
-                return;
-            },
-        };
-
-        const content_range = try std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, file_len });
-        defer allocator.free(content_range);
-        const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: {s}\r\n", .{ base_headers, content_range });
-        defer allocator.free(headers);
-        const body_len = range.end - range.start + 1;
-
-        if (is_head) {
-            try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body_len, close_connection, headers);
-            return;
-        }
-
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body_len, close_connection, headers);
-        try static_files.streamRangeBody(io, stream, selected_path, range.start, body_len, .{ .metrics = &server_metrics, .write_all = streamWriteAll });
-        return;
-    }
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
-        return;
-    }
-
-    try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
-    try static_files.streamRangeBody(io, stream, selected_path, 0, file_len, .{ .metrics = &server_metrics, .write_all = streamWriteAll });
+    try http1_static.serveStatic(io, stream, allocator, static_dir, rel_path, request_headers, close_connection, is_head, max_file_bytes, http1StaticCallbacks());
 }
 
 fn serveAcmeChallenge(
@@ -1085,38 +986,7 @@ fn serveAcmeChallenge(
     close_connection: bool,
     is_head: bool,
 ) !void {
-    if (token.len == 0 or std.mem.indexOf(u8, token, "..") != null or std.mem.indexOfScalar(u8, token, '\\') != null or std.mem.indexOfScalar(u8, token, '/') != null) {
-        try sendBadRequestForMethod(allocator, stream, "Invalid ACME challenge path.", close_connection, is_head);
-        return;
-    }
-
-    const file_path = try buildAcmeChallengeFilePath(allocator, webroot, token);
-    defer allocator.free(file_path);
-
-    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
-        if (err == error.StreamTooLong) {
-            try sendCoolErrorWithConnection(stream, allocator, 413, "Payload Too Large", "ACME challenge file is too large.", close_connection, is_head, null);
-            return;
-        }
-        if (err == error.NotDir or err == error.FileNotFound) {
-            try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
-            return;
-        }
-        return err;
-    };
-    defer allocator.free(data);
-
-    // ACME files are expected to be small; enforce strict plaintext response.
-    if (data.len > 0 and std.mem.indexOfScalar(u8, data, 0) != null) {
-        try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
-        return;
-    }
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", data.len, close_connection);
-        return;
-    }
-    try sendResponseWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", data, close_connection);
+    try http1_static.serveAcmeChallenge(io, stream, allocator, webroot, token, close_connection, is_head, http1StaticCallbacks());
 }
 
 const RawProxyContext = struct {
