@@ -9,6 +9,7 @@ const cgi_headers = @import("cgi_headers.zig");
 const config_mod = @import("config.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
+const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
@@ -125,9 +126,7 @@ const statRegularFile = static_files.statRegularFile;
 const TlsChannel = native_tls.Channel;
 const HttpRequest = request_mod.HttpRequest;
 const H2BufferedResponse = h2_support.BufferedResponse;
-const H2Frame = h2_support.Frame;
 const H2PendingReader = h2_support.PendingReader;
-const H2RequestState = h2_support.RequestState;
 const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
 const upstreamInSlowStart = upstream_mod.upstreamInSlowStart;
@@ -244,11 +243,6 @@ const DEFAULT_COMPRESSION_MIN_BYTES = 512;
 const DEFAULT_COMPRESSION_MAX_BYTES = 1024 * 1024;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
 const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = 512 * 1024;
-const HTTP2_MAX_PENDING_BODY_STREAMS = 128;
-const HTTP2_ERROR_NO_ERROR: u32 = 0x0;
-const HTTP2_ERROR_PROTOCOL: u32 = 0x1;
-const HTTP2_ERROR_STREAM_CLOSED: u32 = 0x5;
-const HTTP2_ERROR_REFUSED_STREAM: u32 = 0x7;
 const MAX_CONFIG_BYTES = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES = 4096;
 const DEFAULT_CONFIG_PATH = "server.conf";
@@ -2507,225 +2501,14 @@ fn sendCompletedHttp2Request(
     if (!access_ctx.logged) emitAccessLog(0, 0);
 }
 
-fn handleHttp2HeadersFrame(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    state_allocator: std.mem.Allocator,
-    hpack_decoder: *h2_native.HpackDecoder,
-    cfg: *ServerConfig,
-    process_env: *const std.process.Environ.Map,
-    states: *std.ArrayList(H2RequestState),
-    frame: H2Frame,
-) !void {
-    current_response_headers = &.{};
-
-    if (frame.header.stream_id == 0 or (frame.header.flags & h2_native.FLAG_END_HEADERS) == 0) {
-        if (frame.header.stream_id != 0) try h2_support.sendRst(stream, frame.header.stream_id, HTTP2_ERROR_PROTOCOL, streamWriteAll);
-        return;
-    }
-    if (h2_support.findRequestState(states, frame.header.stream_id) != null) {
-        try h2_support.sendRst(stream, frame.header.stream_id, HTTP2_ERROR_PROTOCOL, streamWriteAll);
-        return;
-    }
-
-    var offset: usize = 0;
-    var pad_len: usize = 0;
-    if ((frame.header.flags & h2_native.FLAG_PADDED) != 0) {
-        if (offset >= frame.payload.len) return error.BadRequest;
-        pad_len = frame.payload[offset];
-        offset += 1;
-    }
-    if ((frame.header.flags & h2_native.FLAG_PRIORITY) != 0) {
-        if (frame.payload.len < offset + 5) return error.BadRequest;
-        offset += 5;
-    }
-    if (frame.payload.len < offset + pad_len) return error.BadRequest;
-    const header_block = frame.payload[offset .. frame.payload.len - pad_len];
-
-    var decoded = hpack_decoder.decodeHeaderBlock(allocator, header_block) catch |err| {
-        const response = switch (err) {
-            else => try h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid HTTP/2 header block."),
-        };
-        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
-        return;
+fn http2Callbacks() h2_server.Callbacks {
+    return .{
+        .send_response = sendHttp2Response,
+        .error_response = h2CoolErrorResponse,
+        .complete_request = sendCompletedHttp2Request,
+        .write_all = streamWriteAll,
+        .shutdown_requested = &shutdown_requested,
     };
-    defer decoded.deinit(allocator);
-
-    const req = h2_support.parseRequest(allocator, &decoded) catch {
-        const response = try h2CoolErrorResponse(allocator, 400, "Bad Request", "Missing required HTTP/2 pseudo-headers.");
-        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
-        return;
-    };
-
-    const expected_content_length = h2_support.parseRequestContentLength(req.headers) catch {
-        const response = try h2CoolErrorResponse(allocator, 400, "Bad Request", "Invalid HTTP/2 Content-Length header.");
-        try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
-        return;
-    };
-
-    if ((frame.header.flags & h2_native.FLAG_END_STREAM) != 0) {
-        if (expected_content_length) |content_length| {
-            if (content_length != 0) {
-                const response = try h2CoolErrorResponse(allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-                try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
-                return;
-            }
-        }
-        try sendCompletedHttp2Request(io, stream, allocator, cfg, process_env, frame.header.stream_id, req);
-        return;
-    }
-
-    if (expected_content_length) |content_length| {
-        if (content_length > cfg.max_body_bytes) {
-            const response = try h2CoolErrorResponse(allocator, 413, "Payload Too Large", "Request body exceeds configured limit.");
-            try sendHttp2Response(stream, allocator, frame.header.stream_id, response, false);
-            return;
-        }
-    }
-    if (states.items.len >= HTTP2_MAX_PENDING_BODY_STREAMS) {
-        try h2_support.sendRst(stream, frame.header.stream_id, HTTP2_ERROR_REFUSED_STREAM, streamWriteAll);
-        return;
-    }
-
-    var pending = H2RequestState{
-        .stream_id = frame.header.stream_id,
-        .req = try h2_support.cloneRequest(state_allocator, req),
-        .expected_content_length = expected_content_length,
-    };
-    errdefer pending.deinit(state_allocator);
-    try states.append(state_allocator, pending);
-}
-
-fn handleHttp2DataFrame(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    scratch_allocator: std.mem.Allocator,
-    state_allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
-    process_env: *const std.process.Environ.Map,
-    states: *std.ArrayList(H2RequestState),
-    frame: H2Frame,
-) !void {
-    if (frame.header.stream_id == 0) return error.BadRequest;
-
-    const state_index = h2_support.findRequestState(states, frame.header.stream_id) orelse {
-        try h2_support.sendRst(stream, frame.header.stream_id, HTTP2_ERROR_STREAM_CLOSED, streamWriteAll);
-        return;
-    };
-    const state = &states.items[state_index];
-
-    var offset: usize = 0;
-    var pad_len: usize = 0;
-    if ((frame.header.flags & h2_native.FLAG_PADDED) != 0) {
-        if (frame.payload.len == 0) return error.BadRequest;
-        pad_len = frame.payload[0];
-        offset = 1;
-    }
-    if (frame.payload.len < offset + pad_len) return error.BadRequest;
-    const data = frame.payload[offset .. frame.payload.len - pad_len];
-
-    if (data.len > cfg.max_body_bytes or state.body.items.len > cfg.max_body_bytes - data.len) {
-        h2_support.removeRequestState(states, state_allocator, state_index);
-        const response = try h2CoolErrorResponse(scratch_allocator, 413, "Payload Too Large", "Request body exceeds configured limit.");
-        try sendHttp2Response(stream, scratch_allocator, frame.header.stream_id, response, false);
-        return;
-    }
-    if (state.expected_content_length) |content_length| {
-        if (state.body.items.len + data.len > content_length) {
-            h2_support.removeRequestState(states, state_allocator, state_index);
-            const response = try h2CoolErrorResponse(scratch_allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-            try sendHttp2Response(stream, scratch_allocator, frame.header.stream_id, response, false);
-            return;
-        }
-    }
-
-    if (data.len > 0) try state.body.appendSlice(state_allocator, data);
-    try h2_support.sendWindowUpdate(stream, 0, frame.payload.len, streamWriteAll);
-    try h2_support.sendWindowUpdate(stream, frame.header.stream_id, frame.payload.len, streamWriteAll);
-
-    if ((frame.header.flags & h2_native.FLAG_END_STREAM) == 0) return;
-    if (state.expected_content_length) |content_length| {
-        if (state.body.items.len != content_length) {
-            h2_support.removeRequestState(states, state_allocator, state_index);
-            const response = try h2CoolErrorResponse(scratch_allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-            try sendHttp2Response(stream, scratch_allocator, frame.header.stream_id, response, false);
-            return;
-        }
-    }
-
-    state.req.body = state.body.items;
-    try sendCompletedHttp2Request(io, stream, scratch_allocator, cfg, process_env, frame.header.stream_id, state.req);
-    h2_support.removeRequestState(states, state_allocator, state_index);
-}
-
-fn runHttp2FrameLoop(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
-    reader: *H2PendingReader,
-    process_env: *const std.process.Environ.Map,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var hpack_decoder = h2_native.HpackDecoder.init(allocator);
-    defer hpack_decoder.deinit();
-    var body_states = std.ArrayList(H2RequestState).empty;
-    defer {
-        for (body_states.items) |*state| state.deinit(allocator);
-        body_states.deinit(allocator);
-    }
-    var requests_seen: usize = 0;
-    var last_stream_id: u32 = 0;
-
-    while (true) {
-        if (shutdown_requested.load(.acquire)) {
-            try h2_support.sendGoaway(stream, last_stream_id, HTTP2_ERROR_NO_ERROR, streamWriteAll);
-            return;
-        }
-
-        _ = arena.reset(.retain_capacity);
-        const req_alloc = arena.allocator();
-        const frame = h2_support.readFrame(reader, req_alloc, @max(cfg.max_request_bytes, cfg.max_body_bytes)) catch |err| switch (err) {
-            error.ConnectionClosed => return,
-            error.RequestTimeout => return,
-            else => return err,
-        };
-
-        switch (frame.header.frame_type) {
-            h2_native.FRAME_SETTINGS => {
-                if ((frame.header.flags & h2_native.FLAG_ACK) == 0) {
-                    try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, h2_native.FLAG_ACK, 0, "", streamWriteAll);
-                }
-            },
-            h2_native.FRAME_PING => {
-                if (frame.payload.len == 8 and (frame.header.flags & h2_native.FLAG_ACK) == 0) {
-                    try h2_support.sendFrame(stream, h2_native.FRAME_PING, h2_native.FLAG_ACK, 0, frame.payload, streamWriteAll);
-                }
-            },
-            h2_native.FRAME_HEADERS => {
-                if (frame.header.stream_id > last_stream_id) last_stream_id = frame.header.stream_id;
-                if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection) {
-                    try h2_support.sendRst(stream, frame.header.stream_id, HTTP2_ERROR_REFUSED_STREAM, streamWriteAll);
-                    continue;
-                }
-                try handleHttp2HeadersFrame(io, stream, req_alloc, allocator, &hpack_decoder, cfg, process_env, &body_states, frame);
-                requests_seen += 1;
-            },
-            h2_native.FRAME_DATA => {
-                try handleHttp2DataFrame(io, stream, req_alloc, allocator, cfg, process_env, &body_states, frame);
-            },
-            h2_native.FRAME_GOAWAY => return,
-            h2_native.FRAME_WINDOW_UPDATE => {},
-            else => {},
-        }
-
-        if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection and body_states.items.len == 0) {
-            try h2_support.sendGoaway(stream, last_stream_id, HTTP2_ERROR_NO_ERROR, streamWriteAll);
-            return;
-        }
-    }
 }
 
 fn handleHttp2Preface(
@@ -2748,7 +2531,7 @@ fn handleHttp2Preface(
 
     try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", streamWriteAll);
     std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
-    try runHttp2FrameLoop(io, stream, allocator, cfg, &reader, process_env);
+    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, http2Callbacks());
 }
 
 fn handleHttp2Upgrade(
@@ -2791,7 +2574,7 @@ fn handleHttp2Upgrade(
         else => try h2CoolErrorResponse(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 upgrade request."),
     };
     try sendHttp2Response(stream, allocator, 1, response, std.mem.eql(u8, h2_req.method, "HEAD"));
-    try runHttp2FrameLoop(io, stream, allocator, cfg, &reader, process_env);
+    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, http2Callbacks());
 }
 
 fn isHttpUpgradeRequest(req: HttpRequest) bool {
@@ -4437,9 +4220,9 @@ test "gzip response preparation compresses eligible text bodies" {
 }
 
 test "http2 goaway payload masks reserved stream bit" {
-    const payload = h2_support.makeGoawayPayload(0xffff_ffff, HTTP2_ERROR_NO_ERROR);
+    const payload = h2_support.makeGoawayPayload(0xffff_ffff, h2_server.ERROR_NO_ERROR);
     try std.testing.expectEqual(@as(u32, 0x7fff_ffff), std.mem.readInt(u32, payload[0..4], .big));
-    try std.testing.expectEqual(@as(u32, HTTP2_ERROR_NO_ERROR), std.mem.readInt(u32, payload[4..8], .big));
+    try std.testing.expectEqual(@as(u32, h2_server.ERROR_NO_ERROR), std.mem.readInt(u32, payload[4..8], .big));
 }
 
 test "static cache headers include cache status detail" {
