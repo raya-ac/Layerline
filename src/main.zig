@@ -30,6 +30,7 @@ const static_files = @import("static_files.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
 const upstream_mod = @import("upstream.zig");
+const upstream_runtime = @import("upstream_runtime.zig");
 
 const findRedirectRule = routing_mod.findRedirectRule;
 const makeStaticPathFromRequest = routing_mod.makeStaticPathFromRequest;
@@ -1064,6 +1065,26 @@ fn phpCallbacks() php_runtime.Callbacks {
     };
 }
 
+fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
+    return .{
+        .access_log_set_upstream = accessLogSetUpstream,
+        .active_io = activeIo,
+        .bind_thread_io = bindThreadIo,
+        .connect_tcp_host = connectTcpHost,
+        .current_request_id = currentRequestId,
+        .metrics = &server_metrics,
+        .proxy_raw_bidirectional = proxyRawBidirectional,
+        .send_cool_error = sendCoolErrorWithConnection,
+        .set_stream_timeouts = setStreamTimeouts,
+        .shutdown_requested = &shutdown_requested,
+        .stream_close = streamClose,
+        .stream_read = streamRead,
+        .stream_write_all = streamWriteAll,
+        .upstream_now_ms = upstreamNowMs,
+        .write_response_headers = streamWriteConfiguredResponseHeaders,
+    };
+}
+
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool, is_head: bool) !void {
     const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allowed_methods});
     defer allocator.free(allow_header);
@@ -1985,458 +2006,8 @@ fn isHttpUpgradeRequest(req: HttpRequest) bool {
     return proxy_utils.isHttpUpgradeHeaders(req.headers);
 }
 
-const UpstreamConnectionLease = struct {
-    stream: std.Io.net.Stream,
-    requests_served: usize,
-};
-
-fn upstreamKeepaliveConfigured(cfg: *const ServerConfig) bool {
-    return cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0;
-}
-
-fn closeIdleUpstreamConnection(conn: UpstreamIdleConnection) void {
-    streamClose(conn.stream);
-    server_metrics.upstreamConnectionDiscarded();
-}
-
-fn upstreamAcquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, now_ms: i64) !UpstreamConnectionLease {
-    if (upstreamKeepaliveConfigured(cfg) and !upstream.https) {
-        const io = activeIo();
-        upstream.keepalive_pool.mutex.lockUncancelable(io);
-        defer upstream.keepalive_pool.mutex.unlock(io);
-
-        while (upstream.keepalive_pool.idle.pop()) |conn| {
-            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests) {
-                closeIdleUpstreamConnection(conn);
-                continue;
-            }
-
-            server_metrics.upstreamConnectionReused();
-            return .{
-                .stream = conn.stream,
-                .requests_served = conn.requests_served,
-            };
-        }
-    }
-
-    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
-    try setStreamTimeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
-    server_metrics.upstreamConnectionOpened();
-    return .{
-        .stream = upstream_conn,
-        .requests_served = 0,
-    };
-}
-
-fn upstreamReleaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease: UpstreamConnectionLease, reusable: bool, now_ms: i64) void {
-    if (!reusable or !upstreamKeepaliveConfigured(cfg) or upstream.https) {
-        streamClose(lease.stream);
-        server_metrics.upstreamConnectionDiscarded();
-        return;
-    }
-
-    const served = lease.requests_served + 1;
-    if (served >= cfg.upstream_keepalive_max_requests) {
-        streamClose(lease.stream);
-        server_metrics.upstreamConnectionDiscarded();
-        return;
-    }
-
-    const idle_conn = UpstreamIdleConnection{
-        .stream = lease.stream,
-        .expires_at_ms = now_ms + @as(i64, @intCast(cfg.upstream_keepalive_idle_timeout_ms)),
-        .requests_served = served,
-    };
-
-    const io = activeIo();
-    upstream.keepalive_pool.mutex.lockUncancelable(io);
-    defer upstream.keepalive_pool.mutex.unlock(io);
-
-    while (upstream.keepalive_pool.idle.items.len >= cfg.upstream_keepalive_max_idle) {
-        closeIdleUpstreamConnection(upstream.keepalive_pool.idle.orderedRemove(0));
-    }
-
-    upstream.keepalive_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
-        streamClose(idle_conn.stream);
-        server_metrics.upstreamConnectionDiscarded();
-        return;
-    };
-    server_metrics.upstreamConnectionPooled();
-}
-
-fn forwardFixedUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, content_length: usize) !bool {
-    const initial = @min(body_tail.len, content_length);
-    if (initial > 0) streamWriteAll(stream, body_tail[0..initial]) catch return error.CloseConnection;
-    if (body_tail.len > content_length) return false;
-
-    var remaining = content_length - initial;
-    var buf: [8192]u8 = undefined;
-    while (remaining > 0) {
-        const max_read = @min(remaining, buf.len);
-        const n = try streamRead(upstream_conn, buf[0..max_read]);
-        if (n == 0) return error.BadGateway;
-        remaining -= n;
-        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
-    }
-    return true;
-}
-
-fn forwardChunkedUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8) !void {
-    var scanner = ChunkedBodyScanner{};
-
-    if (body_tail.len > 0) {
-        var consumed: usize = 0;
-        while (consumed < body_tail.len) : (consumed += 1) {
-            if (try scanner.consume(body_tail[consumed])) {
-                streamWriteAll(stream, body_tail[0 .. consumed + 1]) catch return error.CloseConnection;
-                return;
-            }
-        }
-        streamWriteAll(stream, body_tail) catch return error.CloseConnection;
-    }
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try streamRead(upstream_conn, &buf);
-        if (n == 0) return error.BadGateway;
-
-        var consumed: usize = 0;
-        while (consumed < n) : (consumed += 1) {
-            if (try scanner.consume(buf[consumed])) {
-                streamWriteAll(stream, buf[0 .. consumed + 1]) catch return error.CloseConnection;
-                return;
-            }
-        }
-        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
-    }
-}
-
-fn forwardUnknownLengthUpstreamBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8) !void {
-    if (body_tail.len > 0) streamWriteAll(stream, body_tail) catch return error.CloseConnection;
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try streamRead(upstream_conn, &buf);
-        if (n == 0) break;
-        streamWriteAll(stream, buf[0..n]) catch return error.CloseConnection;
-    }
-}
-
-fn forwardUpstreamResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest) !UpstreamResponseForwardResult {
-    var response_buffer: [DEFAULT_MAX_REQUEST_BYTES]u8 = undefined;
-    var used: usize = 0;
-
-    // Buffer only the upstream headers so we can scrub hop-by-hop fields, then
-    // stream the body straight through.
-    while (used < response_buffer.len) {
-        const n = try streamRead(upstream_conn, response_buffer[used..]);
-        if (n == 0) return error.BadGateway;
-        used += n;
-        if (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") != null) break;
-    }
-
-    const header_end = (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = response_buffer[0..header_end];
-    const body_tail = response_buffer[header_end..used];
-    const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
-
-    const headers_start = status_line_end + 2;
-    const headers_end = header_end - 4;
-    const response_headers = header_bytes[headers_start..headers_end];
-    const framing = try parseUpstreamResponseFraming(header_bytes, response_headers);
-
-    streamWriteAll(stream, header_bytes[0..status_line_end]) catch return error.CloseConnection;
-    streamWriteAll(stream, "\r\n") catch return error.CloseConnection;
-
-    var headers = std.mem.splitSequence(u8, response_headers, "\r\n");
-    while (headers.next()) |line| {
-        const trimmed = trimValue(line);
-        if (trimmed.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-            const name = trimValue(trimmed[0..colon]);
-            if (isSkippedProxyResponseHeader(name)) continue;
-        }
-        streamWriteAll(stream, trimmed) catch return error.CloseConnection;
-        streamWriteAll(stream, "\r\n") catch return error.CloseConnection;
-    }
-
-    try streamWriteConfiguredResponseHeaders(stream);
-    streamWriteAll(stream, "Connection: close\r\n\r\n") catch return error.CloseConnection;
-
-    if (responseHasNoBody(req.method, framing.status_code)) {
-        return .{ .reusable = !framing.connection_close and body_tail.len == 0 };
-    }
-    if (framing.content_length) |content_length| {
-        const completed = try forwardFixedUpstreamBody(stream, upstream_conn, body_tail, content_length);
-        return .{ .reusable = completed and !framing.connection_close };
-    }
-    if (framing.transfer_chunked) {
-        try forwardChunkedUpstreamBody(stream, upstream_conn, body_tail);
-        return .{ .reusable = !framing.connection_close };
-    }
-
-    try forwardUnknownLengthUpstreamBody(stream, upstream_conn, body_tail);
-    return .{ .reusable = false };
-}
-
-fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream) !void {
-    var response_buffer: [DEFAULT_MAX_REQUEST_BYTES]u8 = undefined;
-    var used: usize = 0;
-
-    while (used < response_buffer.len) {
-        const n = try streamRead(upstream_conn, response_buffer[used..]);
-        if (n == 0) return error.BadGateway;
-        used += n;
-        if (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") != null) break;
-    }
-
-    const header_end = (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = response_buffer[0..header_end];
-    const body_tail = response_buffer[header_end..used];
-    const status_code = parseHttpStatusCode(header_bytes) orelse return error.BadGateway;
-    if (status_code != 101) return error.BadGateway;
-
-    streamWriteAll(stream, header_bytes) catch return error.CloseConnection;
-    try proxyRawBidirectional(upstream_conn, stream, body_tail);
-}
-
-fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32) !void {
-    if (upstream.https) {
-        return error.UnsupportedUpstreamScheme;
-    }
-
-    const upgrade_request = isHttpUpgradeRequest(req);
-    const keepalive_enabled = upstreamKeepaliveConfigured(cfg) and !upgrade_request;
-    const lease = try upstreamAcquireConnection(allocator, upstream, cfg, upstreamNowMs());
-    var lease_released = false;
-    defer if (!lease_released) {
-        streamClose(lease.stream);
-        server_metrics.upstreamConnectionDiscarded();
-    };
-    try setStreamTimeouts(lease.stream, timeout_ms, timeout_ms);
-
-    const proxy_path = try buildProxyPath(allocator, upstream.base_path, req.path, req.query);
-    defer allocator.free(proxy_path);
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const forwarded_host = if (findHeaderValue(req.headers, "Host")) |host|
-        trimValue(host)
-    else
-        upstream.host;
-    const forwarded_proto = if (findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
-        trimValue(proto)
-    else if (cfg.tls_enabled)
-        "https"
-    else
-        "http";
-
-    // Rebuild framing headers from parsed state. Copying the client's
-    // Content-Length here caused duplicate lengths and strict backends rejected it.
-    try out.print(
-        allocator,
-        "{s} {s} HTTP/1.1\r\nHost: {s}\r\nConnection: {s}\r\n",
-        .{
-            req.method,
-            proxy_path,
-            forwarded_host,
-            if (upgrade_request) "Upgrade" else if (keepalive_enabled) "keep-alive" else "close",
-        },
-    );
-    if (upgrade_request) {
-        try out.print(allocator, "Upgrade: {s}\r\n", .{trimValue(findHeaderValue(req.headers, "Upgrade").?)});
-    }
-
-    var saw_forwarded_host = false;
-    var saw_forwarded_proto = false;
-    var headers = std.mem.splitSequence(u8, req.headers, "\r\n");
-    while (headers.next()) |line| {
-        const trimmed = trimValue(line);
-        if (trimmed.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-            const name = trimValue(trimmed[0..colon]);
-            if (isSkippedProxyHeader(name)) continue;
-            const value = trimValue(trimmed[colon + 1 ..]);
-            if (value.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
-            if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
-            try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
-        }
-    }
-
-    // App frameworks commonly build absolute URLs from these. Keep caller-provided
-    // values when a trusted frontend has already set them.
-    if (!saw_forwarded_host) try out.print(allocator, "X-Forwarded-Host: {s}\r\n", .{forwarded_host});
-    if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
-    if (current_request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{current_request_id});
-
-    if (upgrade_request and req.body.len == 0) {
-        try out.appendSlice(allocator, "\r\n");
-    } else {
-        try out.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
-    }
-    const request_line = try out.toOwnedSlice(allocator);
-    defer allocator.free(request_line);
-
-    streamWriteAll(lease.stream, request_line) catch |err| switch (err) {
-        error.RequestTimeout => {
-            return err;
-        },
-        else => |e| return e,
-    };
-    if (req.body.len > 0) {
-        streamWriteAll(lease.stream, req.body) catch |err| switch (err) {
-            error.RequestTimeout => {
-                return err;
-            },
-            else => |e| return e,
-        };
-    }
-
-    if (upgrade_request) {
-        try forwardUpgradeResponse(stream, lease.stream);
-        return error.CloseConnection;
-    }
-
-    const result = forwardUpstreamResponse(stream, lease.stream, req) catch |err| switch (err) {
-        error.RequestTimeout => {
-            return err;
-        },
-        else => |e| return e,
-    };
-    upstreamReleaseConnection(upstream, cfg, lease, result.reusable, upstreamNowMs());
-    lease_released = true;
-
-    return error.CloseConnection;
-}
-
-fn readUpstreamHealthStatus(upstream_conn: std.Io.net.Stream) !u16 {
-    var buffer: [2048]u8 = undefined;
-    var used: usize = 0;
-    while (used < buffer.len) {
-        const n = streamRead(upstream_conn, buffer[used..]) catch |err| switch (err) {
-            error.RequestTimeout => return err,
-            else => |e| return e,
-        };
-        if (n == 0) break;
-        used += n;
-        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n") != null) break;
-    }
-
-    if (used == 0) return error.InvalidUpstream;
-    return parseHttpStatusCode(buffer[0..used]) orelse error.InvalidUpstream;
-}
-
-fn checkUpstreamHealth(allocator: std.mem.Allocator, upstream: *const UpstreamConfig, health_path: []const u8, timeout_ms: u32) !bool {
-    if (upstream.https) return error.UnsupportedUpstreamScheme;
-
-    const upstream_conn = try connectTcpHost(allocator, upstream.host, upstream.port);
-    defer streamClose(upstream_conn);
-    try setStreamTimeouts(upstream_conn, timeout_ms, timeout_ms);
-
-    const probe_path = try buildProxyPath(allocator, upstream.base_path, health_path, "");
-    defer allocator.free(probe_path);
-
-    var request_buffer: [1024]u8 = undefined;
-    const request = try std.fmt.bufPrint(
-        &request_buffer,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: Layerline-healthcheck\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        .{ probe_path, upstream.host },
-    );
-    try streamWriteAll(upstream_conn, request);
-
-    const status_code = try readUpstreamHealthStatus(upstream_conn);
-    return status_code >= 200 and status_code < 400;
-}
-
-const UpstreamHealthTransition = enum {
-    unchanged,
-    ejected,
-    recovered,
-};
-
-fn upstreamRecordActiveHealthResult(upstream: *UpstreamConfig, healthy: bool, now_ms: i64, cooldown_ms: u32, slow_start_ms: u32) UpstreamHealthTransition {
-    if (healthy) {
-        const was_unavailable = upstream.ejected_until_ms.load(.monotonic) != 0 or upstream.passive_failures.load(.monotonic) != 0;
-        upstreamRecordSuccess(upstream, now_ms, slow_start_ms);
-        return if (was_unavailable) .recovered else .unchanged;
-    }
-
-    const was_available = !upstreamIsEjected(upstream, now_ms);
-    upstream.passive_failures.store(1, .monotonic);
-    upstream.ejected_until_ms.store(now_ms + @as(i64, @intCast(cooldown_ms)), .monotonic);
-    return if (was_available) .ejected else .unchanged;
-}
-
-fn activeHealthCooldownMs(cfg: *const ServerConfig) u32 {
-    const doubled_interval = cfg.upstream_health_check_interval_ms *| 2;
-    return @max(doubled_interval, cfg.upstream_health_check_timeout_ms);
-}
-
-fn recordActiveHealthMetrics(transition: UpstreamHealthTransition, healthy: bool) void {
-    server_metrics.upstreamHealthCheckRan();
-    if (!healthy) server_metrics.upstreamHealthCheckFailed();
-    switch (transition) {
-        .ejected => server_metrics.upstreamEjected(),
-        .recovered => server_metrics.upstreamHealthCheckRecovered(),
-        .unchanged => {},
-    }
-}
-
-fn runActiveHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, cfg: *const ServerConfig) void {
-    const cooldown_ms = activeHealthCooldownMs(cfg);
-    for (pool.targets.items) |*upstream| {
-        if (shutdown_requested.load(.acquire)) return;
-
-        const healthy = checkUpstreamHealth(allocator, upstream, cfg.upstream_health_check_path, cfg.upstream_health_check_timeout_ms) catch false;
-        const transition = upstreamRecordActiveHealthResult(upstream, healthy, upstreamNowMs(), cooldown_ms, cfg.upstream_slow_start_ms);
-        recordActiveHealthMetrics(transition, healthy);
-    }
-}
-
-fn runActiveHealthCheckCycle(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
-    if (cfg.upstream) |*pool| {
-        runActiveHealthCheckForPool(allocator, pool, cfg);
-    }
-    for (cfg.routes.items) |*route| {
-        if (route.upstream) |*pool| {
-            runActiveHealthCheckForPool(allocator, pool, cfg);
-        }
-    }
-    for (cfg.domains.items) |*domain| {
-        if (domain.upstream) |*pool| {
-            runActiveHealthCheckForPool(allocator, pool, cfg);
-        }
-        for (domain.routes.items) |*route| {
-            if (route.upstream) |*pool| {
-                runActiveHealthCheckForPool(allocator, pool, cfg);
-            }
-        }
-    }
-}
-
-const UpstreamHealthCheckContext = struct {
-    io: std.Io,
-    cfg: *ServerConfig,
-};
-
-fn sleepUpstreamHealthInterval(io: std.Io, interval_ms: u32) void {
-    var remaining = interval_ms;
-    while (remaining > 0 and !shutdown_requested.load(.acquire)) {
-        const chunk = @min(remaining, 250);
-        io.sleep(.fromMilliseconds(chunk), .awake) catch {};
-        remaining -= chunk;
-    }
-}
-
-fn upstreamHealthCheckTask(ctx: UpstreamHealthCheckContext) void {
-    bindThreadIo(ctx.io);
-    while (!shutdown_requested.load(.acquire)) {
-        runActiveHealthCheckCycle(std.heap.page_allocator, ctx.cfg);
-        sleepUpstreamHealthInterval(ctx.io, ctx.cfg.upstream_health_check_interval_ms);
-    }
-}
+const UpstreamHealthTransition = upstream_runtime.HealthTransition;
+const upstreamRecordActiveHealthResult = upstream_runtime.recordActiveHealthResult;
 
 fn forwardToUpstreamPool(
     stream: std.Io.net.Stream,
@@ -2447,82 +2018,8 @@ fn forwardToUpstreamPool(
     req: HttpRequest,
     cfg: *const ServerConfig,
 ) !void {
-    const is_head = std.mem.eql(u8, req.method, "HEAD");
-    if (pool.targets.items.len == 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.", true, is_head, null);
-        return;
-    }
-
-    const attempt_limit = upstreamAttemptLimit(pool, cfg.upstream_retries);
-    const now_ms = upstreamNowMs();
-    const start_ticket = upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), cfg);
-    var considered: usize = 0;
-    var attempts: usize = 0;
-    var skipped_ejected: usize = 0;
-    var last_error: ?anyerror = null;
-
-    attempt_loop: while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
-        const upstream = upstreamAtAttempt(pool, start_ticket, considered);
-        const lease = upstreamBeginAttempt(upstream, now_ms, cfg) orelse {
-            skipped_ejected += 1;
-            server_metrics.upstreamEjectedSkip();
-            continue :attempt_loop;
-        };
-
-        if (attempts > 0) server_metrics.upstreamRetried();
-        attempts += 1;
-        server_metrics.upstreamRequestStarted();
-        const upstream_label = try std.fmt.allocPrint(
-            allocator,
-            "{s}://{s}:{d}{s}",
-            .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
-        );
-        accessLogSetUpstream(upstream_label);
-        forwardToUpstream(stream, allocator, upstream, req, cfg, timeout_ms) catch |err| switch (err) {
-            error.CloseConnection => {
-                upstreamEndAttempt(upstream, lease);
-                upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
-                return err;
-            },
-            error.OutOfMemory => {
-                upstreamEndAttempt(upstream, lease);
-                return err;
-            },
-            else => {
-                upstreamEndAttempt(upstream, lease);
-                last_error = err;
-                server_metrics.upstreamRequestFailed();
-                if (upstreamRecordFailure(upstream, upstreamNowMs(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
-                    server_metrics.upstreamEjected();
-                }
-                continue :attempt_loop;
-            },
-        };
-        upstreamEndAttempt(upstream, lease);
-        upstreamRecordSuccess(upstream, upstreamNowMs(), cfg.upstream_slow_start_ms);
-        return;
-    }
-
-    if (attempts == 0 and skipped_ejected > 0) {
-        try sendCoolErrorWithConnection(stream, allocator, 503, "Service Unavailable", "All configured upstream targets are unavailable or limited by circuit breaker recovery.", true, is_head, null);
-        return;
-    }
-
-    if (last_error) |err| switch (err) {
-        error.RequestTimeout => {
-            try sendCoolErrorWithConnection(stream, allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out.", true, is_head, null);
-            return;
-        },
-        error.UnsupportedUpstreamScheme => {
-            try sendCoolErrorWithConnection(stream, allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this single-file server path. Use HTTPS reverse proxy in front of this binary.", true, is_head, null);
-            return;
-        },
-        else => {},
-    };
-
-    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "All configured upstream attempts failed.", true, is_head, null);
+    try upstream_runtime.forwardToPool(stream, allocator, pool, policy, timeout_ms, req, cfg, upstreamRuntimeCallbacks());
 }
-
 
 fn handlePhp(
     io: std.Io,
@@ -4744,7 +4241,7 @@ pub fn main(init: std.process.Init) !void {
                 if (cfg.upstream_circuit_breaker_enabled) "on" else "off",
                 cfg.upstream_circuit_half_open_max,
                 cfg.upstream_slow_start_ms,
-                if (upstreamKeepaliveConfigured(&cfg)) "on" else "off",
+                if (cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0) "on" else "off",
                 cfg.upstream_keepalive_max_idle,
             },
         );
@@ -4766,7 +4263,7 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     if (cfg.upstream_health_check_enabled) {
-        const health_worker = std.Thread.spawn(.{}, upstreamHealthCheckTask, .{UpstreamHealthCheckContext{ .io = init.io, .cfg = &cfg }}) catch |err| {
+        const health_worker = std.Thread.spawn(.{}, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = init.io, .cfg = &cfg, .callbacks = upstreamRuntimeCallbacks() }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return;
         };
