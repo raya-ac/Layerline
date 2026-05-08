@@ -9,7 +9,6 @@ const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
-const error_pages = @import("error_pages.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
@@ -17,6 +16,7 @@ const h2_support = @import("http2_support.zig");
 const http2_content = @import("http2_content.zig");
 const http2_upstream = @import("http2_upstream.zig");
 const http1_router = @import("http1_router.zig");
+const http1_responses = @import("http1_responses.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
 const http3_server = @import("http3_server.zig");
@@ -28,7 +28,6 @@ const php_runtime = @import("php_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
-const redirects = @import("redirects.zig");
 const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
@@ -100,7 +99,6 @@ const setStreamWriteTimeout = stream_runtime.setStreamWriteTimeout;
 const streamClose = stream_runtime.streamClose;
 const streamRead = stream_runtime.streamRead;
 const streamWriteAll = stream_runtime.streamWriteAll;
-const streamWriteFmt = stream_runtime.streamWriteFmt;
 const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const H2PendingReader = h2_support.PendingReader;
@@ -216,17 +214,28 @@ fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
     }
 }
 
+fn http1ResponseContext() http1_responses.Context {
+    return .{
+        .server_name = SERVER_NAME,
+        .server_tagline = SERVER_TAGLINE,
+        .server_header = SERVER_HEADER,
+        .request_headers = current_request_headers,
+        .request_id = current_request_id,
+        .response_headers = current_response_headers,
+        .compression_policy = current_compression_policy,
+        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
+        .metrics = &server_metrics,
+        .emit_access_log = emitAccessLog,
+        .stream_write_all = streamWriteAll,
+    };
+}
+
 fn streamWriteRequestIdHeader(stream: std.Io.net.Stream) !void {
-    if (current_request_id.len == 0) return;
-    try streamWriteFmt(stream, "X-Request-Id: {s}\r\n", .{current_request_id});
+    try http1_responses.writeRequestIdHeader(stream, http1ResponseContext());
 }
 
 fn streamWriteConfiguredResponseHeaders(stream: std.Io.net.Stream) !void {
-    try streamWriteRequestIdHeader(stream);
-    for (current_response_headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "X-Request-Id")) continue;
-        try streamWriteFmt(stream, "{s}: {s}\r\n", .{ header.name, header.value });
-    }
+    try http1_responses.writeConfiguredResponseHeaders(stream, http1ResponseContext());
 }
 
 const LetsEncryptRenewalContext = struct {
@@ -332,18 +341,11 @@ fn sendCoolErrorWithConnection(
     is_head: bool,
     extra_headers: ?[]const u8,
 ) !void {
-    const body = try error_pages.render(allocator, SERVER_NAME, SERVER_TAGLINE, status_code, status_text, detail);
-    defer allocator.free(body);
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body.len, close_connection, extra_headers);
-        return;
-    }
-    try sendResponseWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body, close_connection, extra_headers);
+    try http1_responses.sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, close_connection, is_head, extra_headers, http1ResponseContext());
 }
 
 fn sendCoolError(stream: std.Io.net.Stream, allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !void {
-    return sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, true, false, null);
+    return http1_responses.sendCoolError(stream, allocator, status_code, status_text, detail, http1ResponseContext());
 }
 
 fn sendCoolErrorWithConnectionOnly(
@@ -354,81 +356,31 @@ fn sendCoolErrorWithConnectionOnly(
     detail: []const u8,
     close_connection: bool,
 ) !void {
-    return sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, close_connection, false, null);
+    return http1_responses.sendCoolErrorWithConnection(stream, allocator, status_code, status_text, detail, close_connection, false, null, http1ResponseContext());
 }
 
 fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, extra_headers: ?[]const u8) !void {
-    const prepared = try response_body.prepare(std.heap.page_allocator, .{
-        .status_code = status_code,
-        .content_type = content_type,
-        .body = body,
-        .is_head = false,
-        .extra_headers = extra_headers,
-        .request_headers = current_request_headers,
-        .response_headers = current_response_headers,
-        .compression_policy = current_compression_policy,
-        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
-        .metrics = &server_metrics,
-    });
-    defer prepared.deinit(std.heap.page_allocator);
-
-    const body_len = prepared.body.len;
-    var header_buffer: [4096]u8 = undefined;
-    const base_headers = try http_response.formatHttp1BaseHeaders(&header_buffer, .{
-        .status_code = status_code,
-        .status_text = status_text,
-        .server = SERVER_HEADER,
-        .content_type = content_type,
-        .content_length = body_len,
-        .close_connection = close_connection,
-    });
-    try streamWriteAll(stream, base_headers);
-    if (extra_headers) |headers| {
-        try streamWriteAll(stream, headers);
-    }
-    if (prepared.encoding) |encoding| {
-        try streamWriteFmt(stream, "Content-Encoding: {s}\r\nVary: Accept-Encoding\r\n", .{encoding});
-    }
-    try streamWriteConfiguredResponseHeaders(stream);
-    try streamWriteAll(stream, "\r\n");
-
-    if (body_len > 0) try streamWriteAll(stream, prepared.body);
-    recordResponseSent(status_code, body_len);
+    try http1_responses.sendResponseWithConnectionAndHeaders(stream, status_code, status_text, content_type, body, close_connection, extra_headers, http1ResponseContext());
 }
 
 fn sendResponseWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool) !void {
-    try sendResponseWithConnectionAndHeaders(stream, status_code, status_text, content_type, body, close_connection, null);
+    try http1_responses.sendResponseWithConnection(stream, status_code, status_text, content_type, body, close_connection, http1ResponseContext());
 }
 
 fn sendResponse(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8) !void {
-    try sendResponseWithConnectionAndHeaders(stream, status_code, status_text, content_type, body, true, null);
+    try http1_responses.sendResponse(stream, status_code, status_text, content_type, body, http1ResponseContext());
 }
 
 fn sendResponseNoBody(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize) !void {
-    try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, body_len, true);
+    try http1_responses.sendResponseNoBody(stream, status_code, status_text, content_type, body_len, http1ResponseContext());
 }
 
 fn sendResponseNoBodyWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool, extra_headers: ?[]const u8) !void {
-    var header_buffer: [4096]u8 = undefined;
-    const base_headers = try http_response.formatHttp1BaseHeaders(&header_buffer, .{
-        .status_code = status_code,
-        .status_text = status_text,
-        .server = SERVER_HEADER,
-        .content_type = content_type,
-        .content_length = body_len,
-        .close_connection = close_connection,
-    });
-    try streamWriteAll(stream, base_headers);
-    if (extra_headers) |headers| {
-        try streamWriteAll(stream, headers);
-    }
-    try streamWriteConfiguredResponseHeaders(stream);
-    try streamWriteAll(stream, "\r\n");
-    recordResponseSent(status_code, 0);
+    try http1_responses.sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, content_type, body_len, close_connection, extra_headers, http1ResponseContext());
 }
 
 fn sendResponseNoBodyWithConnection(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body_len: usize, close_connection: bool) !void {
-    try sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, content_type, body_len, close_connection, null);
+    try http1_responses.sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, body_len, close_connection, http1ResponseContext());
 }
 
 fn sendNotFound(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
@@ -519,52 +471,15 @@ fn sendNotImplemented(stream: std.Io.net.Stream, allocator: std.mem.Allocator, c
 }
 
 fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
-    if (http_response.canSendBody(status_code, is_head)) {
-        try sendResponseWithConnection(stream, status_code, status_text, content_type, body, close_connection);
-        return;
-    }
-
-    const declared_len = if (is_head) body.len else 0;
-    try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, declared_len, close_connection);
+    try http1_responses.sendResponseForMethod(stream, status_code, status_text, content_type, body, close_connection, is_head, http1ResponseContext());
 }
 
 fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    const location = try redirects.buildLocation(allocator, rule, req);
-    defer allocator.free(location);
-
-    const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
-    defer allocator.free(extra_headers);
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "Redirecting to {s}\n",
-        .{location},
-    );
-    defer allocator.free(body);
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, rule.status_code, redirects.statusText(rule.status_code), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
-        return;
-    }
-
-    try sendResponseWithConnectionAndHeaders(stream, rule.status_code, redirects.statusText(rule.status_code), "text/plain; charset=utf-8", body, close_connection, extra_headers);
+    try http1_responses.sendConfiguredRedirect(stream, allocator, rule, req, close_connection, is_head, http1ResponseContext());
 }
 
 fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    const location = try redirects.buildHttpsLocation(allocator, cfg, req);
-    defer allocator.free(location);
-
-    const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
-    defer allocator.free(extra_headers);
-
-    const body = try std.fmt.allocPrint(allocator, "Redirecting to {s}\n", .{location});
-    defer allocator.free(body);
-
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirects.statusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
-        return;
-    }
-    try sendResponseWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirects.statusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body, close_connection, extra_headers);
+    try http1_responses.sendHttpsRedirect(stream, allocator, cfg, req, close_connection, is_head, http1ResponseContext());
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
