@@ -1,6 +1,5 @@
 const std = @import("std");
 const admin_http = @import("admin_http.zig");
-const access_log_mod = @import("access_log.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
@@ -20,35 +19,23 @@ const http1_router = @import("http1_router.zig");
 const http1_responses = @import("http1_responses.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
-const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const php_runtime = @import("php_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
-const request_trace = @import("request_trace.zig");
+const runtime_state = @import("runtime_state.zig");
 const server_runtime = @import("server_runtime.zig");
 const server_assets = @import("server_assets.zig");
-const static_files = @import("static_files.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const tls_accept = @import("tls_accept.zig");
 const tls_material = @import("tls_material.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
 
-const hasConnectionToken = http_headers.hasConnectionToken;
 const AdminCredentials = admin_support.AdminCredentials;
-const adminPathMatches = admin_support.adminPathMatches;
-const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
 const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
-const ServerMetrics = metrics_mod.ServerMetrics;
-const isSkippedProxyResponseHeader = proxy_utils.isSkippedProxyResponseHeader;
-const ByteRange = static_files.ByteRange;
-const acceptsContentCoding = static_files.acceptsContentCoding;
-const etagMatches = static_files.etagMatches;
-const makeStaticBaseHeaders = static_files.makeStaticBaseHeaders;
-const parseByteRange = static_files.parseByteRange;
 const HttpRequest = request_mod.HttpRequest;
 const activeIo = stream_runtime.activeIo;
 const bindThreadIo = stream_runtime.bindThreadIo;
@@ -63,56 +50,17 @@ const streamClose = stream_runtime.streamClose;
 const streamRead = stream_runtime.streamRead;
 const streamWriteAll = stream_runtime.streamWriteAll;
 const H2BufferedResponse = h2_support.BufferedResponse;
-const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
-const UpstreamConfig = config_mod.UpstreamConfig;
-const PhpFastcgiTcpEndpoint = config_mod.PhpFastcgiTcpEndpoint;
-const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
-const ResponseHeaderRule = config_mod.ResponseHeaderRule;
-const CompressionPolicy = config_mod.CompressionPolicy;
 const RedirectRule = config_mod.RedirectRule;
 const RouteConfig = config_mod.RouteConfig;
 const DomainConfig = config_mod.DomainConfig;
 const ServerConfig = config_mod.ServerConfig;
-const ResponseHeaderContext = config_mod.ResponseHeaderContext;
 const defaultServerConfig = config_mod.defaultServerConfig;
-const compressionPolicyFromConfig = config_mod.compressionPolicyFromConfig;
-const responseHeaderRulesContain = config_mod.responseHeaderRulesContain;
-const parseBool = config_mod.parseBool;
-const disablesOptionalUrl = config_mod.disablesOptionalUrl;
-const parseFastcgiEndpoint = config_mod.parseFastcgiEndpoint;
-const validateFastcgiEndpoint = config_mod.validateFastcgiEndpoint;
-const parseUpstream = config_mod.parseUpstream;
-const parseUpstreamPool = config_mod.parseUpstreamPool;
-const parseUpstreamPoolPolicy = config_mod.parseUpstreamPoolPolicy;
-const parseOptionalUpstreamPoolPolicy = config_mod.parseOptionalUpstreamPoolPolicy;
-const applyConfigLine = config_mod.applyConfigLine;
 const loadConfig = config_mod.loadConfig;
 const loadConfiguredDomainConfigs = config_mod.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const validateConfig = config_mod.validateConfig;
-const initDomainConfig = config_mod.initDomainConfig;
-const findDomainConfigMutable = config_mod.findDomainConfigMutable;
-const appendServerNames = config_mod.appendServerNames;
-const isDomainConfigNameValid = config_mod.isDomainConfigNameValid;
-const isDomainConfigFileName = config_mod.isDomainConfigFileName;
-const setRouteLine = config_mod.setRouteLine;
-const setRouteLineFor = config_mod.setRouteLineFor;
-const setRouteStringProperty = config_mod.setRouteStringProperty;
-const setRouteProxyProperty = config_mod.setRouteProxyProperty;
-const setRouteUpstreamPolicyProperty = config_mod.setRouteUpstreamPolicyProperty;
-const setRouteU32Property = config_mod.setRouteU32Property;
-const setRouteBoolProperty = config_mod.setRouteBoolProperty;
-const setDomainLine = config_mod.setDomainLine;
-const setDomainRouteLine = config_mod.setDomainRouteLine;
-const setDomainStringPropertyDirect = config_mod.setDomainStringPropertyDirect;
-const setDomainBoolPropertyDirect = config_mod.setDomainBoolPropertyDirect;
-const setDomainProxyPropertyDirect = config_mod.setDomainProxyPropertyDirect;
-const setDomainUpstreamPolicyPropertyDirect = config_mod.setDomainUpstreamPolicyPropertyDirect;
-const setDomainU32PropertyDirect = config_mod.setDomainU32PropertyDirect;
-const applyDomainConfigLine = config_mod.applyDomainConfigLine;
-const validateRouteConfig = config_mod.validateRouteConfig;
 
 const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = 64 * 1024;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = std.compress.flate.max_window_len;
@@ -121,17 +69,8 @@ const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
 
-threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
-threadlocal var current_request_headers: []const u8 = "";
-threadlocal var current_request_id: []const u8 = "";
-threadlocal var current_compression_policy: CompressionPolicy = .disabled;
-threadlocal var current_access_log: ?*access_log_mod.Context = null;
-var access_log_writer = access_log_mod.Writer{};
-var request_id_generator = request_trace.Generator{};
-var shutdown_requested = std.atomic.Value(bool).init(false);
-
 fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
-    shutdown_requested.store(true, .release);
+    runtime_state.shutdown_requested.store(true, .release);
 }
 
 fn installShutdownSignalHandlers() void {
@@ -150,12 +89,12 @@ fn http1ResponseContext() http1_responses.Context {
         .server_name = SERVER_NAME,
         .server_tagline = SERVER_TAGLINE,
         .server_header = SERVER_HEADER,
-        .request_headers = current_request_headers,
-        .request_id = current_request_id,
-        .response_headers = current_response_headers,
-        .compression_policy = current_compression_policy,
+        .request_headers = runtime_state.current_request_headers,
+        .request_id = runtime_state.current_request_id,
+        .response_headers = runtime_state.current_response_headers,
+        .compression_policy = runtime_state.current_compression_policy,
         .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .emit_access_log = emitAccessLog,
         .stream_write_all = streamWriteAll,
     };
@@ -176,9 +115,6 @@ fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: 
 fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
     tls_material.deinitAll(allocator, cfg);
 }
-
-var server_metrics = ServerMetrics.init();
-var fastcgi_keepalive_pool = FastcgiKeepAlivePool.init();
 
 fn upstreamNowMs() i64 {
     return std.Io.Timestamp.now(activeIo(), .awake).toMilliseconds();
@@ -322,18 +258,18 @@ fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bo
 }
 
 fn recordResponseSent(status_code: u16, body_bytes: usize) void {
-    server_metrics.responseSent(status_code, body_bytes);
+    runtime_state.server_metrics.responseSent(status_code, body_bytes);
     emitAccessLog(status_code, body_bytes);
 }
 
 fn sendMetrics(stream: std.Io.net.Stream, allocator: std.mem.Allocator, close_connection: bool, is_head: bool) !void {
-    const body = try metrics_mod.render(allocator, &server_metrics);
+    const body = try metrics_mod.render(allocator, &runtime_state.server_metrics);
     defer allocator.free(body);
     try sendResponseForMethod(stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body, close_connection, is_head);
 }
 
 fn adminRuntimeView() admin_pages.RuntimeView {
-    return .{ .server_name = SERVER_NAME, .metrics = &server_metrics };
+    return .{ .server_name = SERVER_NAME, .metrics = &runtime_state.server_metrics };
 }
 
 fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool) !void {
@@ -364,28 +300,16 @@ fn sendAdminDashboardPage(
     try admin_http.sendDashboardPage(io, stream, allocator, cfg, credentials, maybe_notice, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
 }
 
-fn accessLogSetHandler(handler: []const u8) void {
-    access_log_mod.setHandler(current_access_log, handler);
-}
-
-fn accessLogSetUpstream(upstream: []const u8) void {
-    access_log_mod.setUpstream(current_access_log, upstream);
-}
-
-fn accessLogSetError(error_name: []const u8) void {
-    access_log_mod.setError(current_access_log, error_name);
-}
-
 fn emitAccessLog(status_code: u16, body_bytes: usize) void {
-    access_log_writer.emit(activeIo(), current_access_log, SERVER_NAME, status_code, body_bytes);
+    runtime_state.emitAccessLog(activeIo(), SERVER_NAME, status_code, body_bytes);
 }
 
 fn adminRenderMetrics(allocator: std.mem.Allocator) ![]const u8 {
-    return metrics_mod.render(allocator, &server_metrics);
+    return metrics_mod.render(allocator, &runtime_state.server_metrics);
 }
 
 fn adminRequestRestart() void {
-    shutdown_requested.store(true, .release);
+    runtime_state.shutdown_requested.store(true, .release);
 }
 
 fn adminHttpCallbacks() admin_http.Callbacks {
@@ -413,25 +337,21 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .send_response_no_body = sendResponseNoBodyWithConnectionAndHeaders,
         .send_setup_page = sendAdminSetupPage,
         .set_stream_timeouts = setStreamTimeouts,
-        .shutdown_requested = &shutdown_requested,
+        .shutdown_requested = &runtime_state.shutdown_requested,
         .validate_activation = validateConfigFileForActivation,
         .validate_runtime = validateConfig,
         .write_all = streamWriteAll,
     };
 }
 
-fn currentRequestId() []const u8 {
-    return current_request_id;
-}
-
 fn phpCallbacks() php_runtime.Callbacks {
     return .{
         .active_io = activeIo,
         .connect_fastcgi_endpoint = connectFastcgiEndpoint,
-        .current_request_id = currentRequestId,
-        .fastcgi_pool = &fastcgi_keepalive_pool,
+        .current_request_id = runtime_state.currentRequestId,
+        .fastcgi_pool = &runtime_state.fastcgi_keepalive_pool,
         .h2_error_response = h2CoolErrorResponse,
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .now_ms = upstreamNowMs,
         .send_cool_error = sendCoolErrorWithConnection,
         .send_not_found_for_method = sendNotFoundForMethod,
@@ -450,16 +370,16 @@ fn phpCallbacks() php_runtime.Callbacks {
 
 fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
     return .{
-        .access_log_set_upstream = accessLogSetUpstream,
+        .access_log_set_upstream = runtime_state.accessLogSetUpstream,
         .active_io = activeIo,
         .bind_thread_io = bindThreadIo,
         .connect_tcp_host = connectTcpHost,
-        .current_request_id = currentRequestId,
-        .metrics = &server_metrics,
+        .current_request_id = runtime_state.currentRequestId,
+        .metrics = &runtime_state.server_metrics,
         .proxy_raw_bidirectional = proxyRawBidirectional,
         .send_cool_error = sendCoolErrorWithConnection,
         .set_stream_timeouts = setStreamTimeouts,
-        .shutdown_requested = &shutdown_requested,
+        .shutdown_requested = &runtime_state.shutdown_requested,
         .stream_close = streamClose,
         .stream_read = streamRead,
         .stream_write_all = streamWriteAll,
@@ -476,7 +396,7 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
 
 fn http1StaticCallbacks() http1_static.Callbacks {
     return .{
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .send_bad_request_for_method = sendBadRequestForMethod,
         .send_cool_error = sendCoolErrorWithConnection,
         .send_not_found_for_method = sendNotFoundForMethod,
@@ -577,12 +497,12 @@ fn handleTlsClientHelloProbe(
 fn http2SendContext() http2_runtime.SendContext {
     return .{
         .server_header = SERVER_HEADER,
-        .request_id = current_request_id,
-        .request_headers = current_request_headers,
-        .response_headers = current_response_headers,
-        .compression_policy = current_compression_policy,
+        .request_id = runtime_state.current_request_id,
+        .request_headers = runtime_state.current_request_headers,
+        .response_headers = runtime_state.current_response_headers,
+        .compression_policy = runtime_state.current_compression_policy,
         .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .stream_write_all = streamWriteAll,
         .record_response_sent = recordResponseSent,
     };
@@ -606,7 +526,7 @@ fn h2DomainCustomNotFoundResponse(
 }
 
 fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize) !H2BufferedResponse {
-    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, max_file_bytes, &server_metrics, SERVER_NAME, SERVER_TAGLINE);
+    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, max_file_bytes, &runtime_state.server_metrics, SERVER_NAME, SERVER_TAGLINE);
 }
 
 fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, token: []const u8) !H2BufferedResponse {
@@ -625,29 +545,16 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
     return http2_router.buildResponseForRequest(io, allocator, cfg, req, process_env, http2RouterCallbacks());
 }
 
-fn setHttp2RequestContext(headers: []const u8, request_id: []const u8, policy: CompressionPolicy) void {
-    current_request_headers = headers;
-    current_request_id = request_id;
-    current_compression_policy = policy;
-}
-
-fn clearHttp2RequestContext() void {
-    current_request_headers = "";
-    current_request_id = "";
-    current_compression_policy = .disabled;
-    current_response_headers = &.{};
-}
-
 fn http2CompleteContext() http2_runtime.CompleteContext {
     return .{
-        .metrics = &server_metrics,
-        .resolve_request_id = resolveRequestId,
-        .set_request_context = setHttp2RequestContext,
-        .clear_request_context = clearHttp2RequestContext,
-        .set_access_context = setAccessLogContext,
-        .clear_access_context = clearAccessLogContext,
-        .access_log_set_handler = accessLogSetHandler,
-        .access_log_set_error = accessLogSetError,
+        .metrics = &runtime_state.server_metrics,
+        .resolve_request_id = runtime_state.resolveRequestId,
+        .set_request_context = runtime_state.setHttp2RequestContext,
+        .clear_request_context = runtime_state.clearHttp2RequestContext,
+        .set_access_context = runtime_state.setAccessLogContext,
+        .clear_access_context = runtime_state.clearAccessLogContext,
+        .access_log_set_handler = runtime_state.accessLogSetHandler,
+        .access_log_set_error = runtime_state.accessLogSetError,
         .emit_access_log = emitAccessLog,
         .build_response_for_request = buildHttp2ResponseForRequest,
         .cool_error_response = h2CoolErrorResponse,
@@ -673,32 +580,32 @@ fn http2Callbacks() h2_server.Callbacks {
         .error_response = h2CoolErrorResponse,
         .complete_request = sendCompletedHttp2Request,
         .write_all = streamWriteAll,
-        .shutdown_requested = &shutdown_requested,
+        .shutdown_requested = &runtime_state.shutdown_requested,
     };
 }
 
 fn http2RouterCallbacks() http2_router.Callbacks {
     return .{
-        .access_log_set_handler = accessLogSetHandler,
+        .access_log_set_handler = runtime_state.accessLogSetHandler,
         .custom_not_found_response = h2DomainCustomNotFoundResponse,
         .error_response = h2CoolErrorResponse,
         .fetch_upstream_pool_response = fetchHttp2UpstreamPoolResponse,
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .php_callbacks = phpCallbacks(),
         .read_acme_challenge = readAcmeChallengeForHttp2,
         .read_static_file = readStaticFileForHttp2,
         .redirect_response = buildHttp2RedirectResponse,
-        .set_response_headers = setHttp1ResponseHeaders,
+        .set_response_headers = runtime_state.setResponseHeaders,
     };
 }
 
 fn http2UpstreamCallbacks() http2_upstream.Callbacks {
     return .{
-        .access_log_set_upstream = accessLogSetUpstream,
+        .access_log_set_upstream = runtime_state.accessLogSetUpstream,
         .connect_tcp_host = connectTcpHost,
-        .current_request_id = currentRequestId,
+        .current_request_id = runtime_state.currentRequestId,
         .error_response = h2CoolErrorResponse,
-        .metrics = &server_metrics,
+        .metrics = &runtime_state.server_metrics,
         .set_stream_timeouts = setStreamTimeouts,
         .stream_close = streamClose,
         .stream_read = streamRead,
@@ -773,7 +680,7 @@ fn handleNamedRoute(
     process_env: *const std.process.Environ.Map,
 ) !void {
     try http1_route_handlers.handleNamedRoute(io, stream, allocator, cfg, domain, route, req, close_connection, is_head, process_env, .{
-        .access_log_set_handler = accessLogSetHandler,
+        .access_log_set_handler = runtime_state.accessLogSetHandler,
         .forward_to_upstream_pool = forwardToUpstreamPool,
         .php_callbacks = phpCallbacks(),
         .send_cool_error = sendCoolErrorWithConnection,
@@ -784,33 +691,15 @@ fn handleNamedRoute(
     });
 }
 
-fn setHttp1RequestContext(headers: []const u8, policy: CompressionPolicy) void {
-    current_request_headers = headers;
-    current_compression_policy = policy;
-}
-
-fn clearHttp1RequestContext() void {
-    current_request_headers = "";
-    current_compression_policy = .disabled;
-}
-
-fn setHttp1ResponseHeaders(headers: []const ResponseHeaderRule) void {
-    current_response_headers = headers;
-}
-
-fn clearHttp1ResponseHeaders() void {
-    current_response_headers = &.{};
-}
-
 fn routeAdminUi(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
     try admin_runtime.handleUi(io, stream, allocator, cfg, req, close_connection, is_head, adminCallbacks());
 }
 
 fn http1RouterCallbacks() http1_router.Callbacks {
     return .{
-        .access_log_set_handler = accessLogSetHandler,
-        .clear_request_context = clearHttp1RequestContext,
-        .clear_response_headers = clearHttp1ResponseHeaders,
+        .access_log_set_handler = runtime_state.accessLogSetHandler,
+        .clear_request_context = runtime_state.clearHttp1RequestContext,
+        .clear_response_headers = runtime_state.clearResponseHeaders,
         .forward_to_upstream_pool = forwardToUpstreamPool,
         .handle_admin_ui = routeAdminUi,
         .handle_named_route = handleNamedRoute,
@@ -828,8 +717,8 @@ fn http1RouterCallbacks() http1_router.Callbacks {
         .send_server_icon = sendServerIcon,
         .serve_acme_challenge = serveAcmeChallenge,
         .serve_static = serveStatic,
-        .set_request_context = setHttp1RequestContext,
-        .set_response_headers = setHttp1ResponseHeaders,
+        .set_request_context = runtime_state.setHttp1RequestContext,
+        .set_response_headers = runtime_state.setResponseHeaders,
     };
 }
 
@@ -844,34 +733,20 @@ fn routeRequest(
     try http1_router.route(io, stream, allocator, cfg, req, process_env, http1RouterCallbacks());
 }
 
-fn resolveRequestId(io: std.Io, allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {
-    return request_id_generator.resolve(io, allocator, headers);
-}
-
-fn setAccessLogContext(ctx: *access_log_mod.Context, request_id: []const u8) void {
-    current_access_log = ctx;
-    current_request_id = request_id;
-}
-
-fn clearAccessLogContext() void {
-    current_access_log = null;
-    current_request_id = "";
-}
-
 fn http1RuntimeCallbacks() http1_runtime.Callbacks {
     return .{
-        .access_log_set_error = accessLogSetError,
-        .access_log_set_handler = accessLogSetHandler,
+        .access_log_set_error = runtime_state.accessLogSetError,
+        .access_log_set_handler = runtime_state.accessLogSetHandler,
         .bind_thread_io = bindThreadIo,
-        .clear_access_context = clearAccessLogContext,
-        .clear_request_context = clearHttp1RequestContext,
-        .clear_response_headers = clearHttp1ResponseHeaders,
+        .clear_access_context = runtime_state.clearAccessLogContext,
+        .clear_request_context = runtime_state.clearHttp1RequestContext,
+        .clear_response_headers = runtime_state.clearResponseHeaders,
         .emit_access_log = emitAccessLog,
         .handle_http2_preface = handleHttp2Preface,
         .handle_http2_upgrade = handleHttp2Upgrade,
         .handle_tls_client_hello_probe = handleTlsClientHelloProbe,
-        .metrics = &server_metrics,
-        .resolve_request_id = resolveRequestId,
+        .metrics = &runtime_state.server_metrics,
+        .resolve_request_id = runtime_state.resolveRequestId,
         .route_request = routeRequest,
         .send_bad_request = sendBadRequest,
         .send_bad_request_for_method = sendBadRequestForMethod,
@@ -879,13 +754,13 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
         .send_cool_error_with_connection = sendCoolErrorWithConnection,
         .send_https_redirect = sendHttpsRedirect,
         .serve_acme_challenge = serveAcmeChallenge,
-        .set_access_context = setAccessLogContext,
-        .set_request_context = setHttp1RequestContext,
-        .set_response_headers = setHttp1ResponseHeaders,
+        .set_access_context = runtime_state.setAccessLogContext,
+        .set_request_context = runtime_state.setHttp1RequestContext,
+        .set_response_headers = runtime_state.setResponseHeaders,
         .set_stream_read_timeout = setStreamReadTimeout,
         .set_stream_timeouts = setStreamTimeouts,
         .set_stream_write_timeout = setStreamWriteTimeout,
-        .shutdown_requested = &shutdown_requested,
+        .shutdown_requested = &runtime_state.shutdown_requested,
         .stream_close = streamClose,
         .stream_read = streamRead,
         .stream_write_all = streamWriteAll,
@@ -904,7 +779,7 @@ fn usage() void {
 pub fn main(init: std.process.Init) !void {
     bindThreadIo(init.io);
     installShutdownSignalHandlers();
-    shutdown_requested.store(false, .release);
+    runtime_state.shutdown_requested.store(false, .release);
 
     var cfg = defaultServerConfig();
 
@@ -935,8 +810,8 @@ pub fn main(init: std.process.Init) !void {
         .allocator = std.heap.page_allocator,
         .cfg = &cfg,
         .process_env = init.environ_map,
-        .metrics = &server_metrics,
-        .shutdown_requested = &shutdown_requested,
+        .metrics = &runtime_state.server_metrics,
+        .shutdown_requested = &runtime_state.shutdown_requested,
         .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .server_header = SERVER_HEADER,
         .callbacks = .{
