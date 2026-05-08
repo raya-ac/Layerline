@@ -42,7 +42,7 @@ Layerline blends local serving with edge-style deployment:
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, request bodies, and FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
-- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and static/health route dispatch.
+- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and static/health/redirect route dispatch.
 - Auto Let’s Encrypt (certbot) bootstrap, ACME challenge serving from certbot webroots, periodic renewal loop, and systemd renewal timer assets.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
@@ -72,7 +72,7 @@ The next roadmap slice is protocol/parser/cache depth: broader HTTP/3 route pari
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, best-effort external HTTP/3 curl smoke, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -252,9 +252,9 @@ This server now terminates native TLS 1.3 on the TCP listener and uses ALPN to r
 - HTTP/2 is served directly over TLS when the client selects `h2`, and HTTP/1.1 stays on the existing router when the client selects `http/1.1` or sends no ALPN.
 - HTTP/2 cleartext (`h2c`) is still supported for local or upstream cleartext workflows.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
-- The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, decodes simple QPACK request fields, and can dispatch static root, static routes, `/static/*`, `/health`, or the built-in Layerline page as HTTP/3 HEADERS + DATA.
+- The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, decodes simple QPACK request fields, and can dispatch static root, static routes, configured redirects, `/static/*`, `/health`, or the built-in Layerline page as HTTP/3 HEADERS + DATA.
 - HTTP/3 connection state is tracked per QUIC connection ID with a bounded in-process table, so concurrent handshakes no longer share one global assembly buffer.
-- Broader HTTP/3 routing is intentionally still narrow: the native path covers static and health responses, while HTTP/1 and HTTP/2 keep the full static/PHP/proxy surface.
+- Broader HTTP/3 routing is intentionally still narrow: the native path covers static, redirect, and health responses, while HTTP/1 and HTTP/2 keep the full static/PHP/proxy surface.
 
 Run with:
 

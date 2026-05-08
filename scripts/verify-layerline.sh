@@ -7,6 +7,7 @@ PORT=${LAYERLINE_VERIFY_PORT:-18145}
 HOST=${LAYERLINE_VERIFY_HOST:-127.0.0.1}
 REDIRECT_PORT=${LAYERLINE_VERIFY_REDIRECT_PORT:-$((PORT + 1))}
 REDIRECT_TLS_PORT=${LAYERLINE_VERIFY_REDIRECT_TLS_PORT:-$((PORT + 2))}
+H3_PORT=${LAYERLINE_VERIFY_H3_PORT:-$((PORT + 3))}
 
 if [[ -z $ZIG ]]; then
   if [[ -x /opt/homebrew/bin/zig ]]; then
@@ -76,6 +77,10 @@ header_has() {
   grep -qi "$pattern" "$file"
 }
 
+curl_supports_http3() {
+  curl --version 2>/dev/null | grep -Eq '(^Features:| )HTTP3( |$)'
+}
+
 log "building Layerline release binary"
 "$ZIG" build -Doptimize=ReleaseFast
 
@@ -90,6 +95,8 @@ admin_ui = true
 admin_ui_path = /_layerline/admin
 admin_credentials_path = $ADMIN_CREDS
 access_log = $ACCESS_LOG
+http3 = true
+http3_port = $H3_PORT
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
@@ -216,6 +223,15 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_SMOKE=1
 else
   ok "h2c smoke skipped; curl lacks --http2-prior-knowledge"
+fi
+
+if curl_supports_http3; then
+  H3_HEALTH_BODY="$TMP_DIR/h3-health.body"
+  curl -fsSk --http3-only --max-time 5 "https://$HOST:$H3_PORT/health" -o "$H3_HEALTH_BODY"
+  grep -Fq 'ok' "$H3_HEALTH_BODY" || die "HTTP/3 external curl smoke did not receive health body"
+  ok "HTTP/3 external curl smoke"
+else
+  ok "HTTP/3 external curl smoke skipped; curl lacks HTTP3 feature"
 fi
 
 require_command nc

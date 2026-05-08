@@ -126,7 +126,7 @@ pub fn usage() void {
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_proxy.NAME, " ++
             "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
+            "Native HTTP/3 serves static, health, redirect, and fallback page responses over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
             "  zig build run\n" ++
             "  zig build run -- --validate-config\n" ++
@@ -153,7 +153,7 @@ pub fn usage() void {
             "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
             "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
             "  and connection management policies.\n" ++
-            "  Native HTTP/3 currently covers the local default-page path, with broader routing\n" ++
+            "  Native HTTP/3 currently covers static, health, redirect, and fallback page paths, with proxy/PHP\n" ++
             "  and certificate trust/automation still kept separate from the HTTP/1 surface.\n",
         .{},
     );
