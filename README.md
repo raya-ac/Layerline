@@ -61,7 +61,9 @@ The next roadmap slice is protocol/parser/cache depth: broader HTTP/3 route pari
 
 ## Files
 
-- `src/main.zig` – server implementation.
+- `src/main.zig` – tiny entrypoint.
+- `src/app.zig` – runtime assembly for listeners, routing callbacks, reload, and background workers.
+- `src/config.zig` and `src/config_loader.zig` – config model/directive handling plus file loading and line diagnostics.
 - `build.zig` – Zig build script.
 - `public/index.html` and `public/site.css` – the Layerline website served when `serve_static_root = true`.
 - `public/layerline-mark.svg` – the repo/logo mark used by this README and served branding.

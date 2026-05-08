@@ -1,12 +1,13 @@
 const std = @import("std");
 
+const config_loader = @import("config_loader.zig");
 const config_mod = @import("config.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const DEFAULT_CONFIG_PATH = config_mod.DEFAULT_CONFIG_PATH;
 const disablesOptionalUrl = config_mod.disablesOptionalUrl;
-const loadConfig = config_mod.loadConfig;
-const loadConfiguredDomainConfigs = config_mod.loadConfiguredDomainConfigs;
+const loadConfig = config_loader.loadConfig;
+const loadConfiguredDomainConfigs = config_loader.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const parseBool = config_mod.parseBool;
 const parseUpstream = config_mod.parseUpstream;

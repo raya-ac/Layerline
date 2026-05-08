@@ -88,7 +88,7 @@ Sources:
 
 - Local admin API over Unix socket by default: status, activation config validate, runtime validate, reload, managed restart, metrics, route dump, upstream health, and cert status.
 - CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`.
-- Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based domain configs are implemented, including nginx-style per-domain files loaded from `domain_config_dir`.
+- Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based domain configs are implemented, including nginx-style per-domain files loaded from `domain_config_dir`; file loading, domain-file discovery, line scanning, and diagnostics now live in `config_loader.zig` instead of the directive model.
 - Prometheus metrics plus optional OpenTelemetry traces.
 - Systemd/launchd templates, Docker image, Homebrew tap, and reproducible release builds.
 - Crash reporting primitives: panic log, build info, runtime profile, and redacted support bundle.
@@ -119,4 +119,4 @@ Sources:
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, in-memory config reload, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone should be broader HTTP/3 route parity for proxy/PHP, route-local cache/security/upstream policy, a config parser refactor, and then disk/dynamic cache mechanics. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
+The next engineering milestone should be broader HTTP/3 route parity for proxy/PHP, route-local cache/security/upstream policy, deeper parser/directive-table cleanup, and then disk/dynamic cache mechanics. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

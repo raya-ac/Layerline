@@ -114,6 +114,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_static_cache_tests = b.addRunArtifact(static_cache_tests);
 
+    const config_loader_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/config_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_config_loader_tests = b.addRunArtifact(config_loader_tests);
+
     const reactor_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/core/reactor.zig"),
@@ -125,6 +134,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_app_tests.step);
+    test_step.dependOn(&run_config_loader_tests.step);
     test_step.dependOn(&run_h2_tests.step);
     test_step.dependOn(&run_h3_tests.step);
     test_step.dependOn(&run_h3_state_tests.step);

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const admin_support = @import("admin_support.zig");
+const config_loader = @import("config_loader.zig");
 const config_mod = @import("config.zig");
 const routing_mod = @import("routing.zig");
 
@@ -12,7 +13,7 @@ const ADMIN_SITE_CONFIG_MAX_BYTES = admin_support.ADMIN_SITE_CONFIG_MAX_BYTES;
 const appendHtmlEscaped = admin_support.appendHtmlEscaped;
 const appendRedactedConfigEscaped = admin_support.appendRedactedConfigEscaped;
 const domainStaticDir = routing_mod.domainStaticDir;
-const isDomainConfigFileName = config_mod.isDomainConfigFileName;
+const isDomainConfigFileName = config_loader.isDomainConfigFileName;
 const upstreamPoolPolicyName = config_mod.upstreamPoolPolicyName;
 
 pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig, title: []const u8) !void {
