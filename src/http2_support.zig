@@ -7,6 +7,12 @@ const request_mod = @import("request.zig");
 
 pub const PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+pub fn isLikelyPreface(bytes: []const u8) bool {
+    if (bytes.len < 7) return false;
+    if (std.mem.startsWith(u8, bytes, PREFACE_MAGIC)) return true;
+    return std.mem.startsWith(u8, bytes, "PRI * ");
+}
+
 pub const BufferedResponse = struct {
     status_code: u16,
     content_type: []const u8,

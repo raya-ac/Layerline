@@ -33,6 +33,29 @@ pub fn upstreamHashInput(req: HttpRequest) upstream.RequestHashInput {
     };
 }
 
+pub fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
+    if (query.len == 0) return null;
+
+    var cursor = query;
+    while (cursor.len > 0) {
+        const token_end = std.mem.indexOfScalar(u8, cursor, '&') orelse cursor.len;
+        const pair = cursor[0..token_end];
+
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            const k = pair[0..eq];
+            const v = pair[eq + 1 ..];
+            if (std.mem.eql(u8, k, key)) return v;
+        } else if (std.mem.eql(u8, pair, key)) {
+            return "";
+        }
+
+        if (token_end == cursor.len) break;
+        cursor = cursor[token_end + 1 ..];
+    }
+
+    return null;
+}
+
 fn http2SettingsDecodedLength(value: []const u8) ?usize {
     if (value.len == 0 or value.len % 4 != 0) return null;
     var decoded_len: usize = 0;

@@ -1,6 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const http_headers = @import("http_headers.zig");
+const metrics_mod = @import("metrics.zig");
+
+const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+    else => false,
+};
 
 pub const ByteRange = struct {
     start: usize,
@@ -138,4 +145,74 @@ pub fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
     const stat = try std.Io.Dir.cwd().statFile(io, file_path, .{});
     if (stat.kind != .file) return error.NotFile;
     return stat;
+}
+
+pub const RangeBodyCallbacks = struct {
+    metrics: *metrics_mod.ServerMetrics,
+    write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
+};
+
+fn trySendfileRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, body_len: usize) !bool {
+    if (comptime !HAS_DARWIN_SENDFILE) return false;
+    if (body_len == 0) return true;
+
+    var offset = std.math.cast(std.c.off_t, start) orelse return error.FileTooBig;
+    var remaining = body_len;
+    var sent_total: usize = 0;
+
+    while (remaining > 0) {
+        const chunk = @min(remaining, @as(usize, @intCast(std.math.maxInt(i32))));
+        var len: std.c.off_t = @intCast(chunk);
+        switch (std.c.errno(std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0))) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => {
+                if (len == 0) continue;
+            },
+            .OPNOTSUPP, .NOTSOCK, .NOSYS => {
+                if (sent_total == 0) return false;
+                return error.Unexpected;
+            },
+            .PIPE, .NOTCONN => return error.BrokenPipe,
+            .IO => return error.InputOutput,
+            else => return error.Unexpected,
+        }
+
+        if (len <= 0) return error.WriteZero;
+        const sent: usize = @intCast(len);
+        remaining -= sent;
+        sent_total += sent;
+        offset += len;
+    }
+
+    return true;
+}
+
+pub fn streamRangeBody(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    file_path: []const u8,
+    start: usize,
+    body_len: usize,
+    callbacks: RangeBodyCallbacks,
+) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
+    defer file.close(io);
+
+    if (try trySendfileRange(stream, file, start, body_len)) {
+        callbacks.metrics.staticBodySent(body_len, .sendfile);
+        return;
+    }
+
+    var buffer: [8 * 1024]u8 = undefined;
+    var sent: usize = 0;
+    while (sent < body_len) {
+        const chunk_len = @min(buffer.len, body_len - sent);
+        var vec: [1][]u8 = .{buffer[0..chunk_len]};
+        const read_n = try file.readPositional(io, &vec, start + sent);
+        if (read_n == 0) return error.UnexpectedEndOfFile;
+        try callbacks.write_all(stream, buffer[0..read_n]);
+        sent += read_n;
+    }
+
+    callbacks.metrics.staticBodySent(body_len, .buffered);
 }

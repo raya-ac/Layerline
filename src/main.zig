@@ -7,6 +7,8 @@ const admin_support = @import("admin_support.zig");
 const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
 const cgi_headers = @import("cgi_headers.zig");
+const cli_output = @import("cli_output.zig");
+const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
 const error_pages = @import("error_pages.zig");
 const fastcgi = @import("fastcgi.zig");
@@ -23,6 +25,7 @@ const php_runtime = @import("php_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
+const redirects = @import("redirects.zig");
 const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
@@ -52,7 +55,6 @@ const domainPhpFrontController = routing_mod.domainPhpFrontController;
 const routePhpIndex = routing_mod.routePhpIndex;
 const routePhpFrontController = routing_mod.routePhpFrontController;
 const routePhpFastcgi = routing_mod.routePhpFastcgi;
-const domainUpstream = routing_mod.domainUpstream;
 const domainUpstreamMutable = routing_mod.domainUpstreamMutable;
 const domainUpstreamPolicy = routing_mod.domainUpstreamPolicy;
 const routeUpstreamPolicy = routing_mod.routeUpstreamPolicy;
@@ -75,7 +77,6 @@ const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
 const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
 const ServerMetrics = metrics_mod.ServerMetrics;
-const StaticTransferMode = metrics_mod.StaticTransferMode;
 const UpstreamResponseForwardResult = proxy_utils.UpstreamResponseForwardResult;
 const UpstreamResponseFraming = proxy_utils.UpstreamResponseFraming;
 const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
@@ -98,6 +99,7 @@ const parseByteRange = static_files.parseByteRange;
 const statRegularFile = static_files.statRegularFile;
 const TlsChannel = native_tls.Channel;
 const HttpRequest = request_mod.HttpRequest;
+const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const H2PendingReader = h2_support.PendingReader;
 const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
@@ -114,10 +116,6 @@ const upstreamEndAttempt = upstream_mod.upstreamEndAttempt;
 const upstreamAttemptLimit = upstream_mod.upstreamAttemptLimit;
 const upstreamAtAttempt = upstream_mod.upstreamAtAttempt;
 const upstreamStartTicket = upstream_mod.upstreamStartTicket;
-const printUpstreamPool = upstream_mod.printUpstreamPool;
-const UpstreamIdleConnection = config_mod.UpstreamIdleConnection;
-const UpstreamKeepAlivePool = config_mod.UpstreamKeepAlivePool;
-const FastcgiIdleConnection = config_mod.FastcgiIdleConnection;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
 const UpstreamConfig = config_mod.UpstreamConfig;
 const PhpFastcgiTcpEndpoint = config_mod.PhpFastcgiTcpEndpoint;
@@ -127,8 +125,6 @@ const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const ResponseHeaderRule = config_mod.ResponseHeaderRule;
 const CompressionPolicy = config_mod.CompressionPolicy;
 const RedirectRule = config_mod.RedirectRule;
-const RouteMatchKind = config_mod.RouteMatchKind;
-const RouteHandlerKind = config_mod.RouteHandlerKind;
 const RouteConfig = config_mod.RouteConfig;
 const DomainConfig = config_mod.DomainConfig;
 const ServerConfig = config_mod.ServerConfig;
@@ -145,8 +141,6 @@ const parseUpstream = config_mod.parseUpstream;
 const parseUpstreamPool = config_mod.parseUpstreamPool;
 const parseUpstreamPoolPolicy = config_mod.parseUpstreamPoolPolicy;
 const parseOptionalUpstreamPoolPolicy = config_mod.parseOptionalUpstreamPoolPolicy;
-const routeHandlerName = config_mod.routeHandlerName;
-const routeMatchName = config_mod.routeMatchName;
 const upstreamPoolPolicyName = config_mod.upstreamPoolPolicyName;
 const applyConfigLine = config_mod.applyConfigLine;
 const loadConfig = config_mod.loadConfig;
@@ -173,7 +167,6 @@ const setDomainProxyPropertyDirect = config_mod.setDomainProxyPropertyDirect;
 const setDomainUpstreamPolicyPropertyDirect = config_mod.setDomainUpstreamPolicyPropertyDirect;
 const setDomainU32PropertyDirect = config_mod.setDomainU32PropertyDirect;
 const applyDomainConfigLine = config_mod.applyDomainConfigLine;
-const validateUpstreamPool = config_mod.validateUpstreamPool;
 const validateRouteConfig = config_mod.validateRouteConfig;
 
 // Boring defaults on purpose: enough room for local dev, with caps before
@@ -228,10 +221,6 @@ const DEFAULT_ACCESS_LOG_PATH = "stderr";
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
-const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
-    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
-    else => false,
-};
 
 threadlocal var current_io: ?std.Io = null;
 threadlocal var current_tls_channel: ?*TlsChannel = null;
@@ -414,29 +403,6 @@ fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgiEndp
     };
 }
 
-fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
-    if (query.len == 0) return null;
-
-    var cursor = query;
-    while (cursor.len > 0) {
-        const token_end = std.mem.indexOfScalar(u8, cursor, '&') orelse cursor.len;
-        const pair = cursor[0..token_end];
-
-        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
-            const k = pair[0..eq];
-            const v = pair[eq + 1 ..];
-            if (std.mem.eql(u8, k, key)) return v;
-        } else if (std.mem.eql(u8, pair, key)) {
-            return "";
-        }
-
-        if (token_end == cursor.len) break;
-        cursor = cursor[token_end + 1 ..];
-    }
-
-    return null;
-}
-
 test "parses FastCGI tcp and unix endpoints" {
     const tcp = try parseFastcgiEndpoint("tcp://127.0.0.1:9000");
     try std.testing.expectEqualStrings("127.0.0.1", tcp.tcp.host);
@@ -538,41 +504,6 @@ fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig
         domain.tls_material = null;
     }
 }
-
-fn isLikelyHttp2Preface(bytes: []const u8) bool {
-    if (bytes.len < 7) return false;
-    if (std.mem.startsWith(u8, bytes, h2_support.PREFACE_MAGIC)) return true;
-    return std.mem.startsWith(u8, bytes, "PRI * ");
-}
-
-// Shared tracker for active socket workers to enforce max concurrent limit.
-const ConcurrencyState = struct {
-    active_connections: std.atomic.Value(usize),
-
-    fn init() ConcurrencyState {
-        return .{ .active_connections = std.atomic.Value(usize).init(0) };
-    }
-
-    fn tryAcquire(self: *ConcurrencyState, limit: usize) bool {
-        while (true) {
-            const current = self.active_connections.load(.acquire);
-            if (current >= limit) return false;
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null) {
-                server_metrics.connectionAccepted();
-                return true;
-            }
-        }
-    }
-
-    fn release(self: *ConcurrencyState) void {
-        _ = self.active_connections.fetchSub(1, .acq_rel);
-        server_metrics.connectionClosed();
-    }
-
-    fn active(self: *ConcurrencyState) usize {
-        return self.active_connections.load(.acquire);
-    }
-};
 
 var server_metrics = ServerMetrics.init();
 var fastcgi_keepalive_pool = FastcgiKeepAlivePool.init();
@@ -804,34 +735,8 @@ fn sendResponseForMethod(stream: std.Io.net.Stream, status_code: u16, status_tex
     try sendResponseNoBodyWithConnection(stream, status_code, status_text, content_type, declared_len, close_connection);
 }
 
-fn redirectStatusText(status_code: u16) []const u8 {
-    return switch (status_code) {
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        else => "Permanent Redirect",
-    };
-}
-
-fn isRedirectStatusCode(status_code: u16) bool {
-    return switch (status_code) {
-        301, 302, 303, 307, 308 => true,
-        else => false,
-    };
-}
-
-fn buildRedirectLocation(allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest) ![]const u8 {
-    const suffix = if (rule.prefix_match and req.path.len >= rule.from.len) req.path[rule.from.len..] else "";
-    const should_preserve_query = req.query.len > 0 and std.mem.indexOfScalar(u8, rule.to, '?') == null;
-    const joiner: []const u8 = if (should_preserve_query) "?" else "";
-    const query: []const u8 = if (should_preserve_query) req.query else "";
-    return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ rule.to, suffix, joiner, query });
-}
-
 fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    const location = try buildRedirectLocation(allocator, rule, req);
+    const location = try redirects.buildLocation(allocator, rule, req);
     defer allocator.free(location);
 
     const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
@@ -845,62 +750,15 @@ fn sendConfiguredRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocato
     defer allocator.free(body);
 
     if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, rule.status_code, redirectStatusText(rule.status_code), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, rule.status_code, redirects.statusText(rule.status_code), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
         return;
     }
 
-    try sendResponseWithConnectionAndHeaders(stream, rule.status_code, redirectStatusText(rule.status_code), "text/plain; charset=utf-8", body, close_connection, extra_headers);
-}
-
-fn isAsciiDigitSlice(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |byte| {
-        if (byte < '0' or byte > '9') return false;
-    }
-    return true;
-}
-
-fn stripPortFromHostForRedirect(raw_host: []const u8) []const u8 {
-    const host = trimValue(raw_host);
-    if (host.len == 0) return host;
-    if (host[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, host, ']') orelse return host;
-        return host[0 .. close + 1];
-    }
-
-    var colon_count: usize = 0;
-    for (host) |byte| {
-        if (byte == ':') colon_count += 1;
-    }
-    if (colon_count == 1) {
-        const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse return host;
-        if (isAsciiDigitSlice(host[colon + 1 ..])) return host[0..colon];
-    }
-    return host;
-}
-
-fn isSafeRedirectHost(host: []const u8) bool {
-    if (host.len == 0) return false;
-    if (std.mem.indexOfAny(u8, host, " \t\r\n\x00/?#") != null) return false;
-    if (host[0] != '[' and std.mem.indexOfScalar(u8, host, ':') != null) return false;
-    return true;
-}
-
-fn buildHttpsRedirectLocation(allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest) ![]const u8 {
-    if (req.path.len == 0 or req.path[0] != '/') return error.InvalidRedirectPath;
-    const raw_host = findHeaderValue(req.headers, "Host") orelse return error.MissingHostHeader;
-    const host = stripPortFromHostForRedirect(raw_host);
-    if (!isSafeRedirectHost(host)) return error.InvalidRedirectHost;
-
-    const query_joiner: []const u8 = if (req.query.len > 0) "?" else "";
-    if (cfg.http_redirect_https_port == 443) {
-        return std.fmt.allocPrint(allocator, "https://{s}{s}{s}{s}", .{ host, req.path, query_joiner, req.query });
-    }
-    return std.fmt.allocPrint(allocator, "https://{s}:{d}{s}{s}{s}", .{ host, cfg.http_redirect_https_port, req.path, query_joiner, req.query });
+    try sendResponseWithConnectionAndHeaders(stream, rule.status_code, redirects.statusText(rule.status_code), "text/plain; charset=utf-8", body, close_connection, extra_headers);
 }
 
 fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    const location = try buildHttpsRedirectLocation(allocator, cfg, req);
+    const location = try redirects.buildHttpsLocation(allocator, cfg, req);
     defer allocator.free(location);
 
     const extra_headers = try std.fmt.allocPrint(allocator, "Location: {s}\r\n", .{location});
@@ -910,10 +768,10 @@ fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cf
     defer allocator.free(body);
 
     if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirectStatusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirects.statusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
         return;
     }
-    try sendResponseWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirectStatusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body, close_connection, extra_headers);
+    try sendResponseWithConnectionAndHeaders(stream, cfg.http_redirect_status, redirects.statusText(cfg.http_redirect_status), "text/plain; charset=utf-8", body, close_connection, extra_headers);
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
@@ -1091,70 +949,6 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
     try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, is_head, allow_header);
 }
 
-fn trySendfileStaticRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, body_len: usize) !bool {
-    if (comptime !HAS_DARWIN_SENDFILE) return false;
-    if (body_len == 0) return true;
-
-    var offset = std.math.cast(std.c.off_t, start) orelse return error.FileTooBig;
-    var remaining = body_len;
-    var sent_total: usize = 0;
-
-    while (remaining > 0) {
-        const chunk = @min(remaining, @as(usize, @intCast(std.math.maxInt(i32))));
-        var len: std.c.off_t = @intCast(chunk);
-        switch (std.c.errno(std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0))) {
-            .SUCCESS => {},
-            .INTR, .AGAIN => {
-                if (len == 0) continue;
-            },
-            .OPNOTSUPP, .NOTSOCK, .NOSYS => {
-                if (sent_total == 0) return false;
-                return error.Unexpected;
-            },
-            .PIPE, .NOTCONN => return error.BrokenPipe,
-            .IO => return error.InputOutput,
-            else => return error.Unexpected,
-        }
-
-        if (len <= 0) return error.WriteZero;
-        const sent: usize = @intCast(len);
-        remaining -= sent;
-        sent_total += sent;
-        offset += len;
-    }
-
-    return true;
-}
-
-fn streamStaticFileRangeBody(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    file_path: []const u8,
-    start: usize,
-    body_len: usize,
-) !void {
-    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
-
-    if (try trySendfileStaticRange(stream, file, start, body_len)) {
-        server_metrics.staticBodySent(body_len, .sendfile);
-        return;
-    }
-
-    var buffer: [8 * 1024]u8 = undefined;
-    var sent: usize = 0;
-    while (sent < body_len) {
-        const chunk_len = @min(buffer.len, body_len - sent);
-        var vec: [1][]u8 = .{buffer[0..chunk_len]};
-        const read_n = try file.readPositional(io, &vec, start + sent);
-        if (read_n == 0) return error.UnexpectedEndOfFile;
-        try streamWriteAll(stream, buffer[0..read_n]);
-        sent += read_n;
-    }
-
-    server_metrics.staticBodySent(body_len, .buffered);
-}
-
 fn serveStatic(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -1269,7 +1063,7 @@ fn serveStatic(
         }
 
         try sendResponseNoBodyWithConnectionAndHeaders(stream, 206, "Partial Content", contentTypeFromPath(rel_path), body_len, close_connection, headers);
-        try streamStaticFileRangeBody(io, stream, selected_path, range.start, body_len);
+        try static_files.streamRangeBody(io, stream, selected_path, range.start, body_len, .{ .metrics = &server_metrics, .write_all = streamWriteAll });
         return;
     }
 
@@ -1279,7 +1073,7 @@ fn serveStatic(
     }
 
     try sendResponseNoBodyWithConnectionAndHeaders(stream, 200, "OK", contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
-    try streamStaticFileRangeBody(io, stream, selected_path, 0, file_len);
+    try static_files.streamRangeBody(io, stream, selected_path, 0, file_len, .{ .metrics = &server_metrics, .write_all = streamWriteAll });
 }
 
 fn serveAcmeChallenge(
@@ -1563,7 +1357,7 @@ fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *con
 }
 
 fn buildHttp2RedirectResponse(allocator: std.mem.Allocator, rule: RedirectRule, req: HttpRequest) !H2BufferedResponse {
-    const location = try buildRedirectLocation(allocator, rule, req);
+    const location = try redirects.buildLocation(allocator, rule, req);
     const body = try std.fmt.allocPrint(allocator, "Redirecting to {s}\n", .{location});
     const headers = try allocator.alloc(h2_native.Header, 1);
     headers[0] = .{ .name = "location", .value = location };
@@ -1778,7 +1572,7 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
         }
         if (std.mem.eql(u8, req.path, "/api/echo")) {
             accessLogSetHandler("api_echo");
-            if (findQueryValue(req.query, "msg")) |msg| {
+            if (request_mod.findQueryValue(req.query, "msg")) |msg| {
                 return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg}) };
             }
             return h2_support.textResponse(200, "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n");
@@ -2344,7 +2138,7 @@ test "named routes prefer exact and longest prefix matches" {
         .body = "",
         .close_connection = true,
     };
-    const redirect_location = try buildHttpsRedirectLocation(allocator, &cfg, redirect_req);
+    const redirect_location = try redirects.buildHttpsLocation(allocator, &cfg, redirect_req);
     try std.testing.expectEqualStrings("https://example.com:18443/docs?q=1", redirect_location);
     const bad_redirect_req = HttpRequest{
         .method = "GET",
@@ -2355,7 +2149,7 @@ test "named routes prefer exact and longest prefix matches" {
         .body = "",
         .close_connection = true,
     };
-    try std.testing.expectError(error.InvalidRedirectHost, buildHttpsRedirectLocation(allocator, &cfg, bad_redirect_req));
+    try std.testing.expectError(error.InvalidRedirectHost, redirects.buildHttpsLocation(allocator, &cfg, bad_redirect_req));
     normalizeConfig(&cfg);
     try std.testing.expectEqual(@as(usize, DEFAULT_COMPRESSION_WORKER_STACK_BYTES), cfg.worker_stack_size);
     try std.testing.expect(cfg.upstream_health_check_enabled);
@@ -2855,7 +2649,7 @@ fn handleHttpRedirectConnection(
     if (prefill_len == 0) return;
     const prefill = prefill_buf[0..prefill_len];
 
-    if (isLikelyHttp2Preface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or native_tls.isHttp3OverTcpProbe(prefill)) {
+    if (h2_support.isLikelyPreface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or native_tls.isHttp3OverTcpProbe(prefill)) {
         try sendCoolErrorWithConnection(
             stream,
             req_alloc,
@@ -3070,7 +2864,7 @@ fn handleConnection(
         if (prefill_len == 0) return;
         const prefill = prefill_buf[0..prefill_len];
 
-        if (isLikelyHttp2Preface(prefill)) {
+        if (h2_support.isLikelyPreface(prefill)) {
             try handleHttp2Preface(io, stream, req_alloc, cfg, prefill, process_env);
             return;
         }
@@ -3286,174 +3080,11 @@ fn serveConnectionTask(
 }
 
 fn dumpRoutes(cfg: *const ServerConfig) void {
-    if (cfg.routes.items.len == 0 and cfg.domains.items.len == 0) {
-        std.debug.print("Layerline routes: no named routes configured; built-in routes remain active.\n", .{});
-        return;
-    }
-
-    if (cfg.routes.items.len == 0) {
-        std.debug.print("Layerline routes: no global named routes configured.\n", .{});
-    } else {
-        std.debug.print("Layerline routes ({d}):\n", .{cfg.routes.items.len});
-    }
-    for (cfg.routes.items) |route| {
-        std.debug.print(
-            "  {s}: {s} {s} -> {s}",
-            .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) },
-        );
-        switch (route.handler) {
-            .static => {
-                std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse cfg.static_dir, route.index_file orelse cfg.index_file });
-            },
-            .php => {
-                std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse cfg.php_root, route.php_binary orelse cfg.php_binary, route.php_index orelse cfg.php_index });
-                if (routePhpFastcgi(cfg, null, &route)) |endpoint| std.debug.print(" fastcgi={s}", .{endpoint});
-                if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
-                if (route.php_front_controller orelse cfg.php_front_controller) std.debug.print(" front_controller=true", .{});
-            },
-            .proxy => {
-                const maybe_upstream = if (route.upstream) |pool| pool else cfg.upstream;
-                if (maybe_upstream) |pool| {
-                    printUpstreamPool(route.upstream_policy orelse cfg.upstream_policy, pool);
-                } else {
-                    std.debug.print(" upstream=<unset>", .{});
-                }
-                if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
-            },
-        }
-        if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
-        if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
-        std.debug.print("\n", .{});
-    }
-
-    if (cfg.domains.items.len > 0) {
-        std.debug.print("Layerline domains ({d}):\n", .{cfg.domains.items.len});
-    }
-    for (cfg.domains.items) |*domain| {
-        std.debug.print("  server {s}: server_name", .{domain.name});
-        for (domain.server_names.items) |server_name| {
-            std.debug.print(" {s}", .{server_name});
-        }
-        std.debug.print(" root={s} index={s}", .{ domainStaticDir(cfg, domain), domainIndexFile(cfg, domain) });
-        if (domainServeStaticRoot(cfg, domain)) std.debug.print(" serve_static_root=true", .{});
-        if (domain.upstream) |pool| printUpstreamPool(domainUpstreamPolicy(cfg, domain), pool);
-        if (domain.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
-        if (domain.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{domain.response_headers.items.len});
-        std.debug.print("\n", .{});
-
-        for (domain.routes.items) |route| {
-            std.debug.print(
-                "    {s}: {s} {s} -> {s}",
-                .{ route.name, routeMatchName(route.match_kind), route.pattern, routeHandlerName(route.handler) },
-            );
-            switch (route.handler) {
-                .static => {
-                    std.debug.print(" dir={s} index={s}", .{ route.static_dir orelse domainStaticDir(cfg, domain), route.index_file orelse domainIndexFile(cfg, domain) });
-                },
-                .php => {
-                    std.debug.print(" php_root={s} php_bin={s} php_index={s}", .{ route.php_root orelse domainPhpRoot(cfg, domain), route.php_binary orelse domainPhpBinary(cfg, domain), routePhpIndex(cfg, domain, &route) });
-                    if (routePhpFastcgi(cfg, domain, &route)) |endpoint| std.debug.print(" fastcgi={s}", .{endpoint});
-                    if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
-                    if (routePhpFrontController(cfg, domain, &route)) std.debug.print(" front_controller=true", .{});
-                },
-                .proxy => {
-                    const maybe_upstream = if (route.upstream) |pool| pool else domainUpstream(cfg, domain);
-                    if (maybe_upstream) |pool| {
-                        printUpstreamPool(routeUpstreamPolicy(cfg, domain, &route), pool);
-                    } else {
-                        std.debug.print(" upstream=<unset>", .{});
-                    }
-                    if (route.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
-                },
-            }
-            if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
-            if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
-            std.debug.print("\n", .{});
-        }
-    }
+    cli_output.dumpRoutes(cfg);
 }
 
-fn waitForConnectionDrain(io: std.Io, state: *ConcurrencyState, timeout_ms: u32) void {
-    var waited_ms: u32 = 0;
-    while (state.active() > 0 and waited_ms < timeout_ms) {
-        const step_ms: u32 = @min(@as(u32, 25), timeout_ms - waited_ms);
-        io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
-        waited_ms += step_ms;
-    }
-
-    const remaining = state.active();
-    if (remaining == 0) {
-        std.debug.print("Graceful shutdown complete: all connections drained.\n", .{});
-    } else {
-        std.debug.print("Graceful shutdown timeout reached with {d} active connection(s).\n", .{remaining});
-    }
-}
-
-// Emit current runtime usage, flags, and sample invocations.
 fn usage() void {
-    std.debug.print(
-        "Layerline HTTP server\n\n" ++
-            "Usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
-            "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
-            "[--domain-config-dir domains-enabled] " ++
-            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
-            "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
-            "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
-            "[--http-redirect true|false] [--http-redirect-port 80] [--http-redirect-https-port 443] [--http-redirect-status 308] " ++
-            "[--cf-auto-deploy true|false] [--cf-zone-name example.com] [--cf-zone-id ZONE_ID] [--cf-record-name www.example.com] " ++
-            "[--cf-record-type A|AAAA|CNAME|TXT] [--cf-record-content 203.0.113.10] [--cf-record-ttl 300] [--cf-record-proxied true|false] " ++
-            "[--max-request-bytes N] [--max-body-bytes N] [--max-static-bytes N] [--max-concurrent-connections N] " ++
-            "[--max-requests-per-connection N] [--max-php-output-bytes N] [--worker-stack-size N] [--read-header-timeout-ms N] " ++
-            "[--read-body-timeout-ms N] [--idle-timeout-ms N] [--write-timeout-ms N] [--upstream-timeout-ms N] [--upstream-retries N] [--upstream-max-failures N] [--upstream-fail-timeout-ms N] " ++
-            "[--upstream-keepalive true|false] [--upstream-keepalive-max-idle N] [--upstream-keepalive-idle-timeout-ms N] [--upstream-keepalive-max-requests N] " ++
-            "[--fastcgi-keepalive true|false] [--fastcgi-keepalive-max-idle N] [--fastcgi-keepalive-idle-timeout-ms N] [--fastcgi-keepalive-max-requests N] " ++
-            "[--upstream-health-check true|false] [--upstream-health-path /health] [--upstream-health-interval-ms N] [--upstream-health-timeout-ms N] " ++
-            "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
-            "[--graceful-shutdown-timeout-ms N]\n" ++
-            "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, access_log, access_log_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
-            "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, http_redirect, http_redirect_port, http_redirect_https_port, http_redirect_status, " ++
-            "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
-            "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
-            "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
-            "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, route_header.NAME, route_cache_control.NAME, server/domain/vhost, " ++
-            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
-            "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "Native HTTP/3 serves the built-in default page over QUIC on --http3-port.\n\n" ++
-            "Examples:\n" ++
-            "  zig build run\n" ++
-            "  zig build run -- --validate-config\n" ++
-            "  zig build run -- --dump-routes\n" ++
-            "  zig build run -- --port 4000\n" ++
-            "  zig build run -- --index index.php --serve-static true\n" ++
-            "  zig build run -- --php-root public --php-bin php-cgi\n" ++
-            "  zig build run -- --php-root public --php-fastcgi 127.0.0.1:9000\n" ++
-            "  zig build run -- --php-front-controller true --php-index index.php\n" ++
-            "  zig build run -- --config server.conf\n" ++
-            "  zig build run -- --domain-config-dir domains-enabled --dump-routes\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000 --upstream-keepalive true --upstream-keepalive-max-idle 32\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-health-check true\n" ++
-            "  zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-circuit-breaker true --upstream-slow-start-ms 10000\n" ++
-            "  zig build run -- --proxy off\n" ++
-            "  zig build run -- --admin-ui true --admin-ui-path /_layerline/admin\n" ++
-            "  zig build run -- --access-log /var/log/layerline/access.log\n" ++
-            "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
-            "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
-            "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
-            "Notes:\n" ++
-            "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
-            "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
-            "  and connection management policies.\n" ++
-            "  Native HTTP/3 currently covers the local default-page path, with broader routing\n" ++
-            "  and certificate trust/automation still kept separate from the HTTP/1 surface.\n",
-        .{},
-    );
+    cli_output.usage();
 }
 
 // Bootstraps config/CLI, optional cert automation, then starts the accept loop.
@@ -4171,7 +3802,7 @@ pub fn main(init: std.process.Init) !void {
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
 
-    var concurrency = ConcurrencyState.init();
+    var concurrency = ConcurrencyState.init(&server_metrics);
 
     var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try address.listen(init.io, .{ .reuse_address = true });
@@ -4342,7 +3973,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("Shutdown requested; draining active connections for up to {d}ms.\n", .{cfg.graceful_shutdown_timeout_ms});
-    waitForConnectionDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
+    concurrency_mod.waitForDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
     if (cfg.admin_enabled) {
         admin_runtime.unlinkUnixSocket(cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH, adminCallbacks());
     }
