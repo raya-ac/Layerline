@@ -7,6 +7,7 @@ const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
 const cgi_headers = @import("cgi_headers.zig");
 const config_mod = @import("config.zig");
+const error_pages = @import("error_pages.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
@@ -19,7 +20,9 @@ const native_tls = @import("native_tls_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
+const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
+const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
@@ -260,20 +263,6 @@ const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
     else => false,
 };
 
-const SERVER_ICON_SVG =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
-    \\  <title id="title">Layerline</title>
-    \\  <desc id="desc">A layered route mark for the Layerline HTTP server.</desc>
-    \\  <rect width="128" height="128" rx="30" fill="#fbfaf6"/>
-    \\  <rect x="8" y="8" width="112" height="112" rx="24" fill="none" stroke="#11110f" stroke-opacity=".16" stroke-width="4"/>
-    \\  <path d="M29 33h70L29 96h70" fill="none" stroke="#11110f" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
-    \\  <path d="M40 48h48M40 80h48" fill="none" stroke="#11110f" stroke-opacity=".18" stroke-width="5" stroke-linecap="round"/>
-    \\  <circle cx="38" cy="39" r="8" fill="#fbfaf6" stroke="#11110f" stroke-width="5"/>
-    \\  <circle cx="90" cy="89" r="8" fill="#fbfaf6" stroke="#11110f" stroke-width="5"/>
-    \\  <circle cx="64" cy="64" r="17" fill="none" stroke="#11110f" stroke-opacity=".28" stroke-width="4"/>
-    \\</svg>
-;
-
 threadlocal var current_io: ?std.Io = null;
 threadlocal var current_tls_channel: ?*TlsChannel = null;
 threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
@@ -453,98 +442,6 @@ fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgiEndp
             break :blk try unix_addr.connect(activeIo());
         },
     };
-}
-
-fn headerBlockContainsHeader(headers: ?[]const u8, name: []const u8) bool {
-    const raw_headers = headers orelse return false;
-    var lines = std.mem.splitSequence(u8, raw_headers, "\r\n");
-    while (lines.next()) |line| {
-        const trimmed = trimValue(line);
-        if (trimmed.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
-        const header_name = trimValue(trimmed[0..colon]);
-        if (std.ascii.eqlIgnoreCase(header_name, name)) return true;
-    }
-    return false;
-}
-
-fn h2HeadersContain(headers: []const h2_native.Header, name: []const u8) bool {
-    for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
-    }
-    return false;
-}
-
-fn isCompressibleContentType(content_type: []const u8) bool {
-    const semicolon = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
-    const base = trimValue(content_type[0..semicolon]);
-    return std.mem.startsWith(u8, base, "text/") or
-        std.ascii.eqlIgnoreCase(base, "application/javascript") or
-        std.ascii.eqlIgnoreCase(base, "application/json") or
-        std.ascii.eqlIgnoreCase(base, "application/xml") or
-        std.ascii.eqlIgnoreCase(base, "application/wasm") or
-        std.ascii.eqlIgnoreCase(base, "image/svg+xml");
-}
-
-fn gzipCompressAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    var output = try std.Io.Writer.Allocating.initCapacity(allocator, @max(@as(usize, 64), body.len / 2));
-    errdefer output.deinit();
-
-    const work_buffer = try allocator.alloc(u8, DEFAULT_COMPRESSION_WORK_BUFFER_BYTES);
-    defer allocator.free(work_buffer);
-
-    const GzipCompressor = std.compress.flate.Compress;
-    const gzip = try allocator.create(GzipCompressor);
-    defer allocator.destroy(gzip);
-
-    gzip.* = try GzipCompressor.init(&output.writer, work_buffer, .gzip, .fastest);
-    try gzip.writer.writeAll(body);
-    try gzip.finish();
-    return output.toOwnedSlice();
-}
-
-const PreparedResponseBody = struct {
-    body: []const u8,
-    encoding: ?[]const u8 = null,
-    owned: ?[]u8 = null,
-
-    fn deinit(self: PreparedResponseBody, allocator: std.mem.Allocator) void {
-        if (self.owned) |owned| allocator.free(owned);
-    }
-};
-
-fn prepareResponseBody(
-    allocator: std.mem.Allocator,
-    status_code: u16,
-    content_type: []const u8,
-    body: []const u8,
-    is_head: bool,
-    extra_headers: ?[]const u8,
-    h2_headers: []const h2_native.Header,
-) !PreparedResponseBody {
-    const policy = current_compression_policy;
-    if (!http_response.canSendBody(status_code, is_head) or
-        !policy.enabled or
-        !policy.gzip_enabled or
-        body.len < policy.min_bytes or
-        body.len > policy.max_bytes or
-        !isCompressibleContentType(content_type) or
-        !acceptsContentCoding(current_request_headers, "gzip") or
-        headerBlockContainsHeader(extra_headers, "Content-Encoding") or
-        h2HeadersContain(h2_headers, "content-encoding") or
-        responseHeaderRulesContain(current_response_headers, "Content-Encoding"))
-    {
-        return .{ .body = body };
-    }
-
-    const compressed = try gzipCompressAlloc(allocator, body);
-    if (compressed.len >= body.len) {
-        allocator.free(compressed);
-        return .{ .body = body };
-    }
-
-    server_metrics.compressedResponseSent(compressed.len);
-    return .{ .body = compressed, .encoding = "gzip", .owned = compressed };
 }
 
 fn findQueryValue(query: []const u8, key: []const u8) ?[]const u8 {
@@ -731,86 +628,6 @@ fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
 }
 
-// Render a Memorylayer-style fallback instead of a plain error line.
-fn renderCoolErrorPage(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) ![]const u8 {
-    const eyebrow = if (status_code == 404) "Route not found" else "Request stopped";
-    const headline = if (status_code == 404) "Memory has no path here." else status_text;
-    const route_label = if (status_code == 404) "unresolved route" else "server response";
-    const panel_title = if (status_code == 404) "No matching server surface" else "Boundary held";
-    const panel_text = if (status_code == 404) "Try the root page, health check, or static sample." else "The request stopped inside a controlled response path.";
-
-    return std.fmt.allocPrint(
-        allocator,
-        \\<!doctype html>
-        \\<html lang="en">
-        \\<head>
-        \\<meta charset="utf-8">
-        \\<meta name="viewport" content="width=device-width, initial-scale=1">
-        \\<title>{d} · {s}</title>
-        \\<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-        \\</head>
-        \\<body style="box-sizing:border-box;margin:0;min-height:100vh;overflow-x:hidden;background:radial-gradient(circle at 16% -12%, rgba(255,255,255,0.92), transparent 28%),linear-gradient(180deg,#f7f4ed 0%,#f0ece2 46%,#e9e3d6 100%);color:#11110f;font:14px/1.6 Instrument Sans,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">
-        \\<div style="position:fixed;inset:0;z-index:-2;background:linear-gradient(rgba(15,15,12,0.05) 1px, transparent 1px),linear-gradient(90deg, rgba(15,15,12,0.05) 1px, transparent 1px);background-size:64px 64px;pointer-events:none;"></div>
-        \\<div style="position:fixed;inset:0;z-index:-1;background:radial-gradient(circle at 50% 18%, transparent 0 28%, rgba(244,241,234,0.28) 62%, rgba(214,204,186,0.42) 100%),linear-gradient(90deg,rgba(17,17,15,0.035),transparent 18%,transparent 82%,rgba(17,17,15,0.035));pointer-events:none;"></div>
-        \\<main style="max-width:1280px;margin:0 auto;padding:18px 30px 72px;">
-        \\<header style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 auto 10px;padding:10px;border:1px solid rgba(17,17,15,0.12);border-radius:18px;background:rgba(251,250,246,0.82);box-shadow:0 18px 60px rgba(38,34,24,0.09);backdrop-filter:blur(22px);">
-        \\<a href="/" style="display:flex;gap:12px;align-items:center;color:inherit;text-decoration:none;">
-        \\<img src="/favicon.svg" alt="" width="40" height="40" style="display:block;width:40px;height:40px;border-radius:12px;box-shadow:0 18px 36px rgba(17,17,15,0.08);">
-        \\<span><strong style="display:block;font-size:16px;line-height:1.1;font-weight:700;letter-spacing:-0.035em;">{s}</strong><small style="display:block;color:#8b8c84;font-size:11px;line-height:1.1;">{s}</small></span>
-        \\</a>
-        \\<nav style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-        \\<a href="/health" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Health</a>
-        \\<a href="/static/hello.txt" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Static</a>
-        \\</nav>
-        \\</header>
-        \\<section style="position:relative;min-height:min(740px,calc(100svh - 130px));display:grid;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr));gap:clamp(28px,6vw,86px);align-items:center;overflow:hidden;margin:0 calc(50% - 50vw) 56px;padding:clamp(42px,8vw,92px) max(30px,calc((100vw - 1280px) / 2 + 30px));border-bottom:1px solid rgba(15,15,12,0.12);background:radial-gradient(circle at 74% 42%,rgba(17,17,15,0.14),transparent 18%),linear-gradient(rgba(17,17,15,0.055) 1px,transparent 1px),linear-gradient(90deg,rgba(17,17,15,0.055) 1px,transparent 1px),linear-gradient(135deg,rgba(251,250,246,0.95),rgba(231,225,212,0.84));background-size:auto,56px 56px,56px 56px,auto;">
-        \\<div style="position:absolute;right:clamp(-36px,3vw,44px);bottom:clamp(-18px,2vw,26px);color:rgba(17,17,15,0.045);font:800 clamp(180px,30vw,420px)/0.78 Instrument Sans,ui-sans-serif,system-ui,sans-serif;letter-spacing:-0.12em;pointer-events:none;">{d}</div>
-        \\<div style="position:relative;z-index:2;max-width:650px;">
-        \\<div style="display:inline-flex;align-items:center;gap:8px;padding:6px 10px;margin-bottom:16px;border-radius:999px;border:1px solid rgba(17,17,15,0.18);background:rgba(255,255,255,0.58);color:#5d5e58;font:11px/1 IBM Plex Mono,ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0.16em;text-transform:uppercase;">{s}</div>
-        \\<h1 style="margin:0 0 18px;max-width:10ch;font-size:clamp(56px,8vw,118px);line-height:0.88;letter-spacing:-0.075em;">{s}</h1>
-        \\<p style="max-width:50ch;margin:0 0 18px;color:#5d5e58;font-size:clamp(16px,1.3vw,19px);">{s}</p>
-        \\<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:24px;">
-        \\<a href="/" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid #11110f;background:#11110f;color:#fbfaf6;text-decoration:none;font-weight:600;box-shadow:0 18px 36px rgba(17,17,15,0.16);">Return home</a>
-        \\<a href="/health" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Check health</a>
-        \\<a href="/static/hello.txt" style="display:inline-flex;align-items:center;padding:9px 13px;border-radius:12px;border:1px solid rgba(15,15,12,0.14);background:rgba(255,255,255,0.5);color:#11110f;text-decoration:none;">Static sample</a>
-        \\</div>
-        \\</div>
-        \\<aside aria-hidden="true" style="position:relative;z-index:1;min-height:420px;width:100%;border:1px solid rgba(17,17,15,0.16);border-radius:28px;overflow:hidden;background:rgba(251,250,246,0.72);box-shadow:0 44px 110px rgba(38,34,24,0.14);backdrop-filter:blur(18px);">
-        \\<div style="position:absolute;inset:0;background:linear-gradient(rgba(17,17,15,0.08) 1px,transparent 1px),linear-gradient(90deg,rgba(17,17,15,0.08) 1px,transparent 1px);background-size:44px 44px;"></div>
-        \\<div style="position:absolute;left:28px;right:28px;top:28px;display:flex;justify-content:space-between;gap:16px;padding:12px 14px;border:1px solid rgba(17,17,15,0.14);border-radius:999px;background:rgba(251,250,246,0.86);color:#8b8c84;font:11px/1.2 IBM Plex Mono,ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:0.08em;text-transform:uppercase;"><span>{s}</span><span>/{d}</span></div>
-        \\<div style="position:absolute;left:20%;right:24%;top:48%;height:1px;background:repeating-linear-gradient(90deg,rgba(17,17,15,0.42) 0 12px,transparent 12px 22px);transform:rotate(-9deg);"></div>
-        \\<div style="position:absolute;left:18%;top:34%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
-        \\<div style="position:absolute;right:22%;top:44%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
-        \\<div style="position:absolute;left:46%;bottom:24%;width:12px;height:12px;border-radius:999px;background:#11110f;box-shadow:0 0 0 9px rgba(17,17,15,0.08);"></div>
-        \\<div style="position:absolute;left:28px;right:28px;bottom:28px;display:grid;grid-template-columns:1fr auto;gap:18px;align-items:end;padding:18px;border-top:1px solid rgba(17,17,15,0.12);background:rgba(251,250,246,0.78);">
-        \\<div><strong style="display:block;margin-bottom:5px;font-size:18px;letter-spacing:-0.04em;">{s}</strong><span style="color:#5d5e58;font-size:13px;">{s}</span></div>
-        \\<div style="font:600 48px/0.9 Instrument Sans,ui-sans-serif,system-ui,sans-serif;letter-spacing:-0.08em;">{d}</div>
-        \\</div>
-        \\</aside>
-        \\</section>
-        \\</main>
-        \\</body>
-        \\</html>
-        \\
-    ,
-        .{
-            status_code,
-            SERVER_NAME,
-            SERVER_NAME,
-            SERVER_TAGLINE,
-            status_code,
-            eyebrow,
-            headline,
-            detail,
-            route_label,
-            status_code,
-            panel_title,
-            panel_text,
-            status_code,
-        },
-    );
-}
-
 fn sendCoolErrorWithConnection(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
@@ -821,7 +638,7 @@ fn sendCoolErrorWithConnection(
     is_head: bool,
     extra_headers: ?[]const u8,
 ) !void {
-    const body = try renderCoolErrorPage(allocator, status_code, status_text, detail);
+    const body = try error_pages.render(allocator, SERVER_NAME, SERVER_TAGLINE, status_code, status_text, detail);
     defer allocator.free(body);
 
     if (is_head) {
@@ -847,7 +664,18 @@ fn sendCoolErrorWithConnectionOnly(
 }
 
 fn sendResponseWithConnectionAndHeaders(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, content_type: []const u8, body: []const u8, close_connection: bool, extra_headers: ?[]const u8) !void {
-    const prepared = try prepareResponseBody(std.heap.page_allocator, status_code, content_type, body, false, extra_headers, &.{});
+    const prepared = try response_body.prepare(std.heap.page_allocator, .{
+        .status_code = status_code,
+        .content_type = content_type,
+        .body = body,
+        .is_head = false,
+        .extra_headers = extra_headers,
+        .request_headers = current_request_headers,
+        .response_headers = current_response_headers,
+        .compression_policy = current_compression_policy,
+        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
+        .metrics = &server_metrics,
+    });
     defer prepared.deinit(std.heap.page_allocator);
 
     const body_len = prepared.body.len;
@@ -1119,7 +947,7 @@ fn sendHttpsRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cf
 }
 
 fn sendServerIcon(stream: std.Io.net.Stream, close_connection: bool, is_head: bool) !void {
-    try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", SERVER_ICON_SVG, close_connection, is_head);
+    try sendResponseForMethod(stream, 200, "OK", "image/svg+xml", server_assets.SERVER_ICON_SVG, close_connection, is_head);
 }
 
 fn recordResponseSent(status_code: u16, body_bytes: usize) void {
@@ -2011,7 +1839,18 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
     var header_block = std.ArrayList(u8).empty;
     defer header_block.deinit(allocator);
 
-    const prepared = try prepareResponseBody(allocator, response.status_code, response.content_type, response.body, is_head, null, response.headers);
+    const prepared = try response_body.prepare(allocator, .{
+        .status_code = response.status_code,
+        .content_type = response.content_type,
+        .body = response.body,
+        .is_head = is_head,
+        .h2_headers = response.headers,
+        .request_headers = current_request_headers,
+        .response_headers = current_response_headers,
+        .compression_policy = current_compression_policy,
+        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
+        .metrics = &server_metrics,
+    });
     defer prepared.deinit(allocator);
 
     try h2_native.appendStatus(allocator, &header_block, response.status_code);
@@ -2057,7 +1896,7 @@ fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, st
 }
 
 fn h2CoolErrorResponse(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !H2BufferedResponse {
-    const body = try renderCoolErrorPage(allocator, status_code, status_text, detail);
+    const body = try error_pages.render(allocator, SERVER_NAME, SERVER_TAGLINE, status_code, status_text, detail);
     return .{ .status_code = status_code, .content_type = "text/html; charset=utf-8", .body = body };
 }
 
@@ -2279,14 +2118,6 @@ fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamP
     return h2CoolErrorResponse(allocator, 502, "Bad Gateway", "All configured upstream attempts failed.");
 }
 
-const H2_DEFAULT_PAGE =
-    \\<!doctype html>
-    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    \\<title>Layerline HTTP/2</title><link rel="icon" type="image/svg+xml" href="/favicon.svg">
-    \\<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ed;color:#11110f;font:16px/1.5 system-ui,sans-serif}main{max-width:760px;padding:48px}h1{font-size:clamp(56px,10vw,120px);line-height:.85;margin:0}p{color:#5d5e58;max-width:48ch}.tag{font:12px/1.2 ui-monospace,monospace;text-transform:uppercase;color:#77786f}</style>
-    \\</head><body><main><div class="tag">native h2c route</div><h1>Layerline</h1><p>This response came from Layerline's native HTTP/2 frame path: SETTINGS, HPACK request headers, HEADERS, and DATA frames emitted by the Zig server.</p></main></body></html>
-;
-
 fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
     _ = process_env;
     const is_head = std.mem.eql(u8, req.method, "HEAD");
@@ -2329,7 +2160,7 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
     if (std.mem.eql(u8, req.method, "GET") or is_head) {
         if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
             accessLogSetHandler("builtin_asset");
-            return h2_support.textResponse(200, "image/svg+xml", SERVER_ICON_SVG);
+            return h2_support.textResponse(200, "image/svg+xml", server_assets.SERVER_ICON_SVG);
         }
         if (std.mem.eql(u8, req.path, "/") and domainServeStaticRoot(cfg, domain)) {
             accessLogSetHandler("static_root");
@@ -2337,7 +2168,7 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
         }
         if (std.mem.eql(u8, req.path, "/")) {
             accessLogSetHandler("builtin_root");
-            return h2_support.textResponse(200, "text/html; charset=utf-8", H2_DEFAULT_PAGE);
+            return h2_support.textResponse(200, "text/html; charset=utf-8", server_assets.H2_DEFAULT_PAGE);
         }
         if (std.mem.eql(u8, req.path, "/health")) {
             accessLogSetHandler("health");
@@ -4210,7 +4041,16 @@ test "gzip response preparation compresses eligible text bodies" {
         current_compression_policy = .disabled;
     }
 
-    const prepared = try prepareResponseBody(std.testing.allocator, 200, "text/plain; charset=utf-8", &body, false, null, &.{});
+    const prepared = try response_body.prepare(std.testing.allocator, .{
+        .status_code = 200,
+        .content_type = "text/plain; charset=utf-8",
+        .body = &body,
+        .is_head = false,
+        .request_headers = current_request_headers,
+        .response_headers = current_response_headers,
+        .compression_policy = current_compression_policy,
+        .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
+    });
     defer prepared.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("gzip", prepared.encoding.?);
