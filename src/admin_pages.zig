@@ -45,22 +45,46 @@ pub fn renderRoutes(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]c
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    try out.print(allocator, "global host={s} port={d} static_dir={s} index={s}\n", .{ cfg.host, cfg.port, cfg.static_dir, cfg.index_file });
+    const global_cache = config_mod.responseCachePolicyFor(cfg, null, null);
+    const global_upstream = config_mod.upstreamRuntimePolicyFor(cfg, null, null);
+    try out.print(
+        allocator,
+        "global host={s} port={d} static_dir={s} index={s} security={s} response_cache={s} upstream_timeout_ms={d} upstream_retries={d} upstream_health={s}\n",
+        .{ cfg.host, cfg.port, cfg.static_dir, cfg.index_file, config_mod.securityHeaderPresetName(cfg.security_headers), boolText(global_cache.enabled), global_upstream.timeout_ms, global_upstream.retries, boolText(global_upstream.health_check_enabled) },
+    );
     if (cfg.http_redirect_enabled) {
         try out.print(allocator, "http_redirect port={d} https_port={d} status={d} webroot={s}\n", .{ cfg.http_redirect_port, cfg.http_redirect_https_port, cfg.http_redirect_status, cfg.letsencrypt_webroot });
     }
     for (cfg.routes.items) |route| {
-        try out.print(allocator, "route {s}: {s} {s} -> {s}\n", .{ route.name, config_mod.routeMatchName(route.match_kind), route.pattern, config_mod.routeHandlerName(route.handler) });
+        const cache = config_mod.responseCachePolicyFor(cfg, null, &route);
+        const upstream = config_mod.upstreamRuntimePolicyFor(cfg, null, &route);
+        try out.print(
+            allocator,
+            "route {s}: {s} {s} -> {s} security={s} response_cache={s} cache_ttl_ms={d} max_static_bytes={d} upstream_timeout_ms={d} upstream_retries={d} upstream_health={s}\n",
+            .{ route.name, config_mod.routeMatchName(route.match_kind), route.pattern, config_mod.routeHandlerName(route.handler), config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, null, &route)), boolText(cache.enabled), cache.ttl_ms, config_mod.maxStaticFileBytesFor(cfg, null, &route), upstream.timeout_ms, upstream.retries, boolText(upstream.health_check_enabled) },
+        );
     }
     for (cfg.domains.items) |domain| {
+        const domain_cache = config_mod.responseCachePolicyFor(cfg, &domain, null);
+        const domain_upstream = config_mod.upstreamRuntimePolicyFor(cfg, &domain, null);
         try out.print(allocator, "server {s} names=", .{domain.name});
         for (domain.server_names.items, 0..) |name, index| {
             if (index > 0) try out.append(allocator, ',');
             try out.appendSlice(allocator, name);
         }
-        try out.print(allocator, " root={s} index={s}\n", .{ routing.domainStaticDir(cfg, &domain), routing.domainIndexFile(cfg, &domain) });
+        try out.print(
+            allocator,
+            " root={s} index={s} security={s} response_cache={s} upstream_timeout_ms={d} upstream_retries={d} upstream_health={s}\n",
+            .{ routing.domainStaticDir(cfg, &domain), routing.domainIndexFile(cfg, &domain), config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, &domain, null)), boolText(domain_cache.enabled), domain_upstream.timeout_ms, domain_upstream.retries, boolText(domain_upstream.health_check_enabled) },
+        );
         for (domain.routes.items) |route| {
-            try out.print(allocator, "  route {s}: {s} {s} -> {s}\n", .{ route.name, config_mod.routeMatchName(route.match_kind), route.pattern, config_mod.routeHandlerName(route.handler) });
+            const cache = config_mod.responseCachePolicyFor(cfg, &domain, &route);
+            const upstream = config_mod.upstreamRuntimePolicyFor(cfg, &domain, &route);
+            try out.print(
+                allocator,
+                "  route {s}: {s} {s} -> {s} security={s} response_cache={s} cache_ttl_ms={d} max_static_bytes={d} upstream_timeout_ms={d} upstream_retries={d} upstream_health={s}\n",
+                .{ route.name, config_mod.routeMatchName(route.match_kind), route.pattern, config_mod.routeHandlerName(route.handler), config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, &domain, &route)), boolText(cache.enabled), cache.ttl_ms, config_mod.maxStaticFileBytesFor(cfg, &domain, &route), upstream.timeout_ms, upstream.retries, boolText(upstream.health_check_enabled) },
+            );
         }
     }
 

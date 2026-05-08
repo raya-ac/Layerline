@@ -13,6 +13,7 @@ const UpstreamConfig = config_mod.UpstreamConfig;
 const UpstreamIdleConnection = config_mod.UpstreamIdleConnection;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 const UpstreamResponseForwardResult = proxy_utils.UpstreamResponseForwardResult;
 
 pub const Callbacks = struct {
@@ -413,9 +414,9 @@ pub fn recordActiveHealthResult(upstream: *UpstreamConfig, healthy: bool, now_ms
     return if (was_available) .ejected else .unchanged;
 }
 
-fn activeHealthCooldownMs(cfg: *const ServerConfig) u32 {
-    const doubled_interval = cfg.upstream_health_check_interval_ms *| 2;
-    return @max(doubled_interval, cfg.upstream_health_check_timeout_ms);
+fn activeHealthCooldownMs(policy: UpstreamRuntimePolicy) u32 {
+    const doubled_interval = policy.health_check_interval_ms *| 2;
+    return @max(doubled_interval, policy.health_check_timeout_ms);
 }
 
 fn recordActiveHealthMetrics(transition: HealthTransition, healthy: bool, callbacks: Callbacks) void {
@@ -428,33 +429,34 @@ fn recordActiveHealthMetrics(transition: HealthTransition, healthy: bool, callba
     }
 }
 
-fn runHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, cfg: *const ServerConfig, callbacks: Callbacks) void {
-    const cooldown_ms = activeHealthCooldownMs(cfg);
+fn runHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamRuntimePolicy, callbacks: Callbacks) void {
+    if (!policy.health_check_enabled) return;
+    const cooldown_ms = activeHealthCooldownMs(policy);
     for (pool.targets.items) |*upstream| {
         if (callbacks.shutdown_requested.load(.acquire)) return;
 
-        const healthy = checkHealth(allocator, upstream, cfg.upstream_health_check_path, cfg.upstream_health_check_timeout_ms, callbacks) catch false;
-        const transition = recordActiveHealthResult(upstream, healthy, callbacks.upstream_now_ms(), cooldown_ms, cfg.upstream_slow_start_ms);
+        const healthy = checkHealth(allocator, upstream, policy.health_check_path, policy.health_check_timeout_ms, callbacks) catch false;
+        const transition = recordActiveHealthResult(upstream, healthy, callbacks.upstream_now_ms(), cooldown_ms, policy.slow_start_ms);
         recordActiveHealthMetrics(transition, healthy, callbacks);
     }
 }
 
 fn runHealthCheckCycle(allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) void {
     if (cfg.upstream) |*pool| {
-        runHealthCheckForPool(allocator, pool, cfg, callbacks);
+        runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, null), callbacks);
     }
     for (cfg.routes.items) |*route| {
         if (route.upstream) |*pool| {
-            runHealthCheckForPool(allocator, pool, cfg, callbacks);
+            runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, route), callbacks);
         }
     }
     for (cfg.domains.items) |*domain| {
         if (domain.upstream) |*pool| {
-            runHealthCheckForPool(allocator, pool, cfg, callbacks);
+            runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, null), callbacks);
         }
         for (domain.routes.items) |*route| {
             if (route.upstream) |*pool| {
-                runHealthCheckForPool(allocator, pool, cfg, callbacks);
+                runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, route), callbacks);
             }
         }
     }
@@ -482,7 +484,7 @@ pub fn forwardToPool(
     allocator: std.mem.Allocator,
     pool: *UpstreamPoolConfig,
     policy: UpstreamPoolPolicy,
-    timeout_ms: u32,
+    runtime_policy: UpstreamRuntimePolicy,
     req: HttpRequest,
     cfg: *const ServerConfig,
     callbacks: Callbacks,
@@ -493,9 +495,9 @@ pub fn forwardToPool(
         return;
     }
 
-    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, cfg.upstream_retries);
+    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, runtime_policy.retries);
     const now_ms = callbacks.upstream_now_ms();
-    const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), cfg);
+    const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), &runtime_policy);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -503,7 +505,7 @@ pub fn forwardToPool(
 
     attempt_loop: while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
         const upstream = upstream_mod.upstreamAtAttempt(pool, start_ticket, considered);
-        const lease = upstream_mod.upstreamBeginAttempt(upstream, now_ms, cfg) orelse {
+        const lease = upstream_mod.upstreamBeginAttempt(upstream, now_ms, &runtime_policy) orelse {
             skipped_ejected += 1;
             callbacks.metrics.upstreamEjectedSkip();
             continue :attempt_loop;
@@ -518,10 +520,10 @@ pub fn forwardToPool(
             .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
         );
         callbacks.access_log_set_upstream(upstream_label);
-        forwardToUpstream(stream, allocator, upstream, req, cfg, timeout_ms, callbacks) catch |err| switch (err) {
+        forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, callbacks) catch |err| switch (err) {
             error.CloseConnection => {
                 upstream_mod.upstreamEndAttempt(upstream, lease);
-                upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), cfg.upstream_slow_start_ms);
+                upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
                 return err;
             },
             error.OutOfMemory => {
@@ -532,14 +534,14 @@ pub fn forwardToPool(
                 upstream_mod.upstreamEndAttempt(upstream, lease);
                 last_error = err;
                 callbacks.metrics.upstreamRequestFailed();
-                if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
+                if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
                     callbacks.metrics.upstreamEjected();
                 }
                 continue :attempt_loop;
             },
         };
         upstream_mod.upstreamEndAttempt(upstream, lease);
-        upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), cfg.upstream_slow_start_ms);
+        upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return;
     }
 

@@ -145,11 +145,19 @@ pub const Store = struct {
 };
 
 pub fn policyFromConfig(cfg: *const config_mod.ServerConfig) Policy {
+    return policyFromConfigPolicy(config_mod.responseCachePolicyFromConfig(cfg));
+}
+
+pub fn policyForConfig(cfg: *const config_mod.ServerConfig, domain: ?*const config_mod.DomainConfig, route: ?*const config_mod.RouteConfig) Policy {
+    return policyFromConfigPolicy(config_mod.responseCachePolicyFor(cfg, domain, route));
+}
+
+fn policyFromConfigPolicy(policy: config_mod.ResponseCachePolicy) Policy {
     return .{
-        .enabled = cfg.response_cache_enabled,
-        .max_bytes = cfg.response_cache_max_bytes,
-        .max_entry_bytes = cfg.response_cache_max_entry_bytes,
-        .ttl_ms = cfg.response_cache_ttl_ms,
+        .enabled = policy.enabled,
+        .max_bytes = policy.max_bytes,
+        .max_entry_bytes = policy.max_entry_bytes,
+        .ttl_ms = policy.ttl_ms,
     };
 }
 

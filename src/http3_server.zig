@@ -513,7 +513,7 @@ fn buildHttp3StaticRouteResponse(
     }
 
     const rel = try routing_mod.routeFileRelativePath(allocator, route, request_path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
-    return http2_content.readStaticFile(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline);
+    return http2_content.readStaticFile(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, route), metrics, response_cache, static_cache.policyForConfig(cfg, domain, route), server_identity.name, server_identity.tagline);
 }
 
 fn buildHttp3RoutedResponseData(
@@ -556,7 +556,7 @@ fn buildHttp3RoutedResponseData(
     }
 
     if (std.mem.eql(u8, request_path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
     }
 
     if (std.mem.eql(u8, request_path, "/")) {
@@ -564,12 +564,12 @@ fn buildHttp3RoutedResponseData(
     }
 
     if (std.mem.startsWith(u8, request_path, "/static/")) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), request_path["/static/".len..], cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), request_path["/static/".len..], config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
     }
 
     if (routing_mod.domainServeStaticRoot(cfg, domain) and !std.mem.startsWith(u8, request_path, "/api/") and !std.mem.startsWith(u8, request_path, "/php/")) {
         const rel = try routing_mod.makeStaticPathFromRequest(allocator, request_path, routing_mod.domainIndexFile(cfg, domain));
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
     }
 
     return buildHttp3ErrorResponseData(allocator, server_header, 404, "Not Found", "The requested resource was not found on this server.", is_head);

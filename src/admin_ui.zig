@@ -6,6 +6,7 @@ const config_mod = @import("config.zig");
 const routing_mod = @import("routing.zig");
 
 const ServerConfig = config_mod.ServerConfig;
+const SecurityHeaderPreset = config_mod.SecurityHeaderPreset;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 
@@ -333,6 +334,16 @@ fn appendAdminPolicySelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator
     try out.appendSlice(allocator, "</select></label>\n");
 }
 
+fn appendAdminSecuritySelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: SecurityHeaderPreset) !void {
+    try out.appendSlice(allocator, "<label>Security headers<select name=\"security_headers\">");
+    const options = [_]SecurityHeaderPreset{ .off, .basic, .strict };
+    for (options) |option| {
+        const name = config_mod.securityHeaderPresetName(option);
+        try out.print(allocator, "<option value=\"{s}\" {s}>{s}</option>", .{ name, if (option == value) "selected" else "", name });
+    }
+    try out.appendSlice(allocator, "</select></label>\n");
+}
+
 fn appendAdminSectionTitle(out: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8) !void {
     try out.appendSlice(allocator, "<h3 class=\"form-section\">");
     try appendHtmlEscaped(out, allocator, title);
@@ -371,6 +382,11 @@ pub fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Alloc
     try appendAdminBoolSelect(out, allocator, "Serve static root", "serve_static_root", cfg.serve_static_root);
     try appendAdminBoolSelect(out, allocator, "Compression", "compression", cfg.compression_enabled);
     try appendAdminBoolSelect(out, allocator, "Gzip", "gzip", cfg.gzip_enabled);
+    try appendAdminSecuritySelect(out, allocator, cfg.security_headers);
+    try appendAdminBoolSelect(out, allocator, "Response cache", "response_cache", cfg.response_cache_enabled);
+    try appendAdminNumberInput(out, allocator, "Response cache bytes", "response_cache_max_bytes", cfg.response_cache_max_bytes);
+    try appendAdminNumberInput(out, allocator, "Response cache entry bytes", "response_cache_max_entry_bytes", cfg.response_cache_max_entry_bytes);
+    try appendAdminNumberInput(out, allocator, "Response cache ttl ms", "response_cache_ttl_ms", cfg.response_cache_ttl_ms);
 
     try appendAdminSectionTitle(out, allocator, "PHP and Proxy");
     try appendAdminTextInput(out, allocator, "PHP root", "php_root", cfg.php_root, "public");

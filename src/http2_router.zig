@@ -20,12 +20,13 @@ const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 
 pub const Callbacks = struct {
     access_log_set_handler: *const fn ([]const u8) void,
     custom_not_found_response: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, ?*const DomainConfig) anyerror!?H2BufferedResponse,
     error_response: *const fn (std.mem.Allocator, u16, []const u8, []const u8) anyerror!H2BufferedResponse,
-    fetch_upstream_pool_response: *const fn (std.mem.Allocator, *UpstreamPoolConfig, UpstreamPoolPolicy, HttpRequest, *const ServerConfig) anyerror!H2BufferedResponse,
+    fetch_upstream_pool_response: *const fn (std.mem.Allocator, *UpstreamPoolConfig, UpstreamPoolPolicy, UpstreamRuntimePolicy, HttpRequest, *const ServerConfig) anyerror!H2BufferedResponse,
     metrics: *metrics_mod.ServerMetrics,
     php_callbacks: php_runtime.Callbacks,
     read_acme_challenge: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!H2BufferedResponse,
@@ -80,7 +81,7 @@ pub fn buildResponseForRequest(
     if (domain != null) {
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, cfg);
+            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
         }
     }
 
@@ -91,7 +92,7 @@ pub fn buildResponseForRequest(
         }
         if (std.mem.eql(u8, req.path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
             callbacks.access_log_set_handler("static_root");
-            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
         }
         if (std.mem.eql(u8, req.path, "/")) {
             callbacks.access_log_set_handler("builtin_root");
@@ -118,7 +119,7 @@ pub fn buildResponseForRequest(
         }
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             callbacks.access_log_set_handler("static");
-            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), req.path["/static/".len..], cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), req.path["/static/".len..], config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
         }
         if (routing_mod.domainServeStaticRoot(cfg, domain) and
             !std.mem.startsWith(u8, req.path, "/api/") and
@@ -129,7 +130,7 @@ pub fn buildResponseForRequest(
         {
             const rel = try routing_mod.makeStaticPathFromRequest(allocator, req.path, routing_mod.domainIndexFile(cfg, domain));
             callbacks.access_log_set_handler("static_root");
-            const response = try callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            const response = try callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
             if (response.status_code == 404) {
                 if (try callbacks.custom_not_found_response(io, allocator, cfg, domain)) |custom| return custom;
             }
@@ -137,7 +138,7 @@ pub fn buildResponseForRequest(
         }
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, cfg);
+            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
         }
         callbacks.access_log_set_handler("not_found");
         if (try callbacks.custom_not_found_response(io, allocator, cfg, domain)) |custom| return custom;
@@ -156,7 +157,7 @@ pub fn buildResponseForRequest(
     }
     if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
         callbacks.access_log_set_handler("domain_proxy");
-        return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, cfg);
+        return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
     }
     callbacks.access_log_set_handler("not_implemented");
     return callbacks.error_response(allocator, 501, "Not Implemented", "This server has not implemented that HTTP/2 behavior yet.");
@@ -188,7 +189,7 @@ fn buildRouteResponse(
                 return response;
             }
             const rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
-            return callbacks.read_static_file(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            return callbacks.read_static_file(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, route), static_cache.policyForConfig(cfg, domain, route));
         },
         .proxy => {
             callbacks.access_log_set_handler("route_proxy");
@@ -196,7 +197,7 @@ fn buildRouteResponse(
                 route_pool
             else
                 routing_mod.domainUpstreamMutable(cfg, domain) orelse return callbacks.error_response(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), req, cfg);
+            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
         },
         .php => {
             callbacks.access_log_set_handler("route_php");

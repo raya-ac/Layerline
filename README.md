@@ -30,7 +30,7 @@ Layerline blends local serving with edge-style deployment:
 - HTTP/1.1 WebSocket/Upgrade proxy tunneling for route and domain proxy targets.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
-- Configured redirects and inherited global/domain/route response headers, using familiar Caddy/nginx-style primitives.
+- Configured redirects, inherited global/domain/route response headers, and security header presets using familiar Caddy/nginx-style primitives.
 - Native TLS listener support plus an optional plaintext HTTP listener for ACME HTTP-01 and HTTP-to-HTTPS redirects.
 - HTTP/1.1 parsing with request limits, keep-alive, `HEAD`, `OPTIONS`, chunked request bodies, `Expect: 100-continue`, and forwarding.
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
@@ -39,7 +39,7 @@ Layerline blends local serving with edge-style deployment:
 - Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
-- Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache.
+- Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache with domain/route overrides.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, request bodies, and FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and static/health/redirect route dispatch.
@@ -55,9 +55,9 @@ Layerline is being built toward the Caddy/nginx class: direct TLS termination, v
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, an opt-in shared memory response cache, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, an opt-in shared memory response cache with domain/route overrides, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout/retry/health/breaker overrides, inherited global/domain/route response headers, security presets, and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is protocol/parser/cache depth: broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, a config parser refactor, and then disk/dynamic cache work beyond the current static memory cache. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is protocol/cache depth: broader HTTP/3 proxy/PHP route parity, external h3 smoke coverage where the local client supports it, and then disk/dynamic cache work beyond the current static memory cache. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -386,17 +386,20 @@ Repeat `header` lines in `server.conf` to add global headers to Layerline-genera
 ```conf
 header = X-Frame-Options: DENY
 header = X-Content-Type-Options: nosniff
+security_headers = basic
 ```
 
-Headers inherit from global to domain to route. Use inline server keys or per-domain files when a site or route needs its own policy:
+Headers inherit from global to domain to route. `security_headers = off|basic|strict` adds a standard preset at the effective scope unless you already set the same header manually. Use inline server keys or per-domain files when a site or route needs its own policy:
 
 ```conf
 server = main
 server_name.main = example.com
 server_header.main = Strict-Transport-Security: max-age=31536000
+server_security_headers.main = strict
 
 route = app /app/* proxy
 route_header.app = Cache-Control: no-store
+route_security_headers.app = off
 server_route_header.main.app = X-App-Policy: isolated
 ```
 
@@ -422,7 +425,12 @@ response_cache = true
 response_cache_max_bytes = 16777216
 response_cache_max_entry_bytes = 262144
 response_cache_ttl_ms = 60000
+server_response_cache.main = true
+route_response_cache.assets = true
+route_response_cache_ttl_ms.assets = 300000
 ```
+
+The memory response cache inherits through the same global -> domain -> route chain as compression and headers. A route can turn cache off for dynamic-looking static paths without disabling it for immutable assets.
 
 Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
 
@@ -439,6 +447,7 @@ Named routes are the route-local config surface that future Caddy/nginx-class be
 route = assets /assets/* static
 route_dir.assets = public
 route_index.assets = index.html
+route_max_static_file_bytes.assets = 1048576
 
 route = app /app/* php
 route_php_root.app = public
@@ -447,9 +456,15 @@ route_php_bin.app = php-cgi
 route = api /api/* proxy
 route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 route_upstream_policy.api = random
+route_upstream_retries.api = 2
+route_upstream_max_failures.api = 3
+route_upstream_fail_timeout_ms.api = 5000
+route_upstream_health_check.api = true
+route_upstream_health_check_path.api = /ready
+route_upstream_health_check_timeout_ms.api = 500
 ```
 
-Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random`, `least_connections`, `weighted`, or `consistent_hash` when you want nginx-style per-scope balancing behavior. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random`, `least_connections`, `weighted`, or `consistent_hash` when you want nginx-style per-scope balancing behavior. Route and domain scopes can also override static size limits, response-cache policy, security preset, retries, passive failure thresholds, active health probe path/timeouts, circuit breaker behavior, and slow start. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## Per-Domain Config Files
 
@@ -476,11 +491,14 @@ tls_cert = /etc/letsencrypt/live/example.com/fullchain.pem
 tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 add_header = Strict-Transport-Security: max-age=31536000
 add_header = X-Content-Type-Options: nosniff
+security_headers = strict
 cache_control = private, max-age=30
+response_cache = true
 
 route = assets /assets/* static
 route_dir.assets = public
 route_cache_control.assets = public, max-age=31536000, immutable
+route_response_cache.assets = true
 
 route = app /app/* php
 route_php_root.app = public

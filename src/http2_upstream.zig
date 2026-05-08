@@ -14,6 +14,7 @@ const ServerMetrics = metrics_mod.ServerMetrics;
 const UpstreamConfig = config_mod.UpstreamConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 
 const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024;
 
@@ -84,7 +85,7 @@ fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io
     return raw.toOwnedSlice(allocator);
 }
 
-fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, callbacks: Callbacks) !H2BufferedResponse {
+fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
     if (upstream.https) return error.UnsupportedUpstreamScheme;
 
     const upstream_label = try std.fmt.allocPrint(
@@ -96,7 +97,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
 
     const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
     defer callbacks.stream_close(upstream_conn);
-    try callbacks.set_stream_timeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
+    try callbacks.set_stream_timeouts(upstream_conn, runtime_policy.timeout_ms, runtime_policy.timeout_ms);
 
     const proxy_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, req.path, req.query);
     var request = std.ArrayList(u8).empty;
@@ -137,15 +138,16 @@ pub fn fetchPoolResponse(
     allocator: std.mem.Allocator,
     pool: *UpstreamPoolConfig,
     policy: UpstreamPoolPolicy,
+    runtime_policy: UpstreamRuntimePolicy,
     req: request_mod.HttpRequest,
     cfg: *const ServerConfig,
     callbacks: Callbacks,
 ) !H2BufferedResponse {
     if (pool.targets.items.len == 0) return callbacks.error_response(allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.");
 
-    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, cfg.upstream_retries);
+    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, runtime_policy.retries);
     const start_ms = callbacks.upstream_now_ms();
-    const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, start_ms, request_mod.upstreamHashInput(req), cfg);
+    const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, start_ms, request_mod.upstreamHashInput(req), &runtime_policy);
     var considered: usize = 0;
     var attempts: usize = 0;
     var skipped_ejected: usize = 0;
@@ -153,7 +155,7 @@ pub fn fetchPoolResponse(
 
     while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
         const upstream = upstream_mod.upstreamAtAttempt(pool, start_ticket, considered);
-        const lease = upstream_mod.upstreamBeginAttempt(upstream, start_ms, cfg) orelse {
+        const lease = upstream_mod.upstreamBeginAttempt(upstream, start_ms, &runtime_policy) orelse {
             skipped_ejected += 1;
             callbacks.metrics.upstreamEjectedSkip();
             continue;
@@ -162,17 +164,17 @@ pub fn fetchPoolResponse(
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
-        const response = fetchResponse(allocator, upstream, req, cfg, callbacks) catch |err| {
+        const response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
             upstream_mod.upstreamEndAttempt(upstream, lease);
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
-            if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), cfg.upstream_max_failures, cfg.upstream_fail_timeout_ms)) {
+            if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
                 callbacks.metrics.upstreamEjected();
             }
             continue;
         };
         upstream_mod.upstreamEndAttempt(upstream, lease);
-        upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), cfg.upstream_slow_start_ms);
+        upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return response;
     }
 

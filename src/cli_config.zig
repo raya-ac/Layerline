@@ -10,6 +10,7 @@ const loadConfig = config_loader.loadConfig;
 const loadConfiguredDomainConfigs = config_loader.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const parseBool = config_mod.parseBool;
+const parseSecurityHeaderPreset = config_mod.parseSecurityHeaderPreset;
 const parseUpstream = config_mod.parseUpstream;
 const parseUpstreamPool = config_mod.parseUpstreamPool;
 const parseUpstreamPoolPolicy = config_mod.parseUpstreamPoolPolicy;
@@ -345,6 +346,12 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
                 return false;
             };
             cfg.compression_max_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.compression_max_bytes;
+        } else if (std.mem.eql(u8, arg, "--security-headers") or std.mem.eql(u8, arg, "--security-header-preset")) {
+            const value = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+            cfg.security_headers = parseSecurityHeaderPreset(value) catch cfg.security_headers;
         } else if (std.mem.eql(u8, arg, "--response-cache") or std.mem.eql(u8, arg, "--static-response-cache")) {
             const value = args.next() orelse {
                 callbacks.usage();

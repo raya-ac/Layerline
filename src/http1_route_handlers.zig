@@ -12,6 +12,7 @@ const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 
 pub const MethodNotAllowedCallbacks = struct {
     send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8, bool, bool, ?[]const u8) anyerror!void,
@@ -24,7 +25,7 @@ pub const NamedRouteCallbacks = struct {
         std.mem.Allocator,
         *UpstreamPoolConfig,
         UpstreamPoolPolicy,
-        u32,
+        UpstreamRuntimePolicy,
         HttpRequest,
         *const ServerConfig,
     ) anyerror!void,
@@ -85,7 +86,7 @@ pub fn handleNamedRoute(
             const index_file = route.index_file orelse routing_mod.domainIndexFile(cfg, domain);
             const rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, index_file);
             defer allocator.free(rel);
-            try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, config_mod.maxStaticFileBytesFor(cfg, domain, route), static_cache.policyForConfig(cfg, domain, route));
             return;
         },
         .php => {
@@ -115,7 +116,7 @@ pub fn handleNamedRoute(
                     try callbacks.send_cool_error(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, is_head, null);
                     return;
                 };
-            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), req, cfg);
+            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
             return;
         },
     }

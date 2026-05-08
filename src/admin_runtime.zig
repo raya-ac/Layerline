@@ -218,6 +218,11 @@ fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
     const serve_static_root = admin_support.adminTrimmedField(fields.items, "serve_static_root");
     const compression = admin_support.adminTrimmedField(fields.items, "compression");
     const gzip = admin_support.adminTrimmedField(fields.items, "gzip");
+    const security_headers = admin_support.adminTrimmedField(fields.items, "security_headers");
+    const response_cache = admin_support.adminTrimmedField(fields.items, "response_cache");
+    const response_cache_max_bytes = admin_support.adminTrimmedField(fields.items, "response_cache_max_bytes");
+    const response_cache_max_entry_bytes = admin_support.adminTrimmedField(fields.items, "response_cache_max_entry_bytes");
+    const response_cache_ttl_ms = admin_support.adminTrimmedField(fields.items, "response_cache_ttl_ms");
     const php_root = admin_support.adminTrimmedField(fields.items, "php_root");
     const php_binary = admin_support.adminTrimmedField(fields.items, "php_binary");
     const php_fastcgi = admin_support.adminTrimmedField(fields.items, "php_fastcgi");
@@ -256,6 +261,11 @@ fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
         .{ .key = "serve_static_root", .value = serve_static_root },
         .{ .key = "compression", .value = compression },
         .{ .key = "gzip", .value = gzip },
+        .{ .key = "security_headers", .value = security_headers },
+        .{ .key = "response_cache", .value = response_cache },
+        .{ .key = "response_cache_max_bytes", .value = response_cache_max_bytes },
+        .{ .key = "response_cache_max_entry_bytes", .value = response_cache_max_entry_bytes },
+        .{ .key = "response_cache_ttl_ms", .value = response_cache_ttl_ms },
         .{ .key = "php_root", .value = php_root },
         .{ .key = "php_binary", .value = php_binary },
         .{ .key = "php_fastcgi", .value = if (php_fastcgi.len > 0) php_fastcgi else "off" },

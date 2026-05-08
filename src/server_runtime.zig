@@ -158,13 +158,13 @@ fn startRedirectListener(
 }
 
 fn startBackgroundWorkers(ctx: Context) !void {
-    if (ctx.cfg.upstream_health_check_enabled) {
+    if (config_mod.configCanRunHealthChecks(ctx.cfg)) {
         const health_worker = std.Thread.spawn(.{}, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .cfg = ctx.cfg, .callbacks = ctx.callbacks.upstream }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return err;
         };
         health_worker.detach();
-        std.debug.print("Active upstream health checks: path={s} interval={d}ms timeout={d}ms\n", .{ ctx.cfg.upstream_health_check_path, ctx.cfg.upstream_health_check_interval_ms, ctx.cfg.upstream_health_check_timeout_ms });
+        std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
     }
     if (ctx.cfg.http3_enabled) {
         const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.response_cache, ctx.server_header, ctx.callbacks.active_config }) catch |err| {

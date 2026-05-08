@@ -54,6 +54,7 @@ const streamWriteAll = stream_runtime.streamWriteAll;
 const H2BufferedResponse = h2_support.BufferedResponse;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 const RedirectRule = config_mod.RedirectRule;
 const RouteConfig = config_mod.RouteConfig;
 const DomainConfig = config_mod.DomainConfig;
@@ -448,8 +449,8 @@ fn buildHttp2RedirectResponse(allocator: std.mem.Allocator, rule: RedirectRule, 
     return http2_content.redirectResponse(allocator, rule, req);
 }
 
-fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
-    return http2_upstream.fetchPoolResponse(allocator, pool, policy, req, cfg, http2UpstreamCallbacks());
+fn fetchHttp2UpstreamPoolResponse(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, runtime_policy: UpstreamRuntimePolicy, req: HttpRequest, cfg: *const ServerConfig) !H2BufferedResponse {
+    return http2_upstream.fetchPoolResponse(allocator, pool, policy, runtime_policy, req, cfg, http2UpstreamCallbacks());
 }
 
 fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, process_env: *const std.process.Environ.Map) !H2BufferedResponse {
@@ -572,11 +573,11 @@ fn forwardToUpstreamPool(
     allocator: std.mem.Allocator,
     pool: *UpstreamPoolConfig,
     policy: UpstreamPoolPolicy,
-    timeout_ms: u32,
+    runtime_policy: UpstreamRuntimePolicy,
     req: HttpRequest,
     cfg: *const ServerConfig,
 ) !void {
-    try upstream_runtime.forwardToPool(stream, allocator, pool, policy, timeout_ms, req, cfg, upstreamRuntimeCallbacks());
+    try upstream_runtime.forwardToPool(stream, allocator, pool, policy, runtime_policy, req, cfg, upstreamRuntimeCallbacks());
 }
 
 fn handleNamedRoute(

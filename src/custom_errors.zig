@@ -38,9 +38,10 @@ pub fn readDomainDocument(
         if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
         return err;
     };
-    if (stat.size > cfg.max_static_file_bytes) return null;
+    const max_document_bytes = config_mod.maxStaticFileBytesFor(cfg, domain, null);
+    if (stat.size > max_document_bytes) return null;
 
-    return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(cfg.max_static_file_bytes)) catch |err| {
+    return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_document_bytes)) catch |err| {
         if (err == error.StreamTooLong or err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
         return err;
     };

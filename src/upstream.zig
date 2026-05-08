@@ -9,6 +9,7 @@ const ServerConfig = config_mod.ServerConfig;
 const UpstreamConfig = config_mod.UpstreamConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 const upstreamPoolPolicyName = config_mod.upstreamPoolPolicyName;
 
 pub var round_robin_cursor = std.atomic.Value(usize).init(0);
@@ -31,8 +32,8 @@ fn upstreamRandomTicket() usize {
     return @truncate(z ^ (z >> 31));
 }
 
-pub fn upstreamInSlowStart(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) bool {
-    const slow_start_ms = if (cfg) |config| config.upstream_slow_start_ms else 0;
+pub fn upstreamInSlowStart(upstream: *UpstreamConfig, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) bool {
+    const slow_start_ms = if (policy) |runtime_policy| runtime_policy.slow_start_ms else 0;
     if (slow_start_ms == 0) return false;
     const recovered_at = upstream.recovered_at_ms.load(.monotonic);
     if (recovered_at == 0) return false;
@@ -42,18 +43,18 @@ pub fn upstreamInSlowStart(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const 
     return false;
 }
 
-pub fn upstreamEffectiveWeight(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
+pub fn upstreamEffectiveWeight(upstream: *UpstreamConfig, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) usize {
     const base_weight = upstream.weight;
     if (base_weight <= 1) return base_weight;
-    const config = cfg orelse return base_weight;
-    if (config.upstream_slow_start_ms == 0) return base_weight;
+    const runtime_policy = policy orelse return base_weight;
+    if (runtime_policy.slow_start_ms == 0) return base_weight;
 
     const recovered_at = upstream.recovered_at_ms.load(.monotonic);
     if (recovered_at == 0) return base_weight;
     if (now_ms <= recovered_at) return 1;
 
     const elapsed_ms = now_ms - recovered_at;
-    const slow_start_ms = @as(i64, @intCast(config.upstream_slow_start_ms));
+    const slow_start_ms = @as(i64, @intCast(runtime_policy.slow_start_ms));
     if (elapsed_ms >= slow_start_ms) {
         upstream.recovered_at_ms.store(0, .monotonic);
         return base_weight;
@@ -68,16 +69,16 @@ pub fn upstreamInHalfOpen(upstream: *UpstreamConfig, now_ms: i64) bool {
     return until_ms != 0 and now_ms >= until_ms;
 }
 
-pub fn upstreamIsSelectable(upstream: *UpstreamConfig, now_ms: i64, cfg: ?*const ServerConfig) bool {
+pub fn upstreamIsSelectable(upstream: *UpstreamConfig, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) bool {
     if (upstreamIsEjected(upstream, now_ms)) return false;
-    const config = cfg orelse return true;
-    if (!config.upstream_circuit_breaker_enabled) return true;
+    const runtime_policy = policy orelse return true;
+    if (!runtime_policy.circuit_breaker_enabled) return true;
     if (!upstreamInHalfOpen(upstream, now_ms)) return true;
-    if (config.upstream_circuit_half_open_max == 0) return false;
-    return upstream.half_open_requests.load(.monotonic) < config.upstream_circuit_half_open_max;
+    if (runtime_policy.circuit_half_open_max == 0) return false;
+    return upstream.half_open_requests.load(.monotonic) < runtime_policy.circuit_half_open_max;
 }
 
-fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
+fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) usize {
     const target_count = pool.targets.items.len;
     const tie_ticket = round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return tie_ticket;
@@ -88,10 +89,10 @@ fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?
     while (offset < target_count) : (offset += 1) {
         const index = (tie_ticket + offset) % target_count;
         const upstream = &pool.targets.items[index];
-        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
+        if (!upstreamIsSelectable(upstream, now_ms, policy)) continue;
 
         var active = upstream.active_requests.load(.monotonic);
-        if (upstreamInSlowStart(upstream, now_ms, cfg)) active += 1;
+        if (upstreamInSlowStart(upstream, now_ms, policy)) active += 1;
         if (best_index == null or active < best_active) {
             best_index = index;
             best_active = active;
@@ -101,22 +102,22 @@ fn upstreamLeastConnectionsTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?
     return best_index orelse tie_ticket;
 }
 
-fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64, cfg: ?*const ServerConfig) usize {
+fn upstreamWeightedTicket(pool: *UpstreamPoolConfig, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) usize {
     const target_count = pool.targets.items.len;
     const ticket = round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return ticket;
 
     var total_weight: usize = 0;
     for (pool.targets.items) |*upstream| {
-        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
-        total_weight += upstreamEffectiveWeight(upstream, now_ms, cfg);
+        if (!upstreamIsSelectable(upstream, now_ms, policy)) continue;
+        total_weight += upstreamEffectiveWeight(upstream, now_ms, policy);
     }
     if (total_weight == 0) return ticket;
 
     var remaining = ticket % total_weight;
     for (pool.targets.items, 0..) |*upstream, index| {
-        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
-        const weight = upstreamEffectiveWeight(upstream, now_ms, cfg);
+        if (!upstreamIsSelectable(upstream, now_ms, policy)) continue;
+        const weight = upstreamEffectiveWeight(upstream, now_ms, policy);
         if (remaining < weight) return index;
         remaining -= weight;
     }
@@ -172,7 +173,7 @@ fn upstreamConsistentHashKey(req: RequestHashInput) u64 {
     return hash;
 }
 
-fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInput, now_ms: i64, cfg: ?*const ServerConfig) usize {
+fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInput, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) usize {
     const target_count = pool.targets.items.len;
     const fallback = round_robin_cursor.fetchAdd(1, .monotonic);
     if (target_count == 0) return fallback;
@@ -182,7 +183,7 @@ fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInpu
     var best_score: u64 = 0;
 
     for (pool.targets.items, 0..) |*upstream, index| {
-        if (!upstreamIsSelectable(upstream, now_ms, cfg)) continue;
+        if (!upstreamIsSelectable(upstream, now_ms, policy)) continue;
 
         var score = upstreamHashBytes(key, upstream.host);
         score = upstreamHashU16(upstreamHashByte(score, 0), upstream.port);
@@ -196,13 +197,13 @@ fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInpu
     return best_index orelse @as(usize, @intCast(key % target_count));
 }
 
-pub fn upstreamStartTicket(pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, now_ms: i64, req: ?RequestHashInput, cfg: ?*const ServerConfig) usize {
-    return switch (policy) {
+pub fn upstreamStartTicket(pool: *UpstreamPoolConfig, pool_policy: UpstreamPoolPolicy, now_ms: i64, req: ?RequestHashInput, runtime_policy: ?*const UpstreamRuntimePolicy) usize {
+    return switch (pool_policy) {
         .round_robin => round_robin_cursor.fetchAdd(1, .monotonic),
         .random => upstreamRandomTicket(),
-        .least_connections => upstreamLeastConnectionsTicket(pool, now_ms, cfg),
-        .weighted => upstreamWeightedTicket(pool, now_ms, cfg),
-        .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms, cfg),
+        .least_connections => upstreamLeastConnectionsTicket(pool, now_ms, runtime_policy),
+        .weighted => upstreamWeightedTicket(pool, now_ms, runtime_policy),
+        .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms, runtime_policy),
     };
 }
 
@@ -245,14 +246,14 @@ pub const UpstreamAttemptLease = struct {
     half_open: bool,
 };
 
-pub fn upstreamBeginAttempt(upstream: *UpstreamConfig, now_ms: i64, cfg: *const ServerConfig) ?UpstreamAttemptLease {
+pub fn upstreamBeginAttempt(upstream: *UpstreamConfig, now_ms: i64, policy: *const UpstreamRuntimePolicy) ?UpstreamAttemptLease {
     if (upstreamIsEjected(upstream, now_ms)) return null;
 
     var half_open = false;
-    if (cfg.upstream_circuit_breaker_enabled and upstreamInHalfOpen(upstream, now_ms)) {
-        if (cfg.upstream_circuit_half_open_max == 0) return null;
+    if (policy.circuit_breaker_enabled and upstreamInHalfOpen(upstream, now_ms)) {
+        if (policy.circuit_half_open_max == 0) return null;
         const active_half_open = upstream.half_open_requests.fetchAdd(1, .monotonic);
-        if (active_half_open >= cfg.upstream_circuit_half_open_max) {
+        if (active_half_open >= policy.circuit_half_open_max) {
             _ = upstream.half_open_requests.fetchSub(1, .monotonic);
             return null;
         }

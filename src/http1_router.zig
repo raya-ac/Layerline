@@ -16,6 +16,7 @@ const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
+const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 
 pub const Callbacks = struct {
     access_log_set_handler: *const fn ([]const u8) void,
@@ -26,7 +27,7 @@ pub const Callbacks = struct {
         std.mem.Allocator,
         *UpstreamPoolConfig,
         UpstreamPoolPolicy,
-        u32,
+        UpstreamRuntimePolicy,
         HttpRequest,
         *const ServerConfig,
     ) anyerror!void,
@@ -144,7 +145,7 @@ pub fn route(
     if (domain != null) {
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), req, cfg);
+            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
             return;
         }
     }
@@ -164,7 +165,7 @@ pub fn route(
 
         if (std.mem.eql(u8, req.path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
             callbacks.access_log_set_handler("static_root");
-            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), req.headers, should_close, is_head, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
             return;
         }
 
@@ -221,7 +222,7 @@ pub fn route(
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             callbacks.access_log_set_handler("static");
             const rel = req.path["/static/".len..];
-            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
             return;
         }
 
@@ -248,7 +249,7 @@ pub fn route(
 
             if (file_exists) {
                 callbacks.access_log_set_handler("static_root");
-                try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
+                try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
                 return;
             }
         }
@@ -261,7 +262,7 @@ pub fn route(
 
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), req, cfg);
+            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
             return;
         }
 
@@ -297,7 +298,7 @@ pub fn route(
 
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), req, cfg);
+            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
             return;
         }
 
@@ -324,7 +325,7 @@ pub fn route(
 
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
             callbacks.access_log_set_handler("domain_proxy");
-            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), req, cfg);
+            try callbacks.forward_to_upstream_pool(stream, allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
             return;
         }
         callbacks.access_log_set_handler("method_not_allowed");

@@ -43,6 +43,15 @@ pub fn dumpRoutes(cfg: *const ServerConfig) void {
         }
         if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
         if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
+        const route_cache = config_mod.responseCachePolicyFor(cfg, null, &route);
+        const route_upstream = config_mod.upstreamRuntimePolicyFor(cfg, null, &route);
+        std.debug.print(" security={s} response_cache={} max_static_bytes={d} upstream_retries={d} upstream_health={}", .{
+            config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, null, &route)),
+            route_cache.enabled,
+            config_mod.maxStaticFileBytesFor(cfg, null, &route),
+            route_upstream.retries,
+            route_upstream.health_check_enabled,
+        });
         std.debug.print("\n", .{});
     }
 
@@ -59,6 +68,15 @@ pub fn dumpRoutes(cfg: *const ServerConfig) void {
         if (domain.upstream) |pool| upstream_mod.printUpstreamPool(routing_mod.domainUpstreamPolicy(cfg, domain), pool);
         if (domain.upstream_timeout_ms) |timeout_ms| std.debug.print(" timeout_ms={d}", .{timeout_ms});
         if (domain.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{domain.response_headers.items.len});
+        const domain_cache = config_mod.responseCachePolicyFor(cfg, domain, null);
+        const domain_upstream = config_mod.upstreamRuntimePolicyFor(cfg, domain, null);
+        std.debug.print(" security={s} response_cache={} max_static_bytes={d} upstream_retries={d} upstream_health={}", .{
+            config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, domain, null)),
+            domain_cache.enabled,
+            config_mod.maxStaticFileBytesFor(cfg, domain, null),
+            domain_upstream.retries,
+            domain_upstream.health_check_enabled,
+        });
         std.debug.print("\n", .{});
 
         for (domain.routes.items) |route| {
@@ -88,6 +106,15 @@ pub fn dumpRoutes(cfg: *const ServerConfig) void {
             }
             if (!route.strip_prefix) std.debug.print(" strip_prefix=false", .{});
             if (route.response_headers.items.len > 0) std.debug.print(" response_headers={d}", .{route.response_headers.items.len});
+            const route_cache = config_mod.responseCachePolicyFor(cfg, domain, &route);
+            const route_upstream = config_mod.upstreamRuntimePolicyFor(cfg, domain, &route);
+            std.debug.print(" security={s} response_cache={} max_static_bytes={d} upstream_retries={d} upstream_health={}", .{
+                config_mod.securityHeaderPresetName(config_mod.securityHeaderPresetFor(cfg, domain, &route)),
+                route_cache.enabled,
+                config_mod.maxStaticFileBytesFor(cfg, domain, &route),
+                route_upstream.retries,
+                route_upstream.health_check_enabled,
+            });
             std.debug.print("\n", .{});
         }
     }
@@ -101,7 +128,7 @@ pub fn usage() void {
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash] [--h2-upstream http://HOST:PORT[/path]] " ++
-            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--response-cache true|false] [--response-cache-max-bytes N] [--response-cache-max-entry-bytes N] [--response-cache-ttl-ms N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
+            "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--security-headers off|basic|strict] [--response-cache true|false] [--response-cache-max-bytes N] [--response-cache-max-entry-bytes N] [--response-cache-ttl-ms N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--letsencrypt-webroot /var/www/html] [--letsencrypt-certbot /usr/bin/certbot] [--letsencrypt-staging true|false] [--letsencrypt-renew true|false] [--letsencrypt-renew-interval-ms N] " ++
             "[--http-redirect true|false] [--http-redirect-port 80] [--http-redirect-https-port 443] [--http-redirect-status 308] " ++
@@ -116,15 +143,15 @@ pub fn usage() void {
             "[--upstream-circuit-breaker true|false] [--upstream-circuit-half-open-max N] [--upstream-slow-start-ms N] " ++
             "[--graceful-shutdown-timeout-ms N]\n" ++
             "  Supported config keys: host, port, static_dir/dir, index_file/index, serve_static_root, " ++
-            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, access_log, access_log_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, response_cache, response_cache_max_bytes, response_cache_max_entry_bytes, response_cache_ttl_ms, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
+            "php_root, php_binary/php_bin, php_fastcgi/php_fpm/fastcgi, php_index/php_index_file, php_front_controller, php_info_page/phpinfo_page, proxy, upstream_policy/proxy_policy, h2_upstream, http3, http3_port, admin, admin_socket/admin_socket_path, admin_ui/admin_ui_enabled, admin_ui_path, admin_credentials_path, access_log, access_log_path, compression/compress/encode, gzip, compression_min_bytes, compression_max_bytes, security_headers/security_header_preset, response_cache, response_cache_max_bytes, response_cache_max_entry_bytes, response_cache_ttl_ms, domain_config_dir/domains_dir/sites_enabled, header/response_header/add_header, cache_control, redirect/redir, tls, tls_cert, tls_key, max_request_bytes, " ++
             "tls_auto, letsencrypt_email, letsencrypt_domains, letsencrypt_webroot, letsencrypt_certbot, letsencrypt_staging, letsencrypt_renew, letsencrypt_renew_interval_ms, http_redirect, http_redirect_port, http_redirect_https_port, http_redirect_status, " ++
             "max_body_bytes, max_static_file_bytes, max_requests_per_connection, max_php_output_bytes, max_concurrent_connections, worker_stack_size, " ++
             "read_header_timeout_ms, read_body_timeout_ms, idle_timeout_ms, write_timeout_ms, upstream_timeout_ms, upstream_retries, upstream_max_failures, upstream_fail_timeout_ms, upstream_keepalive, upstream_keepalive_max_idle, upstream_keepalive_idle_timeout_ms, upstream_keepalive_max_requests, fastcgi_keepalive, fastcgi_keepalive_max_idle, fastcgi_keepalive_idle_timeout_ms, fastcgi_keepalive_max_requests, upstream_health_check, upstream_health_check_path, upstream_health_check_interval_ms, upstream_health_check_timeout_ms, upstream_circuit_breaker, upstream_circuit_half_open_max, upstream_slow_start_ms, graceful_shutdown_timeout_ms, " ++
             "cf_auto_deploy, cf_api_base, cf_token, cf_zone_id, cf_zone_name, cf_record_name, cf_record_type, cf_record_content, " ++
-            "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_php_root.NAME, " ++
-            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_strip_prefix.NAME, route_header.NAME, route_cache_control.NAME, server/domain/vhost, " ++
-            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_proxy.NAME, " ++
-            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE\n" ++
+            "cf_record_ttl, cf_record_proxied, cf_record_comment, route, route_dir.NAME, route_index.NAME, route_max_static_file_bytes.NAME, route_php_root.NAME, " ++
+            "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_upstream_retries.NAME, route_upstream_max_failures.NAME, route_upstream_health_check.NAME, route_strip_prefix.NAME, route_header.NAME, route_cache_control.NAME, route_response_cache.NAME, route_security_headers.NAME, server/domain/vhost, " ++
+            "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_response_cache.NAME, server_security_headers.NAME, server_proxy.NAME, " ++
+            "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_upstream_retries.NAME, server_upstream_max_failures.NAME, server_upstream_health_check.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_max_static_file_bytes.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_response_cache.DOMAIN.ROUTE, server_route_security_headers.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE, server_route_upstream_retries.DOMAIN.ROUTE, server_route_upstream_health_check.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
             "Native HTTP/3 serves static, health, redirect, and fallback page responses over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++

@@ -100,6 +100,7 @@ http3_port = $H3_PORT
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
+security_headers = basic
 response_cache = true
 response_cache_max_bytes = 1048576
 response_cache_max_entry_bytes = 65536
@@ -107,6 +108,10 @@ response_cache_ttl_ms = 60000
 route = nogzip /nogzip/* static
 route_compression.nogzip = false
 route_stale_if_error.nogzip = 30
+route = nocache /nocache/* static
+route_response_cache.nocache = false
+route_security_headers.nocache = strict
+route_max_static_file_bytes.nocache = 2048
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
@@ -159,6 +164,12 @@ curl -fsS -D "$STATIC_HIT_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/n
 header_has "$STATIC_HIT_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="response-cache"' || die "static response-cache hit header missing"
 ok "static file route"
 
+ROUTE_POLICY_HEADERS="$TMP_DIR/route-policy.headers"
+curl -fsS -D "$ROUTE_POLICY_HEADERS" "http://$HOST:$PORT/nocache/hello.txt" >/dev/null
+header_has "$ROUTE_POLICY_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; detail="static-file"' || die "route response-cache disable did not bypass memory cache"
+header_has "$ROUTE_POLICY_HEADERS" "^Content-Security-Policy: default-src 'self'; base-uri 'self'; frame-ancestors 'none'" || die "route security header preset missing"
+ok "route-local cache and security policy"
+
 GZIP_HEADERS="$TMP_DIR/gzip.headers"
 GZIP_BODY="$TMP_DIR/gzip.body"
 GZIP_PAYLOAD=$(printf 'layerline%.0s' {1..200})
@@ -194,6 +205,12 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   curl -fsS --http2-prior-knowledge -D "$H2_STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
   header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="response-cache"' || die "h2 static response-cache hit header missing"
   ok "h2c static cache status"
+
+  H2_ROUTE_POLICY_HEADERS="$TMP_DIR/h2-route-policy.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ROUTE_POLICY_HEADERS" "http://$HOST:$PORT/nocache/hello.txt" >/dev/null
+  header_has "$H2_ROUTE_POLICY_HEADERS" '^cache-status: Layerline; fwd=uri-miss; detail="static-file"' || die "h2 route response-cache disable did not bypass memory cache"
+  header_has "$H2_ROUTE_POLICY_HEADERS" "^content-security-policy: default-src 'self'; base-uri 'self'; frame-ancestors 'none'" || die "h2 route security header preset missing"
+  ok "h2c route-local cache and security policy"
 
   H2_REQUEST_ID_HEADERS="$TMP_DIR/h2-request-id.headers"
   curl -fsS --http2-prior-knowledge -D "$H2_REQUEST_ID_HEADERS" -H 'X-Request-Id: verify-h2-request-123' "http://$HOST:$PORT/health" >/dev/null
@@ -295,6 +312,10 @@ case "$ADMIN_ROUTES" in
   *"global host=$HOST port=$PORT"*) ok "admin routes" ;;
   *) die "admin routes response was unexpected: $ADMIN_ROUTES" ;;
 esac
+case "$ADMIN_ROUTES" in
+  *"route nocache:"*"security=strict response_cache=false"*) ok "admin routes show route policy" ;;
+  *) die "admin routes did not show route-local policy: $ADMIN_ROUTES" ;;
+esac
 
 ADMIN_CERTS=$(printf 'certs\n' | nc -U "$SOCKET")
 case "$ADMIN_CERTS" in
@@ -336,11 +357,12 @@ grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not i
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 grep -Fq 'layerline_response_cache_hits_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include response-cache metrics"
+grep -Fq 'security=strict response_cache=false' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose route-local policy"
 ok "admin UI authenticated dashboard"
 
 curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data "host=$HOST&port=$PORT&static_dir=public&index_file=index.html&domain_config_dir=$SITE_DIR&serve_static_root=true&compression=true&gzip=true&php_root=public&php_binary=php-cgi&php_fastcgi=off&php_front_controller=false&proxy=off&upstream_policy=round_robin&upstream_timeout_ms=5000&upstream_retries=1&upstream_keepalive=true&fastcgi_keepalive=true&tls=false&tls_cert=&tls_key=&http_redirect=false&http_redirect_port=$REDIRECT_PORT&http_redirect_https_port=$PORT&http3=false&http3_port=8443&admin_socket=$SOCKET&admin_ui=true&admin_ui_path=%2F_layerline%2Fadmin&admin_credentials_path=$ADMIN_CREDS&access_log=$ACCESS_LOG&max_concurrent_connections=1024&max_request_bytes=1048576&read_header_timeout_ms=5000&idle_timeout_ms=30000&worker_stack_size=524288" \
+  --data "host=$HOST&port=$PORT&static_dir=public&index_file=index.html&domain_config_dir=$SITE_DIR&serve_static_root=true&compression=true&gzip=true&security_headers=basic&response_cache=true&response_cache_max_bytes=1048576&response_cache_max_entry_bytes=65536&response_cache_ttl_ms=60000&php_root=public&php_binary=php-cgi&php_fastcgi=off&php_front_controller=false&proxy=off&upstream_policy=round_robin&upstream_timeout_ms=5000&upstream_retries=1&upstream_keepalive=true&fastcgi_keepalive=true&tls=false&tls_cert=&tls_key=&http_redirect=false&http_redirect_port=$REDIRECT_PORT&http_redirect_https_port=$PORT&http3=false&http3_port=8443&admin_socket=$SOCKET&admin_ui=true&admin_ui_path=%2F_layerline%2Fadmin&admin_credentials_path=$ADMIN_CREDS&access_log=$ACCESS_LOG&max_concurrent_connections=1024&max_request_bytes=1048576&read_header_timeout_ms=5000&idle_timeout_ms=30000&worker_stack_size=524288" \
   "$ADMIN_URL/settings/save"
 grep -Fq 'Saved settings to ' "$TMP_DIR/admin-settings.body" || die "admin settings response did not confirm save"
 grep -Fq 'compression = true' "$CONFIG" || die "admin settings did not update main config"

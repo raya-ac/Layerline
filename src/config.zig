@@ -165,16 +165,23 @@ pub const RouteStringProperty = enum {
     php_binary,
     php_index,
     php_fastcgi,
+    upstream_health_check_path,
 };
 
 pub const RouteBoolProperty = enum {
     php_info_page,
     php_front_controller,
     strip_prefix,
+    upstream_health_check_enabled,
+    upstream_circuit_breaker_enabled,
 };
 
 pub const RouteU32Property = enum {
     upstream_timeout_ms,
+    upstream_fail_timeout_ms,
+    upstream_health_check_interval_ms,
+    upstream_health_check_timeout_ms,
+    upstream_slow_start_ms,
 };
 
 pub const CompressionBoolProperty = enum {
@@ -192,6 +199,31 @@ pub const CacheStaleProperty = enum {
     stale_if_error,
 };
 
+pub const SecurityHeaderPreset = enum {
+    off,
+    basic,
+    strict,
+};
+
+pub const ResponseCacheBoolProperty = enum {
+    enabled,
+};
+
+pub const ResponseCacheSizeProperty = enum {
+    max_bytes,
+    max_entry_bytes,
+};
+
+pub const ResponseCacheU32Property = enum {
+    ttl_ms,
+};
+
+pub const UpstreamUsizeProperty = enum {
+    retries,
+    max_failures,
+    circuit_half_open_max,
+};
+
 pub const DomainStringProperty = enum {
     static_dir,
     index_file,
@@ -201,16 +233,23 @@ pub const DomainStringProperty = enum {
     php_fastcgi,
     tls_cert,
     tls_key,
+    upstream_health_check_path,
 };
 
 pub const DomainBoolProperty = enum {
     serve_static_root,
     php_info_page,
     php_front_controller,
+    upstream_health_check_enabled,
+    upstream_circuit_breaker_enabled,
 };
 
 pub const DomainU32Property = enum {
     upstream_timeout_ms,
+    upstream_fail_timeout_ms,
+    upstream_health_check_interval_ms,
+    upstream_health_check_timeout_ms,
+    upstream_slow_start_ms,
 };
 
 pub const RouteConfig = struct {
@@ -234,6 +273,22 @@ pub const RouteConfig = struct {
     gzip_enabled: ?bool,
     compression_min_bytes: ?usize,
     compression_max_bytes: ?usize,
+    response_cache_enabled: ?bool,
+    response_cache_max_bytes: ?usize,
+    response_cache_max_entry_bytes: ?usize,
+    response_cache_ttl_ms: ?u32,
+    security_headers: ?SecurityHeaderPreset,
+    max_static_file_bytes: ?usize,
+    upstream_retries: ?usize,
+    upstream_max_failures: ?usize,
+    upstream_fail_timeout_ms: ?u32,
+    upstream_health_check_enabled: ?bool,
+    upstream_health_check_path: ?[]const u8,
+    upstream_health_check_interval_ms: ?u32,
+    upstream_health_check_timeout_ms: ?u32,
+    upstream_circuit_breaker_enabled: ?bool,
+    upstream_circuit_half_open_max: ?usize,
+    upstream_slow_start_ms: ?u32,
     response_headers: std.ArrayList(ResponseHeaderRule),
 };
 
@@ -259,6 +314,22 @@ pub const DomainConfig = struct {
     gzip_enabled: ?bool,
     compression_min_bytes: ?usize,
     compression_max_bytes: ?usize,
+    response_cache_enabled: ?bool,
+    response_cache_max_bytes: ?usize,
+    response_cache_max_entry_bytes: ?usize,
+    response_cache_ttl_ms: ?u32,
+    security_headers: ?SecurityHeaderPreset,
+    max_static_file_bytes: ?usize,
+    upstream_retries: ?usize,
+    upstream_max_failures: ?usize,
+    upstream_fail_timeout_ms: ?u32,
+    upstream_health_check_enabled: ?bool,
+    upstream_health_check_path: ?[]const u8,
+    upstream_health_check_interval_ms: ?u32,
+    upstream_health_check_timeout_ms: ?u32,
+    upstream_circuit_breaker_enabled: ?bool,
+    upstream_circuit_half_open_max: ?usize,
+    upstream_slow_start_ms: ?u32,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
@@ -314,6 +385,7 @@ pub const ServerConfig = struct {
     response_cache_max_bytes: usize,
     response_cache_max_entry_bytes: usize,
     response_cache_ttl_ms: u32,
+    security_headers: SecurityHeaderPreset,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
@@ -424,6 +496,7 @@ pub fn defaultServerConfig() ServerConfig {
         .response_cache_max_bytes = DEFAULT_RESPONSE_CACHE_MAX_BYTES,
         .response_cache_max_entry_bytes = DEFAULT_RESPONSE_CACHE_MAX_ENTRY_BYTES,
         .response_cache_ttl_ms = DEFAULT_RESPONSE_CACHE_TTL_MS,
+        .security_headers = .off,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -478,18 +551,201 @@ pub fn appendResponseHeaderSlice(dest: []ResponseHeaderRule, cursor: *usize, sou
     cursor.* += source.len;
 }
 
+const SECURITY_BASIC_HEADERS = [_]ResponseHeaderRule{
+    .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+    .{ .name = "X-Frame-Options", .value = "DENY" },
+    .{ .name = "Referrer-Policy", .value = "strict-origin-when-cross-origin" },
+};
+
+const SECURITY_STRICT_HEADERS = [_]ResponseHeaderRule{
+    .{ .name = "X-Content-Type-Options", .value = "nosniff" },
+    .{ .name = "X-Frame-Options", .value = "DENY" },
+    .{ .name = "Referrer-Policy", .value = "strict-origin-when-cross-origin" },
+    .{ .name = "Cross-Origin-Opener-Policy", .value = "same-origin" },
+    .{ .name = "Cross-Origin-Resource-Policy", .value = "same-origin" },
+    .{ .name = "Permissions-Policy", .value = "geolocation=(), microphone=(), camera=()" },
+    .{ .name = "Content-Security-Policy", .value = "default-src 'self'; base-uri 'self'; frame-ancestors 'none'" },
+};
+
+pub fn securityHeaderPresetName(preset: SecurityHeaderPreset) []const u8 {
+    return switch (preset) {
+        .off => "off",
+        .basic => "basic",
+        .strict => "strict",
+    };
+}
+
+pub fn parseSecurityHeaderPreset(value: []const u8) !SecurityHeaderPreset {
+    if (std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0")) return .off;
+    if (std.ascii.eqlIgnoreCase(value, "basic") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return .basic;
+    if (std.ascii.eqlIgnoreCase(value, "strict") or std.ascii.eqlIgnoreCase(value, "hardened")) return .strict;
+    return error.InvalidConfigValue;
+}
+
+pub fn securityHeaderPresetFor(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) SecurityHeaderPreset {
+    var preset = cfg.security_headers;
+    if (domain) |d| {
+        if (d.security_headers) |value| preset = value;
+    }
+    if (route) |r| {
+        if (r.security_headers) |value| preset = value;
+    }
+    return preset;
+}
+
+fn securityHeaderRulesForPreset(preset: SecurityHeaderPreset) []const ResponseHeaderRule {
+    return switch (preset) {
+        .off => &.{},
+        .basic => &SECURITY_BASIC_HEADERS,
+        .strict => &SECURITY_STRICT_HEADERS,
+    };
+}
+
+fn responseHeaderSourcesContain(name: []const u8, global_headers: []const ResponseHeaderRule, domain_headers: []const ResponseHeaderRule, route_headers: []const ResponseHeaderRule) bool {
+    return responseHeaderRulesContain(global_headers, name) or
+        responseHeaderRulesContain(domain_headers, name) or
+        responseHeaderRulesContain(route_headers, name);
+}
+
+fn appendSecurityHeaderRules(dest: []ResponseHeaderRule, cursor: *usize, preset_headers: []const ResponseHeaderRule, global_headers: []const ResponseHeaderRule, domain_headers: []const ResponseHeaderRule, route_headers: []const ResponseHeaderRule) void {
+    for (preset_headers) |header| {
+        if (responseHeaderSourcesContain(header.name, global_headers, domain_headers, route_headers)) continue;
+        dest[cursor.*] = header;
+        cursor.* += 1;
+    }
+}
+
 pub fn buildResponseHeaderContext(allocator: std.mem.Allocator, cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) !ResponseHeaderContext {
     const domain_headers = if (domain) |d| d.response_headers.items else &.{};
     const route_headers = if (route) |r| r.response_headers.items else &.{};
-    const count = cfg.response_headers.items.len + domain_headers.len + route_headers.len;
+    const preset_headers = securityHeaderRulesForPreset(securityHeaderPresetFor(cfg, domain, route));
+    var preset_count: usize = 0;
+    for (preset_headers) |header| {
+        if (!responseHeaderSourcesContain(header.name, cfg.response_headers.items, domain_headers, route_headers)) preset_count += 1;
+    }
+    const count = preset_count + cfg.response_headers.items.len + domain_headers.len + route_headers.len;
     if (count == 0) return .{ .items = &.{} };
 
     const owned = try allocator.alloc(ResponseHeaderRule, count);
     var cursor: usize = 0;
+    appendSecurityHeaderRules(owned, &cursor, preset_headers, cfg.response_headers.items, domain_headers, route_headers);
     appendResponseHeaderSlice(owned, &cursor, cfg.response_headers.items);
     appendResponseHeaderSlice(owned, &cursor, domain_headers);
     appendResponseHeaderSlice(owned, &cursor, route_headers);
     return .{ .items = owned, .owned = owned };
+}
+
+pub const ResponseCachePolicy = struct {
+    enabled: bool,
+    max_bytes: usize,
+    max_entry_bytes: usize,
+    ttl_ms: u32,
+};
+
+pub fn responseCachePolicyFromConfig(cfg: *const ServerConfig) ResponseCachePolicy {
+    return .{
+        .enabled = cfg.response_cache_enabled,
+        .max_bytes = cfg.response_cache_max_bytes,
+        .max_entry_bytes = cfg.response_cache_max_entry_bytes,
+        .ttl_ms = cfg.response_cache_ttl_ms,
+    };
+}
+
+fn applyDomainResponseCacheOverrides(policy: *ResponseCachePolicy, domain: *const DomainConfig) void {
+    if (domain.response_cache_enabled) |value| policy.enabled = value;
+    if (domain.response_cache_max_bytes) |value| policy.max_bytes = value;
+    if (domain.response_cache_max_entry_bytes) |value| policy.max_entry_bytes = value;
+    if (domain.response_cache_ttl_ms) |value| policy.ttl_ms = value;
+}
+
+fn applyRouteResponseCacheOverrides(policy: *ResponseCachePolicy, route: *const RouteConfig) void {
+    if (route.response_cache_enabled) |value| policy.enabled = value;
+    if (route.response_cache_max_bytes) |value| policy.max_bytes = value;
+    if (route.response_cache_max_entry_bytes) |value| policy.max_entry_bytes = value;
+    if (route.response_cache_ttl_ms) |value| policy.ttl_ms = value;
+}
+
+pub fn responseCachePolicyFor(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) ResponseCachePolicy {
+    var policy = responseCachePolicyFromConfig(cfg);
+    if (domain) |d| applyDomainResponseCacheOverrides(&policy, d);
+    if (route) |r| applyRouteResponseCacheOverrides(&policy, r);
+    return policy;
+}
+
+pub fn maxStaticFileBytesFor(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) usize {
+    var value = cfg.max_static_file_bytes;
+    if (domain) |d| {
+        if (d.max_static_file_bytes) |domain_value| value = domain_value;
+    }
+    if (route) |r| {
+        if (r.max_static_file_bytes) |route_value| value = route_value;
+    }
+    return value;
+}
+
+pub const UpstreamRuntimePolicy = struct {
+    timeout_ms: u32,
+    retries: usize,
+    max_failures: usize,
+    fail_timeout_ms: u32,
+    health_check_enabled: bool,
+    health_check_path: []const u8,
+    health_check_interval_ms: u32,
+    health_check_timeout_ms: u32,
+    circuit_breaker_enabled: bool,
+    circuit_half_open_max: usize,
+    slow_start_ms: u32,
+};
+
+pub fn upstreamRuntimePolicyFromConfig(cfg: *const ServerConfig) UpstreamRuntimePolicy {
+    return .{
+        .timeout_ms = cfg.upstream_timeout_ms,
+        .retries = cfg.upstream_retries,
+        .max_failures = cfg.upstream_max_failures,
+        .fail_timeout_ms = cfg.upstream_fail_timeout_ms,
+        .health_check_enabled = cfg.upstream_health_check_enabled,
+        .health_check_path = cfg.upstream_health_check_path,
+        .health_check_interval_ms = cfg.upstream_health_check_interval_ms,
+        .health_check_timeout_ms = cfg.upstream_health_check_timeout_ms,
+        .circuit_breaker_enabled = cfg.upstream_circuit_breaker_enabled,
+        .circuit_half_open_max = cfg.upstream_circuit_half_open_max,
+        .slow_start_ms = cfg.upstream_slow_start_ms,
+    };
+}
+
+fn applyDomainUpstreamRuntimeOverrides(policy: *UpstreamRuntimePolicy, domain: *const DomainConfig) void {
+    if (domain.upstream_timeout_ms) |value| policy.timeout_ms = value;
+    if (domain.upstream_retries) |value| policy.retries = value;
+    if (domain.upstream_max_failures) |value| policy.max_failures = value;
+    if (domain.upstream_fail_timeout_ms) |value| policy.fail_timeout_ms = value;
+    if (domain.upstream_health_check_enabled) |value| policy.health_check_enabled = value;
+    if (domain.upstream_health_check_path) |value| policy.health_check_path = value;
+    if (domain.upstream_health_check_interval_ms) |value| policy.health_check_interval_ms = value;
+    if (domain.upstream_health_check_timeout_ms) |value| policy.health_check_timeout_ms = value;
+    if (domain.upstream_circuit_breaker_enabled) |value| policy.circuit_breaker_enabled = value;
+    if (domain.upstream_circuit_half_open_max) |value| policy.circuit_half_open_max = value;
+    if (domain.upstream_slow_start_ms) |value| policy.slow_start_ms = value;
+}
+
+fn applyRouteUpstreamRuntimeOverrides(policy: *UpstreamRuntimePolicy, route: *const RouteConfig) void {
+    if (route.upstream_timeout_ms) |value| policy.timeout_ms = value;
+    if (route.upstream_retries) |value| policy.retries = value;
+    if (route.upstream_max_failures) |value| policy.max_failures = value;
+    if (route.upstream_fail_timeout_ms) |value| policy.fail_timeout_ms = value;
+    if (route.upstream_health_check_enabled) |value| policy.health_check_enabled = value;
+    if (route.upstream_health_check_path) |value| policy.health_check_path = value;
+    if (route.upstream_health_check_interval_ms) |value| policy.health_check_interval_ms = value;
+    if (route.upstream_health_check_timeout_ms) |value| policy.health_check_timeout_ms = value;
+    if (route.upstream_circuit_breaker_enabled) |value| policy.circuit_breaker_enabled = value;
+    if (route.upstream_circuit_half_open_max) |value| policy.circuit_half_open_max = value;
+    if (route.upstream_slow_start_ms) |value| policy.slow_start_ms = value;
+}
+
+pub fn upstreamRuntimePolicyFor(cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig) UpstreamRuntimePolicy {
+    var policy = upstreamRuntimePolicyFromConfig(cfg);
+    if (domain) |d| applyDomainUpstreamRuntimeOverrides(&policy, d);
+    if (route) |r| applyRouteUpstreamRuntimeOverrides(&policy, r);
+    return policy;
 }
 
 pub fn compressionPolicyFromConfig(cfg: *const ServerConfig) CompressionPolicy {
@@ -531,6 +787,20 @@ pub fn configCanEnableCompression(cfg: *const ServerConfig) bool {
         if (domain.compression_enabled orelse false) return true;
         for (domain.routes.items) |route| {
             if (route.compression_enabled orelse false) return true;
+        }
+    }
+    return false;
+}
+
+pub fn configCanRunHealthChecks(cfg: *const ServerConfig) bool {
+    if (cfg.upstream != null and upstreamRuntimePolicyFor(cfg, null, null).health_check_enabled) return true;
+    for (cfg.routes.items) |*route| {
+        if (route.upstream != null and upstreamRuntimePolicyFor(cfg, null, route).health_check_enabled) return true;
+    }
+    for (cfg.domains.items) |*domain| {
+        if (domain.upstream != null and upstreamRuntimePolicyFor(cfg, domain, null).health_check_enabled) return true;
+        for (domain.routes.items) |*route| {
+            if (route.upstream != null and upstreamRuntimePolicyFor(cfg, domain, route).health_check_enabled) return true;
         }
     }
     return false;
@@ -956,6 +1226,22 @@ pub fn setRouteLineFor(routes: *std.ArrayList(RouteConfig), allocator: std.mem.A
         .gzip_enabled = null,
         .compression_min_bytes = null,
         .compression_max_bytes = null,
+        .response_cache_enabled = null,
+        .response_cache_max_bytes = null,
+        .response_cache_max_entry_bytes = null,
+        .response_cache_ttl_ms = null,
+        .security_headers = null,
+        .max_static_file_bytes = null,
+        .upstream_retries = null,
+        .upstream_max_failures = null,
+        .upstream_fail_timeout_ms = null,
+        .upstream_health_check_enabled = null,
+        .upstream_health_check_path = null,
+        .upstream_health_check_interval_ms = null,
+        .upstream_health_check_timeout_ms = null,
+        .upstream_circuit_breaker_enabled = null,
+        .upstream_circuit_half_open_max = null,
+        .upstream_slow_start_ms = null,
         .response_headers = .empty,
     });
 }
@@ -981,6 +1267,7 @@ pub fn setRouteStringProperty(
         .php_binary => route.php_binary = dupe_value,
         .php_index => route.php_index = dupe_value,
         .php_fastcgi => route.php_fastcgi = dupe_value,
+        .upstream_health_check_path => route.upstream_health_check_path = dupe_value,
     }
 }
 
@@ -1001,9 +1288,21 @@ pub fn setRouteUpstreamPolicyProperty(routes: *std.ArrayList(RouteConfig), route
 pub fn setRouteU32Property(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: RouteU32Property) !void {
     const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
     const parsed = try parseConfigU32(value);
-    if (parsed == 0) return error.InvalidConfigValue;
     switch (field) {
-        .upstream_timeout_ms => route.upstream_timeout_ms = parsed,
+        .upstream_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            route.upstream_timeout_ms = parsed;
+        },
+        .upstream_fail_timeout_ms => route.upstream_fail_timeout_ms = parsed,
+        .upstream_health_check_interval_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            route.upstream_health_check_interval_ms = parsed;
+        },
+        .upstream_health_check_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            route.upstream_health_check_timeout_ms = parsed;
+        },
+        .upstream_slow_start_ms => route.upstream_slow_start_ms = parsed,
     }
 }
 
@@ -1014,6 +1313,8 @@ pub fn setRouteBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []c
         .php_info_page => route.php_info_page = parsed,
         .php_front_controller => route.php_front_controller = parsed,
         .strip_prefix => route.strip_prefix = parsed,
+        .upstream_health_check_enabled => route.upstream_health_check_enabled = parsed,
+        .upstream_circuit_breaker_enabled => route.upstream_circuit_breaker_enabled = parsed,
     }
 }
 
@@ -1033,6 +1334,58 @@ pub fn setRouteCompressionSizeProperty(routes: *std.ArrayList(RouteConfig), rout
     switch (field) {
         .min_bytes => route.compression_min_bytes = parsed,
         .max_bytes => route.compression_max_bytes = parsed,
+    }
+}
+
+pub fn setRouteResponseCacheBoolProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: ResponseCacheBoolProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => route.response_cache_enabled = parsed,
+    }
+}
+
+pub fn setRouteResponseCacheSizeProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: ResponseCacheSizeProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .max_bytes => route.response_cache_max_bytes = parsed,
+        .max_entry_bytes => route.response_cache_max_entry_bytes = parsed,
+    }
+}
+
+pub fn setRouteResponseCacheU32Property(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: ResponseCacheU32Property) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .ttl_ms => route.response_cache_ttl_ms = parsed,
+    }
+}
+
+pub fn setRouteSecurityHeadersProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    route.security_headers = try parseSecurityHeaderPreset(value);
+}
+
+pub fn setRouteMaxStaticFileBytes(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    route.max_static_file_bytes = parsed;
+}
+
+pub fn setRouteUpstreamUsizeProperty(routes: *std.ArrayList(RouteConfig), route_name: []const u8, value: []const u8, field: UpstreamUsizeProperty) !void {
+    const route = findRouteConfigMutable(routes, route_name) orelse return error.UnknownConfigRoute;
+    const parsed = try parseConfigUsize(value);
+    switch (field) {
+        .retries => route.upstream_retries = parsed,
+        .max_failures => route.upstream_max_failures = parsed,
+        .circuit_half_open_max => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            route.upstream_circuit_half_open_max = parsed;
+        },
     }
 }
 
@@ -1102,6 +1455,22 @@ pub fn initDomainConfig(allocator: std.mem.Allocator, name: []const u8) !DomainC
         .gzip_enabled = null,
         .compression_min_bytes = null,
         .compression_max_bytes = null,
+        .response_cache_enabled = null,
+        .response_cache_max_bytes = null,
+        .response_cache_max_entry_bytes = null,
+        .response_cache_ttl_ms = null,
+        .security_headers = null,
+        .max_static_file_bytes = null,
+        .upstream_retries = null,
+        .upstream_max_failures = null,
+        .upstream_fail_timeout_ms = null,
+        .upstream_health_check_enabled = null,
+        .upstream_health_check_path = null,
+        .upstream_health_check_interval_ms = null,
+        .upstream_health_check_timeout_ms = null,
+        .upstream_circuit_breaker_enabled = null,
+        .upstream_circuit_half_open_max = null,
+        .upstream_slow_start_ms = null,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -1154,6 +1523,7 @@ pub fn setDomainStringProperty(
         .php_fastcgi => domain.php_fastcgi = dupe_value,
         .tls_cert => domain.tls_cert = dupe_value,
         .tls_key => domain.tls_key = dupe_value,
+        .upstream_health_check_path => domain.upstream_health_check_path = dupe_value,
     }
 }
 
@@ -1164,6 +1534,8 @@ pub fn setDomainBoolProperty(cfg: *ServerConfig, domain_name: []const u8, value:
         .serve_static_root => domain.serve_static_root = parsed,
         .php_info_page => domain.php_info_page = parsed,
         .php_front_controller => domain.php_front_controller = parsed,
+        .upstream_health_check_enabled => domain.upstream_health_check_enabled = parsed,
+        .upstream_circuit_breaker_enabled => domain.upstream_circuit_breaker_enabled = parsed,
     }
 }
 
@@ -1184,9 +1556,21 @@ pub fn setDomainUpstreamPolicyProperty(cfg: *ServerConfig, domain_name: []const 
 pub fn setDomainU32Property(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: DomainU32Property) !void {
     const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
     const parsed = try parseConfigU32(value);
-    if (parsed == 0) return error.InvalidConfigValue;
     switch (field) {
-        .upstream_timeout_ms => domain.upstream_timeout_ms = parsed,
+        .upstream_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_timeout_ms = parsed;
+        },
+        .upstream_fail_timeout_ms => domain.upstream_fail_timeout_ms = parsed,
+        .upstream_health_check_interval_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_health_check_interval_ms = parsed;
+        },
+        .upstream_health_check_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_health_check_timeout_ms = parsed;
+        },
+        .upstream_slow_start_ms => domain.upstream_slow_start_ms = parsed,
     }
 }
 
@@ -1206,6 +1590,58 @@ pub fn setDomainCompressionSizeProperty(cfg: *ServerConfig, domain_name: []const
     switch (field) {
         .min_bytes => domain.compression_min_bytes = parsed,
         .max_bytes => domain.compression_max_bytes = parsed,
+    }
+}
+
+pub fn setDomainResponseCacheBoolProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: ResponseCacheBoolProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => domain.response_cache_enabled = parsed,
+    }
+}
+
+pub fn setDomainResponseCacheSizeProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: ResponseCacheSizeProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .max_bytes => domain.response_cache_max_bytes = parsed,
+        .max_entry_bytes => domain.response_cache_max_entry_bytes = parsed,
+    }
+}
+
+pub fn setDomainResponseCacheU32Property(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: ResponseCacheU32Property) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .ttl_ms => domain.response_cache_ttl_ms = parsed,
+    }
+}
+
+pub fn setDomainSecurityHeadersProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    domain.security_headers = try parseSecurityHeaderPreset(value);
+}
+
+pub fn setDomainMaxStaticFileBytes(cfg: *ServerConfig, domain_name: []const u8, value: []const u8) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    domain.max_static_file_bytes = parsed;
+}
+
+pub fn setDomainUpstreamUsizeProperty(cfg: *ServerConfig, domain_name: []const u8, value: []const u8, field: UpstreamUsizeProperty) !void {
+    const domain = findDomainConfigMutable(cfg, domain_name) orelse return error.UnknownConfigDomain;
+    const parsed = try parseConfigUsize(value);
+    switch (field) {
+        .retries => domain.upstream_retries = parsed,
+        .max_failures => domain.upstream_max_failures = parsed,
+        .circuit_half_open_max => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_circuit_half_open_max = parsed;
+        },
     }
 }
 
@@ -1275,6 +1711,42 @@ pub fn setDomainRouteCompressionSizeProperty(cfg: *ServerConfig, property_name: 
     const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
     const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
     try setRouteCompressionSizeProperty(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteResponseCacheBoolProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: ResponseCacheBoolProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteResponseCacheBoolProperty(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteResponseCacheSizeProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: ResponseCacheSizeProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteResponseCacheSizeProperty(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteResponseCacheU32Property(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: ResponseCacheU32Property) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteResponseCacheU32Property(&domain.routes, split.route, value, field);
+}
+
+pub fn setDomainRouteSecurityHeadersProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteSecurityHeadersProperty(&domain.routes, split.route, value);
+}
+
+pub fn setDomainRouteMaxStaticFileBytes(cfg: *ServerConfig, property_name: []const u8, value: []const u8) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteMaxStaticFileBytes(&domain.routes, split.route, value);
+}
+
+pub fn setDomainRouteUpstreamUsizeProperty(cfg: *ServerConfig, property_name: []const u8, value: []const u8, field: UpstreamUsizeProperty) !void {
+    const split = splitDomainRoutePropertyName(property_name) orelse return error.InvalidConfigValue;
+    const domain = findDomainConfigMutable(cfg, split.domain) orelse return error.UnknownConfigDomain;
+    try setRouteUpstreamUsizeProperty(&domain.routes, split.route, value, field);
 }
 
 pub fn appendDomainRouteResponseHeader(cfg: *ServerConfig, allocator: std.mem.Allocator, property_name: []const u8, value: []const u8) !void {
@@ -1442,6 +1914,8 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         cfg.response_cache_max_entry_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "response_cache_ttl_ms") or std.mem.eql(u8, k, "static_response_cache_ttl_ms")) {
         cfg.response_cache_ttl_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "security_headers") or std.mem.eql(u8, k, "security_header_preset") or std.mem.eql(u8, k, "secure_headers")) {
+        cfg.security_headers = try parseSecurityHeaderPreset(v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
@@ -1470,6 +1944,18 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainCompressionSizeProperty(cfg, name, v, .min_bytes);
     } else if (findAnyRoutePropertyName(k, &.{ "server_compression_max_bytes.", "server_gzip_max_bytes." })) |name| {
         try setDomainCompressionSizeProperty(cfg, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "server_response_cache.")) |name| {
+        try setDomainResponseCacheBoolProperty(cfg, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "server_static_response_cache.")) |name| {
+        try setDomainResponseCacheBoolProperty(cfg, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "server_response_cache_max_bytes.")) |name| {
+        try setDomainResponseCacheSizeProperty(cfg, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "server_response_cache_max_entry_bytes.")) |name| {
+        try setDomainResponseCacheSizeProperty(cfg, name, v, .max_entry_bytes);
+    } else if (findRoutePropertyName(k, "server_response_cache_ttl_ms.")) |name| {
+        try setDomainResponseCacheU32Property(cfg, name, v, .ttl_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_security_headers.", "server_security_header_preset.", "server_secure_headers." })) |name| {
+        try setDomainSecurityHeadersProperty(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_header.")) |name| {
         try appendDomainResponseHeader(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_response_header.")) |name| {
@@ -1490,6 +1976,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "server_static_dir.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_max_static_file_bytes.")) |name| {
+        try setDomainMaxStaticFileBytes(cfg, name, v);
+    } else if (findRoutePropertyName(k, "server_max_static_bytes.")) |name| {
+        try setDomainMaxStaticFileBytes(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_index.")) |name| {
         try setDomainStringProperty(cfg, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "server_index_file.")) |name| {
@@ -1542,6 +2032,26 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_fastcgi_timeout_ms.")) |name| {
         try setDomainU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_upstream_retries.")) |name| {
+        try setDomainUpstreamUsizeProperty(cfg, name, v, .retries);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_max_failures.", "server_upstream_max_fails.", "server_proxy_max_fails." })) |name| {
+        try setDomainUpstreamUsizeProperty(cfg, name, v, .max_failures);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_fail_timeout_ms.", "server_proxy_fail_timeout_ms." })) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_fail_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_health_check.", "server_proxy_health_check." })) |name| {
+        try setDomainBoolProperty(cfg, name, v, .upstream_health_check_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_health_check_path.", "server_proxy_health_check_path." })) |name| {
+        try setDomainStringProperty(cfg, allocator, name, v, .upstream_health_check_path);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_health_check_interval_ms.", "server_proxy_health_check_interval_ms." })) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_health_check_interval_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_health_check_timeout_ms.", "server_proxy_health_check_timeout_ms." })) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_health_check_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_circuit_breaker.", "server_proxy_circuit_breaker." })) |name| {
+        try setDomainBoolProperty(cfg, name, v, .upstream_circuit_breaker_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_circuit_half_open_max.", "server_proxy_circuit_half_open_max." })) |name| {
+        try setDomainUpstreamUsizeProperty(cfg, name, v, .circuit_half_open_max);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_upstream_slow_start_ms.", "server_proxy_slow_start_ms." })) |name| {
+        try setDomainU32Property(cfg, name, v, .upstream_slow_start_ms);
     } else if (findRoutePropertyName(k, "server_redirect.")) |name| {
         const domain = findDomainConfigMutable(cfg, name) orelse return error.UnknownConfigDomain;
         if (v.len > 0) try domain.redirects.append(allocator, try parseRedirectRule(allocator, v));
@@ -1551,6 +2061,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainRouteStringProperty(cfg, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "server_route_static_dir.")) |name| {
         try setDomainRouteStringProperty(cfg, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "server_route_max_static_file_bytes.")) |name| {
+        try setDomainRouteMaxStaticFileBytes(cfg, name, v);
+    } else if (findRoutePropertyName(k, "server_route_max_static_bytes.")) |name| {
+        try setDomainRouteMaxStaticFileBytes(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_route_index.")) |name| {
         try setDomainRouteStringProperty(cfg, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "server_route_index_file.")) |name| {
@@ -1595,6 +2109,26 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "server_route_fastcgi_timeout_ms.")) |name| {
         try setDomainRouteU32Property(cfg, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "server_route_upstream_retries.")) |name| {
+        try setDomainRouteUpstreamUsizeProperty(cfg, name, v, .retries);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_max_failures.", "server_route_upstream_max_fails.", "server_route_proxy_max_fails." })) |name| {
+        try setDomainRouteUpstreamUsizeProperty(cfg, name, v, .max_failures);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_fail_timeout_ms.", "server_route_proxy_fail_timeout_ms." })) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_fail_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_health_check.", "server_route_proxy_health_check." })) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .upstream_health_check_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_health_check_path.", "server_route_proxy_health_check_path." })) |name| {
+        try setDomainRouteStringProperty(cfg, allocator, name, v, .upstream_health_check_path);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_health_check_interval_ms.", "server_route_proxy_health_check_interval_ms." })) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_health_check_interval_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_health_check_timeout_ms.", "server_route_proxy_health_check_timeout_ms." })) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_health_check_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_circuit_breaker.", "server_route_proxy_circuit_breaker." })) |name| {
+        try setDomainRouteBoolProperty(cfg, name, v, .upstream_circuit_breaker_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_circuit_half_open_max.", "server_route_proxy_circuit_half_open_max." })) |name| {
+        try setDomainRouteUpstreamUsizeProperty(cfg, name, v, .circuit_half_open_max);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_upstream_slow_start_ms.", "server_route_proxy_slow_start_ms." })) |name| {
+        try setDomainRouteU32Property(cfg, name, v, .upstream_slow_start_ms);
     } else if (findRoutePropertyName(k, "server_route_strip_prefix.")) |name| {
         try setDomainRouteBoolProperty(cfg, name, v, .strip_prefix);
     } else if (findAnyRoutePropertyName(k, &.{ "server_route_compression.", "server_route_compress.", "server_route_encode." })) |name| {
@@ -1605,6 +2139,18 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setDomainRouteCompressionSizeProperty(cfg, name, v, .min_bytes);
     } else if (findAnyRoutePropertyName(k, &.{ "server_route_compression_max_bytes.", "server_route_gzip_max_bytes." })) |name| {
         try setDomainRouteCompressionSizeProperty(cfg, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "server_route_response_cache.")) |name| {
+        try setDomainRouteResponseCacheBoolProperty(cfg, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "server_route_static_response_cache.")) |name| {
+        try setDomainRouteResponseCacheBoolProperty(cfg, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "server_route_response_cache_max_bytes.")) |name| {
+        try setDomainRouteResponseCacheSizeProperty(cfg, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "server_route_response_cache_max_entry_bytes.")) |name| {
+        try setDomainRouteResponseCacheSizeProperty(cfg, name, v, .max_entry_bytes);
+    } else if (findRoutePropertyName(k, "server_route_response_cache_ttl_ms.")) |name| {
+        try setDomainRouteResponseCacheU32Property(cfg, name, v, .ttl_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "server_route_security_headers.", "server_route_security_header_preset.", "server_route_secure_headers." })) |name| {
+        try setDomainRouteSecurityHeadersProperty(cfg, name, v);
     } else if (findRoutePropertyName(k, "server_route_header.")) |name| {
         try appendDomainRouteResponseHeader(cfg, allocator, name, v);
     } else if (findRoutePropertyName(k, "server_route_response_header.")) |name| {
@@ -1625,6 +2171,10 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setRouteStringProperty(&cfg.routes, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "route_static_dir.")) |name| {
         try setRouteStringProperty(&cfg.routes, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_max_static_file_bytes.")) |name| {
+        try setRouteMaxStaticFileBytes(&cfg.routes, name, v);
+    } else if (findRoutePropertyName(k, "route_max_static_bytes.")) |name| {
+        try setRouteMaxStaticFileBytes(&cfg.routes, name, v);
     } else if (findRoutePropertyName(k, "route_index.")) |name| {
         try setRouteStringProperty(&cfg.routes, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "route_index_file.")) |name| {
@@ -1669,6 +2219,26 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_fastcgi_timeout_ms.")) |name| {
         try setRouteU32Property(&cfg.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_upstream_retries.")) |name| {
+        try setRouteUpstreamUsizeProperty(&cfg.routes, name, v, .retries);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_max_failures.", "route_upstream_max_fails.", "route_proxy_max_fails." })) |name| {
+        try setRouteUpstreamUsizeProperty(&cfg.routes, name, v, .max_failures);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_fail_timeout_ms.", "route_proxy_fail_timeout_ms." })) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_fail_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check.", "route_proxy_health_check." })) |name| {
+        try setRouteBoolProperty(&cfg.routes, name, v, .upstream_health_check_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_path.", "route_proxy_health_check_path." })) |name| {
+        try setRouteStringProperty(&cfg.routes, allocator, name, v, .upstream_health_check_path);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_interval_ms.", "route_proxy_health_check_interval_ms." })) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_health_check_interval_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_timeout_ms.", "route_proxy_health_check_timeout_ms." })) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_health_check_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_circuit_breaker.", "route_proxy_circuit_breaker." })) |name| {
+        try setRouteBoolProperty(&cfg.routes, name, v, .upstream_circuit_breaker_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_circuit_half_open_max.", "route_proxy_circuit_half_open_max." })) |name| {
+        try setRouteUpstreamUsizeProperty(&cfg.routes, name, v, .circuit_half_open_max);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_slow_start_ms.", "route_proxy_slow_start_ms." })) |name| {
+        try setRouteU32Property(&cfg.routes, name, v, .upstream_slow_start_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&cfg.routes, name, v, .strip_prefix);
     } else if (findAnyRoutePropertyName(k, &.{ "route_compression.", "route_compress.", "route_encode." })) |name| {
@@ -1679,6 +2249,18 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         try setRouteCompressionSizeProperty(&cfg.routes, name, v, .min_bytes);
     } else if (findAnyRoutePropertyName(k, &.{ "route_compression_max_bytes.", "route_gzip_max_bytes." })) |name| {
         try setRouteCompressionSizeProperty(&cfg.routes, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache.")) |name| {
+        try setRouteResponseCacheBoolProperty(&cfg.routes, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "route_static_response_cache.")) |name| {
+        try setRouteResponseCacheBoolProperty(&cfg.routes, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "route_response_cache_max_bytes.")) |name| {
+        try setRouteResponseCacheSizeProperty(&cfg.routes, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache_max_entry_bytes.")) |name| {
+        try setRouteResponseCacheSizeProperty(&cfg.routes, name, v, .max_entry_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache_ttl_ms.")) |name| {
+        try setRouteResponseCacheU32Property(&cfg.routes, name, v, .ttl_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_security_headers.", "route_security_header_preset.", "route_secure_headers." })) |name| {
+        try setRouteSecurityHeadersProperty(&cfg.routes, name, v);
     } else if (findRoutePropertyName(k, "route_header.")) |name| {
         try appendRouteResponseHeader(&cfg.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
@@ -1824,6 +2406,7 @@ pub fn setDomainStringPropertyDirect(allocator: std.mem.Allocator, domain: *Doma
         .php_fastcgi => domain.php_fastcgi = dupe_value,
         .tls_cert => domain.tls_cert = dupe_value,
         .tls_key => domain.tls_key = dupe_value,
+        .upstream_health_check_path => domain.upstream_health_check_path = dupe_value,
     }
 }
 
@@ -1833,6 +2416,8 @@ pub fn setDomainBoolPropertyDirect(domain: *DomainConfig, value: []const u8, fie
         .serve_static_root => domain.serve_static_root = parsed,
         .php_info_page => domain.php_info_page = parsed,
         .php_front_controller => domain.php_front_controller = parsed,
+        .upstream_health_check_enabled => domain.upstream_health_check_enabled = parsed,
+        .upstream_circuit_breaker_enabled => domain.upstream_circuit_breaker_enabled = parsed,
     }
 }
 
@@ -1850,9 +2435,21 @@ pub fn setDomainUpstreamPolicyPropertyDirect(domain: *DomainConfig, value: []con
 
 pub fn setDomainU32PropertyDirect(domain: *DomainConfig, value: []const u8, field: DomainU32Property) !void {
     const parsed = try parseConfigU32(value);
-    if (parsed == 0) return error.InvalidConfigValue;
     switch (field) {
-        .upstream_timeout_ms => domain.upstream_timeout_ms = parsed,
+        .upstream_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_timeout_ms = parsed;
+        },
+        .upstream_fail_timeout_ms => domain.upstream_fail_timeout_ms = parsed,
+        .upstream_health_check_interval_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_health_check_interval_ms = parsed;
+        },
+        .upstream_health_check_timeout_ms => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_health_check_timeout_ms = parsed;
+        },
+        .upstream_slow_start_ms => domain.upstream_slow_start_ms = parsed,
     }
 }
 
@@ -1873,6 +2470,52 @@ pub fn setDomainCompressionSizePropertyDirect(domain: *DomainConfig, value: []co
     }
 }
 
+pub fn setDomainResponseCacheBoolPropertyDirect(domain: *DomainConfig, value: []const u8, field: ResponseCacheBoolProperty) !void {
+    const parsed = try parseConfigBool(value);
+    switch (field) {
+        .enabled => domain.response_cache_enabled = parsed,
+    }
+}
+
+pub fn setDomainResponseCacheSizePropertyDirect(domain: *DomainConfig, value: []const u8, field: ResponseCacheSizeProperty) !void {
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .max_bytes => domain.response_cache_max_bytes = parsed,
+        .max_entry_bytes => domain.response_cache_max_entry_bytes = parsed,
+    }
+}
+
+pub fn setDomainResponseCacheU32PropertyDirect(domain: *DomainConfig, value: []const u8, field: ResponseCacheU32Property) !void {
+    const parsed = try parseConfigU32(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    switch (field) {
+        .ttl_ms => domain.response_cache_ttl_ms = parsed,
+    }
+}
+
+pub fn setDomainSecurityHeadersPropertyDirect(domain: *DomainConfig, value: []const u8) !void {
+    domain.security_headers = try parseSecurityHeaderPreset(value);
+}
+
+pub fn setDomainMaxStaticFileBytesDirect(domain: *DomainConfig, value: []const u8) !void {
+    const parsed = try parseConfigUsize(value);
+    if (parsed == 0) return error.InvalidConfigValue;
+    domain.max_static_file_bytes = parsed;
+}
+
+pub fn setDomainUpstreamUsizePropertyDirect(domain: *DomainConfig, value: []const u8, field: UpstreamUsizeProperty) !void {
+    const parsed = try parseConfigUsize(value);
+    switch (field) {
+        .retries => domain.upstream_retries = parsed,
+        .max_failures => domain.upstream_max_failures = parsed,
+        .circuit_half_open_max => {
+            if (parsed == 0) return error.InvalidConfigValue;
+            domain.upstream_circuit_half_open_max = parsed;
+        },
+    }
+}
+
 pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     const k = std.mem.trim(u8, key, " \t\r\n");
     const v = trimValue(value);
@@ -1884,6 +2527,8 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try appendServerNames(allocator, domain, v);
     } else if (std.mem.eql(u8, k, "root") or std.mem.eql(u8, k, "dir") or std.mem.eql(u8, k, "static_dir") or std.mem.eql(u8, k, "server_root")) {
         try setDomainStringPropertyDirect(allocator, domain, v, .static_dir);
+    } else if (std.mem.eql(u8, k, "max_static_file_bytes") or std.mem.eql(u8, k, "max_static_bytes")) {
+        try setDomainMaxStaticFileBytesDirect(domain, v);
     } else if (std.mem.eql(u8, k, "index") or std.mem.eql(u8, k, "index_file") or std.mem.eql(u8, k, "server_index")) {
         try setDomainStringPropertyDirect(allocator, domain, v, .index_file);
     } else if (std.mem.eql(u8, k, "serve_static") or std.mem.eql(u8, k, "serve_static_root")) {
@@ -1910,6 +2555,26 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setDomainUpstreamPolicyPropertyDirect(domain, v);
     } else if (std.mem.eql(u8, k, "upstream_timeout_ms") or std.mem.eql(u8, k, "proxy_timeout_ms") or std.mem.eql(u8, k, "php_timeout_ms") or std.mem.eql(u8, k, "fastcgi_timeout_ms")) {
         try setDomainU32PropertyDirect(domain, v, .upstream_timeout_ms);
+    } else if (std.mem.eql(u8, k, "upstream_retries") or std.mem.eql(u8, k, "proxy_retries")) {
+        try setDomainUpstreamUsizePropertyDirect(domain, v, .retries);
+    } else if (std.mem.eql(u8, k, "upstream_max_failures") or std.mem.eql(u8, k, "upstream_max_fails") or std.mem.eql(u8, k, "proxy_max_fails")) {
+        try setDomainUpstreamUsizePropertyDirect(domain, v, .max_failures);
+    } else if (std.mem.eql(u8, k, "upstream_fail_timeout_ms") or std.mem.eql(u8, k, "proxy_fail_timeout_ms")) {
+        try setDomainU32PropertyDirect(domain, v, .upstream_fail_timeout_ms);
+    } else if (std.mem.eql(u8, k, "upstream_health_check") or std.mem.eql(u8, k, "upstream_health_check_enabled") or std.mem.eql(u8, k, "proxy_health_check")) {
+        try setDomainBoolPropertyDirect(domain, v, .upstream_health_check_enabled);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_path") or std.mem.eql(u8, k, "proxy_health_check_path")) {
+        try setDomainStringPropertyDirect(allocator, domain, v, .upstream_health_check_path);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_interval_ms") or std.mem.eql(u8, k, "proxy_health_check_interval_ms")) {
+        try setDomainU32PropertyDirect(domain, v, .upstream_health_check_interval_ms);
+    } else if (std.mem.eql(u8, k, "upstream_health_check_timeout_ms") or std.mem.eql(u8, k, "proxy_health_check_timeout_ms")) {
+        try setDomainU32PropertyDirect(domain, v, .upstream_health_check_timeout_ms);
+    } else if (std.mem.eql(u8, k, "upstream_circuit_breaker") or std.mem.eql(u8, k, "upstream_circuit_breaker_enabled") or std.mem.eql(u8, k, "proxy_circuit_breaker")) {
+        try setDomainBoolPropertyDirect(domain, v, .upstream_circuit_breaker_enabled);
+    } else if (std.mem.eql(u8, k, "upstream_circuit_half_open_max") or std.mem.eql(u8, k, "proxy_circuit_half_open_max")) {
+        try setDomainUpstreamUsizePropertyDirect(domain, v, .circuit_half_open_max);
+    } else if (std.mem.eql(u8, k, "upstream_slow_start_ms") or std.mem.eql(u8, k, "proxy_slow_start_ms")) {
+        try setDomainU32PropertyDirect(domain, v, .upstream_slow_start_ms);
     } else if (isCompressionEnabledKey(k)) {
         try setDomainCompressionBoolPropertyDirect(domain, v, .enabled);
     } else if (isGzipEnabledKey(k)) {
@@ -1918,6 +2583,16 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setDomainCompressionSizePropertyDirect(domain, v, .min_bytes);
     } else if (isCompressionMaxBytesKey(k)) {
         try setDomainCompressionSizePropertyDirect(domain, v, .max_bytes);
+    } else if (std.mem.eql(u8, k, "response_cache") or std.mem.eql(u8, k, "static_response_cache")) {
+        try setDomainResponseCacheBoolPropertyDirect(domain, v, .enabled);
+    } else if (std.mem.eql(u8, k, "response_cache_max_bytes") or std.mem.eql(u8, k, "static_response_cache_max_bytes")) {
+        try setDomainResponseCacheSizePropertyDirect(domain, v, .max_bytes);
+    } else if (std.mem.eql(u8, k, "response_cache_max_entry_bytes") or std.mem.eql(u8, k, "static_response_cache_max_entry_bytes")) {
+        try setDomainResponseCacheSizePropertyDirect(domain, v, .max_entry_bytes);
+    } else if (std.mem.eql(u8, k, "response_cache_ttl_ms") or std.mem.eql(u8, k, "static_response_cache_ttl_ms")) {
+        try setDomainResponseCacheU32PropertyDirect(domain, v, .ttl_ms);
+    } else if (std.mem.eql(u8, k, "security_headers") or std.mem.eql(u8, k, "security_header_preset") or std.mem.eql(u8, k, "secure_headers")) {
+        try setDomainSecurityHeadersPropertyDirect(domain, v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try domain.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
@@ -1934,6 +2609,10 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setRouteStringProperty(&domain.routes, allocator, name, v, .static_dir);
     } else if (findRoutePropertyName(k, "route_static_dir.")) |name| {
         try setRouteStringProperty(&domain.routes, allocator, name, v, .static_dir);
+    } else if (findRoutePropertyName(k, "route_max_static_file_bytes.")) |name| {
+        try setRouteMaxStaticFileBytes(&domain.routes, name, v);
+    } else if (findRoutePropertyName(k, "route_max_static_bytes.")) |name| {
+        try setRouteMaxStaticFileBytes(&domain.routes, name, v);
     } else if (findRoutePropertyName(k, "route_index.")) |name| {
         try setRouteStringProperty(&domain.routes, allocator, name, v, .index_file);
     } else if (findRoutePropertyName(k, "route_index_file.")) |name| {
@@ -1978,6 +2657,26 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
     } else if (findRoutePropertyName(k, "route_fastcgi_timeout_ms.")) |name| {
         try setRouteU32Property(&domain.routes, name, v, .upstream_timeout_ms);
+    } else if (findRoutePropertyName(k, "route_upstream_retries.")) |name| {
+        try setRouteUpstreamUsizeProperty(&domain.routes, name, v, .retries);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_max_failures.", "route_upstream_max_fails.", "route_proxy_max_fails." })) |name| {
+        try setRouteUpstreamUsizeProperty(&domain.routes, name, v, .max_failures);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_fail_timeout_ms.", "route_proxy_fail_timeout_ms." })) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_fail_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check.", "route_proxy_health_check." })) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .upstream_health_check_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_path.", "route_proxy_health_check_path." })) |name| {
+        try setRouteStringProperty(&domain.routes, allocator, name, v, .upstream_health_check_path);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_interval_ms.", "route_proxy_health_check_interval_ms." })) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_health_check_interval_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_health_check_timeout_ms.", "route_proxy_health_check_timeout_ms." })) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_health_check_timeout_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_circuit_breaker.", "route_proxy_circuit_breaker." })) |name| {
+        try setRouteBoolProperty(&domain.routes, name, v, .upstream_circuit_breaker_enabled);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_circuit_half_open_max.", "route_proxy_circuit_half_open_max." })) |name| {
+        try setRouteUpstreamUsizeProperty(&domain.routes, name, v, .circuit_half_open_max);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_upstream_slow_start_ms.", "route_proxy_slow_start_ms." })) |name| {
+        try setRouteU32Property(&domain.routes, name, v, .upstream_slow_start_ms);
     } else if (findRoutePropertyName(k, "route_strip_prefix.")) |name| {
         try setRouteBoolProperty(&domain.routes, name, v, .strip_prefix);
     } else if (findAnyRoutePropertyName(k, &.{ "route_compression.", "route_compress.", "route_encode." })) |name| {
@@ -1988,6 +2687,18 @@ pub fn applyDomainConfigLine(domain: *DomainConfig, allocator: std.mem.Allocator
         try setRouteCompressionSizeProperty(&domain.routes, name, v, .min_bytes);
     } else if (findAnyRoutePropertyName(k, &.{ "route_compression_max_bytes.", "route_gzip_max_bytes." })) |name| {
         try setRouteCompressionSizeProperty(&domain.routes, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache.")) |name| {
+        try setRouteResponseCacheBoolProperty(&domain.routes, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "route_static_response_cache.")) |name| {
+        try setRouteResponseCacheBoolProperty(&domain.routes, name, v, .enabled);
+    } else if (findRoutePropertyName(k, "route_response_cache_max_bytes.")) |name| {
+        try setRouteResponseCacheSizeProperty(&domain.routes, name, v, .max_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache_max_entry_bytes.")) |name| {
+        try setRouteResponseCacheSizeProperty(&domain.routes, name, v, .max_entry_bytes);
+    } else if (findRoutePropertyName(k, "route_response_cache_ttl_ms.")) |name| {
+        try setRouteResponseCacheU32Property(&domain.routes, name, v, .ttl_ms);
+    } else if (findAnyRoutePropertyName(k, &.{ "route_security_headers.", "route_security_header_preset.", "route_secure_headers." })) |name| {
+        try setRouteSecurityHeadersProperty(&domain.routes, name, v);
     } else if (findRoutePropertyName(k, "route_header.")) |name| {
         try appendRouteResponseHeader(&domain.routes, allocator, name, v);
     } else if (findRoutePropertyName(k, "route_response_header.")) |name| {
@@ -2088,6 +2799,25 @@ fn validateDomainCompressionOverrides(domain: *const DomainConfig) !void {
     }
 }
 
+fn validateResponseCachePolicy(policy: ResponseCachePolicy) !void {
+    if (!policy.enabled) return;
+    if (policy.max_bytes == 0) return error.InvalidConfigValue;
+    if (policy.max_entry_bytes == 0) return error.InvalidConfigValue;
+    if (policy.max_entry_bytes > policy.max_bytes) return error.InvalidConfigValue;
+    if (policy.ttl_ms == 0) return error.InvalidConfigValue;
+}
+
+fn validateUpstreamRuntimePolicy(policy: UpstreamRuntimePolicy) !void {
+    if (policy.timeout_ms == 0) return error.InvalidConfigValue;
+    if (policy.max_failures > 0 and policy.fail_timeout_ms == 0) return error.InvalidConfigValue;
+    if (policy.health_check_enabled) {
+        if (policy.health_check_path.len == 0 or policy.health_check_path[0] != '/') return error.InvalidConfigValue;
+        if (policy.health_check_interval_ms == 0) return error.InvalidConfigValue;
+        if (policy.health_check_timeout_ms == 0) return error.InvalidConfigValue;
+    }
+    if (policy.circuit_breaker_enabled and policy.circuit_half_open_max == 0) return error.InvalidConfigValue;
+}
+
 pub fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?UpstreamPoolConfig) !void {
     if (!isRouteNameValid(route.name)) return error.InvalidConfigValue;
     if (route.pattern.len == 0 or route.pattern[0] != '/') return error.InvalidConfigValue;
@@ -2118,6 +2848,9 @@ pub fn validateRouteConfig(route: *const RouteConfig, fallback_upstream: ?Upstre
     if (route.upstream_timeout_ms) |timeout_ms| {
         if (timeout_ms == 0) return error.InvalidConfigValue;
     }
+    if (route.max_static_file_bytes) |limit| {
+        if (limit == 0) return error.InvalidConfigValue;
+    }
     try validateRouteCompressionOverrides(route);
 }
 
@@ -2146,12 +2879,8 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         if (std.mem.indexOfAny(u8, cfg.access_log_path, "\r\n\x00") != null) return error.InvalidConfigValue;
     }
     try validateCompressionPolicy(compressionPolicyFromConfig(cfg));
-    if (cfg.response_cache_enabled) {
-        if (cfg.response_cache_max_bytes == 0) return error.InvalidConfigValue;
-        if (cfg.response_cache_max_entry_bytes == 0) return error.InvalidConfigValue;
-        if (cfg.response_cache_max_entry_bytes > cfg.response_cache_max_bytes) return error.InvalidConfigValue;
-        if (cfg.response_cache_ttl_ms == 0) return error.InvalidConfigValue;
-    }
+    try validateResponseCachePolicy(responseCachePolicyFromConfig(cfg));
+    try validateUpstreamRuntimePolicy(upstreamRuntimePolicyFromConfig(cfg));
     if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
     if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
@@ -2196,6 +2925,8 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     for (cfg.routes.items) |*route| {
         try validateRouteConfig(route, cfg.upstream);
         try validateCompressionPolicy(compressionPolicyFor(cfg, null, route));
+        try validateResponseCachePolicy(responseCachePolicyFor(cfg, null, route));
+        try validateUpstreamRuntimePolicy(upstreamRuntimePolicyFor(cfg, null, route));
     }
 
     for (cfg.domains.items) |*domain| {
@@ -2229,13 +2960,20 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         if (domain.upstream_timeout_ms) |timeout_ms| {
             if (timeout_ms == 0) return error.InvalidConfigValue;
         }
+        if (domain.max_static_file_bytes) |limit| {
+            if (limit == 0) return error.InvalidConfigValue;
+        }
         try validateDomainCompressionOverrides(domain);
         try validateCompressionPolicy(compressionPolicyFor(cfg, domain, null));
+        try validateResponseCachePolicy(responseCachePolicyFor(cfg, domain, null));
+        try validateUpstreamRuntimePolicy(upstreamRuntimePolicyFor(cfg, domain, null));
 
         const fallback_upstream = if (domain.upstream) |upstream| upstream else cfg.upstream;
         for (domain.routes.items) |*route| {
             try validateRouteConfig(route, fallback_upstream);
             try validateCompressionPolicy(compressionPolicyFor(cfg, domain, route));
+            try validateResponseCachePolicy(responseCachePolicyFor(cfg, domain, route));
+            try validateUpstreamRuntimePolicy(upstreamRuntimePolicyFor(cfg, domain, route));
         }
     }
 }

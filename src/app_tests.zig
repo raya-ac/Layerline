@@ -68,6 +68,8 @@ const upstreamRecordFailure = upstream_mod.upstreamRecordFailure;
 const upstreamRecordSuccess = upstream_mod.upstreamRecordSuccess;
 const upstreamIsEjected = upstream_mod.upstreamIsEjected;
 const upstreamStartTicket = upstream_mod.upstreamStartTicket;
+const upstreamRuntimePolicyFromConfig = config_mod.upstreamRuntimePolicyFromConfig;
+const upstreamRuntimePolicyFor = config_mod.upstreamRuntimePolicyFor;
 const HttpRequest = request_mod.HttpRequest;
 
 test "parses FastCGI tcp and unix endpoints" {
@@ -235,21 +237,22 @@ test "named routes prefer exact and longest prefix matches" {
 
     var breaker_target = try parseUpstream(allocator, "http://127.0.0.1:9200");
     breaker_target.weight = 5;
+    const runtime_policy = upstreamRuntimePolicyFromConfig(&cfg);
     try std.testing.expect(upstreamRecordFailure(&breaker_target, 10_000, 1, 500));
     try std.testing.expect(upstreamIsEjected(&breaker_target, 10_250));
-    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_250, &cfg) == null);
-    const half_open_1 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
-    const half_open_2 = upstreamBeginAttempt(&breaker_target, 10_500, &cfg) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_250, &runtime_policy) == null);
+    const half_open_1 = upstreamBeginAttempt(&breaker_target, 10_500, &runtime_policy) orelse return error.TestUnexpectedResult;
+    const half_open_2 = upstreamBeginAttempt(&breaker_target, 10_500, &runtime_policy) orelse return error.TestUnexpectedResult;
     try std.testing.expect(half_open_1.half_open);
     try std.testing.expect(half_open_2.half_open);
-    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_500, &cfg) == null);
+    try std.testing.expect(upstreamBeginAttempt(&breaker_target, 10_500, &runtime_policy) == null);
     upstreamEndAttempt(&breaker_target, half_open_2);
     upstreamEndAttempt(&breaker_target, half_open_1);
     upstreamRecordSuccess(&breaker_target, 10_550, cfg.upstream_slow_start_ms);
     try std.testing.expect(!upstreamIsEjected(&breaker_target, 10_551));
-    try std.testing.expect(upstreamInSlowStart(&breaker_target, 10_551, &cfg));
-    try std.testing.expectEqual(@as(usize, 1), upstreamEffectiveWeight(&breaker_target, 10_551, &cfg));
-    try std.testing.expectEqual(@as(usize, 5), upstreamEffectiveWeight(&breaker_target, 16_550, &cfg));
+    try std.testing.expect(upstreamInSlowStart(&breaker_target, 10_551, &runtime_policy));
+    try std.testing.expectEqual(@as(usize, 1), upstreamEffectiveWeight(&breaker_target, 10_551, &runtime_policy));
+    try std.testing.expectEqual(@as(usize, 5), upstreamEffectiveWeight(&breaker_target, 16_550, &runtime_policy));
 
     try applyConfigLine(&cfg, allocator, "route_proxy.health", "http://127.0.0.1:9101");
     const health_route = findNamedRouteMutable(&cfg, "/health").?;
@@ -371,6 +374,55 @@ test "cache stale shortcuts inherit through domain and route scopes" {
     try std.testing.expect(headersContainRule(domain_route_context.items, "Cache-Control", "stale-while-revalidate=15"));
 
     try std.testing.expectError(error.InvalidConfigValue, applyConfigLine(&cfg, allocator, "route_stale_if_error.assets", "0"));
+}
+
+test "route-local policy overrides cache security and upstream health settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = defaultServerConfig();
+    try applyConfigLine(&cfg, allocator, "response_cache", "true");
+    try applyConfigLine(&cfg, allocator, "response_cache_ttl_ms", "60000");
+    try applyConfigLine(&cfg, allocator, "security_headers", "basic");
+    try applyConfigLine(&cfg, allocator, "route", "assets /assets/* static");
+    try applyConfigLine(&cfg, allocator, "route_response_cache.assets", "false");
+    try applyConfigLine(&cfg, allocator, "route_security_headers.assets", "strict");
+    try applyConfigLine(&cfg, allocator, "route_max_static_file_bytes.assets", "2048");
+    try applyConfigLine(&cfg, allocator, "route", "api /api/* proxy");
+    try applyConfigLine(&cfg, allocator, "route_proxy.api", "http://127.0.0.1:9100");
+    try applyConfigLine(&cfg, allocator, "route_upstream_retries.api", "3");
+    try applyConfigLine(&cfg, allocator, "route_upstream_max_failures.api", "4");
+    try applyConfigLine(&cfg, allocator, "route_upstream_fail_timeout_ms.api", "250");
+    try applyConfigLine(&cfg, allocator, "route_upstream_health_check.api", "true");
+    try applyConfigLine(&cfg, allocator, "route_upstream_health_check_path.api", "/ready");
+    try applyConfigLine(&cfg, allocator, "route_upstream_health_check_interval_ms.api", "1500");
+    try applyConfigLine(&cfg, allocator, "route_upstream_health_check_timeout_ms.api", "300");
+    try applyConfigLine(&cfg, allocator, "route_upstream_circuit_breaker.api", "false");
+    try applyConfigLine(&cfg, allocator, "route_upstream_slow_start_ms.api", "0");
+
+    const assets_route = findNamedRoute(&cfg, "/assets/app.css").?;
+    const cache_policy = static_cache.policyForConfig(&cfg, null, assets_route);
+    try std.testing.expect(!cache_policy.enabled);
+    try std.testing.expectEqual(@as(usize, 2048), config_mod.maxStaticFileBytesFor(&cfg, null, assets_route));
+
+    const headers = try buildResponseHeaderContext(allocator, &cfg, null, assets_route);
+    defer headers.deinit(allocator);
+    try std.testing.expect(headersContainRule(headers.items, "Content-Security-Policy", "default-src 'self'; base-uri 'self'; frame-ancestors 'none'"));
+
+    const api_route = findNamedRoute(&cfg, "/api/status").?;
+    const upstream_policy = upstreamRuntimePolicyFor(&cfg, null, api_route);
+    try std.testing.expectEqual(@as(u32, config_mod.DEFAULT_UPSTREAM_TIMEOUT_MS), upstream_policy.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 3), upstream_policy.retries);
+    try std.testing.expectEqual(@as(usize, 4), upstream_policy.max_failures);
+    try std.testing.expectEqual(@as(u32, 250), upstream_policy.fail_timeout_ms);
+    try std.testing.expect(upstream_policy.health_check_enabled);
+    try std.testing.expectEqualStrings("/ready", upstream_policy.health_check_path);
+    try std.testing.expectEqual(@as(u32, 1500), upstream_policy.health_check_interval_ms);
+    try std.testing.expectEqual(@as(u32, 300), upstream_policy.health_check_timeout_ms);
+    try std.testing.expect(!upstream_policy.circuit_breaker_enabled);
+    try std.testing.expectEqual(@as(u32, 0), upstream_policy.slow_start_ms);
+    try std.testing.expect(config_mod.configCanRunHealthChecks(&cfg));
 }
 
 test "php front controller target keeps script and path info separate" {
