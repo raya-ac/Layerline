@@ -11,11 +11,11 @@ const cli_output = @import("cli_output.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
 const custom_errors = @import("custom_errors.zig");
-const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
 const http2_content = @import("http2_content.zig");
 const http2_router = @import("http2_router.zig");
+const http2_runtime = @import("http2_runtime.zig");
 const http2_upstream = @import("http2_upstream.zig");
 const http1_router = @import("http1_router.zig");
 const http1_responses = @import("http1_responses.zig");
@@ -23,7 +23,6 @@ const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
-const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const php_runtime = @import("php_runtime.zig");
@@ -31,7 +30,6 @@ const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
-const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
@@ -65,7 +63,6 @@ const domainUpstreamTimeoutMs = routing_mod.domainUpstreamTimeoutMs;
 const routeUpstreamTimeoutMs = routing_mod.routeUpstreamTimeoutMs;
 const findDomainRoute = routing_mod.findDomainRoute;
 const routeFileRelativePath = routing_mod.routeFileRelativePath;
-const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
 const AdminCredentials = admin_support.AdminCredentials;
 const adminPathMatches = admin_support.adminPathMatches;
@@ -95,7 +92,6 @@ const streamRead = stream_runtime.streamRead;
 const streamWriteAll = stream_runtime.streamWriteAll;
 const ConcurrencyState = concurrency_mod.State;
 const H2BufferedResponse = h2_support.BufferedResponse;
-const H2PendingReader = h2_support.PendingReader;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
 const UpstreamConfig = config_mod.UpstreamConfig;
@@ -636,68 +632,26 @@ fn handleTlsClientHelloProbe(
     try tls_accept.handleClientHelloProbe(io, stream, allocator, cfg, prefill, process_env, tlsAcceptCallbacks());
 }
 
-fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, response: H2BufferedResponse, is_head: bool) !void {
-    var header_block = std.ArrayList(u8).empty;
-    defer header_block.deinit(allocator);
-
-    const prepared = try response_body.prepare(allocator, .{
-        .status_code = response.status_code,
-        .content_type = response.content_type,
-        .body = response.body,
-        .is_head = is_head,
-        .h2_headers = response.headers,
+fn http2SendContext() http2_runtime.SendContext {
+    return .{
+        .server_header = SERVER_HEADER,
+        .request_id = current_request_id,
         .request_headers = current_request_headers,
         .response_headers = current_response_headers,
         .compression_policy = current_compression_policy,
         .compression_work_buffer_bytes = DEFAULT_COMPRESSION_WORK_BUFFER_BYTES,
         .metrics = &server_metrics,
-    });
-    defer prepared.deinit(allocator);
+        .stream_write_all = streamWriteAll,
+        .record_response_sent = recordResponseSent,
+    };
+}
 
-    try h2_native.appendStatus(allocator, &header_block, response.status_code);
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 54, SERVER_HEADER);
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 31, response.content_type);
-
-    var len_buf: [32]u8 = undefined;
-    const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
-    const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{body_len});
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
-    if (current_request_id.len > 0) {
-        try h2_support.appendHeader(allocator, &header_block, "x-request-id", current_request_id);
-    }
-
-    for (response.headers) |header| {
-        if (h2_support.isSkippedResponseHeader(header.name)) continue;
-        try h2_support.appendHeader(allocator, &header_block, header.name, header.value);
-    }
-    if (prepared.encoding) |encoding| {
-        try h2_support.appendHeader(allocator, &header_block, "content-encoding", encoding);
-        try h2_support.appendHeader(allocator, &header_block, "vary", "Accept-Encoding");
-    }
-    for (current_response_headers) |header| {
-        if (h2_support.isSkippedResponseHeader(header.name)) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "x-request-id")) continue;
-        try h2_support.appendHeader(allocator, &header_block, header.name, header.value);
-    }
-
-    const header_flags = h2_native.FLAG_END_HEADERS | if (body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0);
-    try h2_support.sendFrame(stream, h2_native.FRAME_HEADERS, header_flags, stream_id, header_block.items, streamWriteAll);
-
-    if (body_len > 0) {
-        var sent: usize = 0;
-        while (sent < body_len) {
-            const chunk_len = @min(@as(usize, 16 * 1024), body_len - sent);
-            const flags = if (sent + chunk_len == body_len) h2_native.FLAG_END_STREAM else @as(u8, 0);
-            try h2_support.sendFrame(stream, h2_native.FRAME_DATA, flags, stream_id, prepared.body[sent .. sent + chunk_len], streamWriteAll);
-            sent += chunk_len;
-        }
-    }
-
-    recordResponseSent(response.status_code, body_len);
+fn sendHttp2Response(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, response: H2BufferedResponse, is_head: bool) !void {
+    try http2_runtime.sendResponse(stream, allocator, stream_id, response, is_head, http2SendContext());
 }
 
 fn h2CoolErrorResponse(allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, detail: []const u8) !H2BufferedResponse {
-    return http2_content.coolErrorResponse(allocator, SERVER_NAME, SERVER_TAGLINE, status_code, status_text, detail);
+    return http2_runtime.coolErrorResponse(allocator, SERVER_NAME, SERVER_TAGLINE, status_code, status_text, detail);
 }
 
 fn h2DomainCustomNotFoundResponse(
@@ -729,6 +683,36 @@ fn buildHttp2ResponseForRequest(io: std.Io, allocator: std.mem.Allocator, cfg: *
     return http2_router.buildResponseForRequest(io, allocator, cfg, req, process_env, http2RouterCallbacks());
 }
 
+fn setHttp2RequestContext(headers: []const u8, request_id: []const u8, policy: CompressionPolicy) void {
+    current_request_headers = headers;
+    current_request_id = request_id;
+    current_compression_policy = policy;
+}
+
+fn clearHttp2RequestContext() void {
+    current_request_headers = "";
+    current_request_id = "";
+    current_compression_policy = .disabled;
+    current_response_headers = &.{};
+}
+
+fn http2CompleteContext() http2_runtime.CompleteContext {
+    return .{
+        .metrics = &server_metrics,
+        .resolve_request_id = resolveRequestId,
+        .set_request_context = setHttp2RequestContext,
+        .clear_request_context = clearHttp2RequestContext,
+        .set_access_context = setAccessLogContext,
+        .clear_access_context = clearAccessLogContext,
+        .access_log_set_handler = accessLogSetHandler,
+        .access_log_set_error = accessLogSetError,
+        .emit_access_log = emitAccessLog,
+        .build_response_for_request = buildHttp2ResponseForRequest,
+        .cool_error_response = h2CoolErrorResponse,
+        .send_response = sendHttp2Response,
+    };
+}
+
 fn sendCompletedHttp2Request(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -738,42 +722,7 @@ fn sendCompletedHttp2Request(
     stream_id: u32,
     req: HttpRequest,
 ) !void {
-    current_request_headers = req.headers;
-    current_compression_policy = compressionPolicyFromConfig(cfg);
-    defer {
-        current_request_headers = "";
-        current_request_id = "";
-        current_compression_policy = .disabled;
-        current_response_headers = &.{};
-    }
-    const request_id = try request_id_generator.resolve(io, allocator, req.headers);
-    current_request_id = request_id;
-
-    var access_ctx = access_log_mod.Context{
-        .enabled = cfg.access_log_enabled,
-        .sink = cfg.access_log_path,
-        .method = req.method,
-        .path = req.path,
-        .query = req.query,
-        .protocol = req.version,
-        .host = findHeaderValue(req.headers, "Host") orelse "",
-        .request_id = request_id,
-        .start_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
-    };
-    current_access_log = &access_ctx;
-    defer current_access_log = null;
-
-    server_metrics.requestStarted();
-    accessLogSetHandler("h2");
-    const response = buildHttp2ResponseForRequest(io, allocator, cfg, req, process_env) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => blk: {
-            accessLogSetError(@errorName(err));
-            break :blk try h2CoolErrorResponse(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request.");
-        },
-    };
-    try sendHttp2Response(stream, allocator, stream_id, response, std.mem.eql(u8, req.method, "HEAD"));
-    if (!access_ctx.logged) emitAccessLog(0, 0);
+    try http2_runtime.completeRequest(io, stream, allocator, cfg, process_env, stream_id, req, http2CompleteContext());
 }
 
 fn http2Callbacks() h2_server.Callbacks {
@@ -816,6 +765,21 @@ fn http2UpstreamCallbacks() http2_upstream.Callbacks {
     };
 }
 
+fn http2ConnectionContext() http2_runtime.ConnectionContext {
+    return .{
+        .server_header = SERVER_HEADER,
+        .stream_read = streamRead,
+        .stream_write_all = streamWriteAll,
+        .write_request_id_header = streamWriteRequestIdHeader,
+        .record_response_sent = recordResponseSent,
+        .send_cool_error_with_connection = sendCoolErrorWithConnection,
+        .build_response_for_request = buildHttp2ResponseForRequest,
+        .cool_error_response = h2CoolErrorResponse,
+        .send_response = sendHttp2Response,
+        .frame_callbacks = http2Callbacks(),
+    };
+}
+
 fn handleHttp2Preface(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -824,19 +788,7 @@ fn handleHttp2Preface(
     prefill: []const u8,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    var reader = H2PendingReader{
-        .stream = stream,
-        .pending = prefill,
-        .read = streamRead,
-    };
-    h2_support.readClientPreface(&reader) catch {
-        try sendCoolErrorWithConnection(stream, allocator, 400, "Bad Request", "Invalid HTTP/2 connection preface.", true, false, null);
-        return;
-    };
-
-    try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", streamWriteAll);
-    std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
-    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, http2Callbacks());
+    try http2_runtime.handlePreface(io, stream, allocator, cfg, prefill, process_env, http2ConnectionContext());
 }
 
 fn handleHttp2Upgrade(
@@ -847,39 +799,7 @@ fn handleHttp2Upgrade(
     req: HttpRequest,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    try streamWriteAll(
-        stream,
-        "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Upgrade: h2c\r\n",
-    );
-    try streamWriteRequestIdHeader(stream);
-    try streamWriteAll(stream, "\r\n");
-    recordResponseSent(101, 0);
-
-    try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", streamWriteAll);
-
-    var reader = H2PendingReader{
-        .stream = stream,
-        .pending = req.h2c_upgrade_tail,
-        .read = streamRead,
-    };
-    h2_support.readClientPreface(&reader) catch {
-        try h2_support.sendFrame(stream, h2_native.FRAME_GOAWAY, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x01", streamWriteAll);
-        return;
-    };
-
-    var h2_req = req;
-    h2_req.version = "HTTP/2.0";
-    h2_req.close_connection = true;
-    std.debug.print("HTTP/2 h2c upgrade {s} {s}\n", .{ h2_req.method, h2_req.path });
-    const response = buildHttp2ResponseForRequest(io, allocator, cfg, h2_req, process_env) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => try h2CoolErrorResponse(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 upgrade request."),
-    };
-    try sendHttp2Response(stream, allocator, 1, response, std.mem.eql(u8, h2_req.method, "HEAD"));
-    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, http2Callbacks());
+    try http2_runtime.handleUpgrade(io, stream, allocator, cfg, req, process_env, http2ConnectionContext());
 }
 
 fn isHttpUpgradeRequest(req: HttpRequest) bool {
