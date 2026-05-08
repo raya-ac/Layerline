@@ -13,6 +13,7 @@ const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
+const http1_router = @import("http1_router.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
@@ -3675,6 +3676,56 @@ test "passive upstream health ejects and recovers targets" {
     try std.testing.expect(!upstreamIsEjected(&upstream, 1_401));
 }
 
+fn setHttp1RequestContext(headers: []const u8, policy: CompressionPolicy) void {
+    current_request_headers = headers;
+    current_compression_policy = policy;
+}
+
+fn clearHttp1RequestContext() void {
+    current_request_headers = "";
+    current_compression_policy = .disabled;
+}
+
+fn setHttp1ResponseHeaders(headers: []const ResponseHeaderRule) void {
+    current_response_headers = headers;
+}
+
+fn clearHttp1ResponseHeaders() void {
+    current_response_headers = &.{};
+}
+
+fn routeAdminUi(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
+    try admin_runtime.handleUi(io, stream, allocator, cfg, req, close_connection, is_head, adminCallbacks());
+}
+
+fn http1RouterCallbacks() http1_router.Callbacks {
+    return .{
+        .access_log_set_handler = accessLogSetHandler,
+        .clear_request_context = clearHttp1RequestContext,
+        .clear_response_headers = clearHttp1ResponseHeaders,
+        .forward_to_upstream_pool = forwardToUpstreamPool,
+        .handle_admin_ui = routeAdminUi,
+        .handle_named_route = handleNamedRoute,
+        .handle_php_front_controller = handlePhpFrontController,
+        .handle_php_script = handlePhpScript,
+        .send_configured_redirect = sendConfiguredRedirect,
+        .send_domain_custom_not_found = sendDomainCustomNotFoundForMethod,
+        .send_method_not_allowed = sendMethodNotAllowedWithAllow,
+        .send_metrics = sendMetrics,
+        .send_not_found_for_method = sendNotFoundForMethod,
+        .send_not_found_with_connection = sendNotFoundWithConnection,
+        .send_not_implemented = sendNotImplemented,
+        .send_response = sendResponseWithConnection,
+        .send_response_for_method = sendResponseForMethod,
+        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
+        .send_server_icon = sendServerIcon,
+        .serve_acme_challenge = serveAcmeChallenge,
+        .serve_static = serveStatic,
+        .set_request_context = setHttp1RequestContext,
+        .set_response_headers = setHttp1ResponseHeaders,
+    };
+}
+
 fn routeRequest(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -3683,259 +3734,7 @@ fn routeRequest(
     req: HttpRequest,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    // Route locally first, then fall back to proxying so known endpoints stay predictable.
-    const should_close = req.close_connection;
-    const method = req.method;
-    const is_head = std.mem.eql(u8, method, "HEAD");
-    const domain = findDomainForRequestMutable(cfg, req.headers);
-    current_request_headers = req.headers;
-    current_compression_policy = compressionPolicyFromConfig(cfg);
-    defer {
-        current_request_headers = "";
-        current_compression_policy = .disabled;
-    }
-
-    const base_header_context = try buildResponseHeaderContext(allocator, cfg, domain, null);
-    defer base_header_context.deinit(allocator);
-    current_response_headers = base_header_context.items;
-    defer current_response_headers = &.{};
-
-    if (cfg.admin_ui_enabled and adminPathMatches(cfg.admin_ui_path, req.path)) {
-        accessLogSetHandler("admin_ui");
-        try admin_runtime.handleUi(io, stream, allocator, cfg, req, should_close, is_head, adminCallbacks());
-        return;
-    }
-
-    if (findDomainRedirectRule(domain, req.path)) |redirect| {
-        accessLogSetHandler("domain_redirect");
-        try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
-        return;
-    }
-
-    if (findRedirectRule(cfg, req.path)) |redirect| {
-        accessLogSetHandler("redirect");
-        try sendConfiguredRedirect(stream, allocator, redirect, req, should_close, is_head);
-        return;
-    }
-
-    if (findDomainRouteMutable(domain, req.path)) |route| {
-        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
-        defer route_header_context.deinit(allocator);
-        current_response_headers = route_header_context.items;
-        try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
-        return;
-    }
-
-    if (findNamedRouteMutable(cfg, req.path)) |route| {
-        const route_header_context = try buildResponseHeaderContext(allocator, cfg, domain, route);
-        defer route_header_context.deinit(allocator);
-        current_response_headers = route_header_context.items;
-        try handleNamedRoute(io, stream, allocator, cfg, domain, route, req, should_close, is_head, process_env);
-        return;
-    }
-
-    if ((std.mem.eql(u8, method, "GET") or is_head) and std.mem.startsWith(u8, req.path, "/.well-known/acme-challenge/")) {
-        accessLogSetHandler("acme_challenge");
-        const token = req.path["/.well-known/acme-challenge/".len..];
-        try serveAcmeChallenge(io, stream, allocator, cfg.letsencrypt_webroot, token, should_close, is_head);
-        return;
-    }
-
-    // A domain-level proxy is the virtual host's fallback owner. Keep the
-    // built-in Layerline pages for direct/default hosts, not for proxied apps.
-    if (domain != null) {
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
-            return;
-        }
-    }
-
-    if (std.mem.eql(u8, method, "GET") or is_head) {
-        if (std.mem.eql(u8, req.path, "/favicon.svg") or std.mem.eql(u8, req.path, "/icon.svg")) {
-            accessLogSetHandler("builtin_asset");
-            try sendServerIcon(stream, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/") and domainPhpFrontController(cfg, domain)) {
-            accessLogSetHandler("php_front_controller");
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/") and domainServeStaticRoot(cfg, domain)) {
-            accessLogSetHandler("static_root");
-            try serveStatic(io, stream, allocator, domainStaticDir(cfg, domain), domainIndexFile(cfg, domain), req.headers, should_close, is_head, cfg.max_static_file_bytes);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/")) {
-            accessLogSetHandler("builtin_root");
-            try sendResponseForMethod(stream, 200, "OK", "text/html; charset=utf-8", server_assets.H3_DEFAULT_PAGE, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/health")) {
-            accessLogSetHandler("health");
-            try sendResponseForMethod(stream, 200, "OK", "text/plain; charset=utf-8", "ok\n", should_close, is_head);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/metrics")) {
-            accessLogSetHandler("metrics");
-            try sendMetrics(stream, allocator, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/time")) {
-            accessLogSetHandler("time");
-            var ts_buf: [64]u8 = undefined;
-            const ts = try std.fmt.bufPrint(&ts_buf, "{{\"time\":{}}}\n", .{std.Io.Timestamp.now(io, .real).toSeconds()});
-            try sendResponseForMethod(stream, 200, "OK", "application/json; charset=utf-8", ts, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/api/echo")) {
-            accessLogSetHandler("api_echo");
-            if (findQueryValue(req.query, "msg")) |msg| {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg});
-                defer allocator.free(payload);
-                try sendResponseForMethod(stream, 200, "OK", "application/json; charset=utf-8", payload, should_close, is_head);
-            } else {
-                try sendResponseForMethod(stream, 200, "OK", "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n", should_close, is_head);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/test.php") and !domainPhpInfoPage(cfg, domain)) {
-            try sendNotFoundForMethod(allocator, stream, should_close, is_head);
-            return;
-        }
-
-        if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
-            accessLogSetHandler("php");
-            const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
-            return;
-        }
-
-        if (std.mem.startsWith(u8, req.path, "/static/")) {
-            accessLogSetHandler("static");
-            const rel = req.path["/static/".len..];
-            try serveStatic(io, stream, allocator, domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
-            return;
-        }
-
-        if (domainServeStaticRoot(cfg, domain) and
-            !std.mem.startsWith(u8, req.path, "/api/") and
-            !std.mem.startsWith(u8, req.path, "/php/") and
-            !std.mem.eql(u8, req.path, "/health") and
-            !std.mem.eql(u8, req.path, "/time") and
-            !std.mem.eql(u8, req.path, "/"))
-        {
-            const static_dir = domainStaticDir(cfg, domain);
-            const rel = try makeStaticPathFromRequest(allocator, req.path, domainIndexFile(cfg, domain));
-            defer allocator.free(rel);
-
-            const candidate_path = try std.fs.path.join(allocator, &.{ static_dir, rel });
-            defer allocator.free(candidate_path);
-
-            var file_exists = false;
-            if (std.Io.Dir.cwd().statFile(io, candidate_path, .{})) |stat| {
-                if (stat.kind == .file) {
-                    file_exists = true;
-                }
-            } else |_| {}
-
-            if (file_exists) {
-                accessLogSetHandler("static_root");
-                try serveStatic(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
-                return;
-            }
-        }
-
-        if (domainPhpFrontController(cfg, domain)) {
-            accessLogSetHandler("php_front_controller");
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, is_head, process_env);
-            return;
-        }
-
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
-            return;
-        }
-
-        accessLogSetHandler("not_found");
-        try sendDomainCustomNotFoundForMethod(io, stream, allocator, cfg, domain, should_close, is_head);
-        return;
-    }
-
-    if (std.mem.eql(u8, method, "POST")) {
-        if (std.mem.eql(u8, req.path, "/test.php") and !domainPhpInfoPage(cfg, domain)) {
-            try sendNotFoundWithConnection(allocator, stream, should_close);
-            return;
-        }
-
-        if (std.mem.endsWith(u8, req.path, ".php")) {
-            accessLogSetHandler("php");
-            const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try handlePhpScript(io, stream, allocator, cfg, req, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
-            return;
-        }
-
-        if (std.mem.eql(u8, req.path, "/api/echo")) {
-            accessLogSetHandler("api_echo");
-            try sendResponseWithConnection(stream, 200, "OK", "text/plain; charset=utf-8", req.body, should_close);
-            return;
-        }
-
-        if (domainPhpFrontController(cfg, domain)) {
-            accessLogSetHandler("php_front_controller");
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
-            return;
-        }
-
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
-            return;
-        }
-
-        accessLogSetHandler("not_found");
-        try sendNotFoundWithConnection(allocator, stream, should_close);
-        return;
-    }
-
-    if (std.mem.eql(u8, method, "OPTIONS")) {
-        accessLogSetHandler("options");
-        const allow = "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS";
-        const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allow});
-        defer allocator.free(allow_header);
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 204, "No Content", "text/plain; charset=utf-8", 0, should_close, allow_header);
-        return;
-    }
-
-    if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
-        if (domainPhpFrontController(cfg, domain)) {
-            accessLogSetHandler("php_front_controller");
-            try handlePhpFrontController(io, stream, allocator, cfg, req, null, domainPhpRoot(cfg, domain), domainPhpBinary(cfg, domain), domainPhpFastcgi(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), domainPhpIndex(cfg, domain), should_close, false, process_env);
-            return;
-        }
-
-        if (domainUpstreamMutable(cfg, domain)) |pool| {
-            accessLogSetHandler("domain_proxy");
-            try forwardToUpstreamPool(stream, allocator, pool, domainUpstreamPolicy(cfg, domain), domainUpstreamTimeoutMs(cfg, domain), req, cfg);
-            return;
-        }
-        accessLogSetHandler("method_not_allowed");
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS", should_close, false);
-        return;
-    }
-
-    accessLogSetHandler("not_implemented");
-    try sendNotImplemented(stream, allocator, should_close);
+    try http1_router.route(io, stream, allocator, cfg, req, process_env, http1RouterCallbacks());
 }
 
 fn routeHttpRedirectRequest(
