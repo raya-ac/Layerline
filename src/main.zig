@@ -6,6 +6,7 @@ const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
 const cgi_headers = @import("cgi_headers.zig");
 const config_mod = @import("config.zig");
+const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const http3_server = @import("http3_server.zig");
 const http_headers = @import("http_headers.zig");
@@ -114,6 +115,16 @@ const parseOptionalContentLength = proxy_utils.parseOptionalContentLength;
 const parseUpstreamResponseFraming = proxy_utils.parseUpstreamResponseFraming;
 const responseHasNoBody = proxy_utils.responseHasNoBody;
 const parseHttpStatusCode = proxy_utils.parseHttpStatusCode;
+const FastcgiRunResult = fastcgi.RunResult;
+const PhpFrontControllerTarget = fastcgi.PhpFrontControllerTarget;
+const appendFastcgiParam = fastcgi.appendParam;
+const makePhpFrontControllerTarget = fastcgi.makePhpFrontControllerTarget;
+const FASTCGI_BEGIN_REQUEST = fastcgi.BEGIN_REQUEST;
+const FASTCGI_PARAMS = fastcgi.PARAMS;
+const FASTCGI_STDIN = fastcgi.STDIN;
+const FASTCGI_RESPONDER = fastcgi.RESPONDER;
+const FASTCGI_KEEP_CONN = fastcgi.KEEP_CONN;
+const FASTCGI_REQUEST_COMPLETE = fastcgi.REQUEST_COMPLETE;
 const RequestHashInput = upstream_mod.RequestHashInput;
 const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
@@ -173,7 +184,6 @@ const findDomainConfigMutable = config_mod.findDomainConfigMutable;
 const appendServerNames = config_mod.appendServerNames;
 const isDomainConfigNameValid = config_mod.isDomainConfigNameValid;
 const isDomainConfigFileName = config_mod.isDomainConfigFileName;
-const isSafeRelativeScriptPath = config_mod.isSafeRelativeScriptPath;
 const setRouteLine = config_mod.setRouteLine;
 const setRouteLineFor = config_mod.setRouteLineFor;
 const setRouteStringProperty = config_mod.setRouteStringProperty;
@@ -250,16 +260,6 @@ const DEFAULT_ACCESS_LOG_PATH = "stderr";
 const SERVER_NAME = "Layerline";
 const SERVER_TAGLINE = "Modern web server";
 const SERVER_HEADER = "Layerline";
-const FASTCGI_VERSION: u8 = 1;
-const FASTCGI_BEGIN_REQUEST: u8 = 1;
-const FASTCGI_END_REQUEST: u8 = 3;
-const FASTCGI_PARAMS: u8 = 4;
-const FASTCGI_STDIN: u8 = 5;
-const FASTCGI_STDOUT: u8 = 6;
-const FASTCGI_STDERR: u8 = 7;
-const FASTCGI_RESPONDER: u16 = 1;
-const FASTCGI_KEEP_CONN: u8 = 1;
-const FASTCGI_REQUEST_COMPLETE: u8 = 0;
 const TLS_MAX_INNER_PLAINTEXT_BYTES = 16 * 1024;
 const TLS_MAX_RECORD_BYTES = 5 + TLS_MAX_INNER_PLAINTEXT_BYTES + 256;
 const TLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -4799,77 +4799,6 @@ fn handlePhp(
     try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, cfg.php_fastcgi, cfg.upstream_timeout_ms, rel_path, req.path, "", close_connection, is_head, process_env);
 }
 
-const PhpFrontControllerTarget = struct {
-    script_rel_path: []const u8,
-    script_name: []const u8,
-    path_info: []const u8,
-
-    fn deinit(self: *const PhpFrontControllerTarget, allocator: std.mem.Allocator) void {
-        allocator.free(self.script_rel_path);
-        allocator.free(self.script_name);
-        allocator.free(self.path_info);
-    }
-};
-
-fn appendUrlPath(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    if (value.len == 0) return;
-    const segment = if (value[0] == '/') value[1..] else value;
-    if (segment.len == 0) return;
-    if (out.items.len == 0 or out.items[out.items.len - 1] != '/') try out.append(allocator, '/');
-    try out.appendSlice(allocator, segment);
-}
-
-fn phpFrontControllerScriptName(allocator: std.mem.Allocator, route: ?*const RouteConfig, php_index: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '/');
-
-    if (route) |r| {
-        if (r.strip_prefix and r.match_kind == .prefix) {
-            try appendUrlPath(&out, allocator, r.pattern);
-        }
-    }
-    try appendUrlPath(&out, allocator, php_index);
-    return out.toOwnedSlice(allocator);
-}
-
-fn phpFrontControllerPathInfo(allocator: std.mem.Allocator, route: ?*const RouteConfig, request_path: []const u8, script_name: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, request_path, script_name)) return allocator.dupe(u8, "");
-
-    if (route) |r| {
-        if (r.strip_prefix and r.match_kind == .prefix) {
-            const raw = if (request_path.len > r.pattern.len) request_path[r.pattern.len..] else "";
-            if (raw.len == 0) return allocator.dupe(u8, "/");
-            return if (raw[0] == '/')
-                allocator.dupe(u8, raw)
-            else
-                std.fmt.allocPrint(allocator, "/{s}", .{raw});
-        }
-    }
-
-    return if (request_path.len == 0)
-        allocator.dupe(u8, "/")
-    else
-        allocator.dupe(u8, request_path);
-}
-
-fn makePhpFrontControllerTarget(allocator: std.mem.Allocator, route: ?*const RouteConfig, request_path: []const u8, php_index: []const u8) !PhpFrontControllerTarget {
-    if (!isSafeRelativeScriptPath(php_index)) return error.InvalidConfigValue;
-
-    const script_rel_path = try allocator.dupe(u8, php_index);
-    errdefer allocator.free(script_rel_path);
-    const script_name = try phpFrontControllerScriptName(allocator, route, php_index);
-    errdefer allocator.free(script_name);
-    const path_info = try phpFrontControllerPathInfo(allocator, route, request_path, script_name);
-    errdefer allocator.free(path_info);
-
-    return .{
-        .script_rel_path = script_rel_path,
-        .script_name = script_name,
-        .path_info = path_info,
-    };
-}
-
 fn handlePhpFrontController(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -4889,252 +4818,6 @@ fn handlePhpFrontController(
     const target = try makePhpFrontControllerTarget(allocator, route, req.path, php_index);
     defer target.deinit(allocator);
     try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, timeout_ms, target.script_rel_path, target.script_name, target.path_info, close_connection, is_head, process_env);
-}
-
-fn appendFastcgiLength(out: *std.ArrayList(u8), allocator: std.mem.Allocator, len: usize) !void {
-    if (len < 128) {
-        try out.append(allocator, @intCast(len));
-        return;
-    }
-    if (len > 0x7fff_ffff) return error.InvalidConfigValue;
-    const wide: u32 = @intCast(len);
-    try out.append(allocator, @intCast(((wide >> 24) & 0x7f) | 0x80));
-    try out.append(allocator, @intCast((wide >> 16) & 0xff));
-    try out.append(allocator, @intCast((wide >> 8) & 0xff));
-    try out.append(allocator, @intCast(wide & 0xff));
-}
-
-fn appendFastcgiParam(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
-    if (name.len == 0) return;
-    try appendFastcgiLength(out, allocator, name.len);
-    try appendFastcgiLength(out, allocator, value.len);
-    try out.appendSlice(allocator, name);
-    try out.appendSlice(allocator, value);
-}
-
-fn appendFastcgiRequestHeaders(allocator: std.mem.Allocator, params: *std.ArrayList(u8), request_headers: []const u8) !void {
-    var lines = std.mem.splitSequence(u8, request_headers, "\r\n");
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const name = trimValue(line[0..colon]);
-            const value = trimValue(line[colon + 1 ..]);
-            if (name.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(name, "Content-Type") or std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
-            if (std.ascii.eqlIgnoreCase(name, "X-Request-Id")) continue;
-
-            var env_name = std.ArrayList(u8).empty;
-            defer env_name.deinit(allocator);
-            try env_name.appendSlice(allocator, "HTTP_");
-            for (name) |c| {
-                if (!isCgiHeaderNameChar(c)) {
-                    env_name.clearRetainingCapacity();
-                    break;
-                }
-                try env_name.append(allocator, if (c == '-') '_' else std.ascii.toUpper(c));
-            }
-            if (env_name.items.len <= "HTTP_".len) continue;
-            try appendFastcgiParam(params, allocator, env_name.items, value);
-        }
-    }
-}
-
-fn buildPhpFastcgiParams(
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    req: HttpRequest,
-    php_root: []const u8,
-    script_path: []const u8,
-    script_name: []const u8,
-    path_info: []const u8,
-) ![]u8 {
-    var params = std.ArrayList(u8).empty;
-    errdefer params.deinit(allocator);
-
-    const request_uri = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        req.path,
-        if (req.query.len > 0) "?" else "",
-        req.query,
-    });
-    defer allocator.free(request_uri);
-
-    const content_length = try std.fmt.allocPrint(allocator, "{d}", .{req.body.len});
-    defer allocator.free(content_length);
-
-    const server_port = try std.fmt.allocPrint(allocator, "{d}", .{cfg.port});
-    defer allocator.free(server_port);
-
-    const path_translated = if (path_info.len > 0 and path_info[0] == '/') blk: {
-        const translated_rel = path_info[1..];
-        break :blk try std.fs.path.join(allocator, &.{ php_root, translated_rel });
-    } else try allocator.dupe(u8, script_path);
-    defer allocator.free(path_translated);
-
-    try appendFastcgiParam(&params, allocator, "GATEWAY_INTERFACE", "CGI/1.1");
-    try appendFastcgiParam(&params, allocator, "SERVER_SOFTWARE", SERVER_HEADER);
-    try appendFastcgiParam(&params, allocator, "SERVER_NAME", cfg.host);
-    try appendFastcgiParam(&params, allocator, "SERVER_PORT", server_port);
-    try appendFastcgiParam(&params, allocator, "SERVER_PROTOCOL", req.version);
-    try appendFastcgiParam(&params, allocator, "REQUEST_METHOD", req.method);
-    try appendFastcgiParam(&params, allocator, "REQUEST_URI", request_uri);
-    try appendFastcgiParam(&params, allocator, "SCRIPT_NAME", script_name);
-    try appendFastcgiParam(&params, allocator, "SCRIPT_FILENAME", script_path);
-    try appendFastcgiParam(&params, allocator, "PHP_SELF", script_name);
-    try appendFastcgiParam(&params, allocator, "PATH_TRANSLATED", path_translated);
-    try appendFastcgiParam(&params, allocator, "PATH_INFO", path_info);
-    try appendFastcgiParam(&params, allocator, "QUERY_STRING", req.query);
-    try appendFastcgiParam(&params, allocator, "DOCUMENT_ROOT", php_root);
-    try appendFastcgiParam(&params, allocator, "REQUEST_SCHEME", "http");
-    try appendFastcgiParam(&params, allocator, "HTTPS", "off");
-    try appendFastcgiParam(&params, allocator, "REDIRECT_STATUS", "200");
-    try appendFastcgiParam(&params, allocator, "CONTENT_LENGTH", content_length);
-    try appendFastcgiParam(&params, allocator, "CONTENT_TYPE", findHeaderValue(req.headers, "Content-Type") orelse "");
-    try appendFastcgiParam(&params, allocator, "FCGI_ROLE", "RESPONDER");
-    try appendFastcgiRequestHeaders(allocator, &params, req.headers);
-    if (current_request_id.len > 0) try appendFastcgiParam(&params, allocator, "HTTP_X_REQUEST_ID", current_request_id);
-
-    return params.toOwnedSlice(allocator);
-}
-
-fn writeFastcgiRecord(conn: std.Io.net.Stream, record_type: u8, request_id: u16, content: []const u8) !void {
-    if (content.len == 0) {
-        const header = [_]u8{
-            FASTCGI_VERSION,
-            record_type,
-            @intCast(request_id >> 8),
-            @intCast(request_id & 0xff),
-            0,
-            0,
-            0,
-            0,
-        };
-        try streamWriteAll(conn, &header);
-        return;
-    }
-
-    var offset: usize = 0;
-    while (offset < content.len) {
-        const chunk_len = @min(content.len - offset, 0xffff);
-        const padding_len: u8 = @intCast((8 - (chunk_len % 8)) % 8);
-        const header = [_]u8{
-            FASTCGI_VERSION,
-            record_type,
-            @intCast(request_id >> 8),
-            @intCast(request_id & 0xff),
-            @intCast(chunk_len >> 8),
-            @intCast(chunk_len & 0xff),
-            padding_len,
-            0,
-        };
-        try streamWriteAll(conn, &header);
-        try streamWriteAll(conn, content[offset .. offset + chunk_len]);
-        if (padding_len > 0) {
-            const padding = [_]u8{0} ** 8;
-            try streamWriteAll(conn, padding[0..padding_len]);
-        }
-        offset += chunk_len;
-    }
-}
-
-fn readFastcgiBytes(conn: std.Io.net.Stream, out: []u8) !void {
-    var used: usize = 0;
-    while (used < out.len) {
-        const n = try streamRead(conn, out[used..]);
-        if (n == 0) return error.BadGateway;
-        used += n;
-    }
-}
-
-fn skipFastcgiBytes(conn: std.Io.net.Stream, len: usize) !void {
-    var scratch: [512]u8 = undefined;
-    var remaining = len;
-    while (remaining > 0) {
-        const n = @min(remaining, scratch.len);
-        try readFastcgiBytes(conn, scratch[0..n]);
-        remaining -= n;
-    }
-}
-
-const FastcgiRunResult = struct {
-    stdout: []u8,
-    stderr: []u8,
-    app_status: u32,
-    protocol_status: u8,
-
-    fn deinit(self: *const FastcgiRunResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
-    }
-};
-
-fn readFastcgiResponse(allocator: std.mem.Allocator, conn: std.Io.net.Stream, request_id: u16, max_stdout: usize) !FastcgiRunResult {
-    var stdout = std.ArrayList(u8).empty;
-    errdefer stdout.deinit(allocator);
-    var stderr = std.ArrayList(u8).empty;
-    errdefer stderr.deinit(allocator);
-
-    var app_status: u32 = 0;
-    var protocol_status: u8 = FASTCGI_REQUEST_COMPLETE;
-
-    while (true) {
-        var header: [8]u8 = undefined;
-        try readFastcgiBytes(conn, &header);
-        if (header[0] != FASTCGI_VERSION) return error.BadGateway;
-
-        const record_type = header[1];
-        const rec_request_id = (@as(u16, header[2]) << 8) | @as(u16, header[3]);
-        const content_len = (@as(usize, header[4]) << 8) | @as(usize, header[5]);
-        const padding_len = @as(usize, header[6]);
-
-        if (rec_request_id != request_id and rec_request_id != 0) {
-            try skipFastcgiBytes(conn, content_len + padding_len);
-            continue;
-        }
-
-        switch (record_type) {
-            FASTCGI_STDOUT => {
-                if (stdout.items.len + content_len > max_stdout) return error.StreamTooLong;
-                const old_len = stdout.items.len;
-                try stdout.resize(allocator, old_len + content_len);
-                try readFastcgiBytes(conn, stdout.items[old_len..]);
-            },
-            FASTCGI_STDERR => {
-                var remaining = content_len;
-                var scratch: [512]u8 = undefined;
-                while (remaining > 0) {
-                    const n = @min(remaining, scratch.len);
-                    try readFastcgiBytes(conn, scratch[0..n]);
-                    if (stderr.items.len < DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES) {
-                        const keep = @min(n, DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES - stderr.items.len);
-                        try stderr.appendSlice(allocator, scratch[0..keep]);
-                    }
-                    remaining -= n;
-                }
-            },
-            FASTCGI_END_REQUEST => {
-                var body: [8]u8 = .{0} ** 8;
-                if (content_len >= body.len) {
-                    try readFastcgiBytes(conn, &body);
-                    try skipFastcgiBytes(conn, content_len - body.len);
-                } else {
-                    try readFastcgiBytes(conn, body[0..content_len]);
-                }
-                app_status = (@as(u32, body[0]) << 24) | (@as(u32, body[1]) << 16) | (@as(u32, body[2]) << 8) | @as(u32, body[3]);
-                protocol_status = body[4];
-                if (padding_len > 0) try skipFastcgiBytes(conn, padding_len);
-                return .{
-                    .stdout = try stdout.toOwnedSlice(allocator),
-                    .stderr = try stderr.toOwnedSlice(allocator),
-                    .app_status = app_status,
-                    .protocol_status = protocol_status,
-                };
-            },
-            else => try skipFastcgiBytes(conn, content_len),
-        }
-
-        if (record_type != FASTCGI_END_REQUEST and padding_len > 0) {
-            try skipFastcgiBytes(conn, padding_len);
-        }
-    }
 }
 
 fn sendPhpOutput(stream: std.Io.net.Stream, allocator: std.mem.Allocator, output: []const u8, close_connection: bool, is_head: bool) !void {
@@ -5229,16 +4912,27 @@ fn runPhpFastcgiRequest(
 
     const request_id: u16 = 1;
     const begin_body = [_]u8{ 0, @intCast(FASTCGI_RESPONDER), if (fastcgiKeepaliveConfigured(cfg)) FASTCGI_KEEP_CONN else 0, 0, 0, 0, 0, 0 };
-    try writeFastcgiRecord(conn, FASTCGI_BEGIN_REQUEST, request_id, &begin_body);
+    try fastcgi.writeRecord(conn, FASTCGI_BEGIN_REQUEST, request_id, &begin_body, streamWriteAll);
 
-    const params = try buildPhpFastcgiParams(allocator, cfg, req, php_root, script_path, script_name, path_info);
+    const params = try fastcgi.buildParams(allocator, .{
+        .server_header = SERVER_HEADER,
+        .current_request_id = current_request_id,
+        .server_host = cfg.host,
+        .server_port = cfg.port,
+        .method = req.method,
+        .path = req.path,
+        .query = req.query,
+        .version = req.version,
+        .headers = req.headers,
+        .body_len = req.body.len,
+    }, php_root, script_path, script_name, path_info);
     defer allocator.free(params);
-    try writeFastcgiRecord(conn, FASTCGI_PARAMS, request_id, params);
-    try writeFastcgiRecord(conn, FASTCGI_PARAMS, request_id, "");
-    if (req.body.len > 0) try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, req.body);
-    try writeFastcgiRecord(conn, FASTCGI_STDIN, request_id, "");
+    try fastcgi.writeRecord(conn, FASTCGI_PARAMS, request_id, params, streamWriteAll);
+    try fastcgi.writeRecord(conn, FASTCGI_PARAMS, request_id, "", streamWriteAll);
+    if (req.body.len > 0) try fastcgi.writeRecord(conn, FASTCGI_STDIN, request_id, req.body, streamWriteAll);
+    try fastcgi.writeRecord(conn, FASTCGI_STDIN, request_id, "", streamWriteAll);
 
-    const result = try readFastcgiResponse(allocator, conn, request_id, cfg.max_php_output_bytes);
+    const result = try fastcgi.readResponse(allocator, conn, request_id, cfg.max_php_output_bytes, DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES, streamRead);
     errdefer result.deinit(allocator);
 
     if (result.protocol_status != FASTCGI_REQUEST_COMPLETE) return error.FastcgiProtocolFailed;
