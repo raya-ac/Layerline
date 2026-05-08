@@ -17,6 +17,7 @@ const http2_content = @import("http2_content.zig");
 const http2_router = @import("http2_router.zig");
 const http2_runtime = @import("http2_runtime.zig");
 const http2_upstream = @import("http2_upstream.zig");
+const http1_route_handlers = @import("http1_route_handlers.zig");
 const http1_router = @import("http1_router.zig");
 const http1_responses = @import("http1_responses.zig");
 const http1_runtime = @import("http1_runtime.zig");
@@ -30,7 +31,6 @@ const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const request_trace = @import("request_trace.zig");
-const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 const static_files = @import("static_files.zig");
 const stream_runtime = @import("stream_runtime.zig");
@@ -39,30 +39,6 @@ const tls_material = @import("tls_material.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
 
-const findNamedRoute = routing_mod.findNamedRoute;
-const findDomainForHost = routing_mod.findDomainForHost;
-const findDomainForHostMutable = routing_mod.findDomainForHostMutable;
-const findDomainForRequest = routing_mod.findDomainForRequest;
-const findDomainForRequestMutable = routing_mod.findDomainForRequestMutable;
-const domainStaticDir = routing_mod.domainStaticDir;
-const domainServeStaticRoot = routing_mod.domainServeStaticRoot;
-const domainIndexFile = routing_mod.domainIndexFile;
-const domainPhpRoot = routing_mod.domainPhpRoot;
-const domainPhpBinary = routing_mod.domainPhpBinary;
-const domainPhpFastcgi = routing_mod.domainPhpFastcgi;
-const domainPhpIndex = routing_mod.domainPhpIndex;
-const domainPhpInfoPage = routing_mod.domainPhpInfoPage;
-const domainPhpFrontController = routing_mod.domainPhpFrontController;
-const routePhpIndex = routing_mod.routePhpIndex;
-const routePhpFrontController = routing_mod.routePhpFrontController;
-const routePhpFastcgi = routing_mod.routePhpFastcgi;
-const domainUpstreamMutable = routing_mod.domainUpstreamMutable;
-const domainUpstreamPolicy = routing_mod.domainUpstreamPolicy;
-const routeUpstreamPolicy = routing_mod.routeUpstreamPolicy;
-const domainUpstreamTimeoutMs = routing_mod.domainUpstreamTimeoutMs;
-const routeUpstreamTimeoutMs = routing_mod.routeUpstreamTimeoutMs;
-const findDomainRoute = routing_mod.findDomainRoute;
-const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const hasConnectionToken = http_headers.hasConnectionToken;
 const AdminCredentials = admin_support.AdminCredentials;
 const adminPathMatches = admin_support.adminPathMatches;
@@ -527,9 +503,9 @@ fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
 }
 
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool, is_head: bool) !void {
-    const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allowed_methods});
-    defer allocator.free(allow_header);
-    try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, is_head, allow_header);
+    try http1_route_handlers.sendMethodNotAllowedWithAllow(stream, allocator, allowed_methods, close_connection, is_head, .{
+        .send_cool_error = sendCoolErrorWithConnection,
+    });
 }
 
 fn http1StaticCallbacks() http1_static.Callbacks {
@@ -898,63 +874,17 @@ fn handleNamedRoute(
     is_head: bool,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    if (std.mem.eql(u8, req.method, "OPTIONS")) {
-        const allow = switch (route.handler) {
-            .static => "GET,HEAD,OPTIONS",
-            .php => "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
-            .proxy => "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
-        };
-        const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allow});
-        defer allocator.free(allow_header);
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 204, "No Content", "text/plain; charset=utf-8", 0, close_connection, allow_header);
-        return;
-    }
-
-    switch (route.handler) {
-        .static => {
-            accessLogSetHandler("route_static");
-            if (!(std.mem.eql(u8, req.method, "GET") or is_head)) {
-                try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,OPTIONS", close_connection, is_head);
-                return;
-            }
-            const static_dir = route.static_dir orelse domainStaticDir(cfg, domain);
-            const index_file = route.index_file orelse domainIndexFile(cfg, domain);
-            const rel = try routeFileRelativePath(allocator, route, req.path, index_file);
-            defer allocator.free(rel);
-            try serveStatic(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes);
-            return;
-        },
-        .php => {
-            accessLogSetHandler("route_php");
-            if (std.mem.eql(u8, req.path, "/test.php") and !(route.php_info_page orelse domainPhpInfoPage(cfg, domain))) {
-                try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
-                return;
-            }
-            const php_root = route.php_root orelse domainPhpRoot(cfg, domain);
-            const php_binary = route.php_binary orelse domainPhpBinary(cfg, domain);
-            const php_fastcgi = routePhpFastcgi(cfg, domain, route);
-            if (routePhpFrontController(cfg, domain, route)) {
-                try handlePhpFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, routeUpstreamTimeoutMs(cfg, domain, route), routePhpIndex(cfg, domain, route), close_connection, is_head, process_env);
-                return;
-            }
-            const script_rel = try routeFileRelativePath(allocator, route, req.path, route.index_file orelse domainIndexFile(cfg, domain));
-            defer allocator.free(script_rel);
-            try handlePhpScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, routeUpstreamTimeoutMs(cfg, domain, route), script_rel, req.path, "", close_connection, is_head, process_env);
-            return;
-        },
-        .proxy => {
-            accessLogSetHandler("route_proxy");
-            const pool = if (route.upstream) |*route_pool|
-                route_pool
-            else
-                domainUpstreamMutable(cfg, domain) orelse {
-                    try sendCoolErrorWithConnection(stream, allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.", close_connection, is_head, null);
-                    return;
-                };
-            try forwardToUpstreamPool(stream, allocator, pool, routeUpstreamPolicy(cfg, domain, route), routeUpstreamTimeoutMs(cfg, domain, route), req, cfg);
-            return;
-        },
-    }
+    try http1_route_handlers.handleNamedRoute(io, stream, allocator, cfg, domain, route, req, close_connection, is_head, process_env, .{
+        .access_log_set_handler = accessLogSetHandler,
+        .forward_to_upstream_pool = forwardToUpstreamPool,
+        .handle_php_front_controller = handlePhpFrontController,
+        .handle_php_script = handlePhpScript,
+        .send_cool_error = sendCoolErrorWithConnection,
+        .send_method_not_allowed = sendMethodNotAllowedWithAllow,
+        .send_not_found_for_method = sendNotFoundForMethod,
+        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
+        .serve_static = serveStatic,
+    });
 }
 
 fn setHttp1RequestContext(headers: []const u8, policy: CompressionPolicy) void {
