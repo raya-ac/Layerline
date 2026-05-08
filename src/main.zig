@@ -15,6 +15,7 @@ const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_trace = @import("request_trace.zig");
 const routing_mod = @import("routing.zig");
+const static_files = @import("static_files.zig");
 const tls13_native = @import("tls13_native.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
@@ -125,6 +126,14 @@ const FASTCGI_STDIN = fastcgi.STDIN;
 const FASTCGI_RESPONDER = fastcgi.RESPONDER;
 const FASTCGI_KEEP_CONN = fastcgi.KEEP_CONN;
 const FASTCGI_REQUEST_COMPLETE = fastcgi.REQUEST_COMPLETE;
+const ByteRange = static_files.ByteRange;
+const acceptsContentCoding = static_files.acceptsContentCoding;
+const contentTypeFromPath = static_files.contentTypeFromPath;
+const etagMatches = static_files.etagMatches;
+const makeStaticBaseHeaders = static_files.makeStaticBaseHeaders;
+const makeStaticEtag = static_files.makeStaticEtag;
+const parseByteRange = static_files.parseByteRange;
+const statRegularFile = static_files.statRegularFile;
 const RequestHashInput = upstream_mod.RequestHashInput;
 const UpstreamAttemptLease = upstream_mod.UpstreamAttemptLease;
 const upstreamPoolTargetCount = upstream_mod.upstreamPoolTargetCount;
@@ -796,23 +805,6 @@ fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg
     // Catch bad certificate paths before an operator asks a supervisor to
     // restart into them. The arena drops the temporary material afterwards.
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
-}
-
-fn contentTypeFromPath(path: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".json")) return "application/json; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".xml")) return "application/xml; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
-    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
-    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
-    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
-    if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
-    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
-    if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
-    return "text/plain; charset=utf-8";
 }
 
 // Render a Memorylayer-style fallback instead of a plain error line.
@@ -1956,127 +1948,6 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
     const allow_header = try std.fmt.allocPrint(allocator, "Allow: {s}\r\n", .{allowed_methods});
     defer allocator.free(allow_header);
     try sendCoolErrorWithConnection(stream, allocator, 405, "Method Not Allowed", "That method is not supported for this endpoint.", close_connection, is_head, allow_header);
-}
-
-const ByteRange = struct {
-    start: usize,
-    end: usize,
-};
-
-// Single ranges cover the common browser/media case. Multi-range responses are
-// MIME multipart work, so they stay rejected until there is a real need.
-fn etagMatches(raw: []const u8, etag: []const u8) bool {
-    var cursor = raw;
-    while (cursor.len > 0) {
-        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
-        const item = trimValue(cursor[0..comma_pos]);
-        if (std.mem.eql(u8, item, "*") or std.mem.eql(u8, item, etag)) return true;
-        if (comma_pos >= cursor.len) break;
-        cursor = cursor[comma_pos + 1 ..];
-    }
-    return false;
-}
-
-fn parseByteRange(raw: []const u8, total_len: usize) !ByteRange {
-    if (!std.mem.startsWith(u8, raw, "bytes=")) return error.BadRequest;
-    if (total_len == 0) return error.RangeNotSatisfiable;
-
-    const spec = trimValue(raw["bytes=".len..]);
-    if (std.mem.indexOfScalar(u8, spec, ',') != null) return error.BadRequest;
-
-    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.BadRequest;
-    const start_raw = trimValue(spec[0..dash]);
-    const end_raw = trimValue(spec[dash + 1 ..]);
-
-    if (start_raw.len == 0) {
-        if (end_raw.len == 0) return error.BadRequest;
-        const suffix_len = std.fmt.parseInt(usize, end_raw, 10) catch return error.BadRequest;
-        if (suffix_len == 0) return error.RangeNotSatisfiable;
-        const actual_len = @min(suffix_len, total_len);
-        return .{ .start = total_len - actual_len, .end = total_len - 1 };
-    }
-
-    const start = std.fmt.parseInt(usize, start_raw, 10) catch return error.BadRequest;
-    const end = if (end_raw.len == 0)
-        total_len - 1
-    else
-        std.fmt.parseInt(usize, end_raw, 10) catch return error.BadRequest;
-
-    if (start >= total_len or start > end) return error.RangeNotSatisfiable;
-    return .{ .start = start, .end = @min(end, total_len - 1) };
-}
-
-fn makeStaticEtag(allocator: std.mem.Allocator, stat: std.Io.File.Stat) ![]const u8 {
-    // Cheap validator, not a content hash. Good enough to catch ordinary local
-    // edits without reading the file twice.
-    return std.fmt.allocPrint(
-        allocator,
-        "\"{d}-{d}-{d}\"",
-        .{ stat.inode, stat.size, stat.mtime.toNanoseconds() },
-    );
-}
-
-fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content_encoding: ?[]const u8) ![]const u8 {
-    if (content_encoding) |encoding| {
-        return std.fmt.allocPrint(
-            allocator,
-            "Accept-Ranges: bytes\r\n" ++
-                "ETag: {s}\r\n" ++
-                "Cache-Control: public, max-age=60\r\n" ++
-                "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n" ++
-                "Vary: Accept-Encoding\r\n" ++
-                "Content-Encoding: {s}\r\n",
-            .{ etag, encoding },
-        );
-    }
-
-    return std.fmt.allocPrint(
-        allocator,
-        "Accept-Ranges: bytes\r\n" ++
-            "ETag: {s}\r\n" ++
-            "Cache-Control: public, max-age=60\r\n" ++
-            "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n" ++
-            "Vary: Accept-Encoding\r\n",
-        .{etag},
-    );
-}
-
-fn contentCodingQAllows(item: []const u8) bool {
-    var parts = std.mem.splitScalar(u8, item, ';');
-    _ = parts.next();
-    while (parts.next()) |part| {
-        const param = trimValue(part);
-        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
-        const name = trimValue(param[0..eq]);
-        if (!std.ascii.eqlIgnoreCase(name, "q")) continue;
-        const value = trimValue(param[eq + 1 ..]);
-        const q = std.fmt.parseFloat(f64, value) catch return false;
-        return q > 0.0;
-    }
-    return true;
-}
-
-fn acceptsContentCoding(request_headers: []const u8, coding: []const u8) bool {
-    const raw = findHeaderValue(request_headers, "Accept-Encoding") orelse return false;
-    var wildcard_allowed: ?bool = null;
-    var cursor = raw;
-    while (cursor.len > 0) {
-        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
-        const item = trimValue(cursor[0..comma_pos]);
-        const semicolon_pos = std.mem.indexOfScalar(u8, item, ';') orelse item.len;
-        const token = trimValue(item[0..semicolon_pos]);
-        if (std.ascii.eqlIgnoreCase(token, coding)) return contentCodingQAllows(item);
-        if (std.mem.eql(u8, token, "*")) wildcard_allowed = contentCodingQAllows(item);
-        if (comma_pos >= cursor.len) break;
-        cursor = cursor[comma_pos + 1 ..];
-    }
-    return wildcard_allowed orelse false;
-}
-
-fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
-    const stat = try std.Io.Dir.cwd().statFile(io, file_path, .{});
-    if (stat.kind != .file) return error.NotFile;
-    return stat;
 }
 
 fn trySendfileStaticRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, body_len: usize) !bool {
