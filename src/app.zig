@@ -9,6 +9,7 @@ const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
+const custom_errors = @import("custom_errors.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
@@ -77,7 +78,6 @@ const acceptsContentCoding = static_files.acceptsContentCoding;
 const etagMatches = static_files.etagMatches;
 const makeStaticBaseHeaders = static_files.makeStaticBaseHeaders;
 const parseByteRange = static_files.parseByteRange;
-const statRegularFile = static_files.statRegularFile;
 const HttpRequest = request_mod.HttpRequest;
 const activeIo = stream_runtime.activeIo;
 const bindThreadIo = stream_runtime.bindThreadIo;
@@ -387,38 +387,6 @@ fn sendNotFoundForMethod(allocator: std.mem.Allocator, stream: std.Io.net.Stream
     try sendCoolErrorWithConnection(stream, allocator, 404, "Not Found", "The requested resource was not found on this server.", close_connection, is_head, null);
 }
 
-fn customErrorDocumentName(status_code: u16) ?[]const u8 {
-    return switch (status_code) {
-        404 => "404.html",
-        else => null,
-    };
-}
-
-fn readDomainCustomErrorDocument(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    domain: ?*const DomainConfig,
-    status_code: u16,
-) !?[]u8 {
-    const name = customErrorDocumentName(status_code) orelse return null;
-    if (domain == null) return null;
-
-    const file_path = try std.fs.path.join(allocator, &.{ domainStaticDir(cfg, domain), name });
-    defer allocator.free(file_path);
-
-    const stat = statRegularFile(io, file_path) catch |err| {
-        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
-        return err;
-    };
-    if (stat.size > cfg.max_static_file_bytes) return null;
-
-    return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(cfg.max_static_file_bytes)) catch |err| {
-        if (err == error.StreamTooLong or err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
-        return err;
-    };
-}
-
 fn sendDomainCustomNotFoundForMethod(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -428,13 +396,10 @@ fn sendDomainCustomNotFoundForMethod(
     close_connection: bool,
     is_head: bool,
 ) !void {
-    if (try readDomainCustomErrorDocument(io, allocator, cfg, domain, 404)) |body| {
-        defer allocator.free(body);
-        try sendResponseForMethod(stream, 404, "Not Found", "text/html; charset=utf-8", body, close_connection, is_head);
-        return;
-    }
-
-    try sendNotFoundForMethod(allocator, stream, close_connection, is_head);
+    try custom_errors.sendHttp1DomainNotFound(io, stream, allocator, cfg, domain, close_connection, is_head, .{
+        .send_not_found_for_method = sendNotFoundForMethod,
+        .send_response_for_method = sendResponseForMethod,
+    });
 }
 
 fn sendBadRequest(allocator: std.mem.Allocator, stream: std.Io.net.Stream, reason: []const u8) !void {
@@ -801,10 +766,7 @@ fn h2DomainCustomNotFoundResponse(
     cfg: *const ServerConfig,
     domain: ?*const DomainConfig,
 ) !?H2BufferedResponse {
-    if (try readDomainCustomErrorDocument(io, allocator, cfg, domain, 404)) |body| {
-        return .{ .status_code = 404, .content_type = "text/html; charset=utf-8", .body = body };
-    }
-    return null;
+    return custom_errors.h2DomainNotFoundResponse(io, allocator, cfg, domain);
 }
 
 fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize) !H2BufferedResponse {
