@@ -15,6 +15,7 @@ const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
 
 pub const Callbacks = struct {
+    active_config: *const fn () *ServerConfig,
     admin: admin_runtime.Callbacks,
     bind_thread_io: *const fn (std.Io) void,
     http1: http1_runtime.Callbacks,
@@ -164,7 +165,7 @@ fn startBackgroundWorkers(ctx: Context) !void {
         std.debug.print("Active upstream health checks: path={s} interval={d}ms timeout={d}ms\n", .{ ctx.cfg.upstream_health_check_path, ctx.cfg.upstream_health_check_interval_ms, ctx.cfg.upstream_health_check_timeout_ms });
     }
     if (ctx.cfg.http3_enabled) {
-        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.server_header }) catch |err| {
+        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.server_header, ctx.callbacks.active_config }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
             return err;
         };
@@ -206,9 +207,10 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
             break;
         }
 
-        if (!concurrency.tryAcquire(ctx.cfg.max_concurrent_connections)) {
+        const active_cfg = ctx.callbacks.active_config();
+        if (!concurrency.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.metrics.connectionRejected();
-            std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{ctx.cfg.max_concurrent_connections});
+            std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{active_cfg.max_concurrent_connections});
             ctx.callbacks.send_cool_error(
                 conn,
                 ctx.allocator,
@@ -222,13 +224,13 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
 
         const worker = std.Thread.spawn(
             .{
-                .stack_size = ctx.cfg.worker_stack_size,
+                .stack_size = active_cfg.worker_stack_size,
             },
             http1_runtime.serveConnectionTask,
             .{
                 ctx.io,
                 conn,
-                ctx.cfg,
+                active_cfg,
                 ctx.allocator,
                 concurrency,
                 ctx.process_env,

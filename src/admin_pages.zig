@@ -205,6 +205,8 @@ pub fn renderDashboardPage(
     try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/validate\"><button type=\"submit\">Validate config</button></form><form method=\"post\" action=\"");
     try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
+    try out.appendSlice(allocator, "/reload\"><button type=\"submit\">Reload config</button></form><form method=\"post\" action=\"");
+    try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/restart\"><button type=\"submit\">Graceful restart</button></form><form method=\"post\" action=\"");
     try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/logout\"><button type=\"submit\">Log out</button></form></div>\n");

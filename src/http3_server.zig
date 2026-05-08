@@ -664,7 +664,7 @@ test "extracts HTTP/3 request path from a request stream" {
     try std.testing.expectEqualStrings("/health", request.path);
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetrics, server_header: []const u8) void {
+pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig) void {
     var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
         std.debug.print("HTTP/3 bind address error: {}\n", .{err});
         return;
@@ -835,7 +835,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
                         continue;
                     };
                     if (request_opt) |request| {
-                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, cfg, metrics, server_header) catch |err| {
+                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), metrics, server_header) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
@@ -875,7 +875,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
             };
             if (request_opt) |request| {
                 if (!assembly.h3_response_sent) {
-                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, cfg, metrics, server_header) catch |err| {
+                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), metrics, server_header) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };

@@ -1,12 +1,14 @@
 const std = @import("std");
 
 const access_log_mod = @import("access_log.zig");
+const config_store_mod = @import("config_store.zig");
 const config_mod = @import("config.zig");
 const metrics_mod = @import("metrics.zig");
 const request_trace = @import("request_trace.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const ResponseHeaderRule = config_mod.ResponseHeaderRule;
+const ServerConfig = config_mod.ServerConfig;
 
 pub threadlocal var current_response_headers: []const ResponseHeaderRule = &.{};
 pub threadlocal var current_request_headers: []const u8 = "";
@@ -15,6 +17,7 @@ pub threadlocal var current_compression_policy: CompressionPolicy = .disabled;
 pub threadlocal var current_access_log: ?*access_log_mod.Context = null;
 
 pub var access_log_writer = access_log_mod.Writer{};
+pub var config_store = config_store_mod.Store{};
 pub var request_id_generator = request_trace.Generator{};
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 pub var server_metrics = metrics_mod.ServerMetrics.init();
@@ -22,6 +25,10 @@ pub var fastcgi_keepalive_pool = config_mod.FastcgiKeepAlivePool.init();
 
 pub fn currentRequestId() []const u8 {
     return current_request_id;
+}
+
+pub fn activeConfig() *ServerConfig {
+    return config_store.current();
 }
 
 pub fn resolveRequestId(io: std.Io, allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {

@@ -22,6 +22,7 @@ const MAX_CHUNK_LINE_BYTES = 4096;
 pub const Callbacks = struct {
     access_log_set_error: *const fn ([]const u8) void,
     access_log_set_handler: *const fn ([]const u8) void,
+    active_config: *const fn () *ServerConfig,
     bind_thread_io: *const fn (std.Io) void,
     clear_access_context: *const fn () void,
     clear_request_context: *const fn () void,
@@ -258,7 +259,8 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
             break;
         }
 
-        if (!ctx.state.tryAcquire(ctx.cfg.max_concurrent_connections)) {
+        const active_cfg = ctx.callbacks.active_config();
+        if (!ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.callbacks.metrics.connectionRejected();
             ctx.callbacks.send_cool_error(
                 conn,
@@ -272,9 +274,9 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
         }
 
         const worker = std.Thread.spawn(
-            .{ .stack_size = ctx.cfg.worker_stack_size },
+            .{ .stack_size = active_cfg.worker_stack_size },
             serveHttpRedirectConnectionTask,
-            .{ ctx.io, conn, ctx.cfg, ctx.allocator, ctx.state, ctx.callbacks },
+            .{ ctx.io, conn, active_cfg, ctx.allocator, ctx.state, ctx.callbacks },
         ) catch |err| {
             std.debug.print("Failed to start HTTP redirect worker: {}\n", .{err});
             ctx.state.release();

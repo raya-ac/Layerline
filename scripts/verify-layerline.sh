@@ -22,6 +22,7 @@ ADMIN_CREDS="$TMP_DIR/layerline-admin.creds"
 ACCESS_LOG="$TMP_DIR/access.log"
 SITE_DIR="$TMP_DIR/domains-enabled"
 CUSTOM_ROOT="$TMP_DIR/custom-root"
+RELOAD_ROOT="$TMP_DIR/reload-root"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -96,7 +97,7 @@ route = nogzip /nogzip/* static
 route_compression.nogzip = false
 route_stale_if_error.nogzip = 30
 CONF
-mkdir -p "$SITE_DIR" "$CUSTOM_ROOT"
+mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
 custom domain root
 HTML
@@ -113,6 +114,9 @@ php_info_page = false
 compression = false
 stale_while_revalidate = 45
 CONF
+cat >"$RELOAD_ROOT/index.html" <<'HTML'
+reloaded domain root
+HTML
 
 log "starting temporary server on http://$HOST:$PORT"
 (
@@ -233,6 +237,24 @@ if header_has "$CUSTOM_404_GZIP_HEADERS" '^Content-Encoding: gzip'; then
 fi
 ok "domain compression override"
 
+cat >"$SITE_DIR/reloaded.conf" <<CONF
+name = reloaded
+server_name = reload.test
+root = $RELOAD_ROOT
+index = index.html
+serve_static_root = true
+CONF
+ADMIN_RELOAD=$(printf 'reload\n' | nc -U "$SOCKET")
+case "$ADMIN_RELOAD" in
+  'OK config reloaded'*) ok "admin reload" ;;
+  *) die "admin reload response was unexpected: $ADMIN_RELOAD" ;;
+esac
+kill -0 "$PID" 2>/dev/null || die "server exited during admin reload"
+RELOAD_BODY="$TMP_DIR/reload-domain.body"
+curl -fsS -H 'Host: reload.test' "http://$HOST:$PORT/" -o "$RELOAD_BODY"
+grep -Fq 'reloaded domain root' "$RELOAD_BODY" || die "reloaded domain was not served without restart"
+ok "in-memory domain reload"
+
 ADMIN_STATUS=$(printf 'status\n' | nc -U "$SOCKET")
 case "$ADMIN_STATUS" in
   *'"server":"Layerline"'*) ok "admin status" ;;
@@ -287,6 +309,7 @@ curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
 grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "admin UI dashboard was not served with setup cookie"
 grep -Fq 'Add site' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include site management"
 grep -Fq 'Save settings' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include settings management"
+grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include in-memory reload"
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 ok "admin UI authenticated dashboard"

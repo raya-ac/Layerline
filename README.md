@@ -36,13 +36,13 @@ Layerline blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2, with global, domain, and route overrides.
-- Optional local Unix-socket admin surface for status, activation config validation, graceful restart, routes, cert visibility, and metrics.
+- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, request bodies, and FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
-- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and a default-page response path.
+- Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and static/health route dispatch.
 - Auto Let’s Encrypt (certbot) bootstrap, ACME challenge serving from certbot webroots, periodic renewal loop, and systemd renewal timer assets.
 - Automatic Cloudflare DNS automation at startup (`--cf-auto-deploy`) with create/update behavior for A/AAAA/CNAME.
 - Concurrent-connection protection (`--max-concurrent-connections`, default 1,000,000) to prevent overload instability.
@@ -51,13 +51,13 @@ Layerline blends local serving with edge-style deployment:
 
 ## What It Replaces
 
-Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, and admin controls in one Zig binary. It is already serving controlled production traffic for Layerline-hosted sites; general Caddy-class replacement still depends on the remaining in-memory reload, HTTP/3 route-dispatch, and soak-test work tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
+Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, reload, and admin controls in one Zig binary. It is already serving controlled production traffic for Layerline-hosted sites; general Caddy-class replacement still depends on broader HTTP/3 route parity, real response-cache work, and soak-test coverage tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, an opt-in first-launch browser admin UI with managed restart control, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is deeper reload/protocol parity: in-memory config snapshot swaps, broader HTTP/3 route parity, real response-cache work, and broader h2/h3 conformance tests. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is cache/protocol/parser work: a real response cache, broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, and a config parser refactor. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -72,7 +72,7 @@ The next roadmap slice is deeper reload/protocol parity: in-memory config snapsh
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI, static files, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -247,9 +247,9 @@ This server now terminates native TLS 1.3 on the TCP listener and uses ALPN to r
 - HTTP/2 is served directly over TLS when the client selects `h2`, and HTTP/1.1 stays on the existing router when the client selects `http/1.1` or sends no ALPN.
 - HTTP/2 cleartext (`h2c`) is still supported for local or upstream cleartext workflows.
 - Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
-- The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, and sends the built-in Layerline page as HTTP/3 HEADERS + DATA.
+- The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, decodes simple QPACK request fields, and can dispatch static root, static routes, `/static/*`, `/health`, or the built-in Layerline page as HTTP/3 HEADERS + DATA.
 - HTTP/3 connection state is tracked per QUIC connection ID with a bounded in-process table, so concurrent handshakes no longer share one global assembly buffer.
-- Broader HTTP/3 routing is intentionally still narrow: the native path serves the default page first, while HTTP/1 keeps the full static/PHP/proxy surface.
+- Broader HTTP/3 routing is intentionally still narrow: the native path covers static and health responses, while HTTP/1 and HTTP/2 keep the full static/PHP/proxy surface.
 
 Run with:
 
@@ -312,15 +312,16 @@ Set `admin_socket` to enable a local Unix socket for operational commands:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `validate-runtime`, `restart`, `routes`, `certs`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart; `validate-runtime` checks the already-loaded in-memory config.
+Commands are one line each: `status`, `validate`, `validate-runtime`, `reload`, `restart`, `routes`, `certs`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
+printf 'reload\n' | nc -U /tmp/layerline-admin.sock
 printf 'routes\n' | nc -U /tmp/layerline-admin.sock
 printf 'certs\n' | nc -U /tmp/layerline-admin.sock
 ```
 
-This socket does not do in-memory hot reload yet. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it. True reload still needs an owned immutable config snapshot per worker so existing requests can drain on the old config while new requests move to the new one.
+`reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
 
 ## Admin Web UI
 
@@ -335,7 +336,7 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use managed restart for those changes to become active until the in-memory config snapshot work lands.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
 
 ## Website and branding
 
@@ -512,7 +513,7 @@ zig build run -- \
 
 `letsencrypt_webroot` follows certbot webroot semantics: point it at the public root, and Layerline serves files from `<webroot>/.well-known/acme-challenge/<token>`. Older configs that point directly at `.well-known/acme-challenge` still work, but new production configs should use the public root. Enable `http_redirect = true` when Layerline owns both ports: the plaintext listener serves ACME challenges and redirects every other request to HTTPS with the original host, path, and query.
 
-Renewal updates the certificate files on disk. Until in-memory hot reload lands, the running process must restart to pick up new TLS material. For production systemd hosts, install `deploy/systemd/layerline-cert-renew.timer`; its certbot deploy hook restarts Layerline only after a renewed certificate is deployed.
+Renewal updates the certificate files on disk. A manual/admin reload can pick up renewed TLS material when the listener shape is unchanged; the bundled systemd timer still uses a restart deploy hook because that is the conservative operational default for unattended certificate rotation.
 
 ### Cloudflare automatic deployment
 
@@ -597,7 +598,7 @@ Run the smoke and benchmark harness against a running server:
 ./scripts/benchmark-layerline.sh
 ```
 
-Use `./scripts/benchmark-layerline.sh --verify-only` for deployment checks, or see `docs/benchmarking.md` for concurrency, duration, target, tool, and HTTP/3 smoke-test knobs.
+Use `./scripts/benchmark-layerline.sh --verify-only` for deployment checks, or see `docs/benchmarking.md` for concurrency, duration, target, tool, reload, and HTTP/3 smoke-test knobs.
 
 ## Reverse proxy mode
 

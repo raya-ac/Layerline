@@ -13,10 +13,12 @@ const ServerConfig = config_mod.ServerConfig;
 const trimValue = http_headers.trimValue;
 
 pub const Callbacks = struct {
+    active_config: *const fn () *ServerConfig,
     active_io: *const fn () std.Io,
     bind_thread_io: *const fn (std.Io) void,
     close_stream: *const fn (std.Io.net.Stream) void,
     read_stream: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
+    reload_config: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
     render_metrics: *const fn (std.mem.Allocator) anyerror![]const u8,
     request_restart: *const fn () void,
     runtime_view: *const fn () admin_pages.RuntimeView,
@@ -117,6 +119,18 @@ fn handleRestartPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.A
 
     callbacks.request_restart();
     try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted", close_connection, false);
+}
+
+fn handleReloadPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+    callbacks.reload_config(io, allocator, cfg) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Reload blocked: {}", .{err});
+        defer allocator.free(message);
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    const active_cfg = callbacks.active_config();
+    try callbacks.send_dashboard_page(io, stream, allocator, active_cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK", close_connection, false);
 }
 
 fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
@@ -362,6 +376,10 @@ pub fn handleUi(
         try handleRestartPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/reload")) {
+        try handleReloadPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
         try handleAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
         return;
@@ -387,7 +405,7 @@ fn sendText(stream: std.Io.net.Stream, bytes: []const u8, callbacks: Callbacks) 
 fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8, callbacks: Callbacks) !void {
     const command = trimValue(command_raw);
     if (command.len == 0 or std.mem.eql(u8, command, "help")) {
-        try sendText(stream, "commands: status, validate, validate-runtime, restart, routes, certs, metrics, help\n", callbacks);
+        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, certs, metrics, help\n", callbacks);
         return;
     }
 
@@ -432,6 +450,17 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         return;
     }
 
+    if (std.mem.eql(u8, command, "reload")) {
+        callbacks.reload_config(callbacks.active_io(), allocator, cfg) catch |err| {
+            const body = try std.fmt.allocPrint(allocator, "ERROR reload blocked: {}\n", .{err});
+            defer allocator.free(body);
+            try sendText(stream, body, callbacks);
+            return;
+        };
+        try sendText(stream, "OK config reloaded\n", callbacks);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "routes")) {
         const body = try admin_pages.renderRoutes(allocator, cfg);
         defer allocator.free(body);
@@ -461,7 +490,8 @@ fn handleConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg
     var buffer: [1024]u8 = undefined;
     const n = try callbacks.read_stream(stream, &buffer);
     if (n == 0) return;
-    try handleCommand(stream, allocator, cfg, buffer[0..n], callbacks);
+    _ = cfg;
+    try handleCommand(stream, allocator, callbacks.active_config(), buffer[0..n], callbacks);
 }
 
 pub fn unlinkUnixSocket(path: []const u8, callbacks: Callbacks) void {

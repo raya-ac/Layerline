@@ -136,6 +136,47 @@ fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
 }
 
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const ServerConfig) !void {
+    if (!std.mem.eql(u8, active.host, candidate.host)) return error.ReloadRequiresRestart;
+    if (active.port != candidate.port) return error.ReloadRequiresRestart;
+    if (active.tls_enabled != candidate.tls_enabled) return error.ReloadRequiresRestart;
+    if (active.tls_auto != candidate.tls_auto) return error.ReloadRequiresRestart;
+    if (active.http_redirect_enabled != candidate.http_redirect_enabled) return error.ReloadRequiresRestart;
+    if (active.http_redirect_port != candidate.http_redirect_port) return error.ReloadRequiresRestart;
+    if (active.http_redirect_https_port != candidate.http_redirect_https_port) return error.ReloadRequiresRestart;
+    if (active.http3_enabled != candidate.http3_enabled) return error.ReloadRequiresRestart;
+    if (active.http3_port != candidate.http3_port) return error.ReloadRequiresRestart;
+    if (active.admin_enabled != candidate.admin_enabled) return error.ReloadRequiresRestart;
+    if (!optionalStringEql(active.admin_socket_path, candidate.admin_socket_path)) return error.ReloadRequiresRestart;
+}
+
+fn reloadConfigInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+
+    const candidate_allocator = arena.allocator();
+    const candidate = try candidate_allocator.create(ServerConfig);
+    candidate.* = defaultServerConfig();
+    candidate.config_path = active.config_path;
+    try loadConfig(io, candidate_allocator, candidate, candidate.config_path);
+    try loadConfiguredDomainConfigs(io, candidate_allocator, candidate);
+    normalizeConfig(candidate);
+    try validateConfig(candidate);
+    try validateReloadCompatibility(active, candidate);
+    try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
+    try runtime_state.config_store.activateOwned(allocator, arena, candidate);
+}
+
 fn adminRuntimeView() admin_pages.RuntimeView {
     return .{ .server_name = SERVER_NAME, .metrics = &runtime_state.server_metrics };
 }
@@ -187,10 +228,12 @@ fn adminHttpCallbacks() admin_http.Callbacks {
 
 fn adminCallbacks() admin_runtime.Callbacks {
     return .{
+        .active_config = runtime_state.activeConfig,
         .active_io = activeIo,
         .bind_thread_io = bindThreadIo,
         .close_stream = streamClose,
         .read_stream = streamRead,
+        .reload_config = reloadConfigInMemory,
         .render_metrics = adminRenderMetrics,
         .request_restart = adminRequestRestart,
         .runtime_view = adminRuntimeView,
@@ -602,6 +645,7 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
     return .{
         .access_log_set_error = runtime_state.accessLogSetError,
         .access_log_set_handler = runtime_state.accessLogSetHandler,
+        .active_config = runtime_state.activeConfig,
         .bind_thread_io = bindThreadIo,
         .clear_access_context = runtime_state.clearAccessLogContext,
         .clear_request_context = runtime_state.clearHttp1RequestContext,
@@ -666,6 +710,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
         return err;
     };
+    try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg);
+    defer runtime_state.config_store.deinit();
     defer {
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
@@ -680,6 +726,7 @@ pub fn main(init: std.process.Init) !void {
         .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .server_header = SERVER_HEADER,
         .callbacks = .{
+            .active_config = runtime_state.activeConfig,
             .admin = adminCallbacks(),
             .bind_thread_io = bindThreadIo,
             .http1 = http1RuntimeCallbacks(),
