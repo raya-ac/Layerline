@@ -36,7 +36,7 @@ Sources:
 
 - Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
 - MIME database and override config.
-- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, stale directive shortcuts, and static Cache-Status headers are implemented on top of inherited response-header policy.
+- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, stale directive shortcuts, static Cache-Status headers, and an opt-in shared memory cache for eligible static responses are implemented on top of inherited response-header policy.
 - Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses with inherited global/domain/route policy overrides; brotli/zstd remain.
 - Static transforms: safe template mode, include variables, generated headers, and route-local error pages.
 - Large-file performance: sendfile on supported targets, fallback streaming, mmap evaluation, rate limiting, and backpressure tests.
@@ -78,7 +78,7 @@ Sources:
 
 ## Phase 7: Caching and Edge Behavior
 
-- HTTP cache: memory and disk backends, cache keys, vary keys, TTL, stale-if-error, stale-while-revalidate, purge API, and cache status header.
+- HTTP cache: memory and disk backends, cache keys, vary keys, TTL, stale-if-error, stale-while-revalidate, purge API, and cache status header. Initial in-memory static response caching is implemented with global caps, per-entry caps, TTL, Cache-Status store/hit detail, and metrics; disk and dynamic upstream microcache remain.
 - Microcache for dynamic upstreams.
 - Request coalescing to prevent thundering-herd fills.
 - CDN-like rules: path maps, header maps, redirects, canonical host, trailing slash policy, and language/device variants.
@@ -114,9 +114,9 @@ Sources:
 6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, consumed-body WINDOW_UPDATE, and graceful GOAWAY on request caps/shutdown; prioritization stance and broader conformance tests remain next.
 8. HTTP/3 full routing. Initial QUIC/TLS plus minimal QPACK request decoding can serve static routes, static root, `/static/*`, `/health`, and the fallback protocol page; proxy/PHP routes and broad client conformance remain.
-9. Cache and compression. Initial inherited Cache-Control policy shortcuts, stale directive shortcuts, static Cache-Status detail, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; brotli/zstd and a real response cache remain next.
+9. Cache and compression. Initial inherited Cache-Control policy shortcuts, stale directive shortcuts, static Cache-Status detail, opt-in shared memory static response cache, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; brotli/zstd, disk cache, dynamic microcache, and route-local cache knobs remain next.
 10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, in-memory reload, managed restart, routes, certs, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, enabled domain files, activation preflight, reload, managed restart, and new site-file creation. Live upstream/cert operational controls remain.
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, in-memory config reload, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone should be real response-cache mechanics, broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, route-local cache/security/upstream policy, and a config parser refactor. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.
+The next engineering milestone should be broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, route-local cache/security/upstream policy, a config parser refactor, and then disk/dynamic cache mechanics. Most nginx/Caddy-class features need route-local policy; adding more global booleans will not scale.

@@ -84,17 +84,17 @@ pub fn makeStaticEtag(allocator: std.mem.Allocator, stat: std.Io.File.Stat) ![]c
     );
 }
 
-pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content_encoding: ?[]const u8) ![]const u8 {
+pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content_encoding: ?[]const u8, cache_status: []const u8) ![]const u8 {
     if (content_encoding) |encoding| {
         return std.fmt.allocPrint(
             allocator,
             "Accept-Ranges: bytes\r\n" ++
                 "ETag: {s}\r\n" ++
                 "Cache-Control: public, max-age=60\r\n" ++
-                "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n" ++
+                "Cache-Status: {s}\r\n" ++
                 "Vary: Accept-Encoding\r\n" ++
                 "Content-Encoding: {s}\r\n",
-            .{ etag, encoding },
+            .{ etag, cache_status, encoding },
         );
     }
 
@@ -103,9 +103,9 @@ pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, con
         "Accept-Ranges: bytes\r\n" ++
             "ETag: {s}\r\n" ++
             "Cache-Control: public, max-age=60\r\n" ++
-            "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n" ++
+            "Cache-Status: {s}\r\n" ++
             "Vary: Accept-Encoding\r\n",
-        .{etag},
+        .{ etag, cache_status },
     );
 }
 

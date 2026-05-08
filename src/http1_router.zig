@@ -5,6 +5,7 @@ const php_runtime = @import("php_runtime.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
+const static_cache = @import("static_cache.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const DomainConfig = config_mod.DomainConfig;
@@ -55,7 +56,7 @@ pub const Callbacks = struct {
     send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
     send_server_icon: *const fn (std.Io.net.Stream, bool, bool) anyerror!void,
     serve_acme_challenge: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, []const u8, []const u8, bool, bool) anyerror!void,
-    serve_static: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, []const u8, []const u8, []const u8, bool, bool, usize) anyerror!void,
+    serve_static: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, []const u8, []const u8, []const u8, bool, bool, usize, static_cache.Policy) anyerror!void,
     set_request_context: *const fn ([]const u8, CompressionPolicy) void,
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
 };
@@ -163,7 +164,7 @@ pub fn route(
 
         if (std.mem.eql(u8, req.path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
             callbacks.access_log_set_handler("static_root");
-            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), req.headers, should_close, is_head, cfg.max_static_file_bytes);
+            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
             return;
         }
 
@@ -220,7 +221,7 @@ pub fn route(
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             callbacks.access_log_set_handler("static");
             const rel = req.path["/static/".len..];
-            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
+            try callbacks.serve_static(io, stream, allocator, routing_mod.domainStaticDir(cfg, domain), rel, req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
             return;
         }
 
@@ -247,7 +248,7 @@ pub fn route(
 
             if (file_exists) {
                 callbacks.access_log_set_handler("static_root");
-                try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes);
+                try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, should_close, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
                 return;
             }
         }

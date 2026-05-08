@@ -28,6 +28,7 @@ const request_mod = @import("request.zig");
 const runtime_state = @import("runtime_state.zig");
 const server_runtime = @import("server_runtime.zig");
 const server_identity = @import("server_identity.zig");
+const static_cache = @import("static_cache.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const tls_accept = @import("tls_accept.zig");
 const tls_material = @import("tls_material.zig");
@@ -304,6 +305,7 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
 fn http1StaticCallbacks() http1_static.Callbacks {
     return .{
         .metrics = &runtime_state.server_metrics,
+        .response_cache = &runtime_state.static_response_cache,
         .send_bad_request_for_method = sendBadRequestForMethod,
         .send_cool_error = sendCoolErrorWithConnection,
         .send_not_found_for_method = sendNotFoundForMethod,
@@ -324,8 +326,9 @@ fn serveStatic(
     close_connection: bool,
     is_head: bool,
     max_file_bytes: usize,
+    response_cache_policy: static_cache.Policy,
 ) !void {
-    try http1_static.serveStatic(io, stream, allocator, static_dir, rel_path, request_headers, close_connection, is_head, max_file_bytes, http1StaticCallbacks());
+    try http1_static.serveStatic(io, stream, allocator, static_dir, rel_path, request_headers, close_connection, is_head, max_file_bytes, response_cache_policy, http1StaticCallbacks());
 }
 
 fn serveAcmeChallenge(
@@ -432,8 +435,8 @@ fn h2DomainCustomNotFoundResponse(
     return custom_errors.h2DomainNotFoundResponse(io, allocator, cfg, domain);
 }
 
-fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize) !H2BufferedResponse {
-    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, max_file_bytes, &runtime_state.server_metrics, SERVER_NAME, SERVER_TAGLINE);
+fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize, response_cache_policy: static_cache.Policy) !H2BufferedResponse {
+    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, max_file_bytes, &runtime_state.server_metrics, &runtime_state.static_response_cache, response_cache_policy, SERVER_NAME, SERVER_TAGLINE);
 }
 
 fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, token: []const u8) !H2BufferedResponse {
@@ -713,6 +716,7 @@ pub fn main(init: std.process.Init) !void {
     try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg);
     defer runtime_state.config_store.deinit();
     defer {
+        runtime_state.static_response_cache.deinit();
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
 
@@ -722,6 +726,7 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .process_env = init.environ_map,
         .metrics = &runtime_state.server_metrics,
+        .response_cache = &runtime_state.static_response_cache,
         .shutdown_requested = &runtime_state.shutdown_requested,
         .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .server_header = SERVER_HEADER,

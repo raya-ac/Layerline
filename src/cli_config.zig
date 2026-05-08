@@ -344,6 +344,30 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
                 return false;
             };
             cfg.compression_max_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.compression_max_bytes;
+        } else if (std.mem.eql(u8, arg, "--response-cache") or std.mem.eql(u8, arg, "--static-response-cache")) {
+            const value = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+            cfg.response_cache_enabled = parseBool(value) orelse cfg.response_cache_enabled;
+        } else if (std.mem.eql(u8, arg, "--response-cache-max-bytes")) {
+            const value = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+            cfg.response_cache_max_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.response_cache_max_bytes;
+        } else if (std.mem.eql(u8, arg, "--response-cache-max-entry-bytes")) {
+            const value = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+            cfg.response_cache_max_entry_bytes = std.fmt.parseInt(usize, value, 10) catch cfg.response_cache_max_entry_bytes;
+        } else if (std.mem.eql(u8, arg, "--response-cache-ttl-ms")) {
+            const value = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+            cfg.response_cache_ttl_ms = std.fmt.parseInt(u32, value, 10) catch cfg.response_cache_ttl_ms;
         } else if (std.mem.eql(u8, arg, "--max-request-bytes")) {
             const value = args.next() orelse {
                 callbacks.usage();

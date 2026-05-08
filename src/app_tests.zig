@@ -10,6 +10,7 @@ const request_mod = @import("request.zig");
 const redirects = @import("redirects.zig");
 const response_body = @import("response_body.zig");
 const routing_mod = @import("routing.zig");
+const static_cache = @import("static_cache.zig");
 const static_files = @import("static_files.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
@@ -573,13 +574,17 @@ test "http2 goaway payload masks reserved stream bit" {
 }
 
 test "static cache headers include cache status detail" {
-    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", null);
+    const plain_status = try static_cache.cacheStatusStatic(std.testing.allocator, null);
+    defer std.testing.allocator.free(plain_status);
+    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", null, plain_status);
     defer std.testing.allocator.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "Cache-Status: Layerline; hit; ttl=60; detail=\"static-file\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Cache-Status: Layerline; fwd=uri-miss; detail=\"static-file\"\r\n") != null);
 
-    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "br");
+    const encoded_status = try static_cache.cacheStatusStatic(std.testing.allocator, "br");
+    defer std.testing.allocator.free(encoded_status);
+    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "br", encoded_status);
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; hit; ttl=60; detail=\"precompressed-static\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; fwd=uri-miss; detail=\"precompressed-static\"\r\n") != null);
 }
 
 test "chunked upstream body scanner detects trailers and terminator" {

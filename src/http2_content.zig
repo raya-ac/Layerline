@@ -8,6 +8,7 @@ const h2_support = @import("http2_support.zig");
 const metrics_mod = @import("metrics.zig");
 const redirects = @import("redirects.zig");
 const request_mod = @import("request.zig");
+const static_cache = @import("static_cache.zig");
 const static_files = @import("static_files.zig");
 
 const H2BufferedResponse = h2_support.BufferedResponse;
@@ -33,6 +34,8 @@ pub fn readStaticFile(
     rel_path: []const u8,
     max_file_bytes: usize,
     metrics: *ServerMetrics,
+    response_cache: *static_cache.Store,
+    response_cache_policy: static_cache.Policy,
     server_name: []const u8,
     server_tagline: []const u8,
 ) !H2BufferedResponse {
@@ -51,22 +54,65 @@ pub fn readStaticFile(
         return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
     }
 
+    const etag = try static_files.makeStaticEtag(allocator, stat);
+    const file_len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+    const content_type = static_files.contentTypeFromPath(rel_path);
+    if (response_cache_policy.enabled and file_len <= response_cache_policy.max_entry_bytes) {
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (try response_cache.fetch(allocator, file_path, etag, now_ms)) |cached| {
+            metrics.responseCacheHit(cached.len);
+            const cache_status = try static_cache.cacheStatusHit(allocator, response_cache_policy);
+            const headers = try allocator.alloc(h2_native.Header, 5);
+            headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
+            headers[1] = .{ .name = "etag", .value = etag };
+            headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
+            headers[3] = .{ .name = "cache-status", .value = cache_status };
+            headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+            return .{ .status_code = 200, .content_type = content_type, .body = cached, .headers = headers };
+        }
+
+        metrics.responseCacheMiss();
+        const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
+            if (err == error.StreamTooLong) {
+                return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
+            }
+            return err;
+        };
+        const store_outcome = try response_cache.store(file_path, etag, data, now_ms, response_cache_policy);
+        if (store_outcome.result == .stored) metrics.responseCacheStore();
+        var eviction_index: usize = 0;
+        while (eviction_index < store_outcome.evictions) : (eviction_index += 1) metrics.responseCacheEviction();
+        const cache_status = if (store_outcome.result == .stored)
+            try static_cache.cacheStatusStored(allocator, response_cache_policy)
+        else
+            try static_cache.cacheStatusStatic(allocator, null);
+        const headers = try allocator.alloc(h2_native.Header, 5);
+        headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
+        headers[1] = .{ .name = "etag", .value = etag };
+        headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
+        headers[3] = .{ .name = "cache-status", .value = cache_status };
+        headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+
+        metrics.staticBodySent(data.len, .buffered);
+        return .{ .status_code = 200, .content_type = content_type, .body = data, .headers = headers };
+    }
+
     const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
         if (err == error.StreamTooLong) {
             return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
         }
         return err;
     };
-    const etag = try static_files.makeStaticEtag(allocator, stat);
+    const cache_status = try static_cache.cacheStatusStatic(allocator, null);
     const headers = try allocator.alloc(h2_native.Header, 5);
     headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
     headers[1] = .{ .name = "etag", .value = etag };
     headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
-    headers[3] = .{ .name = "cache-status", .value = "Layerline; hit; ttl=60; detail=\"static-file\"" };
+    headers[3] = .{ .name = "cache-status", .value = cache_status };
     headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
 
     metrics.staticBodySent(data.len, .buffered);
-    return .{ .status_code = 200, .content_type = static_files.contentTypeFromPath(rel_path), .body = data, .headers = headers };
+    return .{ .status_code = 200, .content_type = content_type, .body = data, .headers = headers };
 }
 
 pub fn readAcmeChallenge(

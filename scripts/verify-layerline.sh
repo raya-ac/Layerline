@@ -93,6 +93,10 @@ access_log = $ACCESS_LOG
 compression = true
 compression_min_bytes = 1
 compression_max_bytes = 1048576
+response_cache = true
+response_cache_max_bytes = 1048576
+response_cache_max_entry_bytes = 65536
+response_cache_ttl_ms = 60000
 route = nogzip /nogzip/* static
 route_compression.nogzip = false
 route_stale_if_error.nogzip = 30
@@ -142,7 +146,10 @@ ok "HTTP/1 request id header"
 
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
-header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="static-file"' || die "static Cache-Status header missing"
+header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; stored; ttl=60; detail="response-cache"' || die "static Cache-Status store header missing"
+STATIC_HIT_HEADERS="$TMP_DIR/static-hit.headers"
+curl -fsS -D "$STATIC_HIT_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
+header_has "$STATIC_HIT_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="response-cache"' || die "static response-cache hit header missing"
 ok "static file route"
 
 GZIP_HEADERS="$TMP_DIR/gzip.headers"
@@ -178,7 +185,7 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
 
   H2_STATIC_HEADERS="$TMP_DIR/h2-static.headers"
   curl -fsS --http2-prior-knowledge -D "$H2_STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
-  header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="static-file"' || die "h2 static Cache-Status header missing"
+  header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="response-cache"' || die "h2 static response-cache hit header missing"
   ok "h2c static cache status"
 
   H2_REQUEST_ID_HEADERS="$TMP_DIR/h2-request-id.headers"
@@ -312,6 +319,7 @@ grep -Fq 'Save settings' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not i
 grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include in-memory reload"
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
+grep -Fq 'layerline_response_cache_hits_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include response-cache metrics"
 ok "admin UI authenticated dashboard"
 
 curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \

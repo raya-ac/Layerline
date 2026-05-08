@@ -2,11 +2,13 @@ const std = @import("std");
 
 const acme = @import("acme.zig");
 const metrics_mod = @import("metrics.zig");
+const static_cache = @import("static_cache.zig");
 const static_files = @import("static_files.zig");
 const http_headers = @import("http_headers.zig");
 
 pub const Callbacks = struct {
     metrics: *metrics_mod.ServerMetrics,
+    response_cache: *static_cache.Store,
     send_bad_request_for_method: *const fn (std.mem.Allocator, std.Io.net.Stream, []const u8, bool, bool) anyerror!void,
     send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8, bool, bool, ?[]const u8) anyerror!void,
     send_not_found_for_method: *const fn (std.mem.Allocator, std.Io.net.Stream, bool, bool) anyerror!void,
@@ -26,6 +28,7 @@ pub fn serveStatic(
     close_connection: bool,
     is_head: bool,
     max_file_bytes: usize,
+    response_cache_policy: static_cache.Policy,
     callbacks: Callbacks,
 ) !void {
     // Static paths are deliberately boring: no parent hops, no backslashes, no
@@ -82,17 +85,24 @@ pub fn serveStatic(
 
     const etag = try static_files.makeStaticEtag(allocator, stat);
     defer allocator.free(etag);
-    const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding);
-    defer allocator.free(base_headers);
+    const content_type = static_files.contentTypeFromPath(rel_path);
 
     if (http_headers.findHeaderValue(request_headers, "If-None-Match")) |if_none_match| {
         if (static_files.etagMatches(if_none_match, etag)) {
-            try callbacks.send_response_no_body_headers(stream, 304, "Not Modified", static_files.contentTypeFromPath(rel_path), 0, close_connection, base_headers);
+            const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
+            defer allocator.free(cache_status);
+            const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding, cache_status);
+            defer allocator.free(base_headers);
+            try callbacks.send_response_no_body_headers(stream, 304, "Not Modified", content_type, 0, close_connection, base_headers);
             return;
         }
     }
 
     if (range_header) |range_value| {
+        const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
+        defer allocator.free(cache_status);
+        const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding, cache_status);
+        defer allocator.free(base_headers);
         const range = static_files.parseByteRange(range_value, file_len) catch |err| switch (err) {
             error.RangeNotSatisfiable => {
                 const headers = try std.fmt.allocPrint(allocator, "{s}Content-Range: bytes */{d}\r\n", .{ base_headers, file_len });
@@ -112,14 +122,59 @@ pub fn serveStatic(
         defer allocator.free(headers);
         const body_len = range.end - range.start + 1;
 
-        try callbacks.send_response_no_body_headers(stream, 206, "Partial Content", static_files.contentTypeFromPath(rel_path), body_len, close_connection, headers);
+        try callbacks.send_response_no_body_headers(stream, 206, "Partial Content", content_type, body_len, close_connection, headers);
         if (!is_head) {
             try static_files.streamRangeBody(io, stream, selected_path, range.start, body_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all });
         }
         return;
     }
 
-    try callbacks.send_response_no_body_headers(stream, 200, "OK", static_files.contentTypeFromPath(rel_path), file_len, close_connection, base_headers);
+    if (response_cache_policy.enabled and file_len <= response_cache_policy.max_entry_bytes) {
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (try callbacks.response_cache.fetch(allocator, selected_path, etag, now_ms)) |cached| {
+            defer allocator.free(cached);
+            callbacks.metrics.responseCacheHit(cached.len);
+            const cache_status = try static_cache.cacheStatusHit(allocator, response_cache_policy);
+            defer allocator.free(cache_status);
+            const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding, cache_status);
+            defer allocator.free(base_headers);
+            try callbacks.send_response_no_body_headers(stream, 200, "OK", content_type, cached.len, close_connection, base_headers);
+            if (!is_head and cached.len > 0) try callbacks.write_all(stream, cached);
+            return;
+        }
+
+        callbacks.metrics.responseCacheMiss();
+        const data = std.Io.Dir.cwd().readFileAlloc(io, selected_path, allocator, .limited(response_cache_policy.max_entry_bytes)) catch |err| {
+            if (err == error.StreamTooLong) {
+                try callbacks.send_cool_error(stream, allocator, 413, "Payload Too Large", "Static file is too large for configured cache limits.", close_connection, is_head, null);
+                return;
+            }
+            return err;
+        };
+        defer allocator.free(data);
+
+        const store_outcome = try callbacks.response_cache.store(selected_path, etag, data, now_ms, response_cache_policy);
+        if (store_outcome.result == .stored) callbacks.metrics.responseCacheStore();
+        var eviction_index: usize = 0;
+        while (eviction_index < store_outcome.evictions) : (eviction_index += 1) callbacks.metrics.responseCacheEviction();
+        const cache_status = if (store_outcome.result == .stored)
+            try static_cache.cacheStatusStored(allocator, response_cache_policy)
+        else
+            try static_cache.cacheStatusStatic(allocator, content_encoding);
+        defer allocator.free(cache_status);
+        const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding, cache_status);
+        defer allocator.free(base_headers);
+        try callbacks.send_response_no_body_headers(stream, 200, "OK", content_type, data.len, close_connection, base_headers);
+        if (!is_head and data.len > 0) try callbacks.write_all(stream, data);
+        if (!is_head) callbacks.metrics.staticBodySent(data.len, .buffered);
+        return;
+    }
+
+    const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
+    defer allocator.free(cache_status);
+    const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, content_encoding, cache_status);
+    defer allocator.free(base_headers);
+    try callbacks.send_response_no_body_headers(stream, 200, "OK", content_type, file_len, close_connection, base_headers);
     if (!is_head) {
         try static_files.streamRangeBody(io, stream, selected_path, 0, file_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all });
     }

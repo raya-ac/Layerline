@@ -10,6 +10,7 @@ const metrics_mod = @import("metrics.zig");
 const quic_native = @import("quic_native.zig");
 const routing_mod = @import("routing.zig");
 const server_identity = @import("server_identity.zig");
+const static_cache = @import("static_cache.zig");
 const tls13_native = @import("tls13_native.zig");
 
 const DomainConfig = config_mod.DomainConfig;
@@ -454,6 +455,7 @@ fn buildHttp3StaticRouteResponse(
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     metrics: *ServerMetrics,
+    response_cache: *static_cache.Store,
     domain: ?*const DomainConfig,
     route: *const RouteConfig,
     request: Http3Request,
@@ -466,7 +468,7 @@ fn buildHttp3StaticRouteResponse(
     }
 
     const rel = try routing_mod.routeFileRelativePath(allocator, route, request.path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
-    return http2_content.readStaticFile(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, server_identity.name, server_identity.tagline);
+    return http2_content.readStaticFile(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline);
 }
 
 fn buildHttp3RoutedResponseData(
@@ -474,6 +476,7 @@ fn buildHttp3RoutedResponseData(
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     metrics: *ServerMetrics,
+    response_cache: *static_cache.Store,
     server_header: []const u8,
     request: Http3Request,
 ) ![]u8 {
@@ -481,10 +484,10 @@ fn buildHttp3RoutedResponseData(
     const domain = if (request.authority) |authority| routing_mod.findDomainForHost(cfg, authority) else null;
 
     if (routing_mod.findDomainRoute(domain, request.path)) |route| {
-        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, domain, route, request), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, response_cache, domain, route, request), is_head);
     }
     if (routing_mod.findNamedRoute(cfg, request.path)) |route| {
-        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, domain, route, request), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, response_cache, domain, route, request), is_head);
     }
 
     if (std.mem.eql(u8, request.path, "/health")) {
@@ -499,7 +502,7 @@ fn buildHttp3RoutedResponseData(
     }
 
     if (std.mem.eql(u8, request.path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), cfg.max_static_file_bytes, metrics, server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
     }
 
     if (std.mem.eql(u8, request.path, "/")) {
@@ -507,12 +510,12 @@ fn buildHttp3RoutedResponseData(
     }
 
     if (std.mem.startsWith(u8, request.path, "/static/")) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), request.path["/static/".len..], cfg.max_static_file_bytes, metrics, server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), request.path["/static/".len..], cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
     }
 
     if (routing_mod.domainServeStaticRoot(cfg, domain) and !std.mem.startsWith(u8, request.path, "/api/") and !std.mem.startsWith(u8, request.path, "/php/")) {
         const rel = try routing_mod.makeStaticPathFromRequest(allocator, request.path, routing_mod.domainIndexFile(cfg, domain));
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, server_identity.name, server_identity.tagline), is_head);
+        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, cfg.max_static_file_bytes, metrics, response_cache, static_cache.policyFromConfig(cfg), server_identity.name, server_identity.tagline), is_head);
     }
 
     return buildHttp3ErrorResponseData(allocator, server_header, 404, "Not Found", "The requested resource was not found on this server.", is_head);
@@ -591,6 +594,7 @@ fn sendHttp3ResponsePacket(
     request: Http3Request,
     cfg: *const ServerConfig,
     metrics: *ServerMetrics,
+    response_cache: *static_cache.Store,
     server_header: []const u8,
 ) !usize {
     const ack_frame = try quic_native.buildAckFrame(std.heap.page_allocator, largest_client_packet_number, 0);
@@ -601,7 +605,7 @@ fn sendHttp3ResponsePacket(
     defer std.heap.page_allocator.free(control_stream);
     var response_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer response_arena.deinit();
-    const response_data = try buildHttp3RoutedResponseData(io, response_arena.allocator(), cfg, metrics, server_header, request);
+    const response_data = try buildHttp3RoutedResponseData(io, response_arena.allocator(), cfg, metrics, response_cache, server_header, request);
 
     const max_plaintext = try maxHttp3ShortPlaintextBytes(assembly.scid.slice().len);
     var response_offset: usize = 0;
@@ -664,7 +668,7 @@ test "extracts HTTP/3 request path from a request stream" {
     try std.testing.expectEqualStrings("/health", request.path);
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig) void {
+pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetrics, response_cache: *static_cache.Store, server_header: []const u8, active_config: *const fn () *ServerConfig) void {
     var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
         std.debug.print("HTTP/3 bind address error: {}\n", .{err});
         return;
@@ -835,7 +839,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
                         continue;
                     };
                     if (request_opt) |request| {
-                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), metrics, server_header) catch |err| {
+                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), metrics, response_cache, server_header) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
@@ -875,7 +879,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
             };
             if (request_opt) |request| {
                 if (!assembly.h3_response_sent) {
-                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), metrics, server_header) catch |err| {
+                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), metrics, response_cache, server_header) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };

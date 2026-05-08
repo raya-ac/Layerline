@@ -4,6 +4,7 @@ const config_mod = @import("config.zig");
 const php_runtime = @import("php_runtime.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
+const static_cache = @import("static_cache.zig");
 
 const DomainConfig = config_mod.DomainConfig;
 const HttpRequest = request_mod.HttpRequest;
@@ -32,7 +33,7 @@ pub const NamedRouteCallbacks = struct {
     send_method_not_allowed: *const fn (std.Io.net.Stream, std.mem.Allocator, []const u8, bool, bool) anyerror!void,
     send_not_found_for_method: *const fn (std.mem.Allocator, std.Io.net.Stream, bool, bool) anyerror!void,
     send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
-    serve_static: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, []const u8, []const u8, []const u8, bool, bool, usize) anyerror!void,
+    serve_static: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, []const u8, []const u8, []const u8, bool, bool, usize, static_cache.Policy) anyerror!void,
 };
 
 pub fn sendMethodNotAllowedWithAllow(
@@ -84,7 +85,7 @@ pub fn handleNamedRoute(
             const index_file = route.index_file orelse routing_mod.domainIndexFile(cfg, domain);
             const rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, index_file);
             defer allocator.free(rel);
-            try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes);
+            try callbacks.serve_static(io, stream, allocator, static_dir, rel, req.headers, close_connection, is_head, cfg.max_static_file_bytes, static_cache.policyFromConfig(cfg));
             return;
         },
         .php => {

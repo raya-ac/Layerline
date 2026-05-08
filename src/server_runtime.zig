@@ -7,6 +7,7 @@ const config_mod = @import("config.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http3_server = @import("http3_server.zig");
 const metrics_mod = @import("metrics.zig");
+const static_cache = @import("static_cache.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
@@ -29,6 +30,7 @@ pub const Context = struct {
     cfg: *ServerConfig,
     process_env: *const std.process.Environ.Map,
     metrics: *ServerMetrics,
+    response_cache: *static_cache.Store,
     shutdown_requested: *std.atomic.Value(bool),
     default_admin_socket_path: []const u8,
     server_header: []const u8,
@@ -165,7 +167,7 @@ fn startBackgroundWorkers(ctx: Context) !void {
         std.debug.print("Active upstream health checks: path={s} interval={d}ms timeout={d}ms\n", .{ ctx.cfg.upstream_health_check_path, ctx.cfg.upstream_health_check_interval_ms, ctx.cfg.upstream_health_check_timeout_ms });
     }
     if (ctx.cfg.http3_enabled) {
-        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.server_header, ctx.callbacks.active_config }) catch |err| {
+        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.response_cache, ctx.server_header, ctx.callbacks.active_config }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
             return err;
         };

@@ -36,6 +36,9 @@ pub const DEFAULT_LETSENCRYPT_RENEW_INTERVAL_MS = 12 * 60 * 60 * 1000;
 pub const DEFAULT_COMPRESSION_MIN_BYTES = 512;
 pub const DEFAULT_COMPRESSION_MAX_BYTES = 1024 * 1024;
 pub const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = 512 * 1024;
+pub const DEFAULT_RESPONSE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+pub const DEFAULT_RESPONSE_CACHE_MAX_ENTRY_BYTES = 256 * 1024;
+pub const DEFAULT_RESPONSE_CACHE_TTL_MS = 60 * 1000;
 pub const MAX_CONFIG_BYTES = 64 * 1024;
 pub const DEFAULT_CONFIG_PATH = "server.conf";
 pub const DEFAULT_ADMIN_SOCKET_PATH = "/tmp/layerline-admin.sock";
@@ -307,6 +310,10 @@ pub const ServerConfig = struct {
     gzip_enabled: bool,
     compression_min_bytes: usize,
     compression_max_bytes: usize,
+    response_cache_enabled: bool,
+    response_cache_max_bytes: usize,
+    response_cache_max_entry_bytes: usize,
+    response_cache_ttl_ms: u32,
     response_headers: std.ArrayList(ResponseHeaderRule),
     redirects: std.ArrayList(RedirectRule),
     routes: std.ArrayList(RouteConfig),
@@ -413,6 +420,10 @@ pub fn defaultServerConfig() ServerConfig {
         .gzip_enabled = true,
         .compression_min_bytes = DEFAULT_COMPRESSION_MIN_BYTES,
         .compression_max_bytes = DEFAULT_COMPRESSION_MAX_BYTES,
+        .response_cache_enabled = false,
+        .response_cache_max_bytes = DEFAULT_RESPONSE_CACHE_MAX_BYTES,
+        .response_cache_max_entry_bytes = DEFAULT_RESPONSE_CACHE_MAX_ENTRY_BYTES,
+        .response_cache_ttl_ms = DEFAULT_RESPONSE_CACHE_TTL_MS,
         .response_headers = .empty,
         .redirects = .empty,
         .routes = .empty,
@@ -1423,6 +1434,14 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         cfg.compression_min_bytes = try parseConfigUsize(v);
     } else if (isCompressionMaxBytesKey(k)) {
         cfg.compression_max_bytes = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "response_cache") or std.mem.eql(u8, k, "static_response_cache")) {
+        cfg.response_cache_enabled = try parseConfigBool(v);
+    } else if (std.mem.eql(u8, k, "response_cache_max_bytes") or std.mem.eql(u8, k, "static_response_cache_max_bytes")) {
+        cfg.response_cache_max_bytes = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "response_cache_max_entry_bytes") or std.mem.eql(u8, k, "static_response_cache_max_entry_bytes")) {
+        cfg.response_cache_max_entry_bytes = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "response_cache_ttl_ms") or std.mem.eql(u8, k, "static_response_cache_ttl_ms")) {
+        cfg.response_cache_ttl_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "header") or std.mem.eql(u8, k, "response_header") or std.mem.eql(u8, k, "add_header")) {
         if (v.len > 0) try cfg.response_headers.append(allocator, try parseResponseHeaderRule(allocator, v));
     } else if (std.mem.eql(u8, k, "cache_control") or std.mem.eql(u8, k, "cache-control")) {
@@ -2246,6 +2265,12 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         if (std.mem.indexOfAny(u8, cfg.access_log_path, "\r\n\x00") != null) return error.InvalidConfigValue;
     }
     try validateCompressionPolicy(compressionPolicyFromConfig(cfg));
+    if (cfg.response_cache_enabled) {
+        if (cfg.response_cache_max_bytes == 0) return error.InvalidConfigValue;
+        if (cfg.response_cache_max_entry_bytes == 0) return error.InvalidConfigValue;
+        if (cfg.response_cache_max_entry_bytes > cfg.response_cache_max_bytes) return error.InvalidConfigValue;
+        if (cfg.response_cache_ttl_ms == 0) return error.InvalidConfigValue;
+    }
     if (cfg.max_request_bytes < 1024) return error.InvalidConfigValue;
     if (cfg.max_body_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;

@@ -39,7 +39,7 @@ Layerline blends local serving with edge-style deployment:
 - Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
-- Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, and include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, and single byte-range responses.
+- Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
 - Native HTTP/2 routing for static, redirects, metrics, proxy, request bodies, and FastCGI PHP routes, plus cleartext passthrough target support through `h2_upstream`.
 - Native HTTP/3 work is in the Zig binary: QUIC varints, HTTP/3 frame headers, QPACK literal response headers, QUIC Initial/Handshake/1-RTT packet protection, TLS 1.3 handshake flight generation, and static/health route dispatch.
@@ -51,13 +51,13 @@ Layerline blends local serving with edge-style deployment:
 
 ## What It Replaces
 
-Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, reload, and admin controls in one Zig binary. It is already serving controlled production traffic for Layerline-hosted sites; general Caddy-class replacement still depends on broader HTTP/3 route parity, real response-cache work, and soak-test coverage tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
+Layerline is being built toward the Caddy/nginx class: direct TLS termination, virtual hosts, per-domain config files, PHP/FastCGI, reverse proxying, metrics, access logs, redirects, headers, reload, cache, and admin controls in one Zig binary. It is already serving controlled production traffic for Layerline-hosted sites; general Caddy-class replacement still depends on broader HTTP/3 route parity, dynamic/disk cache work, and soak-test coverage tracked in [docs/caddy-replacement-plan.md](docs/caddy-replacement-plan.md).
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, an opt-in shared memory response cache, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout overrides, inherited global/domain/route response headers and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
 
-The next roadmap slice is cache/protocol/parser work: a real response cache, broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, and a config parser refactor. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
+The next roadmap slice is protocol/parser/cache depth: broader HTTP/3 route parity, external h3 smoke coverage where the local client supports it, a config parser refactor, and then disk/dynamic cache work beyond the current static memory cache. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
 ## Files
 
@@ -198,6 +198,11 @@ proxy = off
 #server_compression.main = true
 #route_compression.app = false
 #server_route_compression.main.assets = true
+# Opt-in memory cache for eligible static responses.
+#response_cache = false
+#response_cache_max_bytes = 16777216
+#response_cache_max_entry_bytes = 262144
+#response_cache_ttl_ms = 60000
 tls = false
 # Let's Encrypt auto TLS bootstrap (webroot mode)
 #tls_auto = true
@@ -407,6 +412,15 @@ server_route_stale_while_revalidate.main.assets = 600
 ```
 
 The stale shortcuts append `Cache-Control` directives with seconds values. They follow the same inheritance model as normal headers, so a route sees global stale policy, matching domain stale policy, and route-local stale policy in that order.
+
+The response cache is separate from header policy. It is disabled by default, stores eligible static responses in process memory, and emits `Cache-Status` details for store/hit decisions:
+
+```conf
+response_cache = true
+response_cache_max_bytes = 16777216
+response_cache_max_entry_bytes = 262144
+response_cache_ttl_ms = 60000
+```
 
 Redirects use `redirect = FROM TO [status]`. `FROM` may end with `*` for prefix matching; the matched suffix is appended to `TO`.
 
