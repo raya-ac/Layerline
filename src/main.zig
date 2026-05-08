@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const access_log_mod = @import("access_log.zig");
 const admin_pages = @import("admin_pages.zig");
+const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
 const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
@@ -71,27 +72,8 @@ const putCgiRequestHeaders = cgi_headers.putRequestHeaders;
 const splitCgiHeaderBlock = cgi_headers.splitHeaderBlock;
 const renderAdminSetupPage = admin_ui_mod.renderAdminSetupPage;
 const renderAdminLoginPage = admin_ui_mod.renderAdminLoginPage;
-const AdminConfigSetting = admin_support.AdminConfigSetting;
 const AdminCredentials = admin_support.AdminCredentials;
-const FormField = admin_support.FormField;
-const adminTrimmedField = admin_support.adminTrimmedField;
-const adminCheckboxEnabled = admin_support.adminCheckboxEnabled;
-const validateAdminSettingsPatch = admin_support.validateAdminSettingsPatch;
-const writeAdminMainConfigFile = admin_support.writeAdminMainConfigFile;
-const buildAdminSiteConfig = admin_support.buildAdminSiteConfig;
-const writeAdminSiteConfigFile = admin_support.writeAdminSiteConfigFile;
-const validateAdminUiPath = admin_support.validateAdminUiPath;
 const adminPathMatches = admin_support.adminPathMatches;
-const adminSubPath = admin_support.adminSubPath;
-const parseUrlEncodedForm = admin_support.parseUrlEncodedForm;
-const freeFormFields = admin_support.freeFormFields;
-const formValue = admin_support.formValue;
-const loadAdminCredentials = admin_support.loadAdminCredentials;
-const createAdminCredentials = admin_support.createAdminCredentials;
-const verifyAdminPassword = admin_support.verifyAdminPassword;
-const adminSessionCookieValid = admin_support.adminSessionCookieValid;
-const makeAdminSessionCookie = admin_support.makeAdminSessionCookie;
-const makeAdminClearCookie = admin_support.makeAdminClearCookie;
 const buildAcmeChallengeFilePath = acme_mod.buildAcmeChallengeFilePath;
 const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
@@ -1036,459 +1018,35 @@ fn emitAccessLog(status_code: u16, body_bytes: usize) void {
     access_log_writer.emit(activeIo(), current_access_log, SERVER_NAME, status_code, body_bytes);
 }
 
-fn handleAdminSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool) !void {
-    var fields = parseUrlEncodedForm(allocator, req.body) catch {
-        try sendAdminSetupPage(stream, allocator, cfg, "The setup form could not be parsed.", 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer freeFormFields(allocator, &fields);
-
-    const username = formValue(fields.items, "username") orelse "";
-    const password = formValue(fields.items, "password") orelse "";
-    const password_confirm = formValue(fields.items, "password_confirm") orelse "";
-    const credentials = createAdminCredentials(io, allocator, cfg, username, password, password_confirm) catch |err| {
-        const message = switch (err) {
-            error.InvalidAdminUsername => "Use 2-64 characters: letters, numbers, dot, underscore, dash, or @.",
-            error.AdminPasswordTooShort => "Use a password with at least 8 characters.",
-            error.AdminPasswordMismatch => "The password confirmation did not match.",
-            error.PathAlreadyExists => "Admin access is already configured. Sign in instead.",
-            else => "Layerline could not create the admin credentials file.",
-        };
-        try sendAdminSetupPage(stream, allocator, cfg, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-    const cookie = try makeAdminSessionCookie(allocator, cfg, credentials);
-    defer allocator.free(cookie);
-    try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
+fn adminRenderMetrics(allocator: std.mem.Allocator) ![]const u8 {
+    return metrics_mod.render(allocator, &server_metrics);
 }
 
-fn handleAdminLoginPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
-    var fields = parseUrlEncodedForm(allocator, req.body) catch {
-        try sendAdminLoginPage(stream, allocator, cfg, "The login form could not be parsed.", 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer freeFormFields(allocator, &fields);
-
-    const username = formValue(fields.items, "username") orelse "";
-    const password = formValue(fields.items, "password") orelse "";
-    if (!std.mem.eql(u8, username, credentials.username) or !(try verifyAdminPassword(credentials, password))) {
-        try sendAdminLoginPage(stream, allocator, cfg, "The username or password was not accepted.", 401, "Unauthorized", close_connection, false);
-        return;
-    }
-
-    const cookie = try makeAdminSessionCookie(allocator, cfg, credentials);
-    defer allocator.free(cookie);
-    try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
-}
-
-fn handleAdminValidatePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool) !void {
-    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "Activation config is invalid: {}", .{err});
-        defer allocator.free(message);
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, "Activation config is valid. A managed restart can apply staged writes.", null, 200, "OK", close_connection, false);
-}
-
-fn handleAdminRestartPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool) !void {
-    validateConfigFileForActivation(io, allocator, cfg) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "Restart blocked because activation config is invalid: {}", .{err});
-        defer allocator.free(message);
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-
+fn adminRequestRestart() void {
     shutdown_requested.store(true, .release);
-    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted", close_connection, false);
 }
 
-fn handleAdminAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
-    var fields = parseUrlEncodedForm(allocator, req.body) catch {
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, "The site form could not be parsed.", 400, "Bad Request", close_connection, false);
-        return;
+fn adminCallbacks() admin_runtime.Callbacks {
+    return .{
+        .active_io = activeIo,
+        .bind_thread_io = bindThreadIo,
+        .close_stream = streamClose,
+        .read_stream = streamRead,
+        .render_metrics = adminRenderMetrics,
+        .request_restart = adminRequestRestart,
+        .runtime_view = adminRuntimeView,
+        .send_dashboard_page = sendAdminDashboardPage,
+        .send_login_page = sendAdminLoginPage,
+        .send_method_not_allowed = sendMethodNotAllowedWithAllow,
+        .send_redirect = sendAdminRedirect,
+        .send_response_no_body = sendResponseNoBodyWithConnectionAndHeaders,
+        .send_setup_page = sendAdminSetupPage,
+        .set_stream_timeouts = setStreamTimeouts,
+        .shutdown_requested = &shutdown_requested,
+        .validate_activation = validateConfigFileForActivation,
+        .validate_runtime = validateConfig,
+        .write_all = streamWriteAll,
     };
-    defer freeFormFields(allocator, &fields);
-
-    const name = adminTrimmedField(fields.items, "name");
-    const server_names = adminTrimmedField(fields.items, "server_names");
-    const root = adminTrimmedField(fields.items, "root");
-    const index = adminTrimmedField(fields.items, "index");
-    const proxy = adminTrimmedField(fields.items, "proxy");
-    const upstream_policy = adminTrimmedField(fields.items, "upstream_policy");
-    const php_fastcgi = adminTrimmedField(fields.items, "php_fastcgi");
-    const tls_cert = adminTrimmedField(fields.items, "tls_cert");
-    const tls_key = adminTrimmedField(fields.items, "tls_key");
-    const route_name = adminTrimmedField(fields.items, "route_name");
-    const route_pattern = adminTrimmedField(fields.items, "route_pattern");
-    const route_handler = adminTrimmedField(fields.items, "route_handler");
-    const route_static_dir = adminTrimmedField(fields.items, "route_static_dir");
-    const route_proxy = adminTrimmedField(fields.items, "route_proxy");
-    const route_php_fastcgi = adminTrimmedField(fields.items, "route_php_fastcgi");
-
-    const site_config = buildAdminSiteConfig(
-        allocator,
-        name,
-        server_names,
-        if (root.len > 0) root else "public",
-        if (index.len > 0) index else "index.html",
-        adminCheckboxEnabled(fields.items, "serve_static_root"),
-        proxy,
-        upstream_policy,
-        php_fastcgi,
-        adminCheckboxEnabled(fields.items, "php_front_controller"),
-        tls_cert,
-        tls_key,
-        route_name,
-        route_pattern,
-        route_handler,
-        route_static_dir,
-        route_proxy,
-        route_php_fastcgi,
-        adminCheckboxEnabled(fields.items, "route_php_front_controller"),
-    ) catch |err| {
-        const message = switch (err) {
-            error.InvalidUpstream => "The proxy field must be one or more http:// or https:// upstream URLs.",
-            error.InvalidConfigValue => "The site values are invalid. Use a simple name, server names, safe paths, and complete route fields when adding a route.",
-            else => "Layerline could not build that site config.",
-        };
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer allocator.free(site_config);
-
-    const path = writeAdminSiteConfigFile(io, allocator, cfg, name, site_config) catch |err| {
-        const message = switch (err) {
-            error.AdminDomainConfigDirMissing => "Set domain_config_dir before adding sites.",
-            error.PathAlreadyExists => "A site config with that internal name already exists.",
-            else => "Layerline could not write the site config file.",
-        };
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer allocator.free(path);
-
-    const message = try std.fmt.allocPrint(allocator, "Created {s}. Restart Layerline for the new site to become active.", .{path});
-    defer allocator.free(message);
-    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, message, null, 201, "Created", close_connection, false);
-}
-
-fn handleAdminSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool) !void {
-    var fields = parseUrlEncodedForm(allocator, req.body) catch {
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, "The settings form could not be parsed.", 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer freeFormFields(allocator, &fields);
-
-    const host = adminTrimmedField(fields.items, "host");
-    const port = adminTrimmedField(fields.items, "port");
-    const static_dir = adminTrimmedField(fields.items, "static_dir");
-    const index_file = adminTrimmedField(fields.items, "index_file");
-    const domain_config_dir = adminTrimmedField(fields.items, "domain_config_dir");
-    const serve_static_root = adminTrimmedField(fields.items, "serve_static_root");
-    const compression = adminTrimmedField(fields.items, "compression");
-    const gzip = adminTrimmedField(fields.items, "gzip");
-    const php_root = adminTrimmedField(fields.items, "php_root");
-    const php_binary = adminTrimmedField(fields.items, "php_binary");
-    const php_fastcgi = adminTrimmedField(fields.items, "php_fastcgi");
-    const php_front_controller = adminTrimmedField(fields.items, "php_front_controller");
-    const proxy = adminTrimmedField(fields.items, "proxy");
-    const upstream_policy = adminTrimmedField(fields.items, "upstream_policy");
-    const upstream_timeout_ms = adminTrimmedField(fields.items, "upstream_timeout_ms");
-    const upstream_retries = adminTrimmedField(fields.items, "upstream_retries");
-    const upstream_keepalive = adminTrimmedField(fields.items, "upstream_keepalive");
-    const fastcgi_keepalive = adminTrimmedField(fields.items, "fastcgi_keepalive");
-    const tls = adminTrimmedField(fields.items, "tls");
-    const tls_cert = adminTrimmedField(fields.items, "tls_cert");
-    const tls_key = adminTrimmedField(fields.items, "tls_key");
-    const http_redirect = adminTrimmedField(fields.items, "http_redirect");
-    const http_redirect_port = adminTrimmedField(fields.items, "http_redirect_port");
-    const http_redirect_https_port = adminTrimmedField(fields.items, "http_redirect_https_port");
-    const http3 = adminTrimmedField(fields.items, "http3");
-    const http3_port = adminTrimmedField(fields.items, "http3_port");
-    const admin_socket = adminTrimmedField(fields.items, "admin_socket");
-    const admin_ui = adminTrimmedField(fields.items, "admin_ui");
-    const admin_ui_path = adminTrimmedField(fields.items, "admin_ui_path");
-    const admin_credentials_path = adminTrimmedField(fields.items, "admin_credentials_path");
-    const access_log = adminTrimmedField(fields.items, "access_log");
-    const max_concurrent_connections = adminTrimmedField(fields.items, "max_concurrent_connections");
-    const max_request_bytes = adminTrimmedField(fields.items, "max_request_bytes");
-    const read_header_timeout_ms = adminTrimmedField(fields.items, "read_header_timeout_ms");
-    const idle_timeout_ms = adminTrimmedField(fields.items, "idle_timeout_ms");
-    const worker_stack_size = adminTrimmedField(fields.items, "worker_stack_size");
-
-    const settings = [_]AdminConfigSetting{
-        .{ .key = "host", .value = host },
-        .{ .key = "port", .value = port },
-        .{ .key = "static_dir", .value = static_dir },
-        .{ .key = "index_file", .value = index_file },
-        .{ .key = "domain_config_dir", .value = domain_config_dir, .emit = domain_config_dir.len > 0 },
-        .{ .key = "serve_static_root", .value = serve_static_root },
-        .{ .key = "compression", .value = compression },
-        .{ .key = "gzip", .value = gzip },
-        .{ .key = "php_root", .value = php_root },
-        .{ .key = "php_binary", .value = php_binary },
-        .{ .key = "php_fastcgi", .value = if (php_fastcgi.len > 0) php_fastcgi else "off" },
-        .{ .key = "php_front_controller", .value = php_front_controller },
-        .{ .key = "proxy", .value = if (proxy.len > 0) proxy else "off" },
-        .{ .key = "upstream_policy", .value = upstream_policy },
-        .{ .key = "upstream_timeout_ms", .value = upstream_timeout_ms },
-        .{ .key = "upstream_retries", .value = upstream_retries },
-        .{ .key = "upstream_keepalive", .value = upstream_keepalive },
-        .{ .key = "fastcgi_keepalive", .value = fastcgi_keepalive },
-        .{ .key = "tls", .value = tls },
-        .{ .key = "tls_cert", .value = tls_cert, .emit = tls_cert.len > 0 },
-        .{ .key = "tls_key", .value = tls_key, .emit = tls_key.len > 0 },
-        .{ .key = "http_redirect", .value = http_redirect },
-        .{ .key = "http_redirect_port", .value = http_redirect_port },
-        .{ .key = "http_redirect_https_port", .value = http_redirect_https_port },
-        .{ .key = "http3", .value = http3 },
-        .{ .key = "http3_port", .value = http3_port },
-        .{ .key = "admin_socket", .value = if (admin_socket.len > 0) admin_socket else "off" },
-        .{ .key = "admin_ui", .value = admin_ui },
-        .{ .key = "admin_ui_path", .value = admin_ui_path },
-        .{ .key = "admin_credentials_path", .value = admin_credentials_path },
-        .{ .key = "access_log", .value = if (access_log.len > 0) access_log else "off" },
-        .{ .key = "max_concurrent_connections", .value = max_concurrent_connections },
-        .{ .key = "max_request_bytes", .value = max_request_bytes },
-        .{ .key = "read_header_timeout_ms", .value = read_header_timeout_ms },
-        .{ .key = "idle_timeout_ms", .value = idle_timeout_ms },
-        .{ .key = "worker_stack_size", .value = worker_stack_size },
-    };
-
-    validateAdminSettingsPatch(allocator, cfg, settings[0..], tls_cert, tls_key) catch |err| {
-        const message = switch (err) {
-            error.InvalidConfigValue => "The settings are invalid. Check ports, booleans, paths, TLS cert/key pairs, and upstream URLs.",
-            error.InvalidUpstream => "The proxy field must be one or more http:// or https:// upstream URLs.",
-            else => "Layerline could not validate those settings.",
-        };
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-
-    const path = writeAdminMainConfigFile(io, allocator, cfg, settings[0..]) catch |err| {
-        const message = switch (err) {
-            error.InvalidConfigValue => "The generated main config was too large or contained unsafe values.",
-            else => "Layerline could not write the main config file.",
-        };
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
-        return;
-    };
-    defer allocator.free(path);
-
-    const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}. A backup was written when the file already existed. Restart Layerline for these changes to become active.", .{path});
-    defer allocator.free(message);
-    try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
-}
-
-fn handleAdminUi(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
-    req: HttpRequest,
-    close_connection: bool,
-    is_head: bool,
-) !void {
-    accessLogSetHandler("admin_ui");
-    const method = req.method;
-    if (std.mem.eql(u8, method, "OPTIONS")) {
-        const allow_header = "Allow: GET,HEAD,POST,OPTIONS\r\nCache-Control: no-store\r\n";
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 204, "No Content", "text/plain; charset=utf-8", 0, close_connection, allow_header);
-        return;
-    }
-    if (!(std.mem.eql(u8, method, "GET") or is_head or std.mem.eql(u8, method, "POST"))) {
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
-        return;
-    }
-
-    const sub_path = adminSubPath(cfg.admin_ui_path, req.path);
-    const maybe_credentials = try loadAdminCredentials(io, allocator, cfg.admin_credentials_path);
-    if (maybe_credentials == null) {
-        if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/setup")) {
-            try handleAdminSetupPost(io, stream, allocator, cfg, req, close_connection);
-            return;
-        }
-        if (std.mem.eql(u8, method, "GET") or is_head) {
-            try sendAdminSetupPage(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
-            return;
-        }
-        try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
-        return;
-    }
-
-    const credentials = maybe_credentials.?;
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/login")) {
-        try handleAdminLoginPost(stream, allocator, cfg, credentials, req, close_connection);
-        return;
-    }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/logout")) {
-        const cookie = try makeAdminClearCookie(allocator, cfg);
-        defer allocator.free(cookie);
-        try sendAdminRedirect(stream, allocator, cfg, cookie, close_connection, false);
-        return;
-    }
-
-    if (!adminSessionCookieValid(req.headers, credentials)) {
-        if (std.mem.eql(u8, method, "GET") or is_head) {
-            try sendAdminLoginPage(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
-            return;
-        }
-        try sendAdminLoginPage(stream, allocator, cfg, "Sign in before using the admin dashboard.", 401, "Unauthorized", close_connection, false);
-        return;
-    }
-
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/validate")) {
-        try handleAdminValidatePost(io, stream, allocator, cfg, credentials, close_connection);
-        return;
-    }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/restart")) {
-        try handleAdminRestartPost(io, stream, allocator, cfg, credentials, close_connection);
-        return;
-    }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
-        try handleAdminAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection);
-        return;
-    }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/settings/save")) {
-        try handleAdminSettingsPost(io, stream, allocator, cfg, credentials, req, close_connection);
-        return;
-    }
-
-    if (std.mem.eql(u8, method, "GET") or is_head) {
-        try sendAdminDashboardPage(io, stream, allocator, cfg, credentials, null, null, 200, "OK", close_connection, is_head);
-        return;
-    }
-
-    try sendMethodNotAllowedWithAllow(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
-}
-
-fn sendAdminText(stream: std.Io.net.Stream, bytes: []const u8) !void {
-    try streamWriteAll(stream, bytes);
-    if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try streamWriteAll(stream, "\n");
-}
-
-fn handleAdminCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8) !void {
-    const command = trimValue(command_raw);
-    if (command.len == 0 or std.mem.eql(u8, command, "help")) {
-        try sendAdminText(stream, "commands: status, validate, validate-runtime, restart, routes, certs, metrics, help\n");
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "status")) {
-        const body = try admin_pages.renderStatus(allocator, cfg, adminRuntimeView());
-        defer allocator.free(body);
-        try sendAdminText(stream, body);
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "validate") or std.mem.eql(u8, command, "validate-config")) {
-        validateConfigFileForActivation(activeIo(), allocator, cfg) catch |err| {
-            const body = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
-            defer allocator.free(body);
-            try sendAdminText(stream, body);
-            return;
-        };
-        try sendAdminText(stream, "OK activation config\n");
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "validate-runtime")) {
-        validateConfig(cfg) catch |err| {
-            const body = try std.fmt.allocPrint(allocator, "ERROR runtime config invalid: {}\n", .{err});
-            defer allocator.free(body);
-            try sendAdminText(stream, body);
-            return;
-        };
-        try sendAdminText(stream, "OK runtime config\n");
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "restart") or std.mem.eql(u8, command, "graceful-restart")) {
-        validateConfigFileForActivation(activeIo(), allocator, cfg) catch |err| {
-            const body = try std.fmt.allocPrint(allocator, "ERROR restart blocked: {}\n", .{err});
-            defer allocator.free(body);
-            try sendAdminText(stream, body);
-            return;
-        };
-        try sendAdminText(stream, "OK graceful restart requested\n");
-        shutdown_requested.store(true, .release);
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "routes")) {
-        const body = try admin_pages.renderRoutes(allocator, cfg);
-        defer allocator.free(body);
-        try sendAdminText(stream, body);
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "certs") or std.mem.eql(u8, command, "certificates")) {
-        const body = try admin_pages.renderCerts(allocator, cfg, adminRuntimeView());
-        defer allocator.free(body);
-        try sendAdminText(stream, body);
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "metrics")) {
-        const body = try metrics_mod.render(allocator, &server_metrics);
-        defer allocator.free(body);
-        try sendAdminText(stream, body);
-        return;
-    }
-
-    try sendAdminText(stream, "ERROR unknown command\n");
-}
-
-fn handleAdminConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
-    setStreamTimeouts(stream, 1_000, 1_000) catch {};
-    var buffer: [1024]u8 = undefined;
-    const n = try streamRead(stream, &buffer);
-    if (n == 0) return;
-    try handleAdminCommand(stream, allocator, cfg, buffer[0..n]);
-}
-
-const AdminSocketContext = struct {
-    io: std.Io,
-    cfg: *ServerConfig,
-    socket_path: []const u8,
-};
-
-fn unlinkUnixSocket(path: []const u8) void {
-    if (builtin.os.tag == .windows) return;
-    std.Io.Dir.deleteFileAbsolute(activeIo(), path) catch {};
-}
-
-fn serveAdminSocketTask(ctx: AdminSocketContext) void {
-    bindThreadIo(ctx.io);
-    unlinkUnixSocket(ctx.socket_path);
-
-    const address = std.Io.net.UnixAddress.init(ctx.socket_path) catch |err| {
-        std.debug.print("Admin socket path invalid: {s}: {}\n", .{ ctx.socket_path, err });
-        return;
-    };
-    var server = address.listen(ctx.io, .{ .kernel_backlog = 16 }) catch |err| {
-        std.debug.print("Admin socket listen failed: {s}: {}\n", .{ ctx.socket_path, err });
-        return;
-    };
-    defer {
-        server.deinit(ctx.io);
-        unlinkUnixSocket(ctx.socket_path);
-    }
-
-    std.debug.print("Admin socket: {s}\n", .{ctx.socket_path});
-    while (!shutdown_requested.load(.acquire)) {
-        const conn = server.accept(ctx.io) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
-            std.debug.print("Admin socket accept failed: {}\n", .{err});
-            ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
-            continue;
-        };
-        handleAdminConnection(conn, std.heap.page_allocator, ctx.cfg) catch |err| {
-            std.debug.print("Admin command failed: {}\n", .{err});
-        };
-        streamClose(conn);
-    }
 }
 
 fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.Allocator, allowed_methods: []const u8, close_connection: bool, is_head: bool) !void {
@@ -4143,7 +3701,8 @@ fn routeRequest(
     defer current_response_headers = &.{};
 
     if (cfg.admin_ui_enabled and adminPathMatches(cfg.admin_ui_path, req.path)) {
-        try handleAdminUi(io, stream, allocator, cfg, req, should_close, is_head);
+        accessLogSetHandler("admin_ui");
+        try admin_runtime.handleUi(io, stream, allocator, cfg, req, should_close, is_head, adminCallbacks());
         return;
     }
 
@@ -6242,7 +5801,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (cfg.admin_enabled) {
         const admin_socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
-        const admin_worker = std.Thread.spawn(.{}, serveAdminSocketTask, .{AdminSocketContext{ .io = init.io, .cfg = &cfg, .socket_path = admin_socket_path }}) catch |err| {
+        const admin_worker = std.Thread.spawn(.{}, admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = init.io, .cfg = &cfg, .socket_path = admin_socket_path, .callbacks = adminCallbacks() }}) catch |err| {
             std.debug.print("Failed to start admin socket: {}\n", .{err});
             return;
         };
@@ -6307,6 +5866,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Shutdown requested; draining active connections for up to {d}ms.\n", .{cfg.graceful_shutdown_timeout_ms});
     waitForConnectionDrain(init.io, &concurrency, cfg.graceful_shutdown_timeout_ms);
     if (cfg.admin_enabled) {
-        unlinkUnixSocket(cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH);
+        admin_runtime.unlinkUnixSocket(cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH, adminCallbacks());
     }
 }
