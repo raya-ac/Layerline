@@ -714,11 +714,11 @@ fn http2Callbacks() h2_server.Callbacks {
 fn http2RouterCallbacks() http2_router.Callbacks {
     return .{
         .access_log_set_handler = accessLogSetHandler,
-        .build_php_fastcgi_response = buildHttp2PhpFastcgiResponse,
         .custom_not_found_response = h2DomainCustomNotFoundResponse,
         .error_response = h2CoolErrorResponse,
         .fetch_upstream_pool_response = fetchHttp2UpstreamPoolResponse,
         .metrics = &server_metrics,
+        .php_callbacks = phpCallbacks(),
         .read_acme_challenge = readAcmeChallengeForHttp2,
         .read_static_file = readStaticFileForHttp2,
         .redirect_response = buildHttp2RedirectResponse,
@@ -794,74 +794,6 @@ fn forwardToUpstreamPool(
     try upstream_runtime.forwardToPool(stream, allocator, pool, policy, timeout_ms, req, cfg, upstreamRuntimeCallbacks());
 }
 
-fn handlePhp(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    req: HttpRequest,
-    close_connection: bool,
-    is_head: bool,
-    process_env: *const std.process.Environ.Map,
-) !void {
-    const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-    try handlePhpScript(io, stream, allocator, cfg, req, cfg.php_root, cfg.php_binary, cfg.php_fastcgi, cfg.upstream_timeout_ms, rel_path, req.path, "", close_connection, is_head, process_env);
-}
-
-fn handlePhpFrontController(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    req: HttpRequest,
-    route: ?*const RouteConfig,
-    php_root: []const u8,
-    php_binary: []const u8,
-    php_fastcgi: ?[]const u8,
-    timeout_ms: u32,
-    php_index: []const u8,
-    close_connection: bool,
-    is_head: bool,
-    process_env: *const std.process.Environ.Map,
-) !void {
-    try php_runtime.handleFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, timeout_ms, php_index, close_connection, is_head, process_env, phpCallbacks());
-}
-
-fn buildHttp2PhpFastcgiResponse(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    req: HttpRequest,
-    php_root: []const u8,
-    php_fastcgi: ?[]const u8,
-    script_rel_path: []const u8,
-    script_name: []const u8,
-    path_info: []const u8,
-    timeout_ms: u32,
-) !H2BufferedResponse {
-    return php_runtime.buildHttp2FastcgiResponse(io, allocator, cfg, req, php_root, php_fastcgi, script_rel_path, script_name, path_info, timeout_ms, phpCallbacks());
-}
-
-fn handlePhpScript(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    req: HttpRequest,
-    php_root: []const u8,
-    php_binary: []const u8,
-    php_fastcgi: ?[]const u8,
-    timeout_ms: u32,
-    script_rel_path: []const u8,
-    script_name: []const u8,
-    path_info: []const u8,
-    close_connection: bool,
-    is_head: bool,
-    process_env: *const std.process.Environ.Map,
-) !void {
-    try php_runtime.handleScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, timeout_ms, script_rel_path, script_name, path_info, close_connection, is_head, process_env, phpCallbacks());
-}
-
 fn handleNamedRoute(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -877,8 +809,7 @@ fn handleNamedRoute(
     try http1_route_handlers.handleNamedRoute(io, stream, allocator, cfg, domain, route, req, close_connection, is_head, process_env, .{
         .access_log_set_handler = accessLogSetHandler,
         .forward_to_upstream_pool = forwardToUpstreamPool,
-        .handle_php_front_controller = handlePhpFrontController,
-        .handle_php_script = handlePhpScript,
+        .php_callbacks = phpCallbacks(),
         .send_cool_error = sendCoolErrorWithConnection,
         .send_method_not_allowed = sendMethodNotAllowedWithAllow,
         .send_not_found_for_method = sendNotFoundForMethod,
@@ -917,8 +848,7 @@ fn http1RouterCallbacks() http1_router.Callbacks {
         .forward_to_upstream_pool = forwardToUpstreamPool,
         .handle_admin_ui = routeAdminUi,
         .handle_named_route = handleNamedRoute,
-        .handle_php_front_controller = handlePhpFrontController,
-        .handle_php_script = handlePhpScript,
+        .php_callbacks = phpCallbacks(),
         .send_configured_redirect = sendConfiguredRedirect,
         .send_domain_custom_not_found = sendDomainCustomNotFoundForMethod,
         .send_method_not_allowed = sendMethodNotAllowedWithAllow,

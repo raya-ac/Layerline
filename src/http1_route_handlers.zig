@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const php_runtime = @import("php_runtime.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 
@@ -26,39 +27,7 @@ pub const NamedRouteCallbacks = struct {
         HttpRequest,
         *const ServerConfig,
     ) anyerror!void,
-    handle_php_front_controller: *const fn (
-        std.Io,
-        std.Io.net.Stream,
-        std.mem.Allocator,
-        *const ServerConfig,
-        HttpRequest,
-        ?*const RouteConfig,
-        []const u8,
-        []const u8,
-        ?[]const u8,
-        u32,
-        []const u8,
-        bool,
-        bool,
-        *const std.process.Environ.Map,
-    ) anyerror!void,
-    handle_php_script: *const fn (
-        std.Io,
-        std.Io.net.Stream,
-        std.mem.Allocator,
-        *const ServerConfig,
-        HttpRequest,
-        []const u8,
-        []const u8,
-        ?[]const u8,
-        u32,
-        []const u8,
-        []const u8,
-        []const u8,
-        bool,
-        bool,
-        *const std.process.Environ.Map,
-    ) anyerror!void,
+    php_callbacks: php_runtime.Callbacks,
     send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8, bool, bool, ?[]const u8) anyerror!void,
     send_method_not_allowed: *const fn (std.Io.net.Stream, std.mem.Allocator, []const u8, bool, bool) anyerror!void,
     send_not_found_for_method: *const fn (std.mem.Allocator, std.Io.net.Stream, bool, bool) anyerror!void,
@@ -128,12 +97,12 @@ pub fn handleNamedRoute(
             const php_binary = route.php_binary orelse routing_mod.domainPhpBinary(cfg, domain);
             const php_fastcgi = routing_mod.routePhpFastcgi(cfg, domain, route);
             if (routing_mod.routePhpFrontController(cfg, domain, route)) {
-                try callbacks.handle_php_front_controller(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), routing_mod.routePhpIndex(cfg, domain, route), close_connection, is_head, process_env);
+                try php_runtime.handleFrontController(io, stream, allocator, cfg, req, route, php_root, php_binary, php_fastcgi, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), routing_mod.routePhpIndex(cfg, domain, route), close_connection, is_head, process_env, callbacks.php_callbacks);
                 return;
             }
             const script_rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
             defer allocator.free(script_rel);
-            try callbacks.handle_php_script(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), script_rel, req.path, "", close_connection, is_head, process_env);
+            try php_runtime.handleScript(io, stream, allocator, cfg, req, php_root, php_binary, php_fastcgi, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), script_rel, req.path, "", close_connection, is_head, process_env, callbacks.php_callbacks);
             return;
         },
         .proxy => {

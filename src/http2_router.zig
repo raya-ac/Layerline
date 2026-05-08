@@ -5,6 +5,7 @@ const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
 const metrics_mod = @import("metrics.zig");
+const php_runtime = @import("php_runtime.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
@@ -20,22 +21,11 @@ const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 
 pub const Callbacks = struct {
     access_log_set_handler: *const fn ([]const u8) void,
-    build_php_fastcgi_response: *const fn (
-        std.Io,
-        std.mem.Allocator,
-        *const ServerConfig,
-        HttpRequest,
-        []const u8,
-        ?[]const u8,
-        []const u8,
-        []const u8,
-        []const u8,
-        u32,
-    ) anyerror!H2BufferedResponse,
     custom_not_found_response: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, ?*const DomainConfig) anyerror!?H2BufferedResponse,
     error_response: *const fn (std.mem.Allocator, u16, []const u8, []const u8) anyerror!H2BufferedResponse,
     fetch_upstream_pool_response: *const fn (std.mem.Allocator, *UpstreamPoolConfig, UpstreamPoolPolicy, HttpRequest, *const ServerConfig) anyerror!H2BufferedResponse,
     metrics: *metrics_mod.ServerMetrics,
+    php_callbacks: php_runtime.Callbacks,
     read_acme_challenge: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!H2BufferedResponse,
     read_static_file: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, usize) anyerror!H2BufferedResponse,
     redirect_response: *const fn (std.mem.Allocator, config_mod.RedirectRule, HttpRequest) anyerror!H2BufferedResponse,
@@ -215,11 +205,11 @@ fn buildRouteResponse(
             if (routing_mod.routePhpFrontController(cfg, domain, route)) {
                 const target = try fastcgi.makePhpFrontControllerTarget(allocator, route, req.path, routing_mod.routePhpIndex(cfg, domain, route));
                 defer target.deinit(allocator);
-                return callbacks.build_php_fastcgi_response(io, allocator, cfg, req, route.php_root orelse routing_mod.domainPhpRoot(cfg, domain), routing_mod.routePhpFastcgi(cfg, domain, route), target.script_rel_path, target.script_name, target.path_info, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route));
+                return php_runtime.buildHttp2FastcgiResponse(io, allocator, cfg, req, route.php_root orelse routing_mod.domainPhpRoot(cfg, domain), routing_mod.routePhpFastcgi(cfg, domain, route), target.script_rel_path, target.script_name, target.path_info, routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), callbacks.php_callbacks);
             }
             const script_rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
             defer allocator.free(script_rel);
-            return callbacks.build_php_fastcgi_response(io, allocator, cfg, req, route.php_root orelse routing_mod.domainPhpRoot(cfg, domain), routing_mod.routePhpFastcgi(cfg, domain, route), script_rel, req.path, "", routing_mod.routeUpstreamTimeoutMs(cfg, domain, route));
+            return php_runtime.buildHttp2FastcgiResponse(io, allocator, cfg, req, route.php_root orelse routing_mod.domainPhpRoot(cfg, domain), routing_mod.routePhpFastcgi(cfg, domain, route), script_rel, req.path, "", routing_mod.routeUpstreamTimeoutMs(cfg, domain, route), callbacks.php_callbacks);
         },
     }
 }

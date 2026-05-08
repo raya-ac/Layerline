@@ -1,6 +1,7 @@
 const std = @import("std");
 const admin_support = @import("admin_support.zig");
 const config_mod = @import("config.zig");
+const php_runtime = @import("php_runtime.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
@@ -41,39 +42,7 @@ pub const Callbacks = struct {
         bool,
         *const std.process.Environ.Map,
     ) anyerror!void,
-    handle_php_front_controller: *const fn (
-        std.Io,
-        std.Io.net.Stream,
-        std.mem.Allocator,
-        *const ServerConfig,
-        HttpRequest,
-        ?*const RouteConfig,
-        []const u8,
-        []const u8,
-        ?[]const u8,
-        u32,
-        []const u8,
-        bool,
-        bool,
-        *const std.process.Environ.Map,
-    ) anyerror!void,
-    handle_php_script: *const fn (
-        std.Io,
-        std.Io.net.Stream,
-        std.mem.Allocator,
-        *const ServerConfig,
-        HttpRequest,
-        []const u8,
-        []const u8,
-        ?[]const u8,
-        u32,
-        []const u8,
-        []const u8,
-        []const u8,
-        bool,
-        bool,
-        *const std.process.Environ.Map,
-    ) anyerror!void,
+    php_callbacks: php_runtime.Callbacks,
     send_configured_redirect: *const fn (std.Io.net.Stream, std.mem.Allocator, RedirectRule, HttpRequest, bool, bool) anyerror!void,
     send_domain_custom_not_found: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?*DomainConfig, bool, bool) anyerror!void,
     send_method_not_allowed: *const fn (std.Io.net.Stream, std.mem.Allocator, []const u8, bool, bool) anyerror!void,
@@ -186,7 +155,7 @@ pub fn route(
 
         if (std.mem.eql(u8, req.path, "/") and routing_mod.domainPhpFrontController(cfg, domain)) {
             callbacks.access_log_set_handler("php_front_controller");
-            try callbacks.handle_php_front_controller(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, is_head, process_env);
+            try php_runtime.handleFrontController(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, is_head, process_env, callbacks.php_callbacks);
             return;
         }
 
@@ -242,7 +211,7 @@ pub fn route(
         if (std.mem.endsWith(u8, req.path, ".php") or std.mem.startsWith(u8, req.path, "/php/")) {
             callbacks.access_log_set_handler("php");
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try callbacks.handle_php_script(io, stream, allocator, cfg, req, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env);
+            try php_runtime.handleScript(io, stream, allocator, cfg, req, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, is_head, process_env, callbacks.php_callbacks);
             return;
         }
 
@@ -283,7 +252,7 @@ pub fn route(
 
         if (routing_mod.domainPhpFrontController(cfg, domain)) {
             callbacks.access_log_set_handler("php_front_controller");
-            try callbacks.handle_php_front_controller(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, is_head, process_env);
+            try php_runtime.handleFrontController(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, is_head, process_env, callbacks.php_callbacks);
             return;
         }
 
@@ -307,7 +276,7 @@ pub fn route(
         if (std.mem.endsWith(u8, req.path, ".php")) {
             callbacks.access_log_set_handler("php");
             const rel_path = if (req.path.len > 0 and req.path[0] == '/') req.path[1..] else req.path;
-            try callbacks.handle_php_script(io, stream, allocator, cfg, req, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, false, process_env);
+            try php_runtime.handleScript(io, stream, allocator, cfg, req, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), rel_path, req.path, "", should_close, false, process_env, callbacks.php_callbacks);
             return;
         }
 
@@ -319,7 +288,7 @@ pub fn route(
 
         if (routing_mod.domainPhpFrontController(cfg, domain)) {
             callbacks.access_log_set_handler("php_front_controller");
-            try callbacks.handle_php_front_controller(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, false, process_env);
+            try php_runtime.handleFrontController(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, false, process_env, callbacks.php_callbacks);
             return;
         }
 
@@ -346,7 +315,7 @@ pub fn route(
     if (std.mem.eql(u8, method, "PUT") or std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "DELETE")) {
         if (routing_mod.domainPhpFrontController(cfg, domain)) {
             callbacks.access_log_set_handler("php_front_controller");
-            try callbacks.handle_php_front_controller(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, false, process_env);
+            try php_runtime.handleFrontController(io, stream, allocator, cfg, req, null, routing_mod.domainPhpRoot(cfg, domain), routing_mod.domainPhpBinary(cfg, domain), routing_mod.domainPhpFastcgi(cfg, domain), routing_mod.domainUpstreamTimeoutMs(cfg, domain), routing_mod.domainPhpIndex(cfg, domain), should_close, false, process_env, callbacks.php_callbacks);
             return;
         }
 
