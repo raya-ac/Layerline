@@ -19,3 +19,5 @@ pub const H2_DEFAULT_PAGE =
     \\<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ed;color:#11110f;font:16px/1.5 system-ui,sans-serif}main{max-width:760px;padding:48px}h1{font-size:clamp(56px,10vw,120px);line-height:.85;margin:0}p{color:#5d5e58;max-width:48ch}.tag{font:12px/1.2 ui-monospace,monospace;text-transform:uppercase;color:#77786f}</style>
     \\</head><body><main><div class="tag">native h2c route</div><h1>Layerline</h1><p>This response came from Layerline's native HTTP/2 frame path: SETTINGS, HPACK request headers, HEADERS, and DATA frames emitted by the Zig server.</p></main></body></html>
 ;
+
+pub const H3_DEFAULT_PAGE = @embedFile("assets/default.html");
