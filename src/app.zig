@@ -1,9 +1,9 @@
 const std = @import("std");
+const admin_http = @import("admin_http.zig");
 const access_log_mod = @import("access_log.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
-const admin_ui_mod = @import("admin_ui.zig");
 const acme_mod = @import("acme.zig");
 const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
@@ -65,8 +65,6 @@ const findDomainRoute = routing_mod.findDomainRoute;
 const routeFileRelativePath = routing_mod.routeFileRelativePath;
 const findHeaderValue = http_headers.findHeaderValue;
 const hasConnectionToken = http_headers.hasConnectionToken;
-const renderAdminSetupPage = admin_ui_mod.renderAdminSetupPage;
-const renderAdminLoginPage = admin_ui_mod.renderAdminLoginPage;
 const AdminCredentials = admin_support.AdminCredentials;
 const adminPathMatches = admin_support.adminPathMatches;
 const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
@@ -496,40 +494,15 @@ fn adminRuntimeView() admin_pages.RuntimeView {
 }
 
 fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool) !void {
-    const extra_headers = if (cookie) |cookie_value|
-        try std.fmt.allocPrint(allocator, "Location: {s}\r\nSet-Cookie: {s}\r\nCache-Control: no-store\r\n", .{ cfg.admin_ui_path, cookie_value })
-    else
-        try std.fmt.allocPrint(allocator, "Location: {s}\r\nCache-Control: no-store\r\n", .{cfg.admin_ui_path});
-    defer allocator.free(extra_headers);
-
-    const body = "Redirecting to Layerline Admin.\n";
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, 303, "See Other", "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
-    } else {
-        try sendResponseWithConnectionAndHeaders(stream, 303, "See Other", "text/plain; charset=utf-8", body, close_connection, extra_headers);
-    }
-}
-
-fn sendAdminPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, status_code: u16, status_text: []const u8, body: []const u8, close_connection: bool, is_head: bool) !void {
-    _ = allocator;
-    const headers = "Cache-Control: no-store\r\n";
-    if (is_head) {
-        try sendResponseNoBodyWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body.len, close_connection, headers);
-    } else {
-        try sendResponseWithConnectionAndHeaders(stream, status_code, status_text, "text/html; charset=utf-8", body, close_connection, headers);
-    }
+    try admin_http.sendRedirect(stream, allocator, cfg, cookie, close_connection, is_head, adminHttpCallbacks());
 }
 
 fn sendAdminSetupPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
-    const body = try renderAdminSetupPage(allocator, cfg, maybe_error);
-    defer allocator.free(body);
-    try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
+    try admin_http.sendSetupPage(stream, allocator, cfg, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
 }
 
 fn sendAdminLoginPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
-    const body = try renderAdminLoginPage(allocator, cfg, maybe_error);
-    defer allocator.free(body);
-    try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
+    try admin_http.sendLoginPage(stream, allocator, cfg, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
 }
 
 fn sendAdminDashboardPage(
@@ -545,9 +518,7 @@ fn sendAdminDashboardPage(
     close_connection: bool,
     is_head: bool,
 ) !void {
-    const body = try admin_pages.renderDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error, adminRuntimeView(), validateConfigFileForActivation);
-    defer allocator.free(body);
-    try sendAdminPage(stream, allocator, status_code, status_text, body, close_connection, is_head);
+    try admin_http.sendDashboardPage(io, stream, allocator, cfg, credentials, maybe_notice, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
 }
 
 fn accessLogSetHandler(handler: []const u8) void {
@@ -572,6 +543,15 @@ fn adminRenderMetrics(allocator: std.mem.Allocator) ![]const u8 {
 
 fn adminRequestRestart() void {
     shutdown_requested.store(true, .release);
+}
+
+fn adminHttpCallbacks() admin_http.Callbacks {
+    return .{
+        .runtime_view = adminRuntimeView,
+        .send_response_headers = sendResponseWithConnectionAndHeaders,
+        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
+        .validate_activation = validateConfigFileForActivation,
+    };
 }
 
 fn adminCallbacks() admin_runtime.Callbacks {
