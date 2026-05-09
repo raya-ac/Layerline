@@ -36,7 +36,7 @@ Layerline blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2, with global, domain, and route overrides.
-- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, graceful restart, routes, cert visibility, and metrics.
+- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, `SIGHUP` reload, graceful restart, routes, cert visibility, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache with domain/route overrides.
@@ -330,6 +330,8 @@ printf 'certs\n' | nc -U /tmp/layerline-admin.sock
 
 `reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
 
+`SIGHUP` follows the same in-memory reload path as the admin `reload` command. If the candidate config changes listener-bound settings, Layerline logs `SIGHUP reload blocked` and keeps serving the current snapshot.
+
 ## Admin Web UI
 
 The browser admin UI is disabled by default. Enable it only on a trusted admin path:
@@ -594,7 +596,7 @@ zig build run -- \
 
 When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
 This process still uses one worker thread per accepted socket, so extreme live-connection fan-in should use a dedicated L4/edge balancing tier while native evented IO is built out.
-`SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for active handlers to drain.
+`SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for active handlers to drain.
 Common host limits to revisit before aggressive load tests:
 
 - Linux/macOS: increase open file limit (`ulimit -n 2000000`).

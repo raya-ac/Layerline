@@ -21,6 +21,7 @@ pub var access_log_writer = access_log_mod.Writer{};
 pub var config_store = config_store_mod.Store{};
 pub var request_id_generator = request_trace.Generator{};
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
+pub var reload_requested = std.atomic.Value(bool).init(false);
 pub var server_metrics = metrics_mod.ServerMetrics.init();
 pub var fastcgi_keepalive_pool = config_mod.FastcgiKeepAlivePool.init();
 pub var static_response_cache = static_cache_mod.Store{};

@@ -24,6 +24,7 @@ ACCESS_LOG="$TMP_DIR/access.log"
 SITE_DIR="$TMP_DIR/domains-enabled"
 CUSTOM_ROOT="$TMP_DIR/custom-root"
 RELOAD_ROOT="$TMP_DIR/reload-root"
+SIGHUP_ROOT="$TMP_DIR/sighup-root"
 CONFIG="$TMP_DIR/server.conf"
 LOG="$TMP_DIR/layerline.log"
 PID=
@@ -113,7 +114,7 @@ route_response_cache.nocache = false
 route_security_headers.nocache = strict
 route_max_static_file_bytes.nocache = 2048
 CONF
-mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT"
+mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT" "$SIGHUP_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
 custom domain root
 HTML
@@ -132,6 +133,9 @@ stale_while_revalidate = 45
 CONF
 cat >"$RELOAD_ROOT/index.html" <<'HTML'
 reloaded domain root
+HTML
+cat >"$SIGHUP_ROOT/index.html" <<'HTML'
+sighup domain root
 HTML
 
 log "starting temporary server on http://$HOST:$PORT"
@@ -276,6 +280,24 @@ if header_has "$CUSTOM_404_GZIP_HEADERS" '^Content-Encoding: gzip'; then
   die "domain compression override still compressed the custom 404"
 fi
 ok "domain compression override"
+
+cat >"$SITE_DIR/sighup.conf" <<CONF
+name = sighup
+server_name = sighup.test
+root = $SIGHUP_ROOT
+index = index.html
+serve_static_root = true
+CONF
+kill -HUP "$PID"
+SIGHUP_BODY="$TMP_DIR/sighup-domain.body"
+for _ in {1..50}; do
+  if curl -fsS -H 'Host: sighup.test' "http://$HOST:$PORT/" -o "$SIGHUP_BODY" 2>/dev/null && grep -Fq 'sighup domain root' "$SIGHUP_BODY"; then
+    ok "SIGHUP config reload"
+    break
+  fi
+  sleep 0.1
+done
+grep -Fq 'sighup domain root' "$SIGHUP_BODY" || die "SIGHUP reload did not activate new domain config"
 
 cat >"$SITE_DIR/reloaded.conf" <<CONF
 name = reloaded

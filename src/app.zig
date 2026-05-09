@@ -99,15 +99,25 @@ fn shutdownSignalHandler(_: std.posix.SIG) callconv(.c) void {
     runtime_state.shutdown_requested.store(true, .release);
 }
 
-fn installShutdownSignalHandlers() void {
+fn reloadSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    runtime_state.reload_requested.store(true, .release);
+}
+
+fn installProcessSignalHandlers() void {
     if (std.posix.Sigaction == void) return;
-    const action: std.posix.Sigaction = .{
+    const shutdown_action: std.posix.Sigaction = .{
         .handler = .{ .handler = shutdownSignalHandler },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-    std.posix.sigaction(.INT, &action, null);
-    std.posix.sigaction(.TERM, &action, null);
+    const reload_action: std.posix.Sigaction = .{
+        .handler = .{ .handler = reloadSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &shutdown_action, null);
+    std.posix.sigaction(.TERM, &shutdown_action, null);
+    std.posix.sigaction(.HUP, &reload_action, null);
 }
 
 fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
@@ -178,6 +188,32 @@ fn reloadConfigInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const
     try validateReloadCompatibility(active, candidate);
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
     try runtime_state.config_store.activateOwned(allocator, arena, candidate);
+}
+
+const ReloadSignalWatcherContext = struct {
+    io: std.Io,
+};
+
+fn reloadSignalWatcherTask(ctx: ReloadSignalWatcherContext) void {
+    bindThreadIo(ctx.io);
+    while (!runtime_state.shutdown_requested.load(.acquire)) {
+        if (runtime_state.reload_requested.swap(false, .acq_rel)) {
+            reloadConfigInMemory(ctx.io, std.heap.page_allocator, runtime_state.activeConfig()) catch |err| {
+                std.debug.print("SIGHUP reload blocked: {}\n", .{err});
+                continue;
+            };
+            std.debug.print("SIGHUP config reload completed for new connections.\n", .{});
+        }
+        ctx.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+}
+
+fn startReloadSignalWatcher(io: std.Io) void {
+    const worker = std.Thread.spawn(.{}, reloadSignalWatcherTask, .{ReloadSignalWatcherContext{ .io = io }}) catch |err| {
+        std.debug.print("Failed to start SIGHUP reload watcher: {}\n", .{err});
+        return;
+    };
+    worker.detach();
 }
 
 fn adminRuntimeView() admin_pages.RuntimeView {
@@ -692,8 +728,9 @@ fn usage() void {
 // Bootstraps config/CLI, optional cert automation, then starts the accept loop.
 pub fn main(init: std.process.Init) !void {
     bindThreadIo(init.io);
-    installShutdownSignalHandlers();
+    installProcessSignalHandlers();
     runtime_state.shutdown_requested.store(false, .release);
+    runtime_state.reload_requested.store(false, .release);
 
     var cfg = defaultServerConfig();
 
@@ -716,6 +753,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg);
+    startReloadSignalWatcher(init.io);
     defer runtime_state.config_store.deinit();
     defer {
         runtime_state.static_response_cache.deinit();
