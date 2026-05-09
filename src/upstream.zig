@@ -14,6 +14,7 @@ const upstreamPoolPolicyName = config_mod.upstreamPoolPolicyName;
 
 pub var round_robin_cursor = std.atomic.Value(usize).init(0);
 pub var random_cursor = std.atomic.Value(u64).init(0x9e3779b97f4a7c15);
+pub const STICKY_COOKIE_NAME = "ll_upstream";
 
 pub const RequestHashInput = struct {
     path: []const u8,
@@ -197,6 +198,45 @@ fn upstreamConsistentHashTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInpu
     return best_index orelse @as(usize, @intCast(key % target_count));
 }
 
+pub fn stickyCookieIndex(headers: []const u8, target_count: usize) ?usize {
+    if (target_count == 0) return null;
+    const cookie_header = findHeaderValue(headers, "Cookie") orelse return null;
+    var parts = std.mem.splitScalar(u8, cookie_header, ';');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const name = std.mem.trim(u8, trimmed[0..eq], " \t");
+        if (!std.mem.eql(u8, name, STICKY_COOKIE_NAME)) continue;
+        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        const index = std.fmt.parseInt(usize, value, 10) catch return null;
+        if (index < target_count) return index;
+        return null;
+    }
+    return null;
+}
+
+fn upstreamStickyCookieTicket(pool: *UpstreamPoolConfig, req: ?RequestHashInput, now_ms: i64, policy: ?*const UpstreamRuntimePolicy) usize {
+    const target_count = pool.targets.items.len;
+    const fallback = round_robin_cursor.fetchAdd(1, .monotonic);
+    if (target_count == 0) return fallback;
+
+    if (req) |request| {
+        if (stickyCookieIndex(request.headers, target_count)) |index| {
+            if (upstreamIsSelectable(&pool.targets.items[index], now_ms, policy)) return index;
+        }
+    }
+
+    return fallback;
+}
+
+pub fn stickyCookieValue(allocator: std.mem.Allocator, index: usize) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}={d}; Path=/; HttpOnly; SameSite=Lax", .{ STICKY_COOKIE_NAME, index });
+}
+
+pub fn stickyCookieHeader(allocator: std.mem.Allocator, index: usize) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "Set-Cookie: {s}={d}; Path=/; HttpOnly; SameSite=Lax\r\n", .{ STICKY_COOKIE_NAME, index });
+}
+
 pub fn upstreamStartTicket(pool: *UpstreamPoolConfig, pool_policy: UpstreamPoolPolicy, now_ms: i64, req: ?RequestHashInput, runtime_policy: ?*const UpstreamRuntimePolicy) usize {
     return switch (pool_policy) {
         .round_robin => round_robin_cursor.fetchAdd(1, .monotonic),
@@ -204,6 +244,7 @@ pub fn upstreamStartTicket(pool: *UpstreamPoolConfig, pool_policy: UpstreamPoolP
         .least_connections => upstreamLeastConnectionsTicket(pool, now_ms, runtime_policy),
         .weighted => upstreamWeightedTicket(pool, now_ms, runtime_policy),
         .consistent_hash => upstreamConsistentHashTicket(pool, req, now_ms, runtime_policy),
+        .sticky_cookie => upstreamStickyCookieTicket(pool, req, now_ms, runtime_policy),
     };
 }
 
@@ -277,6 +318,10 @@ pub fn upstreamAttemptLimit(pool: *const UpstreamPoolConfig, retry_budget: usize
 }
 
 pub fn upstreamAtAttempt(pool: *UpstreamPoolConfig, start_ticket: usize, attempt: usize) *UpstreamConfig {
+    return &pool.targets.items[upstreamAttemptIndex(pool, start_ticket, attempt)];
+}
+
+pub fn upstreamAttemptIndex(pool: *const UpstreamPoolConfig, start_ticket: usize, attempt: usize) usize {
     const target_count = pool.targets.items.len;
     var index = start_ticket % target_count;
     var remaining = attempt;
@@ -284,7 +329,7 @@ pub fn upstreamAtAttempt(pool: *UpstreamPoolConfig, start_ticket: usize, attempt
         index += 1;
         if (index == target_count) index = 0;
     }
-    return &pool.targets.items[index];
+    return index;
 }
 
 pub fn printUpstreamPool(policy: UpstreamPoolPolicy, pool: UpstreamPoolConfig) void {

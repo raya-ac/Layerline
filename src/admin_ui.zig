@@ -326,7 +326,7 @@ fn appendAdminBoolSelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
 
 fn appendAdminPolicySelect(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: UpstreamPoolPolicy) !void {
     try out.appendSlice(allocator, "<label>Load balance<select name=\"upstream_policy\">");
-    const options = [_]UpstreamPoolPolicy{ .round_robin, .random, .least_connections, .weighted, .consistent_hash };
+    const options = [_]UpstreamPoolPolicy{ .round_robin, .random, .least_connections, .weighted, .consistent_hash, .sticky_cookie };
     for (options) |option| {
         const name = upstreamPoolPolicyName(option);
         try out.print(allocator, "<option value=\"{s}\" {s}>{s}</option>", .{ name, if (option == value) "selected" else "", name });
@@ -452,7 +452,7 @@ pub fn appendAdminAddSiteForm(out: *std.ArrayList(u8), allocator: std.mem.Alloca
         \\    <label>Index file<input name="index" required value="index.html" {s}></label>
         \\    <label class="check full"><input type="checkbox" name="serve_static_root" checked {s}> Serve static root before fallback handlers</label>
         \\    <label>Proxy fallback<input name="proxy" placeholder="http://127.0.0.1:3000" {s}></label>
-        \\    <label>Load balance<select name="upstream_policy" {s}><option value="">round_robin</option><option>random</option><option>least_connections</option><option>weighted</option><option>consistent_hash</option></select></label>
+        \\    <label>Load balance<select name="upstream_policy" {s}><option value="">round_robin</option><option>random</option><option>least_connections</option><option>weighted</option><option>consistent_hash</option><option>sticky_cookie</option></select></label>
         \\    <label>php-fpm / FastCGI<input name="php_fastcgi" placeholder="127.0.0.1:9000 or unix:/run/php.sock" {s}></label>
         \\    <label class="check full"><input type="checkbox" name="php_front_controller" {s}> Use index.php as a front controller</label>
         \\    <label>TLS certificate<input name="tls_cert" placeholder="/etc/letsencrypt/live/site/fullchain.pem" {s}></label>

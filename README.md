@@ -26,7 +26,7 @@ Layerline blends local serving with edge-style deployment:
 - Named runtime identity with branded root and error pages.
 - Built-in SVG app icon at `/favicon.svg` and `/icon.svg`.
 - PHP route execution for `.php` paths via `php-cgi`/`php` or pooled php-fpm/FastCGI, plus opt-in `index.php` front-controller fallback with PATH_INFO.
-- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash` policies, target weights, bounded retries, passive upstream ejection, circuit breaker half-open probes, slow start, upstream keep-alive pooling, and opt-in active health checks.
+- Reverse-proxy fallback for anything the local server does not handle, including comma/space-separated upstream pools, selectable `round_robin`/`random`/`least_connections`/`weighted`/`consistent_hash`/`sticky_cookie` policies, target weights, bounded retries, passive upstream ejection, circuit breaker half-open probes, slow start, upstream keep-alive pooling, and opt-in active health checks.
 - HTTP/1.1 WebSocket/Upgrade proxy tunneling for route and domain proxy targets.
 - Named route config for route-local static, PHP, and proxy behavior.
 - Host-based domain configs with nginx-style server names, wildcard names, per-domain roots, redirects, routes, PHP, and proxy fallbacks.
@@ -142,7 +142,7 @@ php_info_page = false
 # Use off/false/no/0/none/null to disable it.
 proxy = off
 #proxy = http://127.0.0.1:9000 weight=3, http://127.0.0.1:9001 weight=1
-# Pick the first target in a pool with round_robin, random, least_connections, weighted, or consistent_hash.
+# Pick the first target in a pool with round_robin, random, least_connections, weighted, consistent_hash, or sticky_cookie.
 #upstream_policy = round_robin
 # Retry failed pooled upstream targets before Layerline commits a proxy response.
 # Set to 0 to disable retry attempts.
@@ -464,7 +464,7 @@ route_upstream_health_check_path.api = /ready
 route_upstream_health_check_timeout_ms.api = 500
 ```
 
-Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random`, `least_connections`, `weighted`, or `consistent_hash` when you want nginx-style per-scope balancing behavior. Route and domain scopes can also override static size limits, response-cache policy, security preset, retries, passive failure thresholds, active health probe path/timeouts, circuit breaker behavior, and slow start. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
+Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefix routes strip their matched prefix by default, so `/assets/hello.txt` maps to `public/hello.txt`. Set `route_strip_prefix.NAME = false` when the upstream filesystem or app expects the full path. Proxy settings accept one upstream or a comma/space-separated upstream pool. Pool policy defaults to `round_robin`; use `upstream_policy`, `server_upstream_policy.NAME`, or `route_upstream_policy.NAME` for `random`, `least_connections`, `weighted`, `consistent_hash`, or `sticky_cookie` when you want nginx-style per-scope balancing behavior. Route and domain scopes can also override static size limits, response-cache policy, security preset, retries, passive failure thresholds, active health probe path/timeouts, circuit breaker behavior, and slow start. Use `zig build run -- --dump-routes` to validate and print the active route table without opening sockets.
 
 ## Per-Domain Config Files
 
@@ -660,10 +660,16 @@ For upstream pools, Layerline retries another target when a target fails before 
 zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-retries 1
 ```
 
-Choose the first target with `round_robin` or `random`; retries still walk the remaining pool members once the first target is picked:
+Choose the first target with `round_robin`, `random`, `least_connections`, `weighted`, `consistent_hash`, or `sticky_cookie`; retries still walk the remaining pool members once the first target is picked:
 
 ```bash
 zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy random
+```
+
+`sticky_cookie` sets a `ll_upstream` affinity cookie after proxy selection and honors it on later requests when the target is still healthy:
+
+```bash
+zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-policy sticky_cookie
 ```
 
 Passive health marks a target as unavailable after repeated failed attempts. After the cooldown, the circuit breaker only allows a small half-open probe window; successful recovery starts the target at reduced weighted capacity before it receives full traffic again.

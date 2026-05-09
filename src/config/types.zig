@@ -111,6 +111,7 @@ pub const UpstreamPoolPolicy = enum {
     least_connections,
     weighted,
     consistent_hash,
+    sticky_cookie,
 };
 
 pub const UpstreamPoolConfig = struct {

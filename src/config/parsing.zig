@@ -292,6 +292,7 @@ pub fn upstreamPoolPolicyName(policy: UpstreamPoolPolicy) []const u8 {
         .least_connections => "least_connections",
         .weighted => "weighted",
         .consistent_hash => "consistent_hash",
+        .sticky_cookie => "sticky_cookie",
     };
 }
 
@@ -327,6 +328,13 @@ pub fn parseUpstreamPoolPolicy(value: []const u8) !UpstreamPoolPolicy {
         std.ascii.eqlIgnoreCase(value, "uri-hash"))
     {
         return .consistent_hash;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "sticky_cookie") or
+        std.ascii.eqlIgnoreCase(value, "sticky-cookie") or
+        std.ascii.eqlIgnoreCase(value, "sticky") or
+        std.ascii.eqlIgnoreCase(value, "cookie"))
+    {
+        return .sticky_cookie;
     }
     return error.InvalidConfigValue;
 }

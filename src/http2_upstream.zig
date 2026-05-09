@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const h2_native = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
@@ -154,7 +155,8 @@ pub fn fetchPoolResponse(
     var last_error: ?anyerror = null;
 
     while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
-        const upstream = upstream_mod.upstreamAtAttempt(pool, start_ticket, considered);
+        const upstream_index = upstream_mod.upstreamAttemptIndex(pool, start_ticket, considered);
+        const upstream = &pool.targets.items[upstream_index];
         const lease = upstream_mod.upstreamBeginAttempt(upstream, start_ms, &runtime_policy) orelse {
             skipped_ejected += 1;
             callbacks.metrics.upstreamEjectedSkip();
@@ -164,7 +166,7 @@ pub fn fetchPoolResponse(
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
-        const response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
+        var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
             upstream_mod.upstreamEndAttempt(upstream, lease);
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
@@ -173,6 +175,13 @@ pub fn fetchPoolResponse(
             }
             continue;
         };
+        if (policy == .sticky_cookie) {
+            const cookie_value = try upstream_mod.stickyCookieValue(allocator, upstream_index);
+            const headers = try allocator.alloc(h2_native.Header, response.headers.len + 1);
+            if (response.headers.len > 0) @memcpy(headers[0..response.headers.len], response.headers);
+            headers[response.headers.len] = .{ .name = "set-cookie", .value = cookie_value };
+            response.headers = headers;
+        }
         upstream_mod.upstreamEndAttempt(upstream, lease);
         upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return response;

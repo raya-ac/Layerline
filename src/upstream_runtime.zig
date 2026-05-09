@@ -183,7 +183,7 @@ fn forwardUnknownLengthBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net
     }
 }
 
-fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest, callbacks: Callbacks) !UpstreamResponseForwardResult {
+fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !UpstreamResponseForwardResult {
     var response_buffer: [16 * 1024]u8 = undefined;
     var used: usize = 0;
 
@@ -221,6 +221,7 @@ fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
         callbacks.stream_write_all(stream, "\r\n") catch return error.CloseConnection;
     }
 
+    if (sticky_cookie_header) |header| try callbacks.stream_write_all(stream, header);
     try callbacks.write_response_headers(stream);
     callbacks.stream_write_all(stream, "Connection: close\r\n\r\n") catch return error.CloseConnection;
 
@@ -261,7 +262,7 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.S
     try callbacks.proxy_raw_bidirectional(upstream_conn, stream, body_tail);
 }
 
-fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32, callbacks: Callbacks) !void {
+fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !void {
     if (upstream.https) {
         return error.UnsupportedUpstreamScheme;
     }
@@ -352,7 +353,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         return error.CloseConnection;
     }
 
-    const result = forwardResponse(stream, lease.stream, req, callbacks) catch |err| switch (err) {
+    const result = forwardResponse(stream, lease.stream, req, sticky_cookie_header, callbacks) catch |err| switch (err) {
         error.RequestTimeout => return err,
         else => |e| return e,
     };
@@ -504,7 +505,8 @@ pub fn forwardToPool(
     var last_error: ?anyerror = null;
 
     attempt_loop: while (considered < pool.targets.items.len and attempts < attempt_limit) : (considered += 1) {
-        const upstream = upstream_mod.upstreamAtAttempt(pool, start_ticket, considered);
+        const upstream_index = upstream_mod.upstreamAttemptIndex(pool, start_ticket, considered);
+        const upstream = &pool.targets.items[upstream_index];
         const lease = upstream_mod.upstreamBeginAttempt(upstream, now_ms, &runtime_policy) orelse {
             skipped_ejected += 1;
             callbacks.metrics.upstreamEjectedSkip();
@@ -520,7 +522,13 @@ pub fn forwardToPool(
             .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
         );
         callbacks.access_log_set_upstream(upstream_label);
-        forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, callbacks) catch |err| switch (err) {
+        const sticky_cookie = if (policy == .sticky_cookie)
+            try upstream_mod.stickyCookieHeader(allocator, upstream_index)
+        else
+            null;
+        defer if (sticky_cookie) |header| allocator.free(header);
+
+        forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, sticky_cookie, callbacks) catch |err| switch (err) {
             error.CloseConnection => {
                 upstream_mod.upstreamEndAttempt(upstream, lease);
                 upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);

@@ -61,6 +61,7 @@ const upstreamBeginAttempt = upstream_mod.upstreamBeginAttempt;
 const upstreamEffectiveWeight = upstream_mod.upstreamEffectiveWeight;
 const upstreamEndAttempt = upstream_mod.upstreamEndAttempt;
 const upstreamInSlowStart = upstream_mod.upstreamInSlowStart;
+const stickyCookieIndex = upstream_mod.stickyCookieIndex;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 const selectUpstream = upstream_mod.selectUpstream;
 const upstreamRecordActiveHealthResult = upstream_runtime.recordActiveHealthResult;
@@ -492,6 +493,9 @@ test "upstream policy parser accepts configured policy names" {
     try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent_hash"));
     try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("consistent-hash"));
     try std.testing.expectEqual(UpstreamPoolPolicy.consistent_hash, try parseUpstreamPoolPolicy("uri_hash"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.sticky_cookie, try parseUpstreamPoolPolicy("sticky_cookie"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.sticky_cookie, try parseUpstreamPoolPolicy("sticky"));
+    try std.testing.expectEqual(UpstreamPoolPolicy.sticky_cookie, try parseUpstreamPoolPolicy("cookie"));
     try std.testing.expectEqual(@as(?UpstreamPoolPolicy, null), try parseOptionalUpstreamPoolPolicy("inherit"));
 }
 
@@ -566,6 +570,30 @@ test "consistent hash policy keeps a stable healthy target" {
     const replacement = upstreamStartTicket(&pool, .consistent_hash, 1_000, request_mod.upstreamHashInput(req), null);
     try std.testing.expect(replacement != first);
     try std.testing.expect(replacement < pool.targets.items.len);
+}
+
+test "sticky cookie policy pins valid cookies and falls back when unhealthy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var pool = try parseUpstreamPool(allocator, "http://127.0.0.1:9000, http://127.0.0.1:9001, http://127.0.0.1:9002");
+    const req = HttpRequest{
+        .method = "GET",
+        .path = "/dashboard",
+        .query = "",
+        .headers = "Host: example.test\r\nCookie: session=abc; ll_upstream=2\r\n",
+        .version = "HTTP/1.1",
+        .body = "",
+        .close_connection = false,
+    };
+
+    try std.testing.expectEqual(@as(?usize, 2), stickyCookieIndex(req.headers, pool.targets.items.len));
+    try std.testing.expectEqual(@as(usize, 2), upstreamStartTicket(&pool, .sticky_cookie, 1_000, request_mod.upstreamHashInput(req), null));
+
+    upstream_mod.round_robin_cursor.store(0, .monotonic);
+    pool.targets.items[2].ejected_until_ms.store(2_000, .monotonic);
+    try std.testing.expectEqual(@as(usize, 0), upstreamStartTicket(&pool, .sticky_cookie, 1_000, request_mod.upstreamHashInput(req), null));
 }
 
 test "active health result transitions update upstream availability" {
