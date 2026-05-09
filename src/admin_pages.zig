@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const admin_support = @import("admin_support.zig");
+const admin_upstreams = @import("admin_upstreams.zig");
 const admin_ui = @import("admin_ui.zig");
 const config_mod = @import("config.zig");
 const metrics_mod = @import("metrics.zig");
@@ -217,6 +218,8 @@ pub fn renderDashboardPage(
     defer allocator.free(routes);
     const certs = try renderCerts(allocator, cfg, runtime);
     defer allocator.free(certs);
+    const upstreams = try admin_upstreams.renderReport(io, allocator, cfg);
+    defer allocator.free(upstreams);
     const metrics = try metrics_mod.render(allocator, runtime.metrics);
     defer allocator.free(metrics);
 
@@ -248,6 +251,7 @@ pub fn renderDashboardPage(
 
     try out.appendSlice(allocator, "<div class=\"workspace\">\n");
     try admin_ui.appendAdminActiveSites(&out, allocator, cfg);
+    try admin_upstreams.appendAdminPanel(io, &out, allocator, cfg);
     try admin_ui.appendAdminSettingsForm(&out, allocator, cfg);
     try admin_ui.appendAdminAddSiteForm(&out, allocator, cfg);
     try appendMainConfigPreview(io, &out, allocator, cfg, validate_config);
@@ -255,6 +259,8 @@ pub fn renderDashboardPage(
 
     try out.appendSlice(allocator, "<section class=\"block\" id=\"status\"><h2>Status</h2><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, status);
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"upstream-report\"><h2>Upstream report</h2><pre>");
+    try admin_support.appendHtmlEscaped(&out, allocator, upstreams);
     try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"routes\"><h2>Routes</h2><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, routes);
     try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><h2>Certificates</h2><pre>");

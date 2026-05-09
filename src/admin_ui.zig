@@ -92,6 +92,9 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\  details.config-file summary::-webkit-details-marker {{ display: none; }}
         \\  pre {{ overflow: auto; max-height: 360px; margin: 0; padding: 14px; border: 1px solid rgba(17,17,15,.13); border-radius: 8px; background: #11110f; color: #f6f0e5; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }}
         \\  .actions {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 18px; }}
+        \\  .inline-actions {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+        \\  .inline-actions form {{ margin: 0; }}
+        \\  .inline-actions button {{ min-height: 30px; padding: 5px 8px; font-size: 12px; }}
         \\  @media (max-width: 900px) {{ .workspace, .form-grid {{ grid-template-columns: 1fr; }} .full, .span-all {{ grid-column: auto; }} }}
         \\  @media (max-width: 760px) {{ header {{ align-items: flex-start; flex-direction: column; }} .grid {{ grid-template-columns: 1fr; }} main {{ width: min(100vw - 24px, 1120px); }} }}
         \\</style>
@@ -107,13 +110,14 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\    <a class="navlink" href="/">Site</a>
         \\    <a class="navlink" href="{s}">Dashboard</a>
         \\    <a class="navlink" href="{s}#sites">Sites</a>
+        \\    <a class="navlink" href="{s}#upstreams">Upstreams</a>
         \\    <a class="navlink" href="{s}#settings">Settings</a>
         \\    <a class="navlink" href="{s}#config">Config</a>
         \\  </nav>
         \\</header>
         \\
     ,
-        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
+        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
     );
 }
 

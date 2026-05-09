@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const acme_mod = @import("acme.zig");
+const admin_upstreams = @import("admin_upstreams.zig");
 const config_mod = @import("config.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_server = @import("http2_server.zig");

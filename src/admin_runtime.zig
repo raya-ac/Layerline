@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
+const admin_upstreams = @import("admin_upstreams.zig");
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const request_mod = @import("request.zig");
@@ -321,6 +322,66 @@ fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
     try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
 }
 
+fn parseAdminUsize(value: []const u8) !usize {
+    if (value.len == 0) return error.InvalidConfigValue;
+    return std.fmt.parseInt(usize, value, 10) catch error.InvalidConfigValue;
+}
+
+fn parseAdminU32OrDefault(value: []const u8, default_value: u32) !u32 {
+    if (value.len == 0) return default_value;
+    return std.fmt.parseInt(u32, value, 10) catch error.InvalidConfigValue;
+}
+
+fn upstreamControlMessage(allocator: std.mem.Allocator, action: admin_upstreams.ControlAction, address: admin_upstreams.TargetAddress) ![]const u8 {
+    const verb = switch (action) {
+        .eject => "Ejected",
+        .recover => "Recovered",
+    };
+    if (std.mem.eql(u8, address.scope, "global")) {
+        return std.fmt.allocPrint(allocator, "{s} global upstream target {d}.", .{ verb, address.index });
+    }
+    if (std.mem.eql(u8, address.scope, "route")) {
+        return std.fmt.allocPrint(allocator, "{s} route {s} upstream target {d}.", .{ verb, address.route, address.index });
+    }
+    if (std.mem.eql(u8, address.scope, "domain")) {
+        return std.fmt.allocPrint(allocator, "{s} domain {s} upstream target {d}.", .{ verb, address.domain, address.index });
+    }
+    return std.fmt.allocPrint(allocator, "{s} domain {s} route {s} upstream target {d}.", .{ verb, address.domain, address.route, address.index });
+}
+
+fn handleUpstreamControlPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, credentials: AdminCredentials, req: HttpRequest, action: admin_upstreams.ControlAction, close_connection: bool, callbacks: Callbacks) !void {
+    var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream control form could not be parsed.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer admin_support.freeFormFields(allocator, &fields);
+
+    const address = admin_upstreams.TargetAddress{
+        .scope = admin_support.adminTrimmedField(fields.items, "scope"),
+        .domain = admin_support.adminTrimmedField(fields.items, "domain"),
+        .route = admin_support.adminTrimmedField(fields.items, "route"),
+        .index = parseAdminUsize(admin_support.adminTrimmedField(fields.items, "index")) catch {
+            try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream target index is invalid.", 400, "Bad Request", close_connection, false);
+            return;
+        },
+    };
+    const duration_ms = parseAdminU32OrDefault(admin_support.adminTrimmedField(fields.items, "duration_ms"), admin_upstreams.DEFAULT_MANUAL_EJECT_MS) catch {
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream ejection duration is invalid.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    admin_upstreams.applyControl(io, cfg, action, address, duration_ms) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Upstream control failed: {}", .{err});
+        defer allocator.free(message);
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    const message = try upstreamControlMessage(allocator, action, address);
+    defer allocator.free(message);
+    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
+}
+
 pub fn handleUi(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -390,6 +451,14 @@ pub fn handleUi(
         try handleReloadPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/eject")) {
+        try handleUpstreamControlPost(io, stream, allocator, cfg, credentials, req, .eject, close_connection, callbacks);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/recover")) {
+        try handleUpstreamControlPost(io, stream, allocator, cfg, credentials, req, .recover, close_connection, callbacks);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
         try handleAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
         return;
@@ -412,21 +481,96 @@ fn sendText(stream: std.Io.net.Stream, bytes: []const u8, callbacks: Callbacks) 
     if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') try callbacks.write_all(stream, "\n");
 }
 
+fn parseSocketUpstreamAddress(command: []const u8) !admin_upstreams.TargetAddress {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    _ = tokens.next() orelse return error.InvalidUpstreamCommand;
+    const scope = tokens.next() orelse return error.InvalidUpstreamCommand;
+
+    if (std.mem.eql(u8, scope, "global")) {
+        const index = parseAdminUsize(tokens.next() orelse return error.InvalidUpstreamCommand) catch return error.InvalidUpstreamCommand;
+        return .{ .scope = "global", .index = index };
+    }
+    if (std.mem.eql(u8, scope, "route")) {
+        const route = tokens.next() orelse return error.InvalidUpstreamCommand;
+        const index = parseAdminUsize(tokens.next() orelse return error.InvalidUpstreamCommand) catch return error.InvalidUpstreamCommand;
+        return .{ .scope = "route", .route = route, .index = index };
+    }
+    if (std.mem.eql(u8, scope, "domain")) {
+        const domain = tokens.next() orelse return error.InvalidUpstreamCommand;
+        const index = parseAdminUsize(tokens.next() orelse return error.InvalidUpstreamCommand) catch return error.InvalidUpstreamCommand;
+        return .{ .scope = "domain", .domain = domain, .index = index };
+    }
+    if (std.mem.eql(u8, scope, "domain-route")) {
+        const domain = tokens.next() orelse return error.InvalidUpstreamCommand;
+        const route = tokens.next() orelse return error.InvalidUpstreamCommand;
+        const index = parseAdminUsize(tokens.next() orelse return error.InvalidUpstreamCommand) catch return error.InvalidUpstreamCommand;
+        return .{ .scope = "domain-route", .domain = domain, .route = route, .index = index };
+    }
+
+    return error.InvalidUpstreamCommand;
+}
+
+fn parseSocketUpstreamDuration(command: []const u8, address: admin_upstreams.TargetAddress) !u32 {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    if (std.mem.eql(u8, address.scope, "global")) {
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    } else if (std.mem.eql(u8, address.scope, "route")) {
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    } else if (std.mem.eql(u8, address.scope, "domain")) {
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    } else if (std.mem.eql(u8, address.scope, "domain-route")) {
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+        _ = tokens.next() orelse return admin_upstreams.DEFAULT_MANUAL_EJECT_MS;
+    }
+    return parseAdminU32OrDefault(tokens.next() orelse "", admin_upstreams.DEFAULT_MANUAL_EJECT_MS) catch error.InvalidUpstreamCommand;
+}
+
+fn handleUpstreamControlCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command: []const u8, action: admin_upstreams.ControlAction, callbacks: Callbacks) !void {
+    const address = parseSocketUpstreamAddress(command) catch {
+        try sendText(stream, "ERROR usage: upstream-eject global <index> [ms] | upstream-eject route <name> <index> [ms] | upstream-eject domain <name> <index> [ms] | upstream-eject domain-route <domain> <route> <index> [ms]\n", callbacks);
+        return;
+    };
+    const duration_ms = parseSocketUpstreamDuration(command, address) catch {
+        try sendText(stream, "ERROR upstream duration must be an unsigned millisecond value\n", callbacks);
+        return;
+    };
+
+    admin_upstreams.applyControl(callbacks.active_io(), cfg, action, address, duration_ms) catch |err| {
+        const body = try std.fmt.allocPrint(allocator, "ERROR upstream control failed: {}\n", .{err});
+        defer allocator.free(body);
+        try sendText(stream, body, callbacks);
+        return;
+    };
+
+    const message = try upstreamControlMessage(allocator, action, address);
+    defer allocator.free(message);
+    const body = try std.fmt.allocPrint(allocator, "OK {s}\n", .{message});
+    defer allocator.free(body);
+    try sendText(stream, body, callbacks);
+}
+
 fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8, callbacks: Callbacks) !void {
     const command = trimValue(command_raw);
-    if (command.len == 0 or std.mem.eql(u8, command, "help")) {
-        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, certs, metrics, help\n", callbacks);
+    var token_it = std.mem.tokenizeAny(u8, command, " \t\r\n");
+    const verb = token_it.next() orelse "";
+    if (command.len == 0 or std.mem.eql(u8, verb, "help")) {
+        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, metrics, help\n", callbacks);
         return;
     }
 
-    if (std.mem.eql(u8, command, "status")) {
+    if (std.mem.eql(u8, verb, "status")) {
         const body = try admin_pages.renderStatus(allocator, cfg, callbacks.runtime_view());
         defer allocator.free(body);
         try sendText(stream, body, callbacks);
         return;
     }
 
-    if (std.mem.eql(u8, command, "validate") or std.mem.eql(u8, command, "validate-config")) {
+    if (std.mem.eql(u8, verb, "validate") or std.mem.eql(u8, verb, "validate-config")) {
         callbacks.validate_activation(callbacks.active_io(), allocator, cfg) catch |err| {
             const body = try std.fmt.allocPrint(allocator, "ERROR config invalid: {}\n", .{err});
             defer allocator.free(body);
@@ -437,7 +581,7 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         return;
     }
 
-    if (std.mem.eql(u8, command, "validate-runtime")) {
+    if (std.mem.eql(u8, verb, "validate-runtime")) {
         callbacks.validate_runtime(cfg) catch |err| {
             const body = try std.fmt.allocPrint(allocator, "ERROR runtime config invalid: {}\n", .{err});
             defer allocator.free(body);
@@ -448,7 +592,7 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         return;
     }
 
-    if (std.mem.eql(u8, command, "restart") or std.mem.eql(u8, command, "graceful-restart")) {
+    if (std.mem.eql(u8, verb, "restart") or std.mem.eql(u8, verb, "graceful-restart")) {
         callbacks.validate_activation(callbacks.active_io(), allocator, cfg) catch |err| {
             const body = try std.fmt.allocPrint(allocator, "ERROR restart blocked: {}\n", .{err});
             defer allocator.free(body);
@@ -460,7 +604,7 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         return;
     }
 
-    if (std.mem.eql(u8, command, "reload")) {
+    if (std.mem.eql(u8, verb, "reload")) {
         callbacks.reload_config(callbacks.active_io(), allocator, cfg) catch |err| {
             const body = try std.fmt.allocPrint(allocator, "ERROR reload blocked: {}\n", .{err});
             defer allocator.free(body);
@@ -471,21 +615,38 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         return;
     }
 
-    if (std.mem.eql(u8, command, "routes")) {
+    if (std.mem.eql(u8, verb, "routes")) {
         const body = try admin_pages.renderRoutes(allocator, cfg);
         defer allocator.free(body);
         try sendText(stream, body, callbacks);
         return;
     }
 
-    if (std.mem.eql(u8, command, "certs") or std.mem.eql(u8, command, "certificates")) {
+    if (std.mem.eql(u8, verb, "upstreams")) {
+        const body = try admin_upstreams.renderReport(callbacks.active_io(), allocator, cfg);
+        defer allocator.free(body);
+        try sendText(stream, body, callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "upstream-eject") or std.mem.eql(u8, verb, "upstream-drain")) {
+        try handleUpstreamControlCommand(stream, allocator, cfg, command, .eject, callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "upstream-recover")) {
+        try handleUpstreamControlCommand(stream, allocator, cfg, command, .recover, callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "certs") or std.mem.eql(u8, verb, "certificates")) {
         const body = try admin_pages.renderCerts(allocator, cfg, callbacks.runtime_view());
         defer allocator.free(body);
         try sendText(stream, body, callbacks);
         return;
     }
 
-    if (std.mem.eql(u8, command, "metrics")) {
+    if (std.mem.eql(u8, verb, "metrics")) {
         const body = try callbacks.render_metrics(allocator);
         defer allocator.free(body);
         try sendText(stream, body, callbacks);

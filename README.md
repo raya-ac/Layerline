@@ -36,8 +36,8 @@ Layerline blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2, with global, domain, and route overrides.
-- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, `SIGHUP` reload, graceful restart, routes, cert visibility, and metrics.
-- Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup.
+- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, `SIGHUP` reload, graceful restart, routes, upstream health/eject/recover, cert visibility, and metrics.
+- Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup plus site, config, and upstream controls.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache with domain/route overrides.
 - Prometheus-style runtime metrics at `/metrics`, including compression, static sendfile/buffered transfer, and reverse-proxy upstream attempt/failure/retry/ejection/connection-pool counters.
@@ -55,7 +55,7 @@ Layerline is being built toward the Caddy/nginx class: direct TLS termination, v
 
 ## Current status
 
-Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, an opt-in shared memory response cache with domain/route overrides, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout/retry/health/breaker overrides, inherited global/domain/route response headers, security presets, and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight and in-memory reload, an opt-in first-launch browser admin UI with reload and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
+Layerline is past the toy-server stage: the HTTP/1 path has strict parsing, bounded bodies, keep-alive rotation, chunked request bodies, static sendfile/precompressed assets with Cache-Status, an opt-in shared memory response cache with domain/route overrides, gzip for eligible buffered responses with domain/route policy overrides, PHP CGI execution, php-fpm/FastCGI transport with worker connection pooling, PHP front-controller fallback, native HTTP/2 request-body routing, graceful GOAWAY on request caps/shutdown, route-local backend timeout/retry/health/breaker overrides, inherited global/domain/route response headers, security presets, and cache stale directives, redirects, WebSocket upgrade proxying, reverse-proxy fallback with pooled retries, configurable pool policy, least-connections, weighted, and consistent-hash balancing, reusable upstream keep-alive sockets, circuit breaker recovery, durable upstream health state, metrics, structured JSON access logs with request IDs, a local Unix admin socket with activation preflight, in-memory reload, and upstream eject/recover controls, an opt-in first-launch browser admin UI with reload, upstream, and managed restart controls, named routes, host-based domain configs, direct TLS, and a companion HTTP redirect/ACME listener for owning ports 80 and 443 without Caddy. The native HTTP/3 work is in-tree and can route simple static and health responses over QUIC/TLS 1.3 after decoding QPACK request fields; proxy/PHP route parity over HTTP/3 is still on the roadmap.
 
 The next roadmap slice is protocol/cache depth: broader HTTP/3 proxy/PHP route parity, external h3 smoke coverage where the local client supports it, and then disk/dynamic cache work beyond the current static memory cache. That work builds on the existing `proxy`, `route_proxy.NAME`, `server_proxy.NAME`, and `server_route_proxy.DOMAIN.ROUTE` config surface instead of adding another parallel config style.
 
@@ -185,7 +185,7 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
-# Local admin socket: status, validate activation config, restart, routes, certs, metrics.
+# Local admin socket: status, validate activation config, restart, routes, upstreams, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Browser admin UI is disabled by default and creates access on first launch.
 #admin_ui = false
@@ -319,14 +319,19 @@ Set `admin_socket` to enable a local Unix socket for operational commands:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `validate-runtime`, `reload`, `restart`, `routes`, `certs`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
+Commands are one line each: `status`, `validate`, `validate-runtime`, `reload`, `restart`, `routes`, `upstreams`, `upstream-eject`, `upstream-recover`, `certs`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
 printf 'reload\n' | nc -U /tmp/layerline-admin.sock
 printf 'routes\n' | nc -U /tmp/layerline-admin.sock
+printf 'upstreams\n' | nc -U /tmp/layerline-admin.sock
+printf 'upstream-eject route api 0 60000\n' | nc -U /tmp/layerline-admin.sock
+printf 'upstream-recover route api 0\n' | nc -U /tmp/layerline-admin.sock
 printf 'certs\n' | nc -U /tmp/layerline-admin.sock
 ```
+
+Upstream target scopes are `global <index>`, `route <route-name> <index>`, `domain <domain-name> <index>`, and `domain-route <domain-name> <route-name> <index>`. `upstream-eject` and the alias `upstream-drain` stop new attempts to that target for the requested millisecond duration while existing active requests finish; `upstream-recover` clears the manual/passive ejection state.
 
 `reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
 
@@ -345,7 +350,7 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, exposes status/routes/certs/metrics, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, exposes status/routes/upstreams/certs/metrics, can eject or recover live upstream targets, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
 
 ## Website and branding
 

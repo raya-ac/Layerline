@@ -113,6 +113,9 @@ route = nocache /nocache/* static
 route_response_cache.nocache = false
 route_security_headers.nocache = strict
 route_max_static_file_bytes.nocache = 2048
+route = verify_proxy /verify-proxy/* proxy
+route_proxy.verify_proxy = http://127.0.0.1:19000 http://127.0.0.1:19001
+route_upstream_policy.verify_proxy = least_connections
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT" "$SIGHUP_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
@@ -339,6 +342,27 @@ case "$ADMIN_ROUTES" in
   *) die "admin routes did not show route-local policy: $ADMIN_ROUTES" ;;
 esac
 
+ADMIN_UPSTREAMS=$(printf 'upstreams\n' | nc -U "$SOCKET")
+case "$ADMIN_UPSTREAMS" in
+  *"route verify_proxy policy=least_connections targets=2"*) ok "admin upstream report" ;;
+  *) die "admin upstream report was unexpected: $ADMIN_UPSTREAMS" ;;
+esac
+ADMIN_EJECT=$(printf 'upstream-eject route verify_proxy 0 60000\n' | nc -U "$SOCKET")
+case "$ADMIN_EJECT" in
+  'OK Ejected route verify_proxy upstream target 0.'*) ok "admin upstream eject" ;;
+  *) die "admin upstream eject response was unexpected: $ADMIN_EJECT" ;;
+esac
+ADMIN_UPSTREAMS_EJECTED=$(printf 'upstreams\n' | nc -U "$SOCKET")
+case "$ADMIN_UPSTREAMS_EJECTED" in
+  *"route verify_proxy 0 http://127.0.0.1:19000/"*"state=ejected"*) ok "admin upstream ejected state" ;;
+  *) die "admin upstream report did not show ejected target: $ADMIN_UPSTREAMS_EJECTED" ;;
+esac
+ADMIN_RECOVER=$(printf 'upstream-recover route verify_proxy 0\n' | nc -U "$SOCKET")
+case "$ADMIN_RECOVER" in
+  'OK Recovered route verify_proxy upstream target 0.'*) ok "admin upstream recover" ;;
+  *) die "admin upstream recover response was unexpected: $ADMIN_RECOVER" ;;
+esac
+
 ADMIN_CERTS=$(printf 'certs\n' | nc -U "$SOCKET")
 case "$ADMIN_CERTS" in
   *"global tls=false"*"acme renewals="*) ok "admin certs" ;;
@@ -377,6 +401,8 @@ grep -Fq 'Add site' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not includ
 grep -Fq 'Save settings' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include settings management"
 grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include in-memory reload"
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
+grep -Fq 'Live proxy targets' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include upstream controls"
+grep -Fq 'route verify_proxy' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose upstream report"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 grep -Fq 'layerline_response_cache_hits_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include response-cache metrics"
 grep -Fq 'security=strict response_cache=false' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose route-local policy"
