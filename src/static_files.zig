@@ -28,7 +28,23 @@ pub fn contentTypeFromPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
     if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
     if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
+    if (std.mem.endsWith(u8, path, ".zip")) return "application/zip";
+    if (std.mem.endsWith(u8, path, ".tar")) return "application/x-tar";
+    if (std.mem.endsWith(u8, path, ".tar.gz") or std.mem.endsWith(u8, path, ".tgz")) return "application/gzip";
+    if (std.mem.endsWith(u8, path, ".gz")) return "application/gzip";
+    if (std.mem.endsWith(u8, path, ".dmg")) return "application/x-apple-diskimage";
+    if (std.mem.endsWith(u8, path, ".exe")) return "application/vnd.microsoft.portable-executable";
+    if (std.mem.endsWith(u8, path, ".msi")) return "application/x-msi";
     return "text/plain; charset=utf-8";
+}
+
+test "contentTypeFromPath recognizes downloadable archives" {
+    try std.testing.expectEqualStrings("application/zip", contentTypeFromPath("junkstep-windows.zip"));
+    try std.testing.expectEqualStrings("application/gzip", contentTypeFromPath("junkstep-linux.tar.gz"));
+    try std.testing.expectEqualStrings("application/gzip", contentTypeFromPath("junkstep-linux.tgz"));
+    try std.testing.expectEqualStrings("application/x-tar", contentTypeFromPath("pack.tar"));
+    try std.testing.expectEqualStrings("application/x-apple-diskimage", contentTypeFromPath("junkstep.dmg"));
+    try std.testing.expectEqualStrings("application/vnd.microsoft.portable-executable", contentTypeFromPath("junkstep.exe"));
 }
 
 // Single ranges cover the common browser/media case. Multi-range responses are
