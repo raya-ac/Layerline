@@ -32,7 +32,7 @@ pub const Callbacks = struct {
     metrics: *metrics_mod.ServerMetrics,
     php_callbacks: php_runtime.Callbacks,
     read_acme_challenge: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!H2BufferedResponse,
-    read_static_file: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, usize, static_cache.Policy) anyerror!H2BufferedResponse,
+    read_static_file: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, []const u8, usize, static_cache.Policy) anyerror!H2BufferedResponse,
     redirect_response: *const fn (std.mem.Allocator, config_mod.RedirectRule, HttpRequest) anyerror!H2BufferedResponse,
     set_compression_policy: *const fn (CompressionPolicy) void,
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
@@ -151,7 +151,7 @@ pub fn buildResponseForRequest(
         }
         if (std.mem.eql(u8, req.path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
             callbacks.access_log_set_handler("static_root");
-            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
+            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), req.headers, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
         }
         if (std.mem.eql(u8, req.path, "/")) {
             callbacks.access_log_set_handler("builtin_root");
@@ -183,7 +183,7 @@ pub fn buildResponseForRequest(
         }
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             callbacks.access_log_set_handler("static");
-            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), req.path["/static/".len..], config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
+            return callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), req.path["/static/".len..], req.headers, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
         }
         if (routing_mod.domainServeStaticRoot(cfg, domain) and
             !std.mem.startsWith(u8, req.path, "/api/") and
@@ -194,7 +194,7 @@ pub fn buildResponseForRequest(
         {
             const rel = try routing_mod.makeStaticPathFromRequest(allocator, req.path, routing_mod.domainIndexFile(cfg, domain));
             callbacks.access_log_set_handler("static_root");
-            const response = try callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
+            const response = try callbacks.read_static_file(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, req.headers, config_mod.maxStaticFileBytesFor(cfg, domain, null), static_cache.policyForConfig(cfg, domain, null));
             if (response.status_code == 404) {
                 if (try callbacks.custom_not_found_response(io, allocator, cfg, domain)) |custom| return custom;
             }
@@ -258,7 +258,7 @@ fn buildRouteResponse(
                 return response;
             }
             const rel = try routing_mod.routeFileRelativePath(allocator, route, req.path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
-            return callbacks.read_static_file(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, route), static_cache.policyForConfig(cfg, domain, route));
+            return callbacks.read_static_file(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, req.headers, config_mod.maxStaticFileBytesFor(cfg, domain, route), static_cache.policyForConfig(cfg, domain, route));
         },
         .proxy => {
             callbacks.access_log_set_handler("route_proxy");

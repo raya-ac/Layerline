@@ -207,6 +207,13 @@ header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; stored; tt
 STATIC_HIT_HEADERS="$TMP_DIR/static-hit.headers"
 curl -fsS -D "$STATIC_HIT_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
 header_has "$STATIC_HIT_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="response-cache"' || die "static response-cache hit header missing"
+header_has "$STATIC_HIT_HEADERS" '^Last-Modified: ' || die "static Last-Modified header missing"
+STATIC_LAST_MODIFIED=$(grep -i '^Last-Modified:' "$STATIC_HIT_HEADERS" | head -1 | sed -E 's/^[^:]+:[[:space:]]*//;s/\r$//')
+HTTP1_IFMOD_HEADERS="$TMP_DIR/http1-if-modified.headers"
+HTTP1_IFMOD_BODY="$TMP_DIR/http1-if-modified.body"
+HTTP1_IFMOD_CODE=$(curl -sS -D "$HTTP1_IFMOD_HEADERS" -o "$HTTP1_IFMOD_BODY" -w '%{http_code}' -H "If-Modified-Since: $STATIC_LAST_MODIFIED" "http://$HOST:$PORT/static/hello.txt")
+[[ $HTTP1_IFMOD_CODE == 304 ]] || die "If-Modified-Since static request returned HTTP $HTTP1_IFMOD_CODE instead of 304"
+[[ ! -s $HTTP1_IFMOD_BODY ]] || die "If-Modified-Since static 304 returned a body"
 ok "static file route"
 
 ROUTE_POLICY_HEADERS="$TMP_DIR/route-policy.headers"
@@ -249,6 +256,13 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_STATIC_HEADERS="$TMP_DIR/h2-static.headers"
   curl -fsS --http2-prior-knowledge -D "$H2_STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
   header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="response-cache"' || die "h2 static response-cache hit header missing"
+  header_has "$H2_STATIC_HEADERS" '^last-modified: ' || die "h2 static Last-Modified header missing"
+  H2_LAST_MODIFIED=$(grep -i '^last-modified:' "$H2_STATIC_HEADERS" | head -1 | sed -E 's/^[^:]+:[[:space:]]*//;s/\r$//')
+  H2_IFMOD_HEADERS="$TMP_DIR/h2-if-modified.headers"
+  H2_IFMOD_BODY="$TMP_DIR/h2-if-modified.body"
+  H2_IFMOD_CODE=$(curl -sS --http2-prior-knowledge -D "$H2_IFMOD_HEADERS" -o "$H2_IFMOD_BODY" -w '%{http_code}' -H "If-Modified-Since: $H2_LAST_MODIFIED" "http://$HOST:$PORT/static/hello.txt")
+  [[ $H2_IFMOD_CODE == 304 ]] || die "h2 If-Modified-Since static request returned HTTP $H2_IFMOD_CODE instead of 304"
+  [[ ! -s $H2_IFMOD_BODY ]] || die "h2 If-Modified-Since static 304 returned a body"
   ok "h2c static cache status"
 
   H2_DYNAMIC_STORE_HEADERS="$TMP_DIR/h2-dynamic-store.headers"

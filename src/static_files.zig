@@ -100,17 +100,141 @@ pub fn makeStaticEtag(allocator: std.mem.Allocator, stat: std.Io.File.Stat) ![]c
     );
 }
 
-pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, content_encoding: ?[]const u8, cache_status: []const u8) ![]const u8 {
+fn weekdayName(index: u3) []const u8 {
+    return switch (index) {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        7 => unreachable,
+    };
+}
+
+fn monthName(month: std.time.epoch.Month) []const u8 {
+    return switch (month) {
+        .jan => "Jan",
+        .feb => "Feb",
+        .mar => "Mar",
+        .apr => "Apr",
+        .may => "May",
+        .jun => "Jun",
+        .jul => "Jul",
+        .aug => "Aug",
+        .sep => "Sep",
+        .oct => "Oct",
+        .nov => "Nov",
+        .dec => "Dec",
+    };
+}
+
+pub fn makeHttpDate(allocator: std.mem.Allocator, timestamp: std.Io.Timestamp) ![]const u8 {
+    const raw_seconds = timestamp.toSeconds();
+    const seconds: u64 = @intCast(@max(raw_seconds, 0));
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const weekday_index: u3 = @intCast((epoch_day.day + 4) % 7);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+        .{
+            weekdayName(weekday_index),
+            month_day.day_index + 1,
+            monthName(month_day.month),
+            year_day.year,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
+fn parseFixedDigits(comptime T: type, raw: []const u8) ?T {
+    if (raw.len == 0) return null;
+    var value: T = 0;
+    for (raw) |byte| {
+        if (byte < '0' or byte > '9') return null;
+        value = value * 10 + @as(T, @intCast(byte - '0'));
+    }
+    return value;
+}
+
+fn parseHttpMonth(raw: []const u8) ?std.time.epoch.Month {
+    if (std.mem.eql(u8, raw, "Jan")) return .jan;
+    if (std.mem.eql(u8, raw, "Feb")) return .feb;
+    if (std.mem.eql(u8, raw, "Mar")) return .mar;
+    if (std.mem.eql(u8, raw, "Apr")) return .apr;
+    if (std.mem.eql(u8, raw, "May")) return .may;
+    if (std.mem.eql(u8, raw, "Jun")) return .jun;
+    if (std.mem.eql(u8, raw, "Jul")) return .jul;
+    if (std.mem.eql(u8, raw, "Aug")) return .aug;
+    if (std.mem.eql(u8, raw, "Sep")) return .sep;
+    if (std.mem.eql(u8, raw, "Oct")) return .oct;
+    if (std.mem.eql(u8, raw, "Nov")) return .nov;
+    if (std.mem.eql(u8, raw, "Dec")) return .dec;
+    return null;
+}
+
+fn daysBeforeMonth(year: std.time.epoch.Year, month: std.time.epoch.Month) u16 {
+    var total: u16 = 0;
+    var index: u4 = 1;
+    while (index < @intFromEnum(month)) : (index += 1) {
+        total += std.time.epoch.getDaysInMonth(year, @enumFromInt(index));
+    }
+    return total;
+}
+
+pub fn parseHttpDate(raw: []const u8) ?i64 {
+    const value = http_headers.trimValue(raw);
+    if (value.len != 29) return null;
+    if (value[3] != ',' or value[4] != ' ' or value[7] != ' ' or value[11] != ' ' or value[16] != ' ' or value[19] != ':' or value[22] != ':' or value[25] != ' ') return null;
+    if (!std.mem.eql(u8, value[26..29], "GMT")) return null;
+
+    const day = parseFixedDigits(u8, value[5..7]) orelse return null;
+    const month = parseHttpMonth(value[8..11]) orelse return null;
+    const year = parseFixedDigits(std.time.epoch.Year, value[12..16]) orelse return null;
+    const hour = parseFixedDigits(u8, value[17..19]) orelse return null;
+    const minute = parseFixedDigits(u8, value[20..22]) orelse return null;
+    const second = parseFixedDigits(u8, value[23..25]) orelse return null;
+
+    if (year < std.time.epoch.epoch_year or day == 0 or hour > 23 or minute > 59 or second > 59) return null;
+    if (day > std.time.epoch.getDaysInMonth(year, month)) return null;
+
+    var days: u64 = 0;
+    var cursor_year: std.time.epoch.Year = std.time.epoch.epoch_year;
+    while (cursor_year < year) : (cursor_year += 1) {
+        days += std.time.epoch.getDaysInYear(cursor_year);
+    }
+    days += daysBeforeMonth(year, month);
+    days += day - 1;
+
+    const seconds = days * std.time.epoch.secs_per_day + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
+    return @intCast(seconds);
+}
+
+pub fn notModifiedSince(stat: std.Io.File.Stat, raw: []const u8) bool {
+    const requested_seconds = parseHttpDate(raw) orelse return false;
+    return stat.mtime.toSeconds() <= requested_seconds;
+}
+
+pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, last_modified: []const u8, content_encoding: ?[]const u8, cache_status: []const u8) ![]const u8 {
     if (content_encoding) |encoding| {
         return std.fmt.allocPrint(
             allocator,
             "Accept-Ranges: bytes\r\n" ++
                 "ETag: {s}\r\n" ++
+                "Last-Modified: {s}\r\n" ++
                 "Cache-Control: public, max-age=60\r\n" ++
                 "Cache-Status: {s}\r\n" ++
                 "Vary: Accept-Encoding\r\n" ++
                 "Content-Encoding: {s}\r\n",
-            .{ etag, cache_status, encoding },
+            .{ etag, last_modified, cache_status, encoding },
         );
     }
 
@@ -118,10 +242,11 @@ pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, con
         allocator,
         "Accept-Ranges: bytes\r\n" ++
             "ETag: {s}\r\n" ++
+            "Last-Modified: {s}\r\n" ++
             "Cache-Control: public, max-age=60\r\n" ++
             "Cache-Status: {s}\r\n" ++
             "Vary: Accept-Encoding\r\n",
-        .{ etag, cache_status },
+        .{ etag, last_modified, cache_status },
     );
 }
 

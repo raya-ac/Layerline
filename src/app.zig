@@ -514,8 +514,8 @@ fn h2DomainCustomNotFoundResponse(
     return custom_errors.h2DomainNotFoundResponse(io, allocator, cfg, domain);
 }
 
-fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, max_file_bytes: usize, response_cache_policy: static_cache.Policy) !H2BufferedResponse {
-    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, max_file_bytes, &runtime_state.server_metrics, &runtime_state.static_response_cache, response_cache_policy, SERVER_NAME, SERVER_TAGLINE);
+fn readStaticFileForHttp2(io: std.Io, allocator: std.mem.Allocator, static_dir: []const u8, rel_path: []const u8, request_headers: []const u8, max_file_bytes: usize, response_cache_policy: static_cache.Policy) !H2BufferedResponse {
+    return http2_content.readStaticFile(io, allocator, static_dir, rel_path, request_headers, max_file_bytes, &runtime_state.server_metrics, &runtime_state.static_response_cache, response_cache_policy, SERVER_NAME, SERVER_TAGLINE);
 }
 
 fn readAcmeChallengeForHttp2(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, token: []const u8) !H2BufferedResponse {

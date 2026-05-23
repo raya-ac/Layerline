@@ -5,6 +5,7 @@ const config_mod = @import("config.zig");
 const error_pages = @import("error_pages.zig");
 const h2_native = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
+const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const redirects = @import("redirects.zig");
 const request_mod = @import("request.zig");
@@ -14,6 +15,17 @@ const static_files = @import("static_files.zig");
 const H2BufferedResponse = h2_support.BufferedResponse;
 const RedirectRule = config_mod.RedirectRule;
 const ServerMetrics = metrics_mod.ServerMetrics;
+
+fn staticResponseHeaders(allocator: std.mem.Allocator, etag: []const u8, last_modified: []const u8, cache_status: []const u8) ![]h2_native.Header {
+    const headers = try allocator.alloc(h2_native.Header, 6);
+    headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
+    headers[1] = .{ .name = "etag", .value = etag };
+    headers[2] = .{ .name = "last-modified", .value = last_modified };
+    headers[3] = .{ .name = "cache-control", .value = "public, max-age=60" };
+    headers[4] = .{ .name = "cache-status", .value = cache_status };
+    headers[5] = .{ .name = "vary", .value = "Accept-Encoding" };
+    return headers;
+}
 
 pub fn coolErrorResponse(
     allocator: std.mem.Allocator,
@@ -32,6 +44,7 @@ pub fn readStaticFile(
     allocator: std.mem.Allocator,
     static_dir: []const u8,
     rel_path: []const u8,
+    request_headers: []const u8,
     max_file_bytes: usize,
     metrics: *ServerMetrics,
     response_cache: *static_cache.Store,
@@ -55,19 +68,31 @@ pub fn readStaticFile(
     }
 
     const etag = try static_files.makeStaticEtag(allocator, stat);
+    const last_modified = try static_files.makeHttpDate(allocator, stat.mtime);
     const file_len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
     const content_type = static_files.contentTypeFromPath(rel_path);
+
+    if (http_headers.findHeaderValue(request_headers, "if-none-match")) |if_none_match| {
+        if (static_files.etagMatches(if_none_match, etag)) {
+            const cache_status = try static_cache.cacheStatusStatic(allocator, null);
+            const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
+            return .{ .status_code = 304, .content_type = content_type, .body = "", .headers = headers };
+        }
+    }
+    if (http_headers.findHeaderValue(request_headers, "if-modified-since")) |if_modified_since| {
+        if (static_files.notModifiedSince(stat, if_modified_since)) {
+            const cache_status = try static_cache.cacheStatusStatic(allocator, null);
+            const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
+            return .{ .status_code = 304, .content_type = content_type, .body = "", .headers = headers };
+        }
+    }
+
     if (response_cache_policy.enabled and file_len <= response_cache_policy.max_entry_bytes) {
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         if (try response_cache.fetch(allocator, file_path, etag, now_ms)) |cached| {
             metrics.responseCacheHit(cached.len);
             const cache_status = try static_cache.cacheStatusHit(allocator, response_cache_policy);
-            const headers = try allocator.alloc(h2_native.Header, 5);
-            headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
-            headers[1] = .{ .name = "etag", .value = etag };
-            headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
-            headers[3] = .{ .name = "cache-status", .value = cache_status };
-            headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+            const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
             return .{ .status_code = 200, .content_type = content_type, .body = cached, .headers = headers };
         }
 
@@ -86,12 +111,7 @@ pub fn readStaticFile(
             try static_cache.cacheStatusStored(allocator, response_cache_policy)
         else
             try static_cache.cacheStatusStatic(allocator, null);
-        const headers = try allocator.alloc(h2_native.Header, 5);
-        headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
-        headers[1] = .{ .name = "etag", .value = etag };
-        headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
-        headers[3] = .{ .name = "cache-status", .value = cache_status };
-        headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+        const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
 
         metrics.staticBodySent(data.len, .buffered);
         return .{ .status_code = 200, .content_type = content_type, .body = data, .headers = headers };
@@ -104,12 +124,7 @@ pub fn readStaticFile(
         return err;
     };
     const cache_status = try static_cache.cacheStatusStatic(allocator, null);
-    const headers = try allocator.alloc(h2_native.Header, 5);
-    headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
-    headers[1] = .{ .name = "etag", .value = etag };
-    headers[2] = .{ .name = "cache-control", .value = "public, max-age=60" };
-    headers[3] = .{ .name = "cache-status", .value = cache_status };
-    headers[4] = .{ .name = "vary", .value = "Accept-Encoding" };
+    const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
 
     metrics.staticBodySent(data.len, .buffered);
     return .{ .status_code = 200, .content_type = content_type, .body = data, .headers = headers };

@@ -684,15 +684,26 @@ test "http2 goaway payload masks reserved stream bit" {
 test "static cache headers include cache status detail" {
     const plain_status = try static_cache.cacheStatusStatic(std.testing.allocator, null);
     defer std.testing.allocator.free(plain_status);
-    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", null, plain_status);
+    const plain = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "Sun, 06 Nov 1994 08:49:37 GMT", null, plain_status);
     defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Cache-Status: Layerline; fwd=uri-miss; detail=\"static-file\"\r\n") != null);
 
     const encoded_status = try static_cache.cacheStatusStatic(std.testing.allocator, "br");
     defer std.testing.allocator.free(encoded_status);
-    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "br", encoded_status);
+    const encoded = try makeStaticBaseHeaders(std.testing.allocator, "\"etag\"", "Sun, 06 Nov 1994 08:49:37 GMT", "br", encoded_status);
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "Cache-Status: Layerline; fwd=uri-miss; detail=\"precompressed-static\"\r\n") != null);
+}
+
+test "static HTTP dates use IMF fixdate format" {
+    const timestamp = std.Io.Timestamp.fromNanoseconds(@as(i96, 784111777) * std.time.ns_per_s);
+    const rendered = try static_files.makeHttpDate(std.testing.allocator, timestamp);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", rendered);
+    try std.testing.expectEqual(@as(i64, 784111777), static_files.parseHttpDate(rendered).?);
+    try std.testing.expect(static_files.parseHttpDate("not a date") == null);
 }
 
 test "chunked upstream body scanner detects trailers and terminator" {
