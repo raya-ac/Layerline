@@ -391,8 +391,8 @@ pub fn usage() void {
             "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
             "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
             "  and connection management policies.\n" ++
-            "  Native HTTP/3 currently covers the buffered route surface, with out-of-order stream\n" ++
-            "  recovery and broader client conformance still being hardened.\n",
+            "  Native HTTP/3 currently covers the buffered route surface, with broader client\n" ++
+            "  conformance and flow-control behavior still being hardened.\n",
         .{},
     );
 }

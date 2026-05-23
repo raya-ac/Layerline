@@ -28,6 +28,7 @@ const HTTP3_MAX_DATAGRAM_BYTES = 1200;
 const HTTP3_CONNECTION_TABLE_CAPACITY = 1024;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
+const HTTP3_MAX_REQUEST_STREAM_BYTES = config_mod.DEFAULT_MAX_BODY_BYTES + config_mod.DEFAULT_MAX_REQUEST_BYTES;
 
 const Http3InitialAssembly = struct {
     has_scid: bool = false,
@@ -55,6 +56,10 @@ const Http3InitialAssembly = struct {
     request_stream_id: u64 = 0,
     request_stream_finished: bool = false,
     request_stream: std.ArrayListUnmanaged(u8) = .empty,
+    request_stream_filled: std.ArrayListUnmanaged(u8) = .empty,
+    request_stream_contiguous_len: usize = 0,
+    request_stream_fin_seen: bool = false,
+    request_stream_final_size: usize = 0,
 
     fn matches(self: *const Http3InitialAssembly, scid: []const u8) bool {
         return self.has_scid and std.mem.eql(u8, self.scid.slice(), scid);
@@ -68,6 +73,7 @@ const Http3InitialAssembly = struct {
         self.crypto.deinit(allocator);
         self.client_handshake_crypto.deinit(allocator);
         self.request_stream.deinit(allocator);
+        self.request_stream_filled.deinit(allocator);
         self.* = .{};
     }
 
@@ -90,6 +96,10 @@ const Http3InitialAssembly = struct {
         self.request_stream_id = 0;
         self.request_stream_finished = false;
         self.request_stream.clearRetainingCapacity();
+        self.request_stream_filled.clearRetainingCapacity();
+        self.request_stream_contiguous_len = 0;
+        self.request_stream_fin_seen = false;
+        self.request_stream_final_size = 0;
         _ = allocator;
     }
 
@@ -303,21 +313,48 @@ fn appendHttp3RequestStreamData(
         assembly.has_request_stream = true;
         assembly.request_stream_id = stream_id;
         assembly.request_stream.clearRetainingCapacity();
+        assembly.request_stream_filled.clearRetainingCapacity();
         assembly.request_stream_finished = false;
+        assembly.request_stream_contiguous_len = 0;
+        assembly.request_stream_fin_seen = false;
+        assembly.request_stream_final_size = 0;
     }
     if (assembly.request_stream_id != stream_id or assembly.request_stream_finished) return;
 
-    const current_len = assembly.request_stream.items.len;
-    if (stream_offset > current_len) return;
-    if (stream_offset < current_len) {
-        const overlap = current_len - stream_offset;
-        if (overlap < data.len) {
-            try assembly.request_stream.appendSlice(allocator, data[overlap..]);
-        }
-    } else {
-        try assembly.request_stream.appendSlice(allocator, data);
+    if (stream_offset > HTTP3_MAX_REQUEST_STREAM_BYTES) return error.Http3RequestStreamTooLarge;
+    const end = std.math.add(usize, stream_offset, data.len) catch return error.InvalidFrame;
+    if (end > HTTP3_MAX_REQUEST_STREAM_BYTES) return error.Http3RequestStreamTooLarge;
+
+    if (end > assembly.request_stream.items.len) {
+        const old_len = assembly.request_stream.items.len;
+        try assembly.request_stream.resize(allocator, end);
+        @memset(assembly.request_stream.items[old_len..end], 0);
+        try assembly.request_stream_filled.resize(allocator, end);
+        @memset(assembly.request_stream_filled.items[old_len..end], 0);
     }
-    if (fin) assembly.request_stream_finished = true;
+
+    for (data, 0..) |byte, i| {
+        const index = stream_offset + i;
+        if (assembly.request_stream_filled.items[index] == 0) {
+            assembly.request_stream.items[index] = byte;
+            assembly.request_stream_filled.items[index] = 1;
+        } else if (assembly.request_stream.items[index] != byte) {
+            return error.Http3StreamDataConflict;
+        }
+    }
+
+    while (assembly.request_stream_contiguous_len < assembly.request_stream_filled.items.len and
+        assembly.request_stream_filled.items[assembly.request_stream_contiguous_len] != 0)
+    {
+        assembly.request_stream_contiguous_len += 1;
+    }
+
+    if (fin) {
+        if (assembly.request_stream_fin_seen and assembly.request_stream_final_size != end) return error.Http3InvalidStreamFinalSize;
+        assembly.request_stream_fin_seen = true;
+        assembly.request_stream_final_size = end;
+    }
+    assembly.request_stream_finished = assembly.request_stream_fin_seen and assembly.request_stream_contiguous_len >= assembly.request_stream_final_size;
 }
 
 fn findHttp3Request(allocator: std.mem.Allocator, assembly: *Http3InitialAssembly, plaintext: []const u8) !?Http3Request {
@@ -365,7 +402,7 @@ fn findHttp3Request(allocator: std.mem.Allocator, assembly: *Http3InitialAssembl
                         fin,
                     );
                     if (assembly.request_stream_finished) {
-                        if (try parseHttp3RequestStreamPayload(allocator, stream_id.value, assembly.request_stream.items)) |request| {
+                        if (try parseHttp3RequestStreamPayload(allocator, stream_id.value, assembly.request_stream.items[0..assembly.request_stream_final_size])) |request| {
                             return request;
                         }
                     }
@@ -864,6 +901,42 @@ test "reassembles ordered HTTP/3 request stream data across packets" {
 
     try std.testing.expect((try findHttp3Request(std.testing.allocator, &assembly, first_stream)) == null);
     const request = (try findHttp3Request(std.testing.allocator, &assembly, second_stream)).?;
+    defer {
+        std.testing.allocator.free(request.headers);
+        std.testing.allocator.free(request.body);
+    }
+
+    try std.testing.expectEqualStrings("POST", request.method);
+    try std.testing.expectEqualStrings("/api/echo", request.path);
+    try std.testing.expectEqualStrings("hello", request.body);
+}
+
+test "reassembles out-of-order HTTP/3 request stream data" {
+    const headers = [_]h3_native.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/api/echo" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = "content-length", .value = "5" },
+    };
+    const header_block = try h3_native.encodeLiteralHeaders(std.testing.allocator, &headers);
+    defer std.testing.allocator.free(header_block);
+
+    var h3_payload = std.ArrayListUnmanaged(u8).empty;
+    defer h3_payload.deinit(std.testing.allocator);
+    try h3_native.appendFrame(std.testing.allocator, &h3_payload, .headers, header_block);
+    try h3_native.appendFrame(std.testing.allocator, &h3_payload, .data, "hello");
+
+    const split = h3_payload.items.len / 2;
+    const tail_stream = try quic_native.buildStreamFrameAt(std.testing.allocator, 0, split, h3_payload.items[split..], true);
+    defer std.testing.allocator.free(tail_stream);
+    const head_stream = try quic_native.buildStreamFrameAt(std.testing.allocator, 0, 0, h3_payload.items[0..split], false);
+    defer std.testing.allocator.free(head_stream);
+
+    var assembly = Http3InitialAssembly{};
+    defer assembly.deinit(std.testing.allocator);
+
+    try std.testing.expect((try findHttp3Request(std.testing.allocator, &assembly, tail_stream)) == null);
+    const request = (try findHttp3Request(std.testing.allocator, &assembly, head_stream)).?;
     defer {
         std.testing.allocator.free(request.headers);
         std.testing.allocator.free(request.body);
