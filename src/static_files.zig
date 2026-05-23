@@ -223,6 +223,14 @@ pub fn notModifiedSince(stat: std.Io.File.Stat, raw: []const u8) bool {
     return stat.mtime.toSeconds() <= requested_seconds;
 }
 
+pub fn ifRangeAllows(raw: []const u8, etag: []const u8, stat: std.Io.File.Stat) bool {
+    const value = http_headers.trimValue(raw);
+    if (value.len == 0) return false;
+    if (std.mem.startsWith(u8, value, "W/")) return false;
+    if (value[0] == '"') return std.mem.eql(u8, value, etag);
+    return notModifiedSince(stat, value);
+}
+
 pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, last_modified: []const u8, content_encoding: ?[]const u8, cache_status: []const u8) ![]const u8 {
     if (content_encoding) |encoding| {
         return std.fmt.allocPrint(

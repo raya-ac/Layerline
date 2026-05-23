@@ -49,7 +49,7 @@ pub fn serveStatic(
         return err;
     };
 
-    const range_header = http_headers.findHeaderValue(request_headers, "Range");
+    const raw_range_header = http_headers.findHeaderValue(request_headers, "Range");
     var selected_path = file_path;
     var encoded_path: ?[]const u8 = null;
     defer if (encoded_path) |path| allocator.free(path);
@@ -57,7 +57,7 @@ pub fn serveStatic(
 
     // Serve precompressed assets when present. On-the-fly compression belongs
     // in a worker/offline build step, not on the hot request path.
-    if (range_header == null) {
+    if (raw_range_header == null) {
         const candidates = [_]struct { coding: []const u8, suffix: []const u8 }{
             .{ .coding = "br", .suffix = ".br" },
             .{ .coding = "gzip", .suffix = ".gz" },
@@ -88,6 +88,12 @@ pub fn serveStatic(
     const last_modified = try static_files.makeHttpDate(allocator, stat.mtime);
     defer allocator.free(last_modified);
     const content_type = static_files.contentTypeFromPath(rel_path);
+    const range_header = if (raw_range_header) |range_value| blk: {
+        if (http_headers.findHeaderValue(request_headers, "If-Range")) |if_range| {
+            if (!static_files.ifRangeAllows(if_range, etag, stat)) break :blk null;
+        }
+        break :blk range_value;
+    } else null;
 
     if (http_headers.findHeaderValue(request_headers, "If-None-Match")) |if_none_match| {
         if (static_files.etagMatches(if_none_match, etag)) {

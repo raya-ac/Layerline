@@ -625,7 +625,7 @@ Common host limits to revisit before aggressive load tests:
 - `GET /api/echo?msg=hello` → JSON `{"msg":"hello"}`.
 - `POST /api/echo` → echoes the POST body as plain text.
 - `GET /static/<file>` → serves files from `public/` with basic MIME detection.
-- Static files support `If-None-Match` and single `Range: bytes=...` requests.
+- Static files support `If-None-Match`, `If-Modified-Since`, and single `Range: bytes=...` requests with `If-Range` fallback handling.
 - `HEAD /...` mirrors GET metadata for matching endpoints.
 - `OPTIONS *` (or path-based OPTIONS) returns advertised methods and keeps response body empty.
 

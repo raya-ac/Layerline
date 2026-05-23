@@ -207,6 +207,7 @@ header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; stored; tt
 STATIC_HIT_HEADERS="$TMP_DIR/static-hit.headers"
 curl -fsS -D "$STATIC_HIT_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
 header_has "$STATIC_HIT_HEADERS" '^Cache-Status: Layerline; hit; ttl=60; detail="response-cache"' || die "static response-cache hit header missing"
+STATIC_ETAG=$(grep -i '^ETag:' "$STATIC_HIT_HEADERS" | head -1 | sed -E 's/^[^:]+:[[:space:]]*//;s/\r$//')
 header_has "$STATIC_HIT_HEADERS" '^Last-Modified: ' || die "static Last-Modified header missing"
 STATIC_LAST_MODIFIED=$(grep -i '^Last-Modified:' "$STATIC_HIT_HEADERS" | head -1 | sed -E 's/^[^:]+:[[:space:]]*//;s/\r$//')
 HTTP1_IFMOD_HEADERS="$TMP_DIR/http1-if-modified.headers"
@@ -214,6 +215,20 @@ HTTP1_IFMOD_BODY="$TMP_DIR/http1-if-modified.body"
 HTTP1_IFMOD_CODE=$(curl -sS -D "$HTTP1_IFMOD_HEADERS" -o "$HTTP1_IFMOD_BODY" -w '%{http_code}' -H "If-Modified-Since: $STATIC_LAST_MODIFIED" "http://$HOST:$PORT/static/hello.txt")
 [[ $HTTP1_IFMOD_CODE == 304 ]] || die "If-Modified-Since static request returned HTTP $HTTP1_IFMOD_CODE instead of 304"
 [[ ! -s $HTTP1_IFMOD_BODY ]] || die "If-Modified-Since static 304 returned a body"
+HTTP1_IFRANGE_HEADERS="$TMP_DIR/http1-if-range.headers"
+HTTP1_IFRANGE_BODY="$TMP_DIR/http1-if-range.body"
+HTTP1_IFRANGE_CODE=$(curl -sS -D "$HTTP1_IFRANGE_HEADERS" -o "$HTTP1_IFRANGE_BODY" -w '%{http_code}' -H 'Range: bytes=0-4' -H "If-Range: $STATIC_ETAG" "http://$HOST:$PORT/static/hello.txt")
+[[ $HTTP1_IFRANGE_CODE == 206 ]] || die "If-Range matching static request returned HTTP $HTTP1_IFRANGE_CODE instead of 206"
+header_has "$HTTP1_IFRANGE_HEADERS" '^Content-Range: bytes 0-4/' || die "If-Range matching static request missed Content-Range"
+grep -Fq 'hello' "$HTTP1_IFRANGE_BODY" || die "If-Range matching static response missed partial body"
+HTTP1_IFRANGE_STALE_HEADERS="$TMP_DIR/http1-if-range-stale.headers"
+HTTP1_IFRANGE_STALE_BODY="$TMP_DIR/http1-if-range-stale.body"
+HTTP1_IFRANGE_STALE_CODE=$(curl -sS -D "$HTTP1_IFRANGE_STALE_HEADERS" -o "$HTTP1_IFRANGE_STALE_BODY" -w '%{http_code}' -H 'Range: bytes=0-4' -H 'If-Range: "stale-etag"' "http://$HOST:$PORT/static/hello.txt")
+[[ $HTTP1_IFRANGE_STALE_CODE == 200 ]] || die "If-Range stale static request returned HTTP $HTTP1_IFRANGE_STALE_CODE instead of 200"
+if header_has "$HTTP1_IFRANGE_STALE_HEADERS" '^Content-Range:'; then
+  die "If-Range stale static request still returned Content-Range"
+fi
+grep -Fq 'static file support' "$HTTP1_IFRANGE_STALE_BODY" || die "If-Range stale static response did not fall back to the full body"
 ok "static file route"
 
 ROUTE_POLICY_HEADERS="$TMP_DIR/route-policy.headers"
