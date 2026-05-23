@@ -331,7 +331,7 @@ pub fn usage() void {
     std.debug.print(
         "Layerline HTTP server\n\n" ++
             "Usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--admin-command status|reload|restart] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] [--h2-upstream http://HOST:PORT[/path]] " ++
@@ -367,6 +367,8 @@ pub fn usage() void {
             "  zig build run -- --doctor\n" ++
             "  zig build run -- --dump-routes\n" ++
             "  zig build run -- --certs\n" ++
+            "  zig build run -- --admin-command status\n" ++
+            "  zig build run -- --reload\n" ++
             "  zig build run -- --port 4000\n" ++
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++

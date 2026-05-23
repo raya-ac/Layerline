@@ -119,6 +119,8 @@ zig build run -- --config server.conf --validate-config
 zig build run -- --config server.conf --doctor
 zig build run -- --dump-routes
 zig build run -- --certs
+zig build run -- --admin-command status
+zig build run -- --reload
 ```
 
 Config files are strict: unknown keys, malformed lines, invalid booleans, invalid numbers, invalid headers, and invalid redirects fail with a line-numbered error.

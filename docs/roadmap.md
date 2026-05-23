@@ -87,7 +87,7 @@ Sources:
 ## Phase 8: Admin, Operations, and Developer Experience
 
 - Local admin API over Unix socket by default: status, activation config validate, runtime validate, reload, managed restart, metrics, route dump, upstream health/eject/recover, cert status, and cert renewal.
-- CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`. Initial `--doctor` checks config-adjacent runtime prerequisites before opening sockets, and `--certs` reports configured TLS and ACME material without starting listeners.
+- CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`. Initial `--doctor` checks config-adjacent runtime prerequisites before opening sockets, `--certs` reports configured TLS and ACME material without starting listeners, and `--admin-command`/`--reload` bridge local CLI operations to the Unix admin socket.
 - Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based domain configs are implemented, including nginx-style per-domain files loaded from `domain_config_dir`; file loading, domain-file discovery, line scanning, and diagnostics now live in `config_loader.zig` instead of the directive model.
 - Prometheus metrics plus optional OpenTelemetry traces.
 - Systemd/launchd templates, Docker image, Homebrew tap, and reproducible release builds.

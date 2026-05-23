@@ -769,6 +769,25 @@ fn doctor(io: std.Io, cfg: *const ServerConfig) usize {
     return cli_output.doctor(io, cfg);
 }
 
+fn runAdminCommand(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, command: []const u8) !void {
+    _ = allocator;
+    bindThreadIo(io);
+    const socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
+    const address = try std.Io.net.UnixAddress.init(socket_path);
+    const stream = try address.connect(io);
+    defer streamClose(stream);
+
+    try rawStreamWriteAll(stream, command);
+    try rawStreamWriteAll(stream, "\n");
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try rawStreamRead(stream, &buf);
+        if (n == 0) break;
+        std.debug.print("{s}", .{buf[0..n]});
+    }
+}
+
 fn usage() void {
     cli_output.usage();
 }
@@ -782,7 +801,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = defaultServerConfig();
 
-    if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor }))) return;
+    if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
 
     if (cfg.tls_auto) {
         ensureLetsEncryptSetup(init.io, std.heap.page_allocator, &cfg) catch |err| {

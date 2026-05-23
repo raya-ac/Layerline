@@ -167,6 +167,14 @@ PID=$!
 
 wait_for_http "http://$HOST:$PORT/health" || die "server did not become healthy"
 
+CLI_ADMIN_OUT="$TMP_DIR/cli-admin-status.out"
+"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --admin-command status >"$CLI_ADMIN_OUT" 2>&1 || {
+  cat "$CLI_ADMIN_OUT" >&2
+  die "CLI admin command failed"
+}
+grep -Fq '"server":"Layerline"' "$CLI_ADMIN_OUT" || die "CLI admin command did not return status JSON"
+ok "CLI admin command"
+
 ROOT_BODY="$TMP_DIR/root.body"
 curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
 grep -Fq 'Layerline' "$ROOT_BODY" || die "root page did not contain Layerline"

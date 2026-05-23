@@ -22,6 +22,7 @@ pub const Callbacks = struct {
     dump_routes: *const fn (*const ServerConfig) void,
     dump_certs: *const fn (*const ServerConfig) void,
     doctor: *const fn (std.Io, *const ServerConfig) usize,
+    admin_command: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!void,
 };
 
 pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) !bool {
@@ -59,6 +60,7 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     var dump_routes = false;
     var dump_certs = false;
     var doctor = false;
+    var admin_command: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             callbacks.usage();
@@ -79,6 +81,19 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
             dump_certs = true;
         } else if (std.mem.eql(u8, arg, "--doctor")) {
             doctor = true;
+        } else if (std.mem.eql(u8, arg, "--admin-command") or std.mem.eql(u8, arg, "--admin-cmd")) {
+            admin_command = args.next() orelse {
+                callbacks.usage();
+                return false;
+            };
+        } else if (std.mem.eql(u8, arg, "--reload")) {
+            admin_command = "reload";
+        } else if (std.mem.eql(u8, arg, "--restart")) {
+            admin_command = "restart";
+        } else if (std.mem.eql(u8, arg, "--runtime-status")) {
+            admin_command = "status";
+        } else if (std.mem.eql(u8, arg, "--runtime-validate")) {
+            admin_command = "validate-runtime";
         } else if (std.mem.eql(u8, arg, "--tls")) {
             if (args.next()) |value| {
                 cfg.tls_enabled = parseBool(value) orelse cfg.tls_enabled;
@@ -658,7 +673,10 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
         const failures = callbacks.doctor(init.io, cfg);
         if (failures > 0) return error.DoctorFailed;
     }
-    if (validate_only or dump_routes or dump_certs or doctor) {
+    if (admin_command) |command| {
+        try callbacks.admin_command(init.io, allocator, cfg, command);
+    }
+    if (validate_only or dump_routes or dump_certs or doctor or admin_command != null) {
         return false;
     }
 
