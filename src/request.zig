@@ -90,6 +90,70 @@ pub fn isH2cUpgradeHeaders(headers: []const u8) bool {
     return isValidHttp2SettingsHeader(settings);
 }
 
+const RequestTarget = struct {
+    path: []const u8,
+    query: []const u8,
+};
+
+fn splitPathAndQuery(value: []const u8) RequestTarget {
+    const query_pos = std.mem.indexOfScalar(u8, value, '?');
+    return .{
+        .path = if (query_pos) |idx| value[0..idx] else value,
+        .query = if (query_pos) |idx| if (idx + 1 < value.len) value[idx + 1 ..] else "" else "",
+    };
+}
+
+pub fn parseRequestTarget(value: []const u8) !RequestTarget {
+    if (value.len == 0) return error.MalformedRequest;
+    if (std.mem.eql(u8, value, "*")) return .{ .path = "*", .query = "" };
+    if (value[0] == '/') return splitPathAndQuery(value);
+
+    const scheme_len: usize = if (std.ascii.startsWithIgnoreCase(value, "http://"))
+        "http://".len
+    else if (std.ascii.startsWithIgnoreCase(value, "https://"))
+        "https://".len
+    else
+        return error.MalformedRequest;
+
+    const rest = value[scheme_len..];
+    const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
+    const query_pos = std.mem.indexOfScalar(u8, rest, '?');
+    const authority_end = @min(slash_pos orelse rest.len, query_pos orelse rest.len);
+    if (authority_end == 0) return error.MalformedRequest;
+
+    if (slash_pos) |slash| {
+        if (query_pos) |query| {
+            if (query < slash) {
+                return .{ .path = "/", .query = if (query + 1 < rest.len) rest[query + 1 ..] else "" };
+            }
+        }
+        return splitPathAndQuery(rest[slash..]);
+    }
+
+    return .{ .path = "/", .query = if (query_pos) |query| if (query + 1 < rest.len) rest[query + 1 ..] else "" else "" };
+}
+
+test "request target parser accepts origin, asterisk, and absolute forms" {
+    const origin = try parseRequestTarget("/static/hello.txt?x=1");
+    try std.testing.expectEqualStrings("/static/hello.txt", origin.path);
+    try std.testing.expectEqualStrings("x=1", origin.query);
+
+    const absolute = try parseRequestTarget("http://example.test/static/hello.txt?x=1");
+    try std.testing.expectEqualStrings("/static/hello.txt", absolute.path);
+    try std.testing.expectEqualStrings("x=1", absolute.query);
+
+    const absolute_root_query = try parseRequestTarget("https://example.test?x=1");
+    try std.testing.expectEqualStrings("/", absolute_root_query.path);
+    try std.testing.expectEqualStrings("x=1", absolute_root_query.query);
+
+    const asterisk = try parseRequestTarget("*");
+    try std.testing.expectEqualStrings("*", asterisk.path);
+    try std.testing.expectEqualStrings("", asterisk.query);
+
+    try std.testing.expectError(error.MalformedRequest, parseRequestTarget("not-a-target"));
+    try std.testing.expectError(error.MalformedRequest, parseRequestTarget("http:///missing-host"));
+}
+
 // Read the whole request envelope while the backing buffer is still alive.
 // Method/path/header slices all point into it.
 pub fn parse(
@@ -132,9 +196,7 @@ pub fn parse(
     const path_and_query = request_parts.next() orelse return error.MalformedRequest;
     const version = request_parts.next() orelse return error.MalformedRequest;
 
-    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
-    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
-    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
+    const target = try parseRequestTarget(path_and_query);
 
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
@@ -149,8 +211,8 @@ pub fn parse(
     if (isH2cUpgradeHeaders(headers)) {
         return HttpRequest{
             .method = method,
-            .path = path,
-            .query = query,
+            .path = target.path,
+            .query = target.query,
             .headers = headers,
             .version = version,
             .body = "",
@@ -170,8 +232,8 @@ pub fn parse(
 
     return HttpRequest{
         .method = method,
-        .path = path,
-        .query = query,
+        .path = target.path,
+        .query = target.query,
         .headers = headers,
         .version = version,
         .body = body_read.body,
@@ -213,9 +275,7 @@ pub fn parseHeadersOnly(
     const path_and_query = request_parts.next() orelse return error.MalformedRequest;
     const version = request_parts.next() orelse return error.MalformedRequest;
 
-    const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
-    const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
-    const query = if (query_pos) |idx| if (idx + 1 < path_and_query.len) path_and_query[idx + 1 ..] else "" else "";
+    const target = try parseRequestTarget(path_and_query);
 
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
@@ -229,8 +289,8 @@ pub fn parseHeadersOnly(
 
     return HttpRequest{
         .method = method,
-        .path = path,
-        .query = query,
+        .path = target.path,
+        .query = target.query,
         .headers = headers,
         .version = version,
         .body = "",

@@ -208,6 +208,13 @@ grep -Fq '400 Bad Request' "$MALFORMED_HEADER_RAW" || die "malformed header line
 DUP_CONTENT_LENGTH_RAW="$TMP_DIR/duplicate-content-length.raw"
 printf 'POST /api/echo HTTP/1.1\r\nHost: %s:%s\r\nContent-Length: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab' "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$DUP_CONTENT_LENGTH_RAW"
 grep -Fq '400 Bad Request' "$DUP_CONTENT_LENGTH_RAW" || die "conflicting duplicate Content-Length did not return 400"
+ABSOLUTE_FORM_RAW="$TMP_DIR/absolute-form.raw"
+printf 'GET http://%s:%s/health HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$HOST" "$PORT" "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$ABSOLUTE_FORM_RAW"
+grep -Fq '200 OK' "$ABSOLUTE_FORM_RAW" || die "absolute-form request target did not return 200"
+grep -Fq 'ok' "$ABSOLUTE_FORM_RAW" || die "absolute-form request target did not route to health endpoint"
+BAD_TARGET_RAW="$TMP_DIR/bad-target.raw"
+printf 'GET not-a-target HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$BAD_TARGET_RAW"
+grep -Fq '400 Bad Request' "$BAD_TARGET_RAW" || die "bad request target did not return 400"
 ok "HTTP/1 parser hardening"
 
 STATIC_HEADERS="$TMP_DIR/static.headers"

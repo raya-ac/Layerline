@@ -24,7 +24,7 @@ Sources:
 
 ## Phase 1: Core Server Correctness
 
-- Harden HTTP/1 parsing and response framing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, HEAD/error response body suppression, and strict keep-alive semantics. Initial header field validation, a 100-field cap, and conflicting duplicate `Content-Length` rejection are implemented.
+- Harden HTTP/1 parsing and response framing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, HEAD/error response body suppression, and strict keep-alive semantics. Initial header field validation, a 100-field cap, conflicting duplicate `Content-Length` rejection, absolute-form target normalization, and invalid target rejection are implemented.
 - Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
 - Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control. Activation preflight, managed graceful restart, in-memory snapshot reload for compatible config changes, and SIGHUP reload are implemented; live listener rebinding remains next.
