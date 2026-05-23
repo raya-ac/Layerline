@@ -287,6 +287,12 @@ fn adminRequestRestart() void {
     runtime_state.shutdown_requested.store(true, .release);
 }
 
+fn adminPurgeCaches() usize {
+    const static_removed = runtime_state.static_response_cache.clear();
+    const buffered_removed = runtime_state.buffered_response_cache.clear();
+    return static_removed + buffered_removed;
+}
+
 fn adminHttpCallbacks() admin_http.Callbacks {
     return .{
         .render_activation_diff = renderActivationConfigDiff,
@@ -304,6 +310,7 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .bind_thread_io = bindThreadIo,
         .close_stream = streamClose,
         .read_stream = streamRead,
+        .purge_caches = adminPurgeCaches,
         .reload_config = reloadConfigInMemory,
         .render_config_diff = renderActivationConfigDiff,
         .renew_certs = renewCertificatesInMemory,

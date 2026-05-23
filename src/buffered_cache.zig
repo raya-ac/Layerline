@@ -105,6 +105,18 @@ pub const Store = struct {
         self.allocator = null;
     }
 
+    pub fn clear(self: *Store) usize {
+        self.lock();
+        defer self.mutex.unlock();
+
+        const allocator = self.allocator orelse return 0;
+        const removed = self.entries.items.len;
+        for (self.entries.items) |entry| self.freeEntry(allocator, entry);
+        self.entries.clearRetainingCapacity();
+        self.body_bytes = 0;
+        return removed;
+    }
+
     fn lock(self: *Store) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }

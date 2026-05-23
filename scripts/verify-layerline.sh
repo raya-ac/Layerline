@@ -447,6 +447,11 @@ case "$ADMIN_METRICS" in
   *'layerline_requests_total'*'layerline_acme_renewals_total'*) ok "admin metrics" ;;
   *) die "admin metrics response was unexpected" ;;
 esac
+ADMIN_CACHE_PURGE=$(printf 'cache-purge\n' | nc -U "$SOCKET")
+case "$ADMIN_CACHE_PURGE" in
+  'OK purged '*" cache entries"*) ok "admin cache purge" ;;
+  *) die "admin cache purge response was unexpected: $ADMIN_CACHE_PURGE" ;;
+esac
 
 ADMIN_URL="http://$HOST:$PORT/_layerline/admin"
 ADMIN_SETUP_BODY="$TMP_DIR/admin-setup.body"

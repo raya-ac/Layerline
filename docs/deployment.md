@@ -162,6 +162,7 @@ printf 'status\n' | nc -U /run/layerline/admin.sock
 printf 'validate\n' | nc -U /run/layerline/admin.sock
 printf 'diff\n' | nc -U /run/layerline/admin.sock
 printf 'config\n' | nc -U /run/layerline/admin.sock
+printf 'cache-purge\n' | nc -U /run/layerline/admin.sock
 printf 'certs\n' | nc -U /run/layerline/admin.sock
 printf 'cert-renew\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
