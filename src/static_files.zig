@@ -19,22 +19,46 @@ pub fn contentTypeFromPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".mjs")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".map")) return "application/json; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".json")) return "application/json; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".webmanifest")) return "application/manifest+json";
     if (std.mem.endsWith(u8, path, ".xml")) return "application/xml; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".avif")) return "image/avif";
     if (std.mem.endsWith(u8, path, ".png")) return "image/png";
     if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
     if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
     if (std.mem.endsWith(u8, path, ".gif")) return "image/gif";
     if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".bmp")) return "image/bmp";
+    if (std.mem.endsWith(u8, path, ".tif") or std.mem.endsWith(u8, path, ".tiff")) return "image/tiff";
     if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
+    if (std.mem.endsWith(u8, path, ".pdf")) return "application/pdf";
     if (std.mem.endsWith(u8, path, ".zip")) return "application/zip";
     if (std.mem.endsWith(u8, path, ".tar")) return "application/x-tar";
     if (std.mem.endsWith(u8, path, ".tar.gz") or std.mem.endsWith(u8, path, ".tgz")) return "application/gzip";
     if (std.mem.endsWith(u8, path, ".gz")) return "application/gzip";
+    if (std.mem.endsWith(u8, path, ".br")) return "application/octet-stream";
+    if (std.mem.endsWith(u8, path, ".7z")) return "application/x-7z-compressed";
+    if (std.mem.endsWith(u8, path, ".rar")) return "application/vnd.rar";
     if (std.mem.endsWith(u8, path, ".dmg")) return "application/x-apple-diskimage";
     if (std.mem.endsWith(u8, path, ".exe")) return "application/vnd.microsoft.portable-executable";
     if (std.mem.endsWith(u8, path, ".msi")) return "application/x-msi";
+    if (std.mem.endsWith(u8, path, ".woff")) return "font/woff";
+    if (std.mem.endsWith(u8, path, ".woff2")) return "font/woff2";
+    if (std.mem.endsWith(u8, path, ".ttf")) return "font/ttf";
+    if (std.mem.endsWith(u8, path, ".otf")) return "font/otf";
+    if (std.mem.endsWith(u8, path, ".eot")) return "application/vnd.ms-fontobject";
+    if (std.mem.endsWith(u8, path, ".mp4")) return "video/mp4";
+    if (std.mem.endsWith(u8, path, ".m4v")) return "video/x-m4v";
+    if (std.mem.endsWith(u8, path, ".webm")) return "video/webm";
+    if (std.mem.endsWith(u8, path, ".mov")) return "video/quicktime";
+    if (std.mem.endsWith(u8, path, ".mp3")) return "audio/mpeg";
+    if (std.mem.endsWith(u8, path, ".m4a")) return "audio/mp4";
+    if (std.mem.endsWith(u8, path, ".ogg")) return "audio/ogg";
+    if (std.mem.endsWith(u8, path, ".wav")) return "audio/wav";
+    if (std.mem.endsWith(u8, path, ".flac")) return "audio/flac";
     return "text/plain; charset=utf-8";
 }
 
@@ -45,6 +69,16 @@ test "contentTypeFromPath recognizes downloadable archives" {
     try std.testing.expectEqualStrings("application/x-tar", contentTypeFromPath("pack.tar"));
     try std.testing.expectEqualStrings("application/x-apple-diskimage", contentTypeFromPath("junkstep.dmg"));
     try std.testing.expectEqualStrings("application/vnd.microsoft.portable-executable", contentTypeFromPath("junkstep.exe"));
+}
+
+test "contentTypeFromPath recognizes common web assets" {
+    try std.testing.expectEqualStrings("application/javascript; charset=utf-8", contentTypeFromPath("app.mjs"));
+    try std.testing.expectEqualStrings("application/manifest+json", contentTypeFromPath("site.webmanifest"));
+    try std.testing.expectEqualStrings("image/avif", contentTypeFromPath("hero.avif"));
+    try std.testing.expectEqualStrings("font/woff2", contentTypeFromPath("inter.woff2"));
+    try std.testing.expectEqualStrings("video/mp4", contentTypeFromPath("demo.mp4"));
+    try std.testing.expectEqualStrings("audio/flac", contentTypeFromPath("track.flac"));
+    try std.testing.expectEqualStrings("application/pdf", contentTypeFromPath("whitepaper.pdf"));
 }
 
 // Single ranges cover the common browser/media case. Multi-range responses are

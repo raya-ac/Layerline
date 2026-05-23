@@ -35,7 +35,7 @@ Sources:
 ## Phase 2: Static Files and Content Handling
 
 - Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
-- MIME database and override config.
+- MIME database and override config. Initial common web, font, media, archive, and document MIME table is implemented; config-level overrides remain.
 - Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial static ETag/Last-Modified validators, `If-None-Match`, `If-Modified-Since`, HTTP/1 `If-Range`, `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, stale directive shortcuts, static Cache-Status headers, an opt-in shared memory cache for eligible static responses, and a conservative HTTP/2/HTTP/3 buffered GET microcache are implemented on top of inherited response-header policy.
 - Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses with inherited global/domain/route policy overrides; brotli/zstd remain.
 - Static transforms: safe template mode, include variables, generated headers, and route-local error pages.

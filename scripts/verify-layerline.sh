@@ -125,6 +125,7 @@ HTML
 cat >"$CUSTOM_ROOT/404.html" <<'HTML'
 custom domain 404 page
 HTML
+printf 'woff2\n' >"$CUSTOM_ROOT/font.woff2"
 cat >"$SITE_DIR/custom404.conf" <<CONF
 name = custom404
 server_name = custom404.test
@@ -358,6 +359,11 @@ grep -Fq 'custom domain 404 page' "$CUSTOM_404_BODY" || die "domain custom 404 b
 header_has "$CUSTOM_404_HEADERS" '^X-Request-Id: ll-' || die "domain custom 404 did not include generated request id"
 header_has "$CUSTOM_404_HEADERS" '^Cache-Control: stale-while-revalidate=45' || die "domain stale-while-revalidate Cache-Control header missing"
 ok "domain custom 404 document"
+
+MIME_HEADERS="$TMP_DIR/mime.headers"
+curl -fsS -H 'Host: custom404.test' -D "$MIME_HEADERS" "http://$HOST:$PORT/font.woff2" >/dev/null
+header_has "$MIME_HEADERS" '^Content-Type: font/woff2' || die "woff2 static MIME type missing"
+ok "static MIME database"
 
 CUSTOM_404_GZIP_HEADERS="$TMP_DIR/custom-404-gzip.headers"
 CUSTOM_404_GZIP_CODE=$(curl -sS --raw -D "$CUSTOM_404_GZIP_HEADERS" -o /dev/null -w '%{http_code}' -H 'Host: custom404.test' -H 'Accept-Encoding: gzip' "http://$HOST:$PORT/missing-custom-page")
