@@ -8,19 +8,20 @@ const http2_support = @import("http2_support.zig");
 const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
 const quic_native = @import("quic_native.zig");
-const redirects = @import("redirects.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_identity = @import("server_identity.zig");
-const static_cache = @import("static_cache.zig");
 const tls13_native = @import("tls13_native.zig");
 
 const DomainConfig = config_mod.DomainConfig;
 const H2BufferedResponse = http2_support.BufferedResponse;
 const HttpRequest = request_mod.HttpRequest;
-const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
+
+pub const Callbacks = struct {
+    build_response_for_request: *const fn (std.Io, std.mem.Allocator, *ServerConfig, HttpRequest, *const std.process.Environ.Map) anyerror!H2BufferedResponse,
+};
 
 const HTTP3_INITIAL_PADDING_BYTES = 600;
 const HTTP3_MAX_DATAGRAM_BYTES = 1200;
@@ -372,7 +373,7 @@ fn buildHttp3ResponseData(allocator: std.mem.Allocator, head: http_response.Resp
     return out.toOwnedSlice(allocator);
 }
 
-fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator, server_header: []const u8) ![]u8 {
+fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator, server_header: []const u8, is_head: bool) ![]u8 {
     const body =
         \\<!doctype html>
         \\<html lang="en">
@@ -402,9 +403,9 @@ fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator, server_header: []
         .status_text = "OK",
         .server = server_header,
         .content_type = "text/html; charset=utf-8",
-        .content_length = body.len,
+        .content_length = if (is_head) 0 else body.len,
         .close_connection = true,
-    }, body, &.{});
+    }, if (is_head) "" else body, &.{});
 }
 
 fn statusText(status_code: u16) []const u8 {
@@ -463,116 +464,60 @@ fn buildHttp3ErrorResponseData(
     return buildHttp3BufferedResponseData(allocator, server_header, response, is_head);
 }
 
-fn buildHttp3RedirectResponseData(
-    allocator: std.mem.Allocator,
-    server_header: []const u8,
-    rule: config_mod.RedirectRule,
-    request: Http3Request,
-    path: []const u8,
-    query: []const u8,
-    is_head: bool,
-) ![]u8 {
-    const req = HttpRequest{
-        .method = request.method,
-        .path = path,
-        .query = query,
-        .headers = "",
+fn http3MethodCanUseBufferedRouter(method: []const u8) bool {
+    return std.mem.eql(u8, method, "GET") or
+        std.mem.eql(u8, method, "HEAD") or
+        std.mem.eql(u8, method, "OPTIONS");
+}
+
+fn http3ToHttpRequest(allocator: std.mem.Allocator, request: Http3Request) !HttpRequest {
+    const path = http3PathOnly(request.path);
+    const query = http3QueryOnly(request.path);
+
+    var headers = std.ArrayList(u8).empty;
+    errdefer headers.deinit(allocator);
+    if (request.authority) |authority| {
+        if (authority.len > 0) try headers.print(allocator, "Host: {s}\r\n", .{authority});
+    }
+
+    return .{
+        .method = try allocator.dupe(u8, request.method),
+        .path = try allocator.dupe(u8, path),
+        .query = try allocator.dupe(u8, query),
+        .headers = try headers.toOwnedSlice(allocator),
         .version = "HTTP/3",
         .body = "",
         .close_connection = true,
     };
-    const location = try redirects.buildLocation(allocator, rule, req);
-    const body = try std.fmt.allocPrint(allocator, "Redirecting to {s}\n", .{location});
-    const headers = [_]h3_native.Header{.{ .name = "location", .value = location }};
-    return buildHttp3ResponseData(allocator, .{
-        .status_code = rule.status_code,
-        .status_text = redirects.statusText(rule.status_code),
-        .server = server_header,
-        .content_type = "text/plain; charset=utf-8",
-        .content_length = if (is_head) 0 else body.len,
-        .close_connection = true,
-    }, if (is_head) "" else body, &headers);
-}
-
-fn buildHttp3StaticRouteResponse(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    metrics: *ServerMetrics,
-    response_cache: *static_cache.Store,
-    domain: ?*const DomainConfig,
-    route: *const RouteConfig,
-    request: Http3Request,
-    request_path: []const u8,
-) !H2BufferedResponse {
-    if (route.handler != .static) {
-        return http2_content.coolErrorResponse(allocator, server_identity.name, server_identity.tagline, 501, "Not Implemented", "HTTP/3 currently routes static endpoints; proxy and PHP HTTP/3 handlers are still on the roadmap.");
-    }
-    if (!(std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD"))) {
-        return http2_content.coolErrorResponse(allocator, server_identity.name, server_identity.tagline, 405, "Method Not Allowed", "That method is not supported for this endpoint.");
-    }
-
-    const rel = try routing_mod.routeFileRelativePath(allocator, route, request_path, route.index_file orelse routing_mod.domainIndexFile(cfg, domain));
-    return http2_content.readStaticFile(io, allocator, route.static_dir orelse routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, route), metrics, response_cache, static_cache.policyForConfig(cfg, domain, route), server_identity.name, server_identity.tagline);
 }
 
 fn buildHttp3RoutedResponseData(
     io: std.Io,
     allocator: std.mem.Allocator,
-    cfg: *const ServerConfig,
-    metrics: *ServerMetrics,
-    response_cache: *static_cache.Store,
+    cfg: *ServerConfig,
+    process_env: *const std.process.Environ.Map,
     server_header: []const u8,
     request: Http3Request,
+    callbacks: Callbacks,
 ) ![]u8 {
     const is_head = std.mem.eql(u8, request.method, "HEAD");
     const request_path = http3PathOnly(request.path);
-    const request_query = http3QueryOnly(request.path);
     const domain = if (request.authority) |authority| routing_mod.findDomainForHost(cfg, authority) else null;
 
-    if (routing_mod.findDomainRedirectRule(domain, request_path)) |redirect| {
-        return buildHttp3RedirectResponseData(allocator, server_header, redirect, request, request_path, request_query, is_head);
-    }
-    if (routing_mod.findRedirectRule(cfg, request_path)) |redirect| {
-        return buildHttp3RedirectResponseData(allocator, server_header, redirect, request, request_path, request_query, is_head);
+    if (std.mem.eql(u8, request_path, "/") and !routing_mod.domainServeStaticRoot(cfg, domain)) {
+        return buildHttp3DefaultResponseData(allocator, server_header, is_head);
     }
 
-    if (routing_mod.findDomainRoute(domain, request_path)) |route| {
-        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, response_cache, domain, route, request, request_path), is_head);
-    }
-    if (routing_mod.findNamedRoute(cfg, request_path)) |route| {
-        return buildHttp3BufferedResponseData(allocator, server_header, try buildHttp3StaticRouteResponse(io, allocator, cfg, metrics, response_cache, domain, route, request, request_path), is_head);
+    if (!http3MethodCanUseBufferedRouter(request.method)) {
+        return buildHttp3ErrorResponseData(allocator, server_header, 501, "Not Implemented", "HTTP/3 request body routing is still on the roadmap for this method.", is_head);
     }
 
-    if (std.mem.eql(u8, request_path, "/health")) {
-        return buildHttp3ResponseData(allocator, .{
-            .status_code = 200,
-            .status_text = "OK",
-            .server = server_header,
-            .content_type = "text/plain; charset=utf-8",
-            .content_length = if (is_head) 0 else 3,
-            .close_connection = true,
-        }, if (is_head) "" else "ok\n", &.{});
-    }
-
-    if (std.mem.eql(u8, request_path, "/") and routing_mod.domainServeStaticRoot(cfg, domain)) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), routing_mod.domainIndexFile(cfg, domain), config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
-    }
-
-    if (std.mem.eql(u8, request_path, "/")) {
-        return buildHttp3DefaultResponseData(allocator, server_header);
-    }
-
-    if (std.mem.startsWith(u8, request_path, "/static/")) {
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), request_path["/static/".len..], config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
-    }
-
-    if (routing_mod.domainServeStaticRoot(cfg, domain) and !std.mem.startsWith(u8, request_path, "/api/") and !std.mem.startsWith(u8, request_path, "/php/")) {
-        const rel = try routing_mod.makeStaticPathFromRequest(allocator, request_path, routing_mod.domainIndexFile(cfg, domain));
-        return buildHttp3BufferedResponseData(allocator, server_header, try http2_content.readStaticFile(io, allocator, routing_mod.domainStaticDir(cfg, domain), rel, config_mod.maxStaticFileBytesFor(cfg, domain, null), metrics, response_cache, static_cache.policyForConfig(cfg, domain, null), server_identity.name, server_identity.tagline), is_head);
-    }
-
-    return buildHttp3ErrorResponseData(allocator, server_header, 404, "Not Found", "The requested resource was not found on this server.", is_head);
+    const req = try http3ToHttpRequest(allocator, request);
+    const response = callbacks.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return buildHttp3ErrorResponseData(allocator, server_header, 500, "Internal Server Error", "Internal server error while routing HTTP/3 request.", is_head),
+    };
+    return buildHttp3BufferedResponseData(allocator, server_header, response, is_head);
 }
 
 fn maxHttp3ShortPlaintextBytes(dcid_len: usize) !usize {
@@ -646,10 +591,10 @@ fn sendHttp3ResponsePacket(
     assembly: *Http3InitialAssembly,
     largest_client_packet_number: u64,
     request: Http3Request,
-    cfg: *const ServerConfig,
-    metrics: *ServerMetrics,
-    response_cache: *static_cache.Store,
+    cfg: *ServerConfig,
+    process_env: *const std.process.Environ.Map,
     server_header: []const u8,
+    callbacks: Callbacks,
 ) !usize {
     const ack_frame = try quic_native.buildAckFrame(std.heap.page_allocator, largest_client_packet_number, 0);
     defer std.heap.page_allocator.free(ack_frame);
@@ -659,7 +604,7 @@ fn sendHttp3ResponsePacket(
     defer std.heap.page_allocator.free(control_stream);
     var response_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer response_arena.deinit();
-    const response_data = try buildHttp3RoutedResponseData(io, response_arena.allocator(), cfg, metrics, response_cache, server_header, request);
+    const response_data = try buildHttp3RoutedResponseData(io, response_arena.allocator(), cfg, process_env, server_header, request, callbacks);
 
     const max_plaintext = try maxHttp3ShortPlaintextBytes(assembly.scid.slice().len);
     var response_offset: usize = 0;
@@ -729,7 +674,88 @@ test "HTTP/3 path helpers split query strings" {
     try std.testing.expectEqualStrings("", http3QueryOnly("/health"));
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetrics, response_cache: *static_cache.Store, server_header: []const u8, active_config: *const fn () *ServerConfig) void {
+test "HTTP/3 request conversion carries host and query into common router shape" {
+    const req = try http3ToHttpRequest(std.testing.allocator, .{
+        .stream_id = 0,
+        .method = "GET",
+        .path = "/api/echo?msg=layerline",
+        .authority = "example.test:8443",
+    });
+    defer {
+        std.testing.allocator.free(req.method);
+        std.testing.allocator.free(req.path);
+        std.testing.allocator.free(req.query);
+        std.testing.allocator.free(req.headers);
+    }
+
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expectEqualStrings("/api/echo", req.path);
+    try std.testing.expectEqualStrings("msg=layerline", req.query);
+    try std.testing.expectEqualStrings("Host: example.test:8443\r\n", req.headers);
+    try std.testing.expectEqualStrings("HTTP/3", req.version);
+}
+
+test "HTTP/3 buffered router is gated to methods without DATA bodies" {
+    try std.testing.expect(http3MethodCanUseBufferedRouter("GET"));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("HEAD"));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("OPTIONS"));
+    try std.testing.expect(!http3MethodCanUseBufferedRouter("POST"));
+    try std.testing.expect(!http3MethodCanUseBufferedRouter("PATCH"));
+}
+
+test "HTTP/3 default showcase suppresses body for HEAD" {
+    const get_data = try buildHttp3DefaultResponseData(std.testing.allocator, "Layerline", false);
+    defer std.testing.allocator.free(get_data);
+    const head_data = try buildHttp3DefaultResponseData(std.testing.allocator, "Layerline", true);
+    defer std.testing.allocator.free(head_data);
+
+    try std.testing.expect(std.mem.indexOf(u8, get_data, "native QUIC response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head_data, "native QUIC response") == null);
+}
+
+fn testHttp3BufferedRouterCallback(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    req: HttpRequest,
+    process_env: *const std.process.Environ.Map,
+) !H2BufferedResponse {
+    _ = io;
+    _ = cfg;
+    _ = process_env;
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expectEqualStrings("/from-h3", req.path);
+    try std.testing.expectEqualStrings("x=1", req.query);
+    try std.testing.expectEqualStrings("Host: example.test\r\n", req.headers);
+    return .{
+        .status_code = 200,
+        .content_type = "text/plain; charset=utf-8",
+        .body = try allocator.dupe(u8, "routed over h3\n"),
+    };
+}
+
+test "HTTP/3 routed responses delegate to the buffered route builder" {
+    var cfg = config_mod.defaultServerConfig();
+    const data = try buildHttp3RoutedResponseData(
+        undefined,
+        std.testing.allocator,
+        &cfg,
+        undefined,
+        "Layerline",
+        .{
+            .stream_id = 0,
+            .method = "GET",
+            .path = "/from-h3?x=1",
+            .authority = "example.test",
+        },
+        .{ .build_response_for_request = testHttp3BufferedRouterCallback },
+    );
+    defer std.testing.allocator.free(data);
+
+    try std.testing.expect(std.mem.indexOf(u8, data, "routed over h3\n") != null);
+}
+
+pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig, callbacks: Callbacks) void {
     var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
         std.debug.print("HTTP/3 bind address error: {}\n", .{err});
         return;
@@ -741,7 +767,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
     defer socket.close(io);
 
     std.debug.print("HTTP/3 native UDP listener on udp://{s}:{d}\n", .{ cfg.host, cfg.http3_port });
-    std.debug.print("HTTP/3 status: native QUIC/TLS handshake and static route response path active.\n", .{});
+    std.debug.print("HTTP/3 status: native QUIC/TLS handshake and buffered route response path active.\n", .{});
 
     var connections = Http3ConnectionTable.init(std.heap.page_allocator, HTTP3_CONNECTION_TABLE_CAPACITY) catch |err| {
         std.debug.print("HTTP/3 connection table allocation failed: {}\n", .{err});
@@ -900,7 +926,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
                         continue;
                     };
                     if (request_opt) |request| {
-                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), metrics, response_cache, server_header) catch |err| {
+                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), process_env, server_header, callbacks) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
@@ -940,7 +966,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, metrics: *ServerMetr
             };
             if (request_opt) |request| {
                 if (!assembly.h3_response_sent) {
-                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), metrics, response_cache, server_header) catch |err| {
+                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), process_env, server_header, callbacks) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };

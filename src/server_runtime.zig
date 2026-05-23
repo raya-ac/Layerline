@@ -20,6 +20,7 @@ pub const Callbacks = struct {
     admin: admin_runtime.Callbacks,
     bind_thread_io: *const fn (std.Io) void,
     http1: http1_runtime.Callbacks,
+    http3: http3_server.Callbacks,
     send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8) anyerror!void,
     upstream: upstream_runtime.Callbacks,
 };
@@ -167,7 +168,7 @@ fn startBackgroundWorkers(ctx: Context) !void {
         std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
     }
     if (ctx.cfg.http3_enabled) {
-        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.metrics, ctx.response_cache, ctx.server_header, ctx.callbacks.active_config }) catch |err| {
+        const h3_worker = std.Thread.spawn(.{}, http3_server.serveProbeTask, .{ ctx.io, ctx.cfg, ctx.process_env, ctx.metrics, ctx.server_header, ctx.callbacks.active_config, ctx.callbacks.http3 }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
             return err;
         };

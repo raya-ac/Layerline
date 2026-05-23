@@ -16,6 +16,7 @@ const http2_content = @import("http2_content.zig");
 const http2_router = @import("http2_router.zig");
 const http2_runtime = @import("http2_runtime.zig");
 const http2_upstream = @import("http2_upstream.zig");
+const http3_server = @import("http3_server.zig");
 const http1_route_handlers = @import("http1_route_handlers.zig");
 const http1_router = @import("http1_router.zig");
 const http1_response_bridge = @import("http1_response_bridge.zig");
@@ -581,6 +582,12 @@ fn http2RouterCallbacks() http2_router.Callbacks {
     };
 }
 
+fn http3Callbacks() http3_server.Callbacks {
+    return .{
+        .build_response_for_request = buildHttp2ResponseForRequest,
+    };
+}
+
 fn http2UpstreamCallbacks() http2_upstream.Callbacks {
     return .{
         .access_log_set_upstream = runtime_state.accessLogSetUpstream,
@@ -812,6 +819,7 @@ pub fn main(init: std.process.Init) !void {
             .admin = adminCallbacks(),
             .bind_thread_io = bindThreadIo,
             .http1 = http1RuntimeCallbacks(),
+            .http3 = http3Callbacks(),
             .send_cool_error = sendCoolError,
             .upstream = upstreamRuntimeCallbacks(),
         },
