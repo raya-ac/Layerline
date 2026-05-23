@@ -44,6 +44,7 @@ pub const Callbacks = struct {
     send_login_page: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8, bool, bool) anyerror!void,
     send_method_not_allowed: *const fn (std.Io.net.Stream, std.mem.Allocator, []const u8, bool, bool) anyerror!void,
     send_redirect: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, bool, bool) anyerror!void,
+    send_response: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, []const u8, bool) anyerror!void,
     send_response_no_body: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
     send_setup_page: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8, bool, bool) anyerror!void,
     set_stream_timeouts: *const fn (std.Io.net.Stream, u32, u32) anyerror!void,
@@ -171,6 +172,49 @@ fn handleCachePurgePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.me
     defer allocator.free(message);
 
     try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, message, null, 200, "OK", close_connection, false);
+}
+
+fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try out.append(allocator, '"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0...0x08, 0x0b...0x0c, 0x0e...0x1f => try out.print(allocator, "\\u{x:0>4}", .{byte}),
+            else => try out.append(allocator, byte),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn cachePurgeTargetFromRequest(allocator: std.mem.Allocator, req: HttpRequest) ![]const u8 {
+    if (req.body.len == 0) return "";
+    var fields = try admin_support.parseUrlEncodedForm(allocator, req.body);
+    defer admin_support.freeFormFields(allocator, &fields);
+    const raw_target = admin_support.adminTrimmedField(fields.items, "target");
+    if (raw_target.len == 0) return "";
+    if (std.ascii.eqlIgnoreCase(raw_target, "all")) return "";
+    return try allocator.dupe(u8, raw_target);
+}
+
+fn handleCachePurgeApiPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+    const target = cachePurgeTargetFromRequest(allocator, req) catch {
+        try callbacks.send_response(stream, 400, "Bad Request", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid_form\"}\n", close_connection);
+        return;
+    };
+    defer if (target.len > 0) allocator.free(target);
+
+    const removed = callbacks.purge_caches(target);
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.print(allocator, "{{\"ok\":true,\"removed\":{d},\"target\":", .{removed});
+    try appendJsonString(&body, allocator, if (target.len == 0) "all" else target);
+    try body.appendSlice(allocator, "}\n");
+
+    try callbacks.send_response(stream, 200, "OK", "application/json; charset=utf-8", body.items, close_connection);
 }
 
 fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
@@ -496,6 +540,10 @@ pub fn handleUi(
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/cache/purge")) {
         try handleCachePurgePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/api/cache/purge")) {
+        try handleCachePurgeApiPost(stream, allocator, req, close_connection, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/eject")) {

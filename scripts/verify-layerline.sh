@@ -549,6 +549,26 @@ if [[ $H2_SMOKE -eq 1 ]]; then
   curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_CACHE_REFILL_HEADERS" "http://$HOST:$PORT/api/echo?msg=ui-cache" >/dev/null
   header_has "$H2_ADMIN_CACHE_REFILL_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 admin cache entry did not refill after UI purge"
   ok "admin UI purges matching cache entries"
+
+  H2_ADMIN_API_CACHE_STORE_HEADERS="$TMP_DIR/h2-admin-api-cache-store.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_API_CACHE_STORE_HEADERS" "http://$HOST:$PORT/api/echo?msg=api-cache" >/dev/null
+  header_has "$H2_ADMIN_API_CACHE_STORE_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 admin API cache prefill did not store microcache entry"
+  H2_ADMIN_API_CACHE_HIT_HEADERS="$TMP_DIR/h2-admin-api-cache-hit.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_API_CACHE_HIT_HEADERS" "http://$HOST:$PORT/api/echo?msg=api-cache" >/dev/null
+  header_has "$H2_ADMIN_API_CACHE_HIT_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="microcache"' || die "h2 admin API cache prefill did not hit microcache entry"
+  ADMIN_CACHE_PURGE_API_HEADERS="$TMP_DIR/admin-cache-purge-api.headers"
+  ADMIN_CACHE_PURGE_API_BODY="$TMP_DIR/admin-cache-purge-api.body"
+  curl -fsS -b "$COOKIE_JAR" -D "$ADMIN_CACHE_PURGE_API_HEADERS" -o "$ADMIN_CACHE_PURGE_API_BODY" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data 'target=api-cache' \
+    "$ADMIN_URL/api/cache/purge"
+  header_has "$ADMIN_CACHE_PURGE_API_HEADERS" '^Content-Type: application/json; charset=utf-8' || die "admin cache purge API did not return JSON"
+  grep -Fq '"ok":true' "$ADMIN_CACHE_PURGE_API_BODY" || die "admin cache purge API did not confirm success"
+  grep -Fq '"target":"api-cache"' "$ADMIN_CACHE_PURGE_API_BODY" || die "admin cache purge API response did not include target"
+  H2_ADMIN_API_CACHE_REFILL_HEADERS="$TMP_DIR/h2-admin-api-cache-refill.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_API_CACHE_REFILL_HEADERS" "http://$HOST:$PORT/api/echo?msg=api-cache" >/dev/null
+  header_has "$H2_ADMIN_API_CACHE_REFILL_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 admin API cache entry did not refill after API purge"
+  ok "admin HTTP API purges matching cache entries"
 fi
 
 curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \

@@ -321,6 +321,7 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .send_login_page = sendAdminLoginPage,
         .send_method_not_allowed = sendMethodNotAllowedWithAllow,
         .send_redirect = sendAdminRedirect,
+        .send_response = sendResponseWithConnection,
         .send_response_no_body = sendResponseNoBodyWithConnectionAndHeaders,
         .send_setup_page = sendAdminSetupPage,
         .set_stream_timeouts = setStreamTimeouts,
