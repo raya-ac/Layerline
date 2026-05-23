@@ -74,7 +74,7 @@ The next roadmap slice is protocol/cache depth: broader HTTP/3 proxy/PHP route p
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, best-effort external HTTP/3 curl smoke, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for CLI doctor, HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, best-effort external HTTP/3 curl smoke, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -116,6 +116,7 @@ Validate a config without opening sockets:
 ```bash
 zig build run -- --validate-config
 zig build run -- --config server.conf --validate-config
+zig build run -- --config server.conf --doctor
 zig build run -- --dump-routes
 ```
 

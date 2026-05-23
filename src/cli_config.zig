@@ -20,6 +20,7 @@ const validateFastcgiEndpoint = config_mod.validateFastcgiEndpoint;
 pub const Callbacks = struct {
     usage: *const fn () void,
     dump_routes: *const fn (*const ServerConfig) void,
+    doctor: *const fn (std.Io, *const ServerConfig) usize,
 };
 
 pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) !bool {
@@ -55,6 +56,7 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     _ = args.next();
     var validate_only = false;
     var dump_routes = false;
+    var doctor = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             callbacks.usage();
@@ -71,6 +73,8 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
             validate_only = true;
         } else if (std.mem.eql(u8, arg, "--dump-routes") or std.mem.eql(u8, arg, "--routes")) {
             dump_routes = true;
+        } else if (std.mem.eql(u8, arg, "--doctor")) {
+            doctor = true;
         } else if (std.mem.eql(u8, arg, "--tls")) {
             if (args.next()) |value| {
                 cfg.tls_enabled = parseBool(value) orelse cfg.tls_enabled;
@@ -643,7 +647,11 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     if (dump_routes) {
         callbacks.dump_routes(cfg);
     }
-    if (validate_only or dump_routes) {
+    if (doctor) {
+        const failures = callbacks.doctor(init.io, cfg);
+        if (failures > 0) return error.DoctorFailed;
+    }
+    if (validate_only or dump_routes or doctor) {
         return false;
     }
 

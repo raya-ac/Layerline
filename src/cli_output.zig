@@ -3,6 +3,8 @@ const config_mod = @import("config.zig");
 const routing_mod = @import("routing.zig");
 const upstream_mod = @import("upstream.zig");
 
+const DomainConfig = config_mod.DomainConfig;
+const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
 
 pub fn dumpRoutes(cfg: *const ServerConfig) void {
@@ -120,11 +122,169 @@ pub fn dumpRoutes(cfg: *const ServerConfig) void {
     }
 }
 
+fn printDoctorLine(status: []const u8, label: []const u8, detail: []const u8) void {
+    std.debug.print("{s}: {s}", .{ status, label });
+    if (detail.len > 0) std.debug.print(" - {s}", .{detail});
+    std.debug.print("\n", .{});
+}
+
+fn statKind(io: std.Io, path: []const u8) ?std.Io.File.Kind {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return stat.kind;
+}
+
+fn checkDir(io: std.Io, label: []const u8, path: []const u8) usize {
+    const kind = statKind(io, path) orelse {
+        printDoctorLine("fail", label, path);
+        return 1;
+    };
+    if (kind != .directory) {
+        printDoctorLine("fail", label, "path exists but is not a directory");
+        return 1;
+    }
+    printDoctorLine("ok", label, path);
+    return 0;
+}
+
+fn checkFile(io: std.Io, label: []const u8, path: []const u8) usize {
+    const kind = statKind(io, path) orelse {
+        printDoctorLine("fail", label, path);
+        return 1;
+    };
+    if (kind != .file) {
+        printDoctorLine("fail", label, "path exists but is not a file");
+        return 1;
+    }
+    printDoctorLine("ok", label, path);
+    return 0;
+}
+
+fn checkOptionalFile(io: std.Io, label: []const u8, path: ?[]const u8) usize {
+    if (path) |value| return checkFile(io, label, value);
+    return 0;
+}
+
+fn checkParentDir(io: std.Io, label: []const u8, path: []const u8) usize {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    return checkDir(io, label, parent);
+}
+
+fn commandLooksAvailable(io: std.Io, command: []const u8) bool {
+    if (command.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return statKind(io, command) == .file;
+    return true;
+}
+
+fn routeNeedsPhp(route: *const RouteConfig) bool {
+    return route.handler == .php or route.php_front_controller == true or route.php_info_page == true;
+}
+
+fn domainNeedsPhp(domain: *const DomainConfig) bool {
+    if (domain.php_front_controller == true or domain.php_info_page == true) return true;
+    for (domain.routes.items) |*route| {
+        if (routeNeedsPhp(route)) return true;
+    }
+    return false;
+}
+
+fn configNeedsPhp(cfg: *const ServerConfig) bool {
+    if (cfg.php_front_controller or cfg.php_info_page) return true;
+    for (cfg.routes.items) |*route| {
+        if (routeNeedsPhp(route)) return true;
+    }
+    for (cfg.domains.items) |*domain| {
+        if (domainNeedsPhp(domain)) return true;
+    }
+    return false;
+}
+
+fn checkStaticRoots(io: std.Io, cfg: *const ServerConfig) usize {
+    var failures: usize = 0;
+    if (cfg.serve_static_root) failures += checkDir(io, "static root", cfg.static_dir);
+    for (cfg.routes.items) |*route| {
+        if (route.handler == .static) failures += checkDir(io, "route static root", route.static_dir orelse cfg.static_dir);
+    }
+    for (cfg.domains.items) |*domain| {
+        if (routing_mod.domainServeStaticRoot(cfg, domain)) failures += checkDir(io, "domain static root", routing_mod.domainStaticDir(cfg, domain));
+        for (domain.routes.items) |*route| {
+            if (route.handler == .static) failures += checkDir(io, "domain route static root", route.static_dir orelse routing_mod.domainStaticDir(cfg, domain));
+        }
+    }
+    return failures;
+}
+
+fn countUpstreamTargets(pool: ?config_mod.UpstreamPoolConfig) usize {
+    if (pool) |upstream| return upstream.targets.items.len;
+    return 0;
+}
+
+fn countConfiguredUpstreams(cfg: *const ServerConfig) usize {
+    var count = countUpstreamTargets(cfg.upstream);
+    for (cfg.routes.items) |route| count += countUpstreamTargets(route.upstream);
+    for (cfg.domains.items) |domain| {
+        count += countUpstreamTargets(domain.upstream);
+        for (domain.routes.items) |route| count += countUpstreamTargets(route.upstream);
+    }
+    return count;
+}
+
+pub fn doctor(io: std.Io, cfg: *const ServerConfig) usize {
+    std.debug.print("Layerline doctor: {s}:{d}\n", .{ cfg.host, cfg.port });
+    var failures: usize = 0;
+
+    failures += checkStaticRoots(io, cfg);
+    if (cfg.domain_config_dir) |dir| failures += checkDir(io, "domain config dir", dir);
+    if (cfg.admin_enabled) {
+        failures += checkParentDir(io, "admin socket parent", cfg.admin_socket_path orelse config_mod.DEFAULT_ADMIN_SOCKET_PATH);
+    }
+    if (cfg.admin_ui_enabled) {
+        if (statKind(io, cfg.admin_credentials_path) == .file) {
+            printDoctorLine("ok", "admin credentials", cfg.admin_credentials_path);
+        } else {
+            printDoctorLine("warn", "admin credentials", "first launch setup will create credentials");
+        }
+    }
+    if (cfg.access_log_enabled and !std.mem.eql(u8, cfg.access_log_path, "stderr")) {
+        failures += checkParentDir(io, "access log parent", cfg.access_log_path);
+    }
+    if (cfg.tls_enabled) {
+        failures += checkOptionalFile(io, "tls certificate", cfg.tls_cert);
+        failures += checkOptionalFile(io, "tls private key", cfg.tls_key);
+    }
+    for (cfg.domains.items) |*domain| {
+        failures += checkOptionalFile(io, "domain tls certificate", domain.tls_cert);
+        failures += checkOptionalFile(io, "domain tls private key", domain.tls_key);
+    }
+    if (cfg.tls_auto and cfg.letsencrypt_renew) {
+        if (cfg.letsencrypt_webroot.len > 0) failures += checkDir(io, "letsencrypt webroot", cfg.letsencrypt_webroot);
+        if (commandLooksAvailable(io, cfg.letsencrypt_certbot)) {
+            printDoctorLine("ok", "certbot command", cfg.letsencrypt_certbot);
+        } else {
+            printDoctorLine("fail", "certbot command", cfg.letsencrypt_certbot);
+            failures += 1;
+        }
+    }
+    if (configNeedsPhp(cfg) and cfg.php_fastcgi == null and !commandLooksAvailable(io, cfg.php_binary)) {
+        printDoctorLine("fail", "php binary", cfg.php_binary);
+        failures += 1;
+    } else if (configNeedsPhp(cfg) and cfg.php_fastcgi == null) {
+        printDoctorLine("ok", "php binary", cfg.php_binary);
+    }
+
+    std.debug.print("ok: routes={d} domains={d} upstream_targets={d}\n", .{ cfg.routes.items.len, cfg.domains.items.len, countConfiguredUpstreams(cfg) });
+    if (failures == 0) {
+        std.debug.print("Layerline doctor OK\n", .{});
+    } else {
+        std.debug.print("Layerline doctor found {d} blocking issue(s)\n", .{failures});
+    }
+    return failures;
+}
+
 pub fn usage() void {
     std.debug.print(
         "Layerline HTTP server\n\n" ++
             "Usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] [--h2-upstream http://HOST:PORT[/path]] " ++
@@ -157,6 +317,7 @@ pub fn usage() void {
             "Examples:\n" ++
             "  zig build run\n" ++
             "  zig build run -- --validate-config\n" ++
+            "  zig build run -- --doctor\n" ++
             "  zig build run -- --dump-routes\n" ++
             "  zig build run -- --port 4000\n" ++
             "  zig build run -- --index index.php --serve-static true\n" ++

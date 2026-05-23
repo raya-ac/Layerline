@@ -754,6 +754,10 @@ fn dumpRoutes(cfg: *const ServerConfig) void {
     cli_output.dumpRoutes(cfg);
 }
 
+fn doctor(io: std.Io, cfg: *const ServerConfig) usize {
+    return cli_output.doctor(io, cfg);
+}
+
 fn usage() void {
     cli_output.usage();
 }
@@ -767,7 +771,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = defaultServerConfig();
 
-    if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes }))) return;
+    if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .doctor = doctor }))) return;
 
     if (cfg.tls_auto) {
         ensureLetsEncryptSetup(init.io, std.heap.page_allocator, &cfg) catch |err| {

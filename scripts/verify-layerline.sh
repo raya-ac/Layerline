@@ -141,6 +141,14 @@ cat >"$SIGHUP_ROOT/index.html" <<'HTML'
 sighup domain root
 HTML
 
+DOCTOR_OUT="$TMP_DIR/doctor.out"
+"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --doctor >"$DOCTOR_OUT" 2>&1 || {
+  cat "$DOCTOR_OUT" >&2
+  die "layerline doctor failed"
+}
+grep -Fq 'Layerline doctor OK' "$DOCTOR_OUT" || die "layerline doctor did not report OK"
+ok "CLI doctor"
+
 log "starting temporary server on http://$HOST:$PORT"
 (
   cd "$ROOT_DIR"
