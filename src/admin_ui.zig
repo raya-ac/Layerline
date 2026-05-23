@@ -113,11 +113,12 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\    <a class="navlink" href="{s}#upstreams">Upstreams</a>
         \\    <a class="navlink" href="{s}#settings">Settings</a>
         \\    <a class="navlink" href="{s}#config">Config</a>
+        \\    <a class="navlink" href="{s}#config-diff">Diff</a>
         \\  </nav>
         \\</header>
         \\
     ,
-        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
+        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
     );
 }
 

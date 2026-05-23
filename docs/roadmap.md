@@ -30,7 +30,7 @@ Sources:
 - Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control. Activation preflight, managed graceful restart, in-memory snapshot reload for compatible config changes, and SIGHUP reload are implemented; live listener rebinding remains next.
 - Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields. Initial opt-in JSON access logs are implemented for HTTP/1 and HTTP/2 request handling with request IDs, method, path, query, host, protocol, status, bytes, latency, handler, route error, and upstream target fields; TLS fields, richer upstream timing, and h3 logging remain.
 - Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
-- Expand the admin control UI beyond the implemented first-launch setup/login dashboard, activation preflight, in-memory reload, managed graceful restart, site-file controls, live upstream eject/recover, and manual certificate renewal into config diff and richer redacted config inspection.
+- Expand the admin control UI beyond the implemented first-launch setup/login dashboard, activation preflight, activation diff, in-memory reload, managed graceful restart, site-file controls, live upstream eject/recover, and manual certificate renewal into richer redacted config inspection.
 
 ## Phase 2: Static Files and Content Handling
 
@@ -98,7 +98,7 @@ Sources:
 - Origin Surface: first-class origin personality pages for error states, health, diagnostics, and protocol demos.
 - Protocol Observatory: built-in debug routes that show negotiated HTTP version, TLS, QUIC, compression, cache, and upstream timing.
 - Config Replay: record a request and replay it against a candidate config before reload.
-- Route Diff: compare two configs and show which routes, headers, upstreams, and security rules changed.
+- Route Diff: compare the activation config with the running config and show which listener, route, domain, upstream, TLS, cache, and security-facing settings changed. Initial admin `diff`/`config-diff` command and browser activation diff are implemented; richer header/security-rule detail remains.
 - Self-Profiling Mode: expose per-route CPU, allocations, bytes, and upstream wait time under an admin-only endpoint.
 - Failure Lab: controlled fault injection for upstream latency, resets, body truncation, and timeout testing.
 - Policy Bundles: reusable named bundles for secure-static, php-app, api-gateway, private-admin, and edge-cache routes.
@@ -115,7 +115,7 @@ Sources:
 7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, consumed-body WINDOW_UPDATE, and graceful GOAWAY on request caps/shutdown; prioritization stance and broader conformance tests remain next.
 8. HTTP/3 full routing. Initial QUIC/TLS plus minimal QPACK request decoding can serve static routes, static root, configured redirects, `/static/*`, `/health`, and the fallback protocol page; proxy/PHP routes and broad client conformance remain.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts, stale directive shortcuts, static Cache-Status detail, opt-in shared memory static response cache with route/domain knobs, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; brotli/zstd, disk cache, and dynamic microcache remain next.
-10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, in-memory reload, SIGHUP reload, managed restart, routes, upstream health/eject/recover, certs, cert-renew, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, live upstream controls, certificate renewal, enabled domain files, activation preflight, reload, managed restart, and new site-file creation. Config diff and richer redacted inspection remain.
+10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, activation diff, in-memory reload, SIGHUP reload, managed restart, routes, upstream health/eject/recover, certs, cert-renew, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, live upstream controls, certificate renewal, enabled domain files, activation preflight, activation diff, reload, managed restart, and new site-file creation. Richer redacted inspection remains.
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers HTTP/1, HEAD 404 framing, static files, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 

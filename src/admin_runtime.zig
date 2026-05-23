@@ -20,6 +20,7 @@ pub const Callbacks = struct {
     close_stream: *const fn (std.Io.net.Stream) void,
     read_stream: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     reload_config: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
+    render_config_diff: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror![]const u8,
     renew_certs: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
     render_metrics: *const fn (std.mem.Allocator) anyerror![]const u8,
     request_restart: *const fn () void,
@@ -579,7 +580,7 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
     var token_it = std.mem.tokenizeAny(u8, command, " \t\r\n");
     const verb = token_it.next() orelse "";
     if (command.len == 0 or std.mem.eql(u8, verb, "help")) {
-        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, cert-renew, metrics, help\n", callbacks);
+        try sendText(stream, "commands: status, validate, validate-runtime, diff, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, cert-renew, metrics, help\n", callbacks);
         return;
     }
 
@@ -609,6 +610,18 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
             return;
         };
         try sendText(stream, "OK runtime config\n", callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "diff") or std.mem.eql(u8, verb, "config-diff") or std.mem.eql(u8, verb, "activation-diff")) {
+        const body = callbacks.render_config_diff(callbacks.active_io(), allocator, cfg) catch |err| {
+            const error_body = try std.fmt.allocPrint(allocator, "ERROR config diff unavailable: {}\n", .{err});
+            defer allocator.free(error_body);
+            try sendText(stream, error_body, callbacks);
+            return;
+        };
+        defer allocator.free(body);
+        try sendText(stream, body, callbacks);
         return;
     }
 

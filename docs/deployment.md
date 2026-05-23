@@ -156,6 +156,7 @@ curl -fsS http://127.0.0.1:8080/health
 curl -fsSI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/ | grep -i '^Content-Encoding: gzip'
 printf 'status\n' | nc -U /run/layerline/admin.sock
 printf 'validate\n' | nc -U /run/layerline/admin.sock
+printf 'diff\n' | nc -U /run/layerline/admin.sock
 printf 'certs\n' | nc -U /run/layerline/admin.sock
 printf 'cert-renew\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3

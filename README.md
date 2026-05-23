@@ -185,7 +185,7 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
-# Local admin socket: status, validate activation config, restart, routes, upstreams, cert-renew, certs, metrics.
+# Local admin socket: status, validate activation config, diff activation config, restart, routes, upstreams, cert-renew, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Browser admin UI is disabled by default and creates access on first launch.
 #admin_ui = false
@@ -319,11 +319,12 @@ Set `admin_socket` to enable a local Unix socket for operational commands:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `validate-runtime`, `reload`, `restart`, `routes`, `upstreams`, `upstream-eject`, `upstream-recover`, `certs`, `cert-renew`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
+Commands are one line each: `status`, `validate`, `validate-runtime`, `diff`, `reload`, `restart`, `routes`, `upstreams`, `upstream-eject`, `upstream-recover`, `certs`, `cert-renew`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
 printf 'reload\n' | nc -U /tmp/layerline-admin.sock
+printf 'diff\n' | nc -U /tmp/layerline-admin.sock
 printf 'routes\n' | nc -U /tmp/layerline-admin.sock
 printf 'upstreams\n' | nc -U /tmp/layerline-admin.sock
 printf 'upstream-eject route api 0 60000\n' | nc -U /tmp/layerline-admin.sock
@@ -351,7 +352,7 @@ domain_config_dir = domains-enabled
 
 On first launch, `GET /_layerline/admin` shows a setup form. The setup POST writes a PBKDF2-HMAC-SHA256 credential file and sets an HttpOnly `SameSite=Strict` session cookie scoped to the admin path. After that, the same URL shows the login screen unless a valid admin session cookie is present.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, exposes status/routes/upstreams/certs/metrics, can eject or recover live upstream targets, can trigger configured Let’s Encrypt renewal and TLS material reload, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
+The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, shows an activation diff against the running config, exposes status/routes/upstreams/certs/metrics, can eject or recover live upstream targets, can trigger configured Let’s Encrypt renewal and TLS material reload, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
 
 ## Website and branding
 

@@ -9,6 +9,7 @@ const AdminCredentials = admin_support.AdminCredentials;
 const ServerConfig = config_mod.ServerConfig;
 
 pub const Callbacks = struct {
+    render_activation_diff: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror![]const u8,
     runtime_view: *const fn () admin_pages.RuntimeView,
     send_response_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, []const u8, bool, ?[]const u8) anyerror!void,
     send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
@@ -65,7 +66,7 @@ pub fn sendDashboardPage(
     is_head: bool,
     callbacks: Callbacks,
 ) !void {
-    const body = try admin_pages.renderDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error, callbacks.runtime_view(), callbacks.validate_activation);
+    const body = try admin_pages.renderDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error, callbacks.runtime_view(), callbacks.validate_activation, callbacks.render_activation_diff);
     defer allocator.free(body);
     try sendPage(stream, status_code, status_text, body, close_connection, is_head, callbacks);
 }

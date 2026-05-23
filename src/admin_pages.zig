@@ -16,6 +16,7 @@ pub const RuntimeView = struct {
 };
 
 pub const ValidateConfigFn = *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void;
+pub const RenderConfigDiffFn = *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror![]const u8;
 
 pub fn renderStatus(allocator: std.mem.Allocator, cfg: *const ServerConfig, runtime: RuntimeView) ![]const u8 {
     return std.fmt.allocPrint(
@@ -211,6 +212,7 @@ pub fn renderDashboardPage(
     maybe_error: ?[]const u8,
     runtime: RuntimeView,
     validate_config: ValidateConfigFn,
+    render_config_diff: RenderConfigDiffFn,
 ) ![]const u8 {
     const status = try renderStatus(allocator, cfg, runtime);
     defer allocator.free(status);
@@ -220,6 +222,8 @@ pub fn renderDashboardPage(
     defer allocator.free(certs);
     const upstreams = try admin_upstreams.renderReport(io, allocator, cfg);
     defer allocator.free(upstreams);
+    const activation_diff = render_config_diff(io, allocator, cfg) catch |err| try std.fmt.allocPrint(allocator, "ERROR activation diff unavailable: {}\n", .{err});
+    defer allocator.free(activation_diff);
     const metrics = try metrics_mod.render(allocator, runtime.metrics);
     defer allocator.free(metrics);
 
@@ -255,6 +259,9 @@ pub fn renderDashboardPage(
     try admin_ui.appendAdminSettingsForm(&out, allocator, cfg);
     try admin_ui.appendAdminAddSiteForm(&out, allocator, cfg);
     try appendMainConfigPreview(io, &out, allocator, cfg, validate_config);
+    try out.appendSlice(allocator, "<section class=\"block span-all\" id=\"config-diff\"><div class=\"section-head\"><div><h2>Activation diff</h2><p>Changes staged on disk compared with the config this process is serving.</p></div><span class=\"pill\">preflight view</span></div><pre>");
+    try admin_support.appendHtmlEscaped(&out, allocator, activation_diff);
+    try out.appendSlice(allocator, "</pre></section>\n");
     try admin_ui.appendAdminDomainFiles(io, &out, allocator, cfg);
 
     try out.appendSlice(allocator, "<section class=\"block\" id=\"status\"><h2>Status</h2><pre>");

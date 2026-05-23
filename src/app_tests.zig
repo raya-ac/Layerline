@@ -2,6 +2,7 @@ const std = @import("std");
 
 const acme_mod = @import("acme.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
+const config_diff = @import("config_diff.zig");
 const config_mod = @import("config.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_server = @import("http2_server.zig");
@@ -346,6 +347,23 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expect(file_domain.compression_enabled.?);
     try std.testing.expectEqual(@as(usize, 32), file_domain.compression_min_bytes.?);
     try std.testing.expect(!file_domain.routes.items[0].compression_enabled.?);
+}
+
+test "activation config diff reports global and route changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var active = defaultServerConfig();
+    var candidate = defaultServerConfig();
+    try applyConfigLine(&candidate, allocator, "compression", "true");
+    try setRouteLine(&candidate, allocator, "api /api/* proxy");
+    try applyConfigLine(&candidate, allocator, "route_proxy.api", "http://127.0.0.1:9000");
+
+    const diff = try config_diff.render(std.testing.allocator, &active, &candidate);
+    defer std.testing.allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "~ global.compression: false -> true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+ route.api: prefix /api/ -> proxy") != null);
 }
 
 fn headersContainRule(headers: []const config_mod.ResponseHeaderRule, name: []const u8, value: []const u8) bool {

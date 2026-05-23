@@ -7,6 +7,7 @@ const acme_mod = @import("acme.zig");
 const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const config_loader = @import("config_loader.zig");
+const config_diff = @import("config_diff.zig");
 const config_mod = @import("config.zig");
 const custom_errors = @import("custom_errors.zig");
 const h2_server = @import("http2_server.zig");
@@ -202,6 +203,23 @@ fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *
     try reloadConfigInMemory(io, allocator, active);
 }
 
+fn renderActivationConfigDiff(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const candidate_allocator = arena.allocator();
+
+    const candidate = try candidate_allocator.create(ServerConfig);
+    candidate.* = defaultServerConfig();
+    candidate.config_path = active.config_path;
+    try loadConfig(io, candidate_allocator, candidate, candidate.config_path);
+    try loadConfiguredDomainConfigs(io, candidate_allocator, candidate);
+    normalizeConfig(candidate);
+    try applyLetsEncryptDefaultCertPaths(candidate_allocator, candidate);
+    try validateConfig(candidate);
+
+    return config_diff.render(allocator, active, candidate);
+}
+
 const ReloadSignalWatcherContext = struct {
     io: std.Io,
 };
@@ -270,6 +288,7 @@ fn adminRequestRestart() void {
 
 fn adminHttpCallbacks() admin_http.Callbacks {
     return .{
+        .render_activation_diff = renderActivationConfigDiff,
         .runtime_view = adminRuntimeView,
         .send_response_headers = sendResponseWithConnectionAndHeaders,
         .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
@@ -285,6 +304,7 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .close_stream = streamClose,
         .read_stream = streamRead,
         .reload_config = reloadConfigInMemory,
+        .render_config_diff = renderActivationConfigDiff,
         .renew_certs = renewCertificatesInMemory,
         .render_metrics = adminRenderMetrics,
         .request_restart = adminRequestRestart,

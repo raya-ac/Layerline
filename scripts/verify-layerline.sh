@@ -331,6 +331,11 @@ case "$ADMIN_VALIDATE" in
   'OK activation config'*) ok "admin validate" ;;
   *) die "admin validate response was unexpected: $ADMIN_VALIDATE" ;;
 esac
+ADMIN_DIFF=$(printf 'diff\n' | nc -U "$SOCKET")
+case "$ADMIN_DIFF" in
+  *'activation diff'*'no activation changes'*) ok "admin config diff" ;;
+  *) die "admin config diff response was unexpected: $ADMIN_DIFF" ;;
+esac
 
 ADMIN_ROUTES=$(printf 'routes\n' | nc -U "$SOCKET")
 case "$ADMIN_ROUTES" in
@@ -406,6 +411,7 @@ grep -Fq 'Add site' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not includ
 grep -Fq 'Save settings' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include settings management"
 grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include in-memory reload"
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
+grep -Fq 'Activation diff' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include activation diff"
 grep -Fq 'Live proxy targets' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include upstream controls"
 grep -Fq 'route verify_proxy' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose upstream report"
 grep -Fq 'Renew certificates' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include certificate renewal control"
