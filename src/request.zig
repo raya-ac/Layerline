@@ -15,7 +15,7 @@ pub const HttpRequest = struct {
     h2c_upgrade_tail: []const u8 = "",
 
     pub fn deinit(self: HttpRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.method.ptr[0..self.headers.ptr + self.headers.len - self.method.ptr]);
+        allocator.free(self.method.ptr[0 .. self.headers.ptr + self.headers.len - self.method.ptr]);
     }
 };
 
@@ -139,6 +139,7 @@ pub fn parse(
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
     const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
+    try http_headers.validateHeaderBlock(headers);
 
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
     if (std.mem.startsWith(u8, version, "HTTP/1.1") and http_headers.findHeaderValue(headers, "Host") == null) {
@@ -219,6 +220,7 @@ pub fn parseHeadersOnly(
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
     const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
+    try http_headers.validateHeaderBlock(headers);
 
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
     if (std.mem.startsWith(u8, version, "HTTP/1.1") and http_headers.findHeaderValue(headers, "Host") == null) {

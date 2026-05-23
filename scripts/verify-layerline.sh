@@ -202,6 +202,14 @@ curl -fsS -D "$GENERATED_REQUEST_ID_HEADERS" "http://$HOST:$PORT/health" >/dev/n
 header_has "$GENERATED_REQUEST_ID_HEADERS" '^X-Request-Id: ll-' || die "HTTP/1 response did not generate X-Request-Id"
 ok "HTTP/1 request id header"
 
+MALFORMED_HEADER_RAW="$TMP_DIR/malformed-header.raw"
+printf 'GET / HTTP/1.1\r\nHost: %s:%s\r\nBroken-Header\r\nConnection: close\r\n\r\n' "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$MALFORMED_HEADER_RAW"
+grep -Fq '400 Bad Request' "$MALFORMED_HEADER_RAW" || die "malformed header line did not return 400"
+DUP_CONTENT_LENGTH_RAW="$TMP_DIR/duplicate-content-length.raw"
+printf 'POST /api/echo HTTP/1.1\r\nHost: %s:%s\r\nContent-Length: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab' "$HOST" "$PORT" | nc "$HOST" "$PORT" >"$DUP_CONTENT_LENGTH_RAW"
+grep -Fq '400 Bad Request' "$DUP_CONTENT_LENGTH_RAW" || die "conflicting duplicate Content-Length did not return 400"
+ok "HTTP/1 parser hardening"
+
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
 header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; stored; ttl=60; detail="response-cache"' || die "static Cache-Status store header missing"
