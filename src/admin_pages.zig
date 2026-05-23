@@ -256,6 +256,7 @@ pub fn renderDashboardPage(
     try out.appendSlice(allocator, "<div class=\"workspace\">\n");
     try admin_ui.appendAdminActiveSites(&out, allocator, cfg);
     try admin_upstreams.appendAdminPanel(io, &out, allocator, cfg);
+    try admin_ui.appendAdminCacheControls(&out, allocator, cfg);
     try admin_ui.appendAdminSettingsForm(&out, allocator, cfg);
     try admin_ui.appendAdminAddSiteForm(&out, allocator, cfg);
     try appendMainConfigPreview(io, &out, allocator, cfg, validate_config);

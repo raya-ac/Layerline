@@ -111,6 +111,7 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\    <a class="navlink" href="{s}">Dashboard</a>
         \\    <a class="navlink" href="{s}#sites">Sites</a>
         \\    <a class="navlink" href="{s}#upstreams">Upstreams</a>
+        \\    <a class="navlink" href="{s}#cache">Cache</a>
         \\    <a class="navlink" href="{s}#settings">Settings</a>
         \\    <a class="navlink" href="{s}#config">Config</a>
         \\    <a class="navlink" href="{s}#config-diff">Diff</a>
@@ -118,7 +119,7 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\</header>
         \\
     ,
-        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
+        .{ title, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path, cfg.admin_ui_path },
     );
 }
 
@@ -299,6 +300,27 @@ pub fn appendAdminDomainFiles(io: std.Io, out: *std.ArrayList(u8), allocator: st
     }
     if (!found) try out.appendSlice(allocator, "<p class=\"muted\">No enabled site files yet.</p>\n");
     try out.appendSlice(allocator, "</div></section>\n");
+}
+
+pub fn appendAdminCacheControls(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    try out.appendSlice(allocator,
+        \\<section class="block" id="cache">
+        \\  <div class="section-head"><div><h2>Cache</h2><p>Clear in-process static and buffered response cache entries without restarting Layerline.</p></div><span class="pill">memory cache</span></div>
+        \\  <div class="panel"><div class="panel-inner">
+        \\  <form class="stack" method="post" action="
+    );
+    try appendHtmlEscaped(out, allocator, cfg.admin_ui_path);
+    try out.appendSlice(allocator,
+        \\/cache/purge">
+        \\    <div class="form-grid">
+        \\      <label>Match key<input name="target" placeholder="all, /api/echo, microcache"></label>
+        \\    </div>
+        \\    <div class="actions"><button class="primary" type="submit">Purge cache</button><span class="muted">Leave blank or use <code>all</code> to clear every in-process entry.</span></div>
+        \\  </form>
+        \\  </div></div>
+        \\</section>
+        \\
+    );
 }
 
 fn appendAdminTextInput(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, name: []const u8, value: []const u8, placeholder: []const u8) !void {

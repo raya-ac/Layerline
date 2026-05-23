@@ -154,6 +154,25 @@ fn handleCertRenewPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem
     try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK", close_connection, false);
 }
 
+fn handleCachePurgePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+    var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The cache purge form could not be parsed.", 400, "Bad Request", close_connection, false);
+        return;
+    };
+    defer admin_support.freeFormFields(allocator, &fields);
+
+    const raw_target = admin_support.adminTrimmedField(fields.items, "target");
+    const target = if (std.ascii.eqlIgnoreCase(raw_target, "all")) "" else raw_target;
+    const removed = callbacks.purge_caches(target);
+    const message = if (target.len == 0)
+        try std.fmt.allocPrint(allocator, "Purged {d} cache entries.", .{removed})
+    else
+        try std.fmt.allocPrint(allocator, "Purged {d} cache entries matching {s}.", .{ removed, target });
+    defer allocator.free(message);
+
+    try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, message, null, 200, "OK", close_connection, false);
+}
+
 fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
         try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The site form could not be parsed.", 400, "Bad Request", close_connection, false);
@@ -473,6 +492,10 @@ pub fn handleUi(
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/certs/renew")) {
         try handleCertRenewPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/cache/purge")) {
+        try handleCachePurgePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/eject")) {

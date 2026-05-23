@@ -490,11 +490,31 @@ grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did no
 grep -Fq 'Activation diff' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include activation diff"
 grep -Fq 'Live proxy targets' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include upstream controls"
 grep -Fq 'route verify_proxy' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose upstream report"
+grep -Fq 'Purge cache' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include cache purge control"
 grep -Fq 'Renew certificates' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include certificate renewal control"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 grep -Fq 'layerline_response_cache_hits_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include response-cache metrics"
 grep -Fq 'security=strict response_cache=false' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose route-local policy"
 ok "admin UI authenticated dashboard"
+
+if [[ $H2_SMOKE -eq 1 ]]; then
+  H2_ADMIN_CACHE_STORE_HEADERS="$TMP_DIR/h2-admin-cache-store.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_CACHE_STORE_HEADERS" "http://$HOST:$PORT/api/echo?msg=ui-cache" >/dev/null
+  header_has "$H2_ADMIN_CACHE_STORE_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 admin cache prefill did not store microcache entry"
+  H2_ADMIN_CACHE_HIT_HEADERS="$TMP_DIR/h2-admin-cache-hit.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_CACHE_HIT_HEADERS" "http://$HOST:$PORT/api/echo?msg=ui-cache" >/dev/null
+  header_has "$H2_ADMIN_CACHE_HIT_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="microcache"' || die "h2 admin cache prefill did not hit microcache entry"
+  curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-cache-purge.body" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data 'target=ui-cache' \
+    "$ADMIN_URL/cache/purge"
+  grep -Fq 'Purged ' "$TMP_DIR/admin-cache-purge.body" || die "admin UI cache purge response did not confirm purge"
+  grep -Fq 'matching ui-cache' "$TMP_DIR/admin-cache-purge.body" || die "admin UI cache purge response did not include target"
+  H2_ADMIN_CACHE_REFILL_HEADERS="$TMP_DIR/h2-admin-cache-refill.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_ADMIN_CACHE_REFILL_HEADERS" "http://$HOST:$PORT/api/echo?msg=ui-cache" >/dev/null
+  header_has "$H2_ADMIN_CACHE_REFILL_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 admin cache entry did not refill after UI purge"
+  ok "admin UI purges matching cache entries"
+fi
 
 curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \
   -H 'Content-Type: application/x-www-form-urlencoded' \
