@@ -208,6 +208,9 @@ const Http3Request = struct {
     method: []const u8 = "GET",
     path: []const u8 = "/",
     authority: ?[]const u8 = null,
+    headers: []const u8 = "",
+    body: []const u8 = "",
+    body_available: bool = false,
 };
 
 fn http3PathOnly(path: []const u8) []const u8 {
@@ -222,6 +225,13 @@ fn http3QueryOnly(path: []const u8) []const u8 {
 
 fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, payload: []const u8) !?Http3Request {
     var offset: usize = 0;
+    var request = Http3Request{ .stream_id = stream_id };
+    var saw_headers = false;
+    var raw_headers = std.ArrayList(u8).empty;
+    errdefer raw_headers.deinit(allocator);
+    var body = std.ArrayList(u8).empty;
+    errdefer body.deinit(allocator);
+
     while (offset < payload.len) {
         const frame_header = try h3_native.decodeFrameHeader(payload[offset..]);
         offset += frame_header.len;
@@ -231,24 +241,45 @@ fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, 
         const frame_payload = payload[offset .. offset + frame_len];
         offset += frame_len;
 
-        if (frame_header.frame_type != @intFromEnum(h3_native.FrameType.headers)) continue;
+        if (frame_header.frame_type == @intFromEnum(h3_native.FrameType.headers)) {
+            if (saw_headers) continue;
+            const headers = try h3_native.decodeHeaderBlock(allocator, frame_payload);
+            defer allocator.free(headers);
 
-        const headers = try h3_native.decodeHeaderBlock(allocator, frame_payload);
-        defer allocator.free(headers);
-
-        var request = Http3Request{ .stream_id = stream_id };
-        for (headers) |header| {
-            if (std.mem.eql(u8, header.name, ":method")) {
-                request.method = header.value;
-            } else if (std.mem.eql(u8, header.name, ":path")) {
-                request.path = header.value;
-            } else if (std.mem.eql(u8, header.name, ":authority")) {
-                request.authority = header.value;
+            for (headers) |header| {
+                if (std.mem.eql(u8, header.name, ":method")) {
+                    request.method = header.value;
+                } else if (std.mem.eql(u8, header.name, ":path")) {
+                    request.path = header.value;
+                } else if (std.mem.eql(u8, header.name, ":authority")) {
+                    request.authority = header.value;
+                } else if (header.name.len > 0 and header.name[0] != ':' and !std.ascii.eqlIgnoreCase(header.name, "connection")) {
+                    try raw_headers.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+                }
             }
+            saw_headers = true;
+            continue;
         }
-        return request;
+
+        if (frame_header.frame_type == @intFromEnum(h3_native.FrameType.data)) {
+            request.body_available = true;
+            if (frame_payload.len > 0) try body.appendSlice(allocator, frame_payload);
+            continue;
+        }
     }
-    return null;
+
+    if (!saw_headers) return null;
+    if (raw_headers.items.len > 0) {
+        request.headers = try raw_headers.toOwnedSlice(allocator);
+    } else {
+        raw_headers.deinit(allocator);
+    }
+    if (request.body_available) {
+        request.body = try body.toOwnedSlice(allocator);
+    } else {
+        body.deinit(allocator);
+    }
+    return request;
 }
 
 fn findHttp3Request(allocator: std.mem.Allocator, plaintext: []const u8) !?Http3Request {
@@ -464,10 +495,13 @@ fn buildHttp3ErrorResponseData(
     return buildHttp3BufferedResponseData(allocator, server_header, response, is_head);
 }
 
-fn http3MethodCanUseBufferedRouter(method: []const u8) bool {
+fn http3MethodCanUseBufferedRouter(method: []const u8, body_available: bool, declared_content_length: ?usize) bool {
     return std.mem.eql(u8, method, "GET") or
         std.mem.eql(u8, method, "HEAD") or
-        std.mem.eql(u8, method, "OPTIONS");
+        std.mem.eql(u8, method, "OPTIONS") or
+        std.mem.eql(u8, method, "DELETE") or
+        body_available or
+        (declared_content_length != null and declared_content_length.? == 0);
 }
 
 fn http3ToHttpRequest(allocator: std.mem.Allocator, request: Http3Request) !HttpRequest {
@@ -479,6 +513,7 @@ fn http3ToHttpRequest(allocator: std.mem.Allocator, request: Http3Request) !Http
     if (request.authority) |authority| {
         if (authority.len > 0) try headers.print(allocator, "Host: {s}\r\n", .{authority});
     }
+    if (request.headers.len > 0) try headers.appendSlice(allocator, request.headers);
 
     return .{
         .method = try allocator.dupe(u8, request.method),
@@ -486,7 +521,7 @@ fn http3ToHttpRequest(allocator: std.mem.Allocator, request: Http3Request) !Http
         .query = try allocator.dupe(u8, query),
         .headers = try headers.toOwnedSlice(allocator),
         .version = "HTTP/3",
-        .body = "",
+        .body = request.body,
         .close_connection = true,
     };
 }
@@ -508,11 +543,21 @@ fn buildHttp3RoutedResponseData(
         return buildHttp3DefaultResponseData(allocator, server_header, is_head);
     }
 
-    if (!http3MethodCanUseBufferedRouter(request.method)) {
+    const req = try http3ToHttpRequest(allocator, request);
+    if (req.body.len > cfg.max_body_bytes) {
+        return buildHttp3ErrorResponseData(allocator, server_header, 413, "Payload Too Large", "Request body exceeds configured limit.", is_head);
+    }
+    const declared_content_length = http2_support.parseRequestContentLength(req.headers) catch {
+        return buildHttp3ErrorResponseData(allocator, server_header, 400, "Bad Request", "HTTP/3 Content-Length was invalid.", is_head);
+    };
+    if (declared_content_length) |content_length| {
+        if (content_length != req.body.len) {
+            return buildHttp3ErrorResponseData(allocator, server_header, 400, "Bad Request", "HTTP/3 Content-Length did not match the received request body.", is_head);
+        }
+    }
+    if (!http3MethodCanUseBufferedRouter(request.method, request.body_available, declared_content_length)) {
         return buildHttp3ErrorResponseData(allocator, server_header, 501, "Not Implemented", "HTTP/3 request body routing is still on the roadmap for this method.", is_head);
     }
-
-    const req = try http3ToHttpRequest(allocator, request);
     const response = callbacks.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return buildHttp3ErrorResponseData(allocator, server_header, 500, "Internal Server Error", "Internal server error while routing HTTP/3 request.", is_head),
@@ -680,6 +725,8 @@ test "HTTP/3 request conversion carries host and query into common router shape"
         .method = "GET",
         .path = "/api/echo?msg=layerline",
         .authority = "example.test:8443",
+        .headers = "accept: text/plain\r\n",
+        .body = "ignored for get",
     });
     defer {
         std.testing.allocator.free(req.method);
@@ -691,16 +738,50 @@ test "HTTP/3 request conversion carries host and query into common router shape"
     try std.testing.expectEqualStrings("GET", req.method);
     try std.testing.expectEqualStrings("/api/echo", req.path);
     try std.testing.expectEqualStrings("msg=layerline", req.query);
-    try std.testing.expectEqualStrings("Host: example.test:8443\r\n", req.headers);
+    try std.testing.expectEqualStrings("Host: example.test:8443\r\naccept: text/plain\r\n", req.headers);
     try std.testing.expectEqualStrings("HTTP/3", req.version);
+    try std.testing.expectEqualStrings("ignored for get", req.body);
 }
 
 test "HTTP/3 buffered router is gated to methods without DATA bodies" {
-    try std.testing.expect(http3MethodCanUseBufferedRouter("GET"));
-    try std.testing.expect(http3MethodCanUseBufferedRouter("HEAD"));
-    try std.testing.expect(http3MethodCanUseBufferedRouter("OPTIONS"));
-    try std.testing.expect(!http3MethodCanUseBufferedRouter("POST"));
-    try std.testing.expect(!http3MethodCanUseBufferedRouter("PATCH"));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("GET", false, null));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("HEAD", false, null));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("OPTIONS", false, null));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("DELETE", false, null));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("POST", true, 5));
+    try std.testing.expect(http3MethodCanUseBufferedRouter("POST", false, 0));
+    try std.testing.expect(!http3MethodCanUseBufferedRouter("POST", false, null));
+    try std.testing.expect(!http3MethodCanUseBufferedRouter("PATCH", false, null));
+}
+
+test "extracts HTTP/3 DATA frames from a request stream" {
+    const headers = [_]h3_native.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/api/echo" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = "content-length", .value = "5" },
+        .{ .name = "content-type", .value = "text/plain" },
+    };
+    const header_block = try h3_native.encodeLiteralHeaders(std.testing.allocator, &headers);
+    defer std.testing.allocator.free(header_block);
+
+    var h3_payload = std.ArrayListUnmanaged(u8).empty;
+    defer h3_payload.deinit(std.testing.allocator);
+    try h3_native.appendFrame(std.testing.allocator, &h3_payload, .headers, header_block);
+    try h3_native.appendFrame(std.testing.allocator, &h3_payload, .data, "hello");
+
+    const request = (try parseHttp3RequestStreamPayload(std.testing.allocator, 0, h3_payload.items)).?;
+    defer {
+        std.testing.allocator.free(request.headers);
+        std.testing.allocator.free(request.body);
+    }
+
+    try std.testing.expectEqualStrings("POST", request.method);
+    try std.testing.expectEqualStrings("/api/echo", request.path);
+    try std.testing.expectEqualStrings("example.test", request.authority.?);
+    try std.testing.expectEqualStrings("content-length: 5\r\ncontent-type: text/plain\r\n", request.headers);
+    try std.testing.expect(request.body_available);
+    try std.testing.expectEqualStrings("hello", request.body);
 }
 
 test "HTTP/3 default showcase suppresses body for HEAD" {
@@ -734,6 +815,27 @@ fn testHttp3BufferedRouterCallback(
     };
 }
 
+fn testHttp3BodyRouterCallback(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *ServerConfig,
+    req: HttpRequest,
+    process_env: *const std.process.Environ.Map,
+) !H2BufferedResponse {
+    _ = io;
+    _ = cfg;
+    _ = process_env;
+    try std.testing.expectEqualStrings("POST", req.method);
+    try std.testing.expectEqualStrings("/api/echo", req.path);
+    try std.testing.expectEqualStrings("Host: example.test\r\ncontent-length: 5\r\ncontent-type: text/plain\r\n", req.headers);
+    try std.testing.expectEqualStrings("hello", req.body);
+    return .{
+        .status_code = 200,
+        .content_type = "text/plain; charset=utf-8",
+        .body = try allocator.dupe(u8, req.body),
+    };
+}
+
 test "HTTP/3 routed responses delegate to the buffered route builder" {
     var cfg = config_mod.defaultServerConfig();
     const data = try buildHttp3RoutedResponseData(
@@ -753,6 +855,30 @@ test "HTTP/3 routed responses delegate to the buffered route builder" {
     defer std.testing.allocator.free(data);
 
     try std.testing.expect(std.mem.indexOf(u8, data, "routed over h3\n") != null);
+}
+
+test "HTTP/3 routed responses accept parsed DATA bodies" {
+    var cfg = config_mod.defaultServerConfig();
+    const data = try buildHttp3RoutedResponseData(
+        undefined,
+        std.testing.allocator,
+        &cfg,
+        undefined,
+        "Layerline",
+        .{
+            .stream_id = 0,
+            .method = "POST",
+            .path = "/api/echo",
+            .authority = "example.test",
+            .headers = "content-length: 5\r\ncontent-type: text/plain\r\n",
+            .body = "hello",
+            .body_available = true,
+        },
+        .{ .build_response_for_request = testHttp3BodyRouterCallback },
+    );
+    defer std.testing.allocator.free(data);
+
+    try std.testing.expect(std.mem.indexOf(u8, data, "hello") != null);
 }
 
 pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig, callbacks: Callbacks) void {
@@ -919,7 +1045,9 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
                         continue;
                     };
                     defer std.heap.page_allocator.free(short.plaintext);
-                    const request_opt = findHttp3Request(std.heap.page_allocator, short.plaintext) catch |err| {
+                    var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer request_arena.deinit();
+                    const request_opt = findHttp3Request(request_arena.allocator(), short.plaintext) catch |err| {
                         if (!assembly.h3_response_sent) {
                             std.debug.print("HTTP/3 coalesced request parse failed from {f}: {}\n", .{ msg.from, err });
                         }
@@ -958,7 +1086,9 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
             };
             defer std.heap.page_allocator.free(decrypted.plaintext);
 
-            const request_opt = findHttp3Request(std.heap.page_allocator, decrypted.plaintext) catch |err| {
+            var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer request_arena.deinit();
+            const request_opt = findHttp3Request(request_arena.allocator(), decrypted.plaintext) catch |err| {
                 if (!assembly.h3_response_sent) {
                     std.debug.print("HTTP/3 request parse failed from {f}: {}\n", .{ msg.from, err });
                 }
