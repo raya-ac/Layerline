@@ -51,6 +51,10 @@ const Http3InitialAssembly = struct {
     server_handshake_packets: h3_state.PacketNumberSpace(16) = h3_state.PacketNumberSpace(16).init(),
     server_application_packets: h3_state.PacketNumberSpace(64) = h3_state.PacketNumberSpace(64).init(),
     h3_response_sent: bool = false,
+    has_request_stream: bool = false,
+    request_stream_id: u64 = 0,
+    request_stream_finished: bool = false,
+    request_stream: std.ArrayListUnmanaged(u8) = .empty,
 
     fn matches(self: *const Http3InitialAssembly, scid: []const u8) bool {
         return self.has_scid and std.mem.eql(u8, self.scid.slice(), scid);
@@ -63,6 +67,7 @@ const Http3InitialAssembly = struct {
     fn deinit(self: *Http3InitialAssembly, allocator: std.mem.Allocator) void {
         self.crypto.deinit(allocator);
         self.client_handshake_crypto.deinit(allocator);
+        self.request_stream.deinit(allocator);
         self.* = .{};
     }
 
@@ -81,6 +86,10 @@ const Http3InitialAssembly = struct {
         self.server_handshake_packets = h3_state.PacketNumberSpace(16).init();
         self.server_application_packets = h3_state.PacketNumberSpace(64).init();
         self.h3_response_sent = false;
+        self.has_request_stream = false;
+        self.request_stream_id = 0;
+        self.request_stream_finished = false;
+        self.request_stream.clearRetainingCapacity();
         _ = allocator;
     }
 
@@ -282,7 +291,36 @@ fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, 
     return request;
 }
 
-fn findHttp3Request(allocator: std.mem.Allocator, plaintext: []const u8) !?Http3Request {
+fn appendHttp3RequestStreamData(
+    allocator: std.mem.Allocator,
+    assembly: *Http3InitialAssembly,
+    stream_id: u64,
+    stream_offset: usize,
+    data: []const u8,
+    fin: bool,
+) !void {
+    if (!assembly.has_request_stream) {
+        assembly.has_request_stream = true;
+        assembly.request_stream_id = stream_id;
+        assembly.request_stream.clearRetainingCapacity();
+        assembly.request_stream_finished = false;
+    }
+    if (assembly.request_stream_id != stream_id or assembly.request_stream_finished) return;
+
+    const current_len = assembly.request_stream.items.len;
+    if (stream_offset > current_len) return;
+    if (stream_offset < current_len) {
+        const overlap = current_len - stream_offset;
+        if (overlap < data.len) {
+            try assembly.request_stream.appendSlice(allocator, data[overlap..]);
+        }
+    } else {
+        try assembly.request_stream.appendSlice(allocator, data);
+    }
+    if (fin) assembly.request_stream_finished = true;
+}
+
+fn findHttp3Request(allocator: std.mem.Allocator, assembly: *Http3InitialAssembly, plaintext: []const u8) !?Http3Request {
     var offset: usize = 0;
     while (offset < plaintext.len) {
         const frame_type_vi = try h3_native.decodeVarInt(plaintext[offset..]);
@@ -303,9 +341,12 @@ fn findHttp3Request(allocator: std.mem.Allocator, plaintext: []const u8) !?Http3
             0x08...0x0f => {
                 const stream_id = try h3_native.decodeVarInt(plaintext[offset..]);
                 offset += stream_id.len;
+                var stream_offset: usize = 0;
                 if ((frame_type & 0x04) != 0) {
-                    const stream_offset = try h3_native.decodeVarInt(plaintext[offset..]);
-                    offset += stream_offset.len;
+                    const stream_offset_vi = try h3_native.decodeVarInt(plaintext[offset..]);
+                    offset += stream_offset_vi.len;
+                    if (stream_offset_vi.value > std.math.maxInt(usize)) return error.InvalidFrame;
+                    stream_offset = @intCast(stream_offset_vi.value);
                 }
                 const data_len = if ((frame_type & 0x02) != 0) len: {
                     const len_vi = try h3_native.decodeVarInt(plaintext[offset..]);
@@ -314,10 +355,20 @@ fn findHttp3Request(allocator: std.mem.Allocator, plaintext: []const u8) !?Http3
                 } else plaintext.len - offset;
                 if (plaintext.len < offset + data_len) return error.Truncated;
                 if ((stream_id.value & 0x03) == 0) {
-                    if (try parseHttp3RequestStreamPayload(allocator, stream_id.value, plaintext[offset .. offset + data_len])) |request| {
-                        return request;
+                    const fin = (frame_type & 0x01) != 0;
+                    try appendHttp3RequestStreamData(
+                        allocator,
+                        assembly,
+                        stream_id.value,
+                        stream_offset,
+                        plaintext[offset .. offset + data_len],
+                        fin,
+                    );
+                    if (assembly.request_stream_finished) {
+                        if (try parseHttp3RequestStreamPayload(allocator, stream_id.value, assembly.request_stream.items)) |request| {
+                            return request;
+                        }
                     }
-                    return Http3Request{ .stream_id = stream_id.value };
                 }
                 offset += data_len;
             },
@@ -703,10 +754,12 @@ test "extracts HTTP/3 request path from a request stream" {
     try h3_payload.appendSlice(std.testing.allocator, frame_header[0..frame_header_len]);
     try h3_payload.appendSlice(std.testing.allocator, header_block);
 
-    const stream_frame = try quic_native.buildStreamFrame(std.testing.allocator, 0, h3_payload.items, false);
+    const stream_frame = try quic_native.buildStreamFrame(std.testing.allocator, 0, h3_payload.items, true);
     defer std.testing.allocator.free(stream_frame);
 
-    const request = (try findHttp3Request(std.testing.allocator, stream_frame)).?;
+    var assembly = Http3InitialAssembly{};
+    defer assembly.deinit(std.testing.allocator);
+    const request = (try findHttp3Request(std.testing.allocator, &assembly, stream_frame)).?;
     try std.testing.expectEqual(@as(u64, 0), request.stream_id);
     try std.testing.expectEqualStrings("GET", request.method);
     try std.testing.expectEqualStrings("/health", request.path);
@@ -781,6 +834,43 @@ test "extracts HTTP/3 DATA frames from a request stream" {
     try std.testing.expectEqualStrings("example.test", request.authority.?);
     try std.testing.expectEqualStrings("content-length: 5\r\ncontent-type: text/plain\r\n", request.headers);
     try std.testing.expect(request.body_available);
+    try std.testing.expectEqualStrings("hello", request.body);
+}
+
+test "reassembles ordered HTTP/3 request stream data across packets" {
+    const headers = [_]h3_native.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/api/echo" },
+        .{ .name = ":authority", .value = "example.test" },
+        .{ .name = "content-length", .value = "5" },
+    };
+    const header_block = try h3_native.encodeLiteralHeaders(std.testing.allocator, &headers);
+    defer std.testing.allocator.free(header_block);
+
+    var first_payload = std.ArrayListUnmanaged(u8).empty;
+    defer first_payload.deinit(std.testing.allocator);
+    try h3_native.appendFrame(std.testing.allocator, &first_payload, .headers, header_block);
+    var second_payload = std.ArrayListUnmanaged(u8).empty;
+    defer second_payload.deinit(std.testing.allocator);
+    try h3_native.appendFrame(std.testing.allocator, &second_payload, .data, "hello");
+
+    const first_stream = try quic_native.buildStreamFrameAt(std.testing.allocator, 0, 0, first_payload.items, false);
+    defer std.testing.allocator.free(first_stream);
+    const second_stream = try quic_native.buildStreamFrameAt(std.testing.allocator, 0, first_payload.items.len, second_payload.items, true);
+    defer std.testing.allocator.free(second_stream);
+
+    var assembly = Http3InitialAssembly{};
+    defer assembly.deinit(std.testing.allocator);
+
+    try std.testing.expect((try findHttp3Request(std.testing.allocator, &assembly, first_stream)) == null);
+    const request = (try findHttp3Request(std.testing.allocator, &assembly, second_stream)).?;
+    defer {
+        std.testing.allocator.free(request.headers);
+        std.testing.allocator.free(request.body);
+    }
+
+    try std.testing.expectEqualStrings("POST", request.method);
+    try std.testing.expectEqualStrings("/api/echo", request.path);
     try std.testing.expectEqualStrings("hello", request.body);
 }
 
@@ -1047,7 +1137,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
                     defer std.heap.page_allocator.free(short.plaintext);
                     var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer request_arena.deinit();
-                    const request_opt = findHttp3Request(request_arena.allocator(), short.plaintext) catch |err| {
+                    const request_opt = findHttp3Request(request_arena.allocator(), assembly, short.plaintext) catch |err| {
                         if (!assembly.h3_response_sent) {
                             std.debug.print("HTTP/3 coalesced request parse failed from {f}: {}\n", .{ msg.from, err });
                         }
@@ -1088,7 +1178,7 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
 
             var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer request_arena.deinit();
-            const request_opt = findHttp3Request(request_arena.allocator(), decrypted.plaintext) catch |err| {
+            const request_opt = findHttp3Request(request_arena.allocator(), assembly, decrypted.plaintext) catch |err| {
                 if (!assembly.h3_response_sent) {
                     std.debug.print("HTTP/3 request parse failed from {f}: {}\n", .{ msg.from, err });
                 }
