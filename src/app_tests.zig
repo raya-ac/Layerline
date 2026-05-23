@@ -20,6 +20,7 @@ const appendFastcgiParam = fastcgi.appendParam;
 const acceptsContentCoding = static_files.acceptsContentCoding;
 const applyConfigLine = config_mod.applyConfigLine;
 const applyDomainConfigLine = config_mod.applyDomainConfigLine;
+const applyLetsEncryptDefaultCertPaths = acme_mod.applyLetsEncryptDefaultCertPaths;
 const appendServerNames = config_mod.appendServerNames;
 const buildAcmeChallengeFilePath = acme_mod.buildAcmeChallengeFilePath;
 const buildResponseHeaderContext = config_mod.buildResponseHeaderContext;
@@ -197,6 +198,14 @@ test "named routes prefer exact and longest prefix matches" {
     try std.testing.expectEqualStrings("public", certbotWebrootFromAcmeConfig("public/.well-known/acme-challenge"));
     const acme_path = try buildAcmeChallengeFilePath(allocator, "public", "token-123");
     try std.testing.expectEqualStrings("public/.well-known/acme-challenge/token-123", acme_path);
+
+    var acme_cfg = defaultServerConfig();
+    acme_cfg.tls_auto = true;
+    acme_cfg.letsencrypt_domains = "example.com,www.example.com";
+    try applyLetsEncryptDefaultCertPaths(allocator, &acme_cfg);
+    try std.testing.expectEqualStrings("/etc/letsencrypt/live/example.com/fullchain.pem", acme_cfg.tls_cert.?);
+    try std.testing.expectEqualStrings("/etc/letsencrypt/live/example.com/privkey.pem", acme_cfg.tls_key.?);
+
     const redirect_req = HttpRequest{
         .method = "GET",
         .path = "/docs",

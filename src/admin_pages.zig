@@ -263,7 +263,9 @@ pub fn renderDashboardPage(
     try admin_support.appendHtmlEscaped(&out, allocator, upstreams);
     try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"routes\"><h2>Routes</h2><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, routes);
-    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><h2>Certificates</h2><pre>");
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><div class=\"section-head\"><div><h2>Certificates</h2><p>Configured TLS material and ACME renewal counters.</p></div><form method=\"post\" action=\"");
+    try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
+    try out.appendSlice(allocator, "/certs/renew\"><button type=\"submit\">Renew certificates</button></form></div><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, certs);
     try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"metrics\"><h2>Metrics</h2><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, metrics);

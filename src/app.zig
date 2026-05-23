@@ -39,6 +39,7 @@ const AdminCredentials = admin_support.AdminCredentials;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
 const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
 const HttpRequest = request_mod.HttpRequest;
+const applyLetsEncryptDefaultCertPaths = acme_mod.applyLetsEncryptDefaultCertPaths;
 const activeIo = stream_runtime.activeIo;
 const bindThreadIo = stream_runtime.bindThreadIo;
 const connectFastcgiEndpoint = stream_runtime.connectFastcgiEndpoint;
@@ -142,6 +143,7 @@ fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg
     try loadConfig(io, candidate_allocator, &candidate, candidate.config_path);
     try loadConfiguredDomainConfigs(io, candidate_allocator, &candidate);
     normalizeConfig(&candidate);
+    try applyLetsEncryptDefaultCertPaths(candidate_allocator, &candidate);
     try validateConfig(&candidate);
 
     // Catch bad certificate paths before an operator asks a supervisor to
@@ -184,10 +186,20 @@ fn reloadConfigInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const
     try loadConfig(io, candidate_allocator, candidate, candidate.config_path);
     try loadConfiguredDomainConfigs(io, candidate_allocator, candidate);
     normalizeConfig(candidate);
+    try applyLetsEncryptDefaultCertPaths(candidate_allocator, candidate);
     try validateConfig(candidate);
     try validateReloadCompatibility(active, candidate);
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
     try runtime_state.config_store.activateOwned(allocator, arena, candidate);
+}
+
+fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
+    if (!active.tls_auto or !active.letsencrypt_renew) return error.AcmeRenewalDisabled;
+    if (active.letsencrypt_domains == null or active.letsencrypt_domains.?.len == 0) return error.AcmeRenewalDisabled;
+    if (active.letsencrypt_webroot.len == 0) return error.AcmeRenewalDisabled;
+
+    try acme_mod.runLetsEncryptRenewal(io, allocator, active, &runtime_state.server_metrics);
+    try reloadConfigInMemory(io, allocator, active);
 }
 
 const ReloadSignalWatcherContext = struct {
@@ -273,6 +285,7 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .close_stream = streamClose,
         .read_stream = streamRead,
         .reload_config = reloadConfigInMemory,
+        .renew_certs = renewCertificatesInMemory,
         .render_metrics = adminRenderMetrics,
         .request_restart = adminRequestRestart,
         .runtime_view = adminRuntimeView,

@@ -20,6 +20,7 @@ pub const Callbacks = struct {
     close_stream: *const fn (std.Io.net.Stream) void,
     read_stream: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     reload_config: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
+    renew_certs: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
     render_metrics: *const fn (std.mem.Allocator) anyerror![]const u8,
     request_restart: *const fn () void,
     runtime_view: *const fn () admin_pages.RuntimeView,
@@ -132,6 +133,21 @@ fn handleReloadPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Al
 
     const active_cfg = callbacks.active_config();
     try callbacks.send_dashboard_page(io, stream, allocator, active_cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK", close_connection, false);
+}
+
+fn handleCertRenewPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+    callbacks.renew_certs(io, allocator, cfg) catch |err| {
+        const message = switch (err) {
+            error.AcmeRenewalDisabled => "Certificate renewal is not enabled. Configure tls_auto, letsencrypt_domains, letsencrypt_webroot, and letsencrypt_renew first.",
+            else => try std.fmt.allocPrint(allocator, "Certificate renewal failed: {}", .{err}),
+        };
+        const allocated = err != error.AcmeRenewalDisabled;
+        defer if (allocated) allocator.free(message);
+        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        return;
+    };
+
+    try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK", close_connection, false);
 }
 
 fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
@@ -451,6 +467,10 @@ pub fn handleUi(
         try handleReloadPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/certs/renew")) {
+        try handleCertRenewPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/eject")) {
         try handleUpstreamControlPost(io, stream, allocator, cfg, credentials, req, .eject, close_connection, callbacks);
         return;
@@ -559,7 +579,7 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
     var token_it = std.mem.tokenizeAny(u8, command, " \t\r\n");
     const verb = token_it.next() orelse "";
     if (command.len == 0 or std.mem.eql(u8, verb, "help")) {
-        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, metrics, help\n", callbacks);
+        try sendText(stream, "commands: status, validate, validate-runtime, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, cert-renew, metrics, help\n", callbacks);
         return;
     }
 
@@ -643,6 +663,17 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
         const body = try admin_pages.renderCerts(allocator, cfg, callbacks.runtime_view());
         defer allocator.free(body);
         try sendText(stream, body, callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "cert-renew") or std.mem.eql(u8, verb, "renew-certs") or std.mem.eql(u8, verb, "acme-renew")) {
+        callbacks.renew_certs(callbacks.active_io(), allocator, cfg) catch |err| {
+            const body = try std.fmt.allocPrint(allocator, "ERROR certificate renewal failed: {}\n", .{err});
+            defer allocator.free(body);
+            try sendText(stream, body, callbacks);
+            return;
+        };
+        try sendText(stream, "OK certificate renewal completed and TLS material reloaded\n", callbacks);
         return;
     }
 

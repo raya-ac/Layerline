@@ -112,6 +112,17 @@ pub fn buildLetsEncryptRenewArgs(
     try appendLetsEncryptWebrootArgs(allocator, out, cfg.letsencrypt_webroot, cfg.letsencrypt_staging);
 }
 
+pub fn applyLetsEncryptDefaultCertPaths(allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
+    if (!cfg.tls_auto) return;
+    if (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0) return;
+    if (cfg.tls_cert != null and cfg.tls_key != null) return;
+
+    if (firstToken(cfg.letsencrypt_domains.?, ',', 0)) |domain| {
+        if (cfg.tls_cert == null) cfg.tls_cert = try std.fmt.allocPrint(allocator, "/etc/letsencrypt/live/{s}/fullchain.pem", .{domain});
+        if (cfg.tls_key == null) cfg.tls_key = try std.fmt.allocPrint(allocator, "/etc/letsencrypt/live/{s}/privkey.pem", .{domain});
+    }
+}
+
 pub fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) ![]const u8 {
     var full_args = std.ArrayList([]const u8).empty;
     defer full_args.deinit(allocator);
@@ -385,12 +396,7 @@ pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Se
         if (err != error.PathAlreadyExists) return err;
     };
 
-    if (cfg.tls_cert == null or cfg.tls_key == null) {
-        if (firstToken(cfg.letsencrypt_domains.?, ',', 0)) |domain| {
-            if (cfg.tls_cert == null) cfg.tls_cert = try std.fmt.allocPrint(allocator, "/etc/letsencrypt/live/{s}/fullchain.pem", .{domain});
-            if (cfg.tls_key == null) cfg.tls_key = try std.fmt.allocPrint(allocator, "/etc/letsencrypt/live/{s}/privkey.pem", .{domain});
-        }
-    }
+    try applyLetsEncryptDefaultCertPaths(allocator, cfg);
 
     var domains = std.ArrayList([]const u8).empty;
     defer {
@@ -426,5 +432,5 @@ pub fn runLetsEncryptRenewal(io: std.Io, allocator: std.mem.Allocator, cfg: *con
         return err;
     };
     metrics.acmeRenewalSucceeded();
-    std.debug.print("Let's Encrypt renewal completed. Restart or future hot reload is still required for already-loaded TLS material.\n", .{});
+    std.debug.print("Let's Encrypt renewal completed. Reload Layerline to activate renewed TLS material.\n", .{});
 }

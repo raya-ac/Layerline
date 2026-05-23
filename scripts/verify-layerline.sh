@@ -368,6 +368,11 @@ case "$ADMIN_CERTS" in
   *"global tls=false"*"acme renewals="*) ok "admin certs" ;;
   *) die "admin certs response was unexpected: $ADMIN_CERTS" ;;
 esac
+ADMIN_CERT_RENEW_DISABLED=$(printf 'cert-renew\n' | nc -U "$SOCKET")
+case "$ADMIN_CERT_RENEW_DISABLED" in
+  'ERROR certificate renewal failed: error.AcmeRenewalDisabled'*) ok "admin cert renew disabled guard" ;;
+  *) die "admin cert renew disabled response was unexpected: $ADMIN_CERT_RENEW_DISABLED" ;;
+esac
 
 ADMIN_METRICS=$(printf 'metrics\n' | nc -U "$SOCKET")
 case "$ADMIN_METRICS" in
@@ -403,6 +408,7 @@ grep -Fq 'Reload config' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not i
 grep -Fq 'redacted preview' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include redacted config previews"
 grep -Fq 'Live proxy targets' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include upstream controls"
 grep -Fq 'route verify_proxy' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose upstream report"
+grep -Fq 'Renew certificates' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include certificate renewal control"
 grep -Fq 'layerline_requests_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include metrics"
 grep -Fq 'layerline_response_cache_hits_total' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not include response-cache metrics"
 grep -Fq 'security=strict response_cache=false' "$ADMIN_DASH_BODY" || die "admin UI dashboard did not expose route-local policy"
