@@ -412,19 +412,19 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
 
     const response_cache_metrics = try std.fmt.allocPrint(
         allocator,
-        "# HELP layerline_response_cache_hits_total Static response-cache lookups served from memory.\n" ++
+        "# HELP layerline_response_cache_hits_total Static and buffered response-cache lookups served from memory.\n" ++
             "# TYPE layerline_response_cache_hits_total counter\n" ++
             "layerline_response_cache_hits_total {d}\n" ++
-            "# HELP layerline_response_cache_misses_total Static response-cache lookups that missed memory.\n" ++
+            "# HELP layerline_response_cache_misses_total Static and buffered response-cache lookups that missed memory.\n" ++
             "# TYPE layerline_response_cache_misses_total counter\n" ++
             "layerline_response_cache_misses_total {d}\n" ++
-            "# HELP layerline_response_cache_stores_total Static responses stored in memory cache.\n" ++
+            "# HELP layerline_response_cache_stores_total Static and buffered responses stored in memory cache.\n" ++
             "# TYPE layerline_response_cache_stores_total counter\n" ++
             "layerline_response_cache_stores_total {d}\n" ++
-            "# HELP layerline_response_cache_evictions_total Static response-cache entries evicted from memory.\n" ++
+            "# HELP layerline_response_cache_evictions_total Static and buffered response-cache entries evicted from memory.\n" ++
             "# TYPE layerline_response_cache_evictions_total counter\n" ++
             "layerline_response_cache_evictions_total {d}\n" ++
-            "# HELP layerline_response_cache_body_bytes_total Static response-cache body bytes served from memory.\n" ++
+            "# HELP layerline_response_cache_body_bytes_total Static and buffered response-cache body bytes served from memory.\n" ++
             "# TYPE layerline_response_cache_body_bytes_total counter\n" ++
             "layerline_response_cache_body_bytes_total {d}\n",
         .{

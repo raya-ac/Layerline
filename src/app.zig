@@ -572,6 +572,7 @@ fn http2RouterCallbacks() http2_router.Callbacks {
         .custom_not_found_response = h2DomainCustomNotFoundResponse,
         .error_response = h2CoolErrorResponse,
         .fetch_upstream_pool_response = fetchHttp2UpstreamPoolResponse,
+        .buffered_cache = &runtime_state.buffered_response_cache,
         .metrics = &runtime_state.server_metrics,
         .php_callbacks = phpCallbacks(),
         .read_acme_challenge = readAcmeChallengeForHttp2,
@@ -823,6 +824,7 @@ pub fn main(init: std.process.Init) !void {
     startReloadSignalWatcher(init.io);
     defer runtime_state.config_store.deinit();
     defer {
+        runtime_state.buffered_response_cache.deinit();
         runtime_state.static_response_cache.deinit();
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }

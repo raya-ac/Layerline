@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const buffered_cache = @import("buffered_cache.zig");
 const config_mod = @import("config.zig");
 const fastcgi = @import("fastcgi.zig");
 const h2_native = @import("h2_native.zig");
@@ -27,6 +28,7 @@ pub const Callbacks = struct {
     custom_not_found_response: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, ?*const DomainConfig) anyerror!?H2BufferedResponse,
     error_response: *const fn (std.mem.Allocator, u16, []const u8, []const u8) anyerror!H2BufferedResponse,
     fetch_upstream_pool_response: *const fn (std.mem.Allocator, *UpstreamPoolConfig, UpstreamPoolPolicy, UpstreamRuntimePolicy, HttpRequest, *const ServerConfig) anyerror!H2BufferedResponse,
+    buffered_cache: *buffered_cache.Store,
     metrics: *metrics_mod.ServerMetrics,
     php_callbacks: php_runtime.Callbacks,
     read_acme_challenge: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, []const u8) anyerror!H2BufferedResponse,
@@ -35,6 +37,58 @@ pub const Callbacks = struct {
     set_compression_policy: *const fn (CompressionPolicy) void,
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
 };
+
+fn fetchBufferedMicrocache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
+    route: ?*const RouteConfig,
+    scope: []const u8,
+    req: HttpRequest,
+    callbacks: Callbacks,
+) !?H2BufferedResponse {
+    const policy = static_cache.policyForConfig(cfg, domain, route);
+    if (!buffered_cache.requestCanUse(req, policy)) return null;
+
+    const key = try buffered_cache.makeKey(allocator, scope, req);
+    defer allocator.free(key);
+    const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    if (try callbacks.buffered_cache.fetch(allocator, key, now_ms, policy)) |cached| {
+        callbacks.metrics.responseCacheHit(cached.body.len);
+        return cached;
+    }
+    callbacks.metrics.responseCacheMiss();
+    return null;
+}
+
+fn storeBufferedMicrocache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    domain: ?*const DomainConfig,
+    route: ?*const RouteConfig,
+    scope: []const u8,
+    req: HttpRequest,
+    response: H2BufferedResponse,
+    callbacks: Callbacks,
+) !H2BufferedResponse {
+    const policy = static_cache.policyForConfig(cfg, domain, route);
+    if (!buffered_cache.requestCanUse(req, policy)) return response;
+
+    const key = try buffered_cache.makeKey(allocator, scope, req);
+    defer allocator.free(key);
+    const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const outcome = try callbacks.buffered_cache.store(key, response, now_ms, policy);
+    if (outcome.result != .stored) return response;
+
+    callbacks.metrics.responseCacheStore();
+    var eviction_index: usize = 0;
+    while (eviction_index < outcome.evictions) : (eviction_index += 1) callbacks.metrics.responseCacheEviction();
+
+    const cache_status = try buffered_cache.cacheStatusStored(allocator, policy);
+    return buffered_cache.withCacheStatus(allocator, response, cache_status);
+}
 
 pub fn buildResponseForRequest(
     io: std.Io,
@@ -80,8 +134,13 @@ pub fn buildResponseForRequest(
 
     if (domain != null) {
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
+            if (try fetchBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, callbacks)) |cached| {
+                callbacks.access_log_set_handler("domain_proxy_cache");
+                return cached;
+            }
             callbacks.access_log_set_handler("domain_proxy");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            return storeBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, response, callbacks);
         }
     }
 
@@ -112,10 +171,15 @@ pub fn buildResponseForRequest(
         }
         if (std.mem.eql(u8, req.path, "/api/echo")) {
             callbacks.access_log_set_handler("api_echo");
-            if (request_mod.findQueryValue(req.query, "msg")) |msg| {
-                return .{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg}) };
+            if (try fetchBufferedMicrocache(io, allocator, cfg, domain, null, "builtin:api_echo", req, callbacks)) |cached| {
+                callbacks.access_log_set_handler("api_echo_cache");
+                return cached;
             }
-            return h2_support.textResponse(200, "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n");
+            const response = if (request_mod.findQueryValue(req.query, "msg")) |msg|
+                H2BufferedResponse{ .status_code = 200, .content_type = "application/json; charset=utf-8", .body = try std.fmt.allocPrint(allocator, "{{\"msg\":\"{s}\"}}\n", .{msg}) }
+            else
+                h2_support.textResponse(200, "text/plain; charset=utf-8", "try /api/echo?msg=your-text\n");
+            return storeBufferedMicrocache(io, allocator, cfg, domain, null, "builtin:api_echo", req, response, callbacks);
         }
         if (std.mem.startsWith(u8, req.path, "/static/")) {
             callbacks.access_log_set_handler("static");
@@ -137,8 +201,13 @@ pub fn buildResponseForRequest(
             return response;
         }
         if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
+            if (try fetchBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, callbacks)) |cached| {
+                callbacks.access_log_set_handler("domain_proxy_cache");
+                return cached;
+            }
             callbacks.access_log_set_handler("domain_proxy");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            return storeBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, response, callbacks);
         }
         callbacks.access_log_set_handler("not_found");
         if (try callbacks.custom_not_found_response(io, allocator, cfg, domain)) |custom| return custom;
@@ -193,11 +262,18 @@ fn buildRouteResponse(
         },
         .proxy => {
             callbacks.access_log_set_handler("route_proxy");
+            const scope = try std.fmt.allocPrint(allocator, "route_proxy:{s}", .{route.name});
+            defer allocator.free(scope);
+            if (try fetchBufferedMicrocache(io, allocator, cfg, domain, route, scope, req, callbacks)) |cached| {
+                callbacks.access_log_set_handler("route_proxy_cache");
+                return cached;
+            }
             const pool = if (route.upstream) |*route_pool|
                 route_pool
             else
                 routing_mod.domainUpstreamMutable(cfg, domain) orelse return callbacks.error_response(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
-            return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
+            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
+            return storeBufferedMicrocache(io, allocator, cfg, domain, route, scope, req, response, callbacks);
         },
         .php => {
             callbacks.access_log_set_handler("route_php");

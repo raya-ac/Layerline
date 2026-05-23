@@ -251,6 +251,14 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   header_has "$H2_STATIC_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="response-cache"' || die "h2 static response-cache hit header missing"
   ok "h2c static cache status"
 
+  H2_DYNAMIC_STORE_HEADERS="$TMP_DIR/h2-dynamic-store.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_DYNAMIC_STORE_HEADERS" "http://$HOST:$PORT/api/echo?msg=microcache" >/dev/null
+  header_has "$H2_DYNAMIC_STORE_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 dynamic microcache store header missing"
+  H2_DYNAMIC_HIT_HEADERS="$TMP_DIR/h2-dynamic-hit.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_DYNAMIC_HIT_HEADERS" "http://$HOST:$PORT/api/echo?msg=microcache" >/dev/null
+  header_has "$H2_DYNAMIC_HIT_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="microcache"' || die "h2 dynamic microcache hit header missing"
+  ok "h2c dynamic microcache"
+
   H2_ROUTE_POLICY_HEADERS="$TMP_DIR/h2-route-policy.headers"
   curl -fsS --http2-prior-knowledge -D "$H2_ROUTE_POLICY_HEADERS" "http://$HOST:$PORT/nocache/hello.txt" >/dev/null
   header_has "$H2_ROUTE_POLICY_HEADERS" '^cache-status: Layerline; fwd=uri-miss; detail="static-file"' || die "h2 route response-cache disable did not bypass memory cache"

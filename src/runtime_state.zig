@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const access_log_mod = @import("access_log.zig");
+const buffered_cache_mod = @import("buffered_cache.zig");
 const config_store_mod = @import("config_store.zig");
 const config_mod = @import("config.zig");
 const metrics_mod = @import("metrics.zig");
@@ -25,6 +26,7 @@ pub var reload_requested = std.atomic.Value(bool).init(false);
 pub var server_metrics = metrics_mod.ServerMetrics.init();
 pub var fastcgi_keepalive_pool = config_mod.FastcgiKeepAlivePool.init();
 pub var static_response_cache = static_cache_mod.Store{};
+pub var buffered_response_cache = buffered_cache_mod.Store{};
 
 pub fn currentRequestId() []const u8 {
     return current_request_id;
