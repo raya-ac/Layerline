@@ -96,6 +96,7 @@ admin_ui = true
 admin_ui_path = /_layerline/admin
 admin_credentials_path = $ADMIN_CREDS
 access_log = $ACCESS_LOG
+cf_token = verify-secret-token
 http3 = true
 http3_port = $H3_PORT
 compression = true
@@ -174,6 +175,18 @@ CLI_ADMIN_OUT="$TMP_DIR/cli-admin-status.out"
 }
 grep -Fq '"server":"Layerline"' "$CLI_ADMIN_OUT" || die "CLI admin command did not return status JSON"
 ok "CLI admin command"
+
+CLI_CONFIG_OUT="$TMP_DIR/cli-admin-config.out"
+"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --admin-command config >"$CLI_CONFIG_OUT" 2>&1 || {
+  cat "$CLI_CONFIG_OUT" >&2
+  die "CLI admin config command failed"
+}
+grep -Fq 'Layerline redacted config' "$CLI_CONFIG_OUT" || die "CLI admin config output missing heading"
+grep -Fq 'cf_token = <redacted>' "$CLI_CONFIG_OUT" || die "CLI admin config did not redact cf_token"
+if grep -Fq 'verify-secret-token' "$CLI_CONFIG_OUT"; then
+  die "CLI admin config leaked a secret token"
+fi
+ok "CLI admin redacted config"
 
 ROOT_BODY="$TMP_DIR/root.body"
 curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
@@ -360,6 +373,23 @@ ADMIN_DIFF=$(printf 'diff\n' | nc -U "$SOCKET")
 case "$ADMIN_DIFF" in
   *'activation diff'*'no activation changes'*) ok "admin config diff" ;;
   *) die "admin config diff response was unexpected: $ADMIN_DIFF" ;;
+esac
+
+ADMIN_CONFIG=$(printf 'config\n' | nc -U "$SOCKET")
+case "$ADMIN_CONFIG" in
+  *'Layerline redacted config'*) ;;
+  *) die "admin config response was unexpected: $ADMIN_CONFIG" ;;
+esac
+case "$ADMIN_CONFIG" in
+  *'cf_token = <redacted>'*) ;;
+  *) die "admin config did not redact cf_token: $ADMIN_CONFIG" ;;
+esac
+case "$ADMIN_CONFIG" in
+  *'custom404.conf'*) ok "admin redacted config" ;;
+  *) die "admin config did not include enabled domain files: $ADMIN_CONFIG" ;;
+esac
+case "$ADMIN_CONFIG" in
+  *'verify-secret-token'*) die "admin config leaked a secret token" ;;
 esac
 
 ADMIN_ROUTES=$(printf 'routes\n' | nc -U "$SOCKET")

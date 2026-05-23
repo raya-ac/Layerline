@@ -36,7 +36,7 @@ Layerline blends local serving with edge-style deployment:
 - Request lifecycle caps like `--max-requests-per-connection` so keep-alive sockets are periodically rotated.
 - Socket-level header/body/idle/write/upstream timeouts plus SIGINT/SIGTERM graceful connection draining.
 - Built-in gzip compression policy for eligible buffered text responses on HTTP/1.1 and native HTTP/2, with global, domain, and route overrides.
-- Optional local Unix-socket admin surface for status, activation config validation, in-memory reload, `SIGHUP` reload, graceful restart, routes, upstream health/eject/recover, cert visibility/renewal, and metrics.
+- Optional local Unix-socket admin surface for status, activation config validation, redacted config inspection, in-memory reload, `SIGHUP` reload, graceful restart, routes, upstream health/eject/recover, cert visibility/renewal, and metrics.
 - Optional browser admin UI served by the same HTTP listener, disabled by default, with first-launch local account setup plus site, config, and upstream controls.
 - Opt-in structured JSON access logs with request IDs, method, path, protocol, status, bytes, latency, handler, and upstream target when proxying.
 - Static responses use kernel `sendfile` on Darwin before falling back to bounded buffered reads, can serve precompressed `.br`/`.gz` sidecars, include ETag/cache headers, `If-None-Match`, `Accept-Ranges`, single byte-range responses, and an opt-in in-memory response cache with domain/route overrides.
@@ -189,7 +189,7 @@ proxy = off
 #domain_config_dir = domains-enabled
 # optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
 #h2_upstream = http://127.0.0.1:9001
-# Local admin socket: status, validate activation config, diff activation config, restart, routes, upstreams, cert-renew, certs, metrics.
+# Local admin socket: status, validate activation config, diff activation config, redacted config inspection, restart, routes, upstreams, cert-renew, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Browser admin UI is disabled by default and creates access on first launch.
 #admin_ui = false
@@ -323,12 +323,13 @@ Set `admin_socket` to enable a local Unix socket for operational commands:
 admin_socket = /tmp/layerline-admin.sock
 ```
 
-Commands are one line each: `status`, `validate`, `validate-runtime`, `diff`, `reload`, `restart`, `routes`, `upstreams`, `upstream-eject`, `upstream-recover`, `certs`, `cert-renew`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config.
+Commands are one line each: `status`, `validate`, `validate-runtime`, `diff`, `config`, `reload`, `restart`, `routes`, `upstreams`, `upstream-eject`, `upstream-recover`, `certs`, `cert-renew`, `metrics`, and `help`. `validate` preflights the config file and TLS material that would be activated by a managed restart or reload; `validate-runtime` checks the already-loaded in-memory config. `config` returns the main config and enabled domain files with token, password, secret, credential, and private-key fields redacted.
 
 ```bash
 printf 'status\n' | nc -U /tmp/layerline-admin.sock
 printf 'reload\n' | nc -U /tmp/layerline-admin.sock
 printf 'diff\n' | nc -U /tmp/layerline-admin.sock
+printf 'config\n' | nc -U /tmp/layerline-admin.sock
 printf 'routes\n' | nc -U /tmp/layerline-admin.sock
 printf 'upstreams\n' | nc -U /tmp/layerline-admin.sock
 printf 'upstream-eject route api 0 60000\n' | nc -U /tmp/layerline-admin.sock

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
+const config_loader = @import("config_loader.zig");
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const request_mod = @import("request.zig");
@@ -11,6 +12,7 @@ const AdminConfigSetting = admin_support.AdminConfigSetting;
 const AdminCredentials = admin_support.AdminCredentials;
 const HttpRequest = request_mod.HttpRequest;
 const ServerConfig = config_mod.ServerConfig;
+const isDomainConfigFileName = config_loader.isDomainConfigFileName;
 const trimValue = http_headers.trimValue;
 
 pub const Callbacks = struct {
@@ -575,12 +577,77 @@ fn handleUpstreamControlCommand(stream: std.Io.net.Stream, allocator: std.mem.Al
     try sendText(stream, body, callbacks);
 }
 
+fn appendRedactedConfigFile(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, path: []const u8, max_bytes: usize) !void {
+    try out.print(allocator, "\n--- {s}: {s} ---\n", .{ label, path });
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => {
+            try out.appendSlice(allocator, "missing\n");
+            return;
+        },
+        error.FileTooBig => {
+            try out.appendSlice(allocator, "too large to preview\n");
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    try admin_support.appendRedactedConfigPlain(out, allocator, content);
+    if (content.len == 0 or content[content.len - 1] != '\n') try out.append(allocator, '\n');
+}
+
+fn appendDomainConfigPreviews(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    const dir_path = cfg.domain_config_dir orelse {
+        try out.appendSlice(allocator, "domain_config_dir = <not configured>\n");
+        return;
+    };
+    try out.print(allocator, "domain_config_dir = {s}\n", .{dir_path});
+
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {
+            try out.appendSlice(allocator, "domain_config_dir_status = missing\n");
+            return;
+        },
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var found = false;
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!isDomainConfigFileName(entry.name)) continue;
+        found = true;
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(path);
+        try appendRedactedConfigFile(io, out, allocator, "domain", path, admin_support.ADMIN_SITE_CONFIG_MAX_BYTES);
+        count += 1;
+        if (count >= 64) {
+            try out.appendSlice(allocator, "domain_config_status = truncated after 64 files\n");
+            break;
+        }
+    }
+    if (!found) try out.appendSlice(allocator, "domain_files = <none>\n");
+}
+
+fn renderRedactedConfig(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "Layerline redacted config\n");
+    try out.print(allocator, "main_config = {s}\n", .{cfg.config_path});
+    try appendDomainConfigPreviews(io, &out, allocator, cfg);
+    try appendRedactedConfigFile(io, &out, allocator, "main", cfg.config_path, admin_support.ADMIN_MAIN_CONFIG_MAX_BYTES);
+
+    return out.toOwnedSlice(allocator);
+}
+
 fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, command_raw: []const u8, callbacks: Callbacks) !void {
     const command = trimValue(command_raw);
     var token_it = std.mem.tokenizeAny(u8, command, " \t\r\n");
     const verb = token_it.next() orelse "";
     if (command.len == 0 or std.mem.eql(u8, verb, "help")) {
-        try sendText(stream, "commands: status, validate, validate-runtime, diff, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, cert-renew, metrics, help\n", callbacks);
+        try sendText(stream, "commands: status, validate, validate-runtime, diff, config, reload, restart, routes, upstreams, upstream-eject, upstream-recover, certs, cert-renew, metrics, help\n", callbacks);
         return;
     }
 
@@ -610,6 +677,18 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
             return;
         };
         try sendText(stream, "OK runtime config\n", callbacks);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "config") or std.mem.eql(u8, verb, "config-redacted") or std.mem.eql(u8, verb, "redacted-config") or std.mem.eql(u8, verb, "main-config")) {
+        const body = renderRedactedConfig(callbacks.active_io(), allocator, cfg) catch |err| {
+            const error_body = try std.fmt.allocPrint(allocator, "ERROR config unavailable: {}\n", .{err});
+            defer allocator.free(error_body);
+            try sendText(stream, error_body, callbacks);
+            return;
+        };
+        defer allocator.free(body);
+        try sendText(stream, body, callbacks);
         return;
     }
 

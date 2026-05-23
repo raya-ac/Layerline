@@ -59,32 +59,48 @@ fn adminConfigKeySensitive(key: []const u8) bool {
         asciiContainsIgnoreCase(key, "ssl_certificate_key");
 }
 
-pub fn appendRedactedConfigEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+fn appendRedactedLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, line: []const u8, comptime escape_html: bool) !void {
+    if (escape_html) {
+        try appendHtmlEscaped(out, allocator, line);
+    } else {
+        try out.appendSlice(allocator, line);
+    }
+}
+
+fn appendRedactedConfig(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8, comptime escape_html: bool) !void {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
         const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
         const trimmed = trimValue(line);
         if (trimmed.len == 0 or trimmed[0] == '#') {
-            try appendHtmlEscaped(out, allocator, line);
+            try appendRedactedLine(out, allocator, line, escape_html);
             try out.append(allocator, '\n');
             continue;
         }
 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            try appendHtmlEscaped(out, allocator, line);
+            try appendRedactedLine(out, allocator, line, escape_html);
             try out.append(allocator, '\n');
             continue;
         };
         const key = trimValue(line[0..eq]);
         if (adminConfigKeySensitive(key)) {
-            try appendHtmlEscaped(out, allocator, key);
-            try out.appendSlice(allocator, " = &lt;redacted&gt;\n");
+            try appendRedactedLine(out, allocator, key, escape_html);
+            try out.appendSlice(allocator, if (escape_html) " = &lt;redacted&gt;\n" else " = <redacted>\n");
             continue;
         }
 
-        try appendHtmlEscaped(out, allocator, line);
+        try appendRedactedLine(out, allocator, line, escape_html);
         try out.append(allocator, '\n');
     }
+}
+
+pub fn appendRedactedConfigEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+    try appendRedactedConfig(out, allocator, content, true);
+}
+
+pub fn appendRedactedConfigPlain(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8) !void {
+    try appendRedactedConfig(out, allocator, content, false);
 }
 
 pub fn adminTrimmedField(fields: []const FormField, name: []const u8) []const u8 {
@@ -531,15 +547,26 @@ test "admin site config builder emits domain file" {
 }
 
 test "admin config preview redacts sensitive keys" {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(std.testing.allocator);
+    var html_out = std.ArrayList(u8).empty;
+    defer html_out.deinit(std.testing.allocator);
 
-    try appendRedactedConfigEscaped(&out, std.testing.allocator, "server_name = example.test\ntls_key = /private/key.pem\ncf_token = secret\n");
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "server_name = example.test\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "tls_key = &lt;redacted&gt;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "cf_token = &lt;redacted&gt;\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "/private/key.pem") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "secret") == null);
+    const source = "server_name = example.test\ntls_key = /private/key.pem\ncf_token = secret\n";
+    try appendRedactedConfigEscaped(&html_out, std.testing.allocator, source);
+    try std.testing.expect(std.mem.indexOf(u8, html_out.items, "server_name = example.test\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_out.items, "tls_key = &lt;redacted&gt;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_out.items, "cf_token = &lt;redacted&gt;\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_out.items, "/private/key.pem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html_out.items, "secret") == null);
+
+    var text_out = std.ArrayList(u8).empty;
+    defer text_out.deinit(std.testing.allocator);
+
+    try appendRedactedConfigPlain(&text_out, std.testing.allocator, source);
+    try std.testing.expect(std.mem.indexOf(u8, text_out.items, "server_name = example.test\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_out.items, "tls_key = <redacted>\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_out.items, "cf_token = <redacted>\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_out.items, "/private/key.pem") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_out.items, "secret") == null);
 }
 
 test "admin settings merge preserves comments and replaces owned keys" {
