@@ -74,7 +74,7 @@ The next roadmap slice is protocol/cache depth: HTTP/3 out-of-order stream recov
 - `domains-available/example.conf` – sample per-domain config file.
 - `domains-enabled/` – nginx-style enabled domain config directory.
 - `scripts/benchmark-layerline.sh` – smoke and benchmark harness for HTTP/1 plus best-effort native HTTP/3 response checks.
-- `scripts/verify-layerline.sh` – self-starting conformance smoke for CLI doctor, HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, best-effort external HTTP/3 curl smoke, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
+- `scripts/verify-layerline.sh` – self-starting conformance smoke for CLI doctor/certs, HTTP/1, HEAD error framing, h2c, h2 request bodies, request IDs, gzip, admin socket/UI reload, static files, best-effort external HTTP/3 curl smoke, custom 404 documents, access logs, the HTTP redirect/ACME listener, and shutdown cleanup.
 - `docs/benchmarking.md` – benchmark runbook and environment knobs.
 - `docs/deployment.md` – Linux/macOS service deployment, limits, certs, smoke checks, and rollback.
 - `deploy/systemd/layerline.service` – production-oriented systemd unit template.
@@ -118,6 +118,7 @@ zig build run -- --validate-config
 zig build run -- --config server.conf --validate-config
 zig build run -- --config server.conf --doctor
 zig build run -- --dump-routes
+zig build run -- --certs
 ```
 
 Config files are strict: unknown keys, malformed lines, invalid booleans, invalid numbers, invalid headers, and invalid redirects fail with a line-numbered error.

@@ -153,6 +153,7 @@ Run these before moving traffic:
 ```bash
 /usr/local/bin/layerline --validate-config --config /etc/layerline/server.conf
 /usr/local/bin/layerline --doctor --config /etc/layerline/server.conf
+/usr/local/bin/layerline --certs --config /etc/layerline/server.conf
 curl -fsS http://127.0.0.1:8080/health
 curl -fsSI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/ | grep -i '^Content-Encoding: gzip'
 printf 'status\n' | nc -U /run/layerline/admin.sock

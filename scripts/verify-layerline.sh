@@ -149,6 +149,15 @@ DOCTOR_OUT="$TMP_DIR/doctor.out"
 grep -Fq 'Layerline doctor OK' "$DOCTOR_OUT" || die "layerline doctor did not report OK"
 ok "CLI doctor"
 
+CERTS_OUT="$TMP_DIR/certs.out"
+"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --certs >"$CERTS_OUT" 2>&1 || {
+  cat "$CERTS_OUT" >&2
+  die "layerline certs failed"
+}
+grep -Fq 'Layerline certificates:' "$CERTS_OUT" || die "layerline certs output missing heading"
+grep -Fq 'acme domains=' "$CERTS_OUT" || die "layerline certs output missing ACME line"
+ok "CLI certs"
+
 log "starting temporary server on http://$HOST:$PORT"
 (
   cd "$ROOT_DIR"

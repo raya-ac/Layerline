@@ -122,6 +122,53 @@ pub fn dumpRoutes(cfg: *const ServerConfig) void {
     }
 }
 
+fn optionalPath(value: ?[]const u8) []const u8 {
+    return value orelse "<none>";
+}
+
+fn configuredSecret(value: ?[]const u8) []const u8 {
+    return if (value != null) "<configured>" else "<none>";
+}
+
+pub fn dumpCerts(cfg: *const ServerConfig) void {
+    std.debug.print("Layerline certificates:\n", .{});
+    std.debug.print(
+        "  global tls={} tls_auto={} cert={s} key={s}\n",
+        .{
+            cfg.tls_enabled,
+            cfg.tls_auto,
+            optionalPath(cfg.tls_cert),
+            configuredSecret(cfg.tls_key),
+        },
+    );
+    std.debug.print(
+        "  acme domains={s} email={s} webroot={s} certbot={s} staging={} renew={} renew_interval_ms={d}\n",
+        .{
+            optionalPath(cfg.letsencrypt_domains),
+            cfg.letsencrypt_email orelse "<none>",
+            cfg.letsencrypt_webroot,
+            cfg.letsencrypt_certbot,
+            cfg.letsencrypt_staging,
+            cfg.letsencrypt_renew,
+            cfg.letsencrypt_renew_interval_ms,
+        },
+    );
+
+    if (cfg.domains.items.len == 0) {
+        std.debug.print("  domains: none\n", .{});
+        return;
+    }
+
+    for (cfg.domains.items) |*domain| {
+        std.debug.print("  server {s} cert={s} key={s} names=", .{ domain.name, optionalPath(domain.tls_cert), configuredSecret(domain.tls_key) });
+        for (domain.server_names.items, 0..) |server_name, index| {
+            if (index > 0) std.debug.print(",", .{});
+            std.debug.print("{s}", .{server_name});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
 fn printDoctorLine(status: []const u8, label: []const u8, detail: []const u8) void {
     std.debug.print("{s}: {s}", .{ status, label });
     if (detail.len > 0) std.debug.print(" - {s}", .{detail});
@@ -284,7 +331,7 @@ pub fn usage() void {
     std.debug.print(
         "Layerline HTTP server\n\n" ++
             "Usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] [--h2-upstream http://HOST:PORT[/path]] " ++
@@ -313,12 +360,13 @@ pub fn usage() void {
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_response_cache.NAME, server_security_headers.NAME, server_proxy.NAME, " ++
             "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_upstream_retries.NAME, server_upstream_max_failures.NAME, server_upstream_health_check.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_max_static_file_bytes.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_response_cache.DOMAIN.ROUTE, server_route_security_headers.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE, server_route_upstream_retries.DOMAIN.ROUTE, server_route_upstream_health_check.DOMAIN.ROUTE\n" ++
             "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "Native HTTP/3 serves static, health, redirect, and fallback page responses over QUIC on --http3-port.\n\n" ++
+            "Native HTTP/3 serves routed static, PHP/FastCGI, proxy, health, redirect, and fallback responses over QUIC on --http3-port.\n\n" ++
             "Examples:\n" ++
             "  zig build run\n" ++
             "  zig build run -- --validate-config\n" ++
             "  zig build run -- --doctor\n" ++
             "  zig build run -- --dump-routes\n" ++
+            "  zig build run -- --certs\n" ++
             "  zig build run -- --port 4000\n" ++
             "  zig build run -- --index index.php --serve-static true\n" ++
             "  zig build run -- --php-root public --php-bin php-cgi\n" ++
@@ -341,8 +389,8 @@ pub fn usage() void {
             "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
             "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
             "  and connection management policies.\n" ++
-            "  Native HTTP/3 currently covers static, health, redirect, and fallback page paths, with proxy/PHP\n" ++
-            "  and certificate trust/automation still kept separate from the HTTP/1 surface.\n",
+            "  Native HTTP/3 currently covers the buffered route surface, with out-of-order stream\n" ++
+            "  recovery and broader client conformance still being hardened.\n",
         .{},
     );
 }
