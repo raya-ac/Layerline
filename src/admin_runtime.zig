@@ -21,7 +21,7 @@ pub const Callbacks = struct {
     bind_thread_io: *const fn (std.Io) void,
     close_stream: *const fn (std.Io.net.Stream) void,
     read_stream: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
-    purge_caches: *const fn () usize,
+    purge_caches: *const fn ([]const u8) usize,
     reload_config: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
     render_config_diff: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror![]const u8,
     renew_certs: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
@@ -729,8 +729,13 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
     }
 
     if (std.mem.eql(u8, verb, "cache-purge") or std.mem.eql(u8, verb, "purge-cache") or std.mem.eql(u8, verb, "purge-caches")) {
-        const removed = callbacks.purge_caches();
-        const body = try std.fmt.allocPrint(allocator, "OK purged {d} cache entries\n", .{removed});
+        const raw_target = token_it.next() orelse "";
+        const target = if (std.ascii.eqlIgnoreCase(raw_target, "all")) "" else raw_target;
+        const removed = callbacks.purge_caches(target);
+        const body = if (target.len == 0)
+            try std.fmt.allocPrint(allocator, "OK purged {d} cache entries\n", .{removed})
+        else
+            try std.fmt.allocPrint(allocator, "OK purged {d} cache entries matching {s}\n", .{ removed, target });
         defer allocator.free(body);
         try sendText(stream, body, callbacks);
         return;

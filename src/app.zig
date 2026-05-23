@@ -287,9 +287,9 @@ fn adminRequestRestart() void {
     runtime_state.shutdown_requested.store(true, .release);
 }
 
-fn adminPurgeCaches() usize {
-    const static_removed = runtime_state.static_response_cache.clear();
-    const buffered_removed = runtime_state.buffered_response_cache.clear();
+fn adminPurgeCaches(target: []const u8) usize {
+    const static_removed = runtime_state.static_response_cache.clearMatching(target);
+    const buffered_removed = runtime_state.buffered_response_cache.clearMatching(target);
     return static_removed + buffered_removed;
 }
 

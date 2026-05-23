@@ -257,6 +257,14 @@ if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_DYNAMIC_HIT_HEADERS="$TMP_DIR/h2-dynamic-hit.headers"
   curl -fsS --http2-prior-knowledge -D "$H2_DYNAMIC_HIT_HEADERS" "http://$HOST:$PORT/api/echo?msg=microcache" >/dev/null
   header_has "$H2_DYNAMIC_HIT_HEADERS" '^cache-status: Layerline; hit; ttl=60; detail="microcache"' || die "h2 dynamic microcache hit header missing"
+  H2_SELECTIVE_PURGE=$(printf 'cache-purge microcache\n' | nc -U "$SOCKET")
+  case "$H2_SELECTIVE_PURGE" in
+    'OK purged '*" cache entries matching microcache"*) ;;
+    *) die "admin selective cache purge response was unexpected: $H2_SELECTIVE_PURGE" ;;
+  esac
+  H2_DYNAMIC_REFILL_HEADERS="$TMP_DIR/h2-dynamic-refill.headers"
+  curl -fsS --http2-prior-knowledge -D "$H2_DYNAMIC_REFILL_HEADERS" "http://$HOST:$PORT/api/echo?msg=microcache" >/dev/null
+  header_has "$H2_DYNAMIC_REFILL_HEADERS" '^cache-status: Layerline; fwd=uri-miss; stored; ttl=60; detail="microcache"' || die "h2 dynamic microcache did not refill after selective purge"
   ok "h2c dynamic microcache"
 
   H2_ROUTE_POLICY_HEADERS="$TMP_DIR/h2-route-policy.headers"

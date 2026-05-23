@@ -126,6 +126,25 @@ pub const Store = struct {
         return removed;
     }
 
+    pub fn clearMatching(self: *Store, needle: []const u8) usize {
+        if (needle.len == 0) return self.clear();
+
+        self.lock();
+        defer self.mutex.unlock();
+
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            if (std.mem.indexOf(u8, self.entries.items[index].key, needle) != null) {
+                self.removeAtLocked(index);
+                removed += 1;
+                continue;
+            }
+            index += 1;
+        }
+        return removed;
+    }
+
     fn lock(self: *Store) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -196,12 +215,19 @@ test "static response cache stores, hits, and expires entries" {
     defer store.deinit();
 
     const policy = Policy{ .enabled = true, .max_bytes = 16, .max_entry_bytes = 16, .ttl_ms = 1000 };
-    try std.testing.expectEqual(StoreResult.stored, (try store.store("file", "\"etag\"", "body", 10, policy)).result);
+    try std.testing.expectEqual(StoreResult.stored, (try store.store("primary", "\"etag\"", "body", 10, policy)).result);
 
-    const hit = (try store.fetch(std.testing.allocator, "file", "\"etag\"", 20)).?;
+    const hit = (try store.fetch(std.testing.allocator, "primary", "\"etag\"", 20)).?;
     defer std.testing.allocator.free(hit);
     try std.testing.expectEqualStrings("body", hit);
 
-    try std.testing.expect(try store.fetch(std.testing.allocator, "file", "\"other\"", 20) == null);
-    try std.testing.expect(try store.fetch(std.testing.allocator, "file", "\"etag\"", 2000) == null);
+    try std.testing.expect(try store.fetch(std.testing.allocator, "primary", "\"other\"", 20) == null);
+    try std.testing.expectEqual(StoreResult.stored, (try store.store("other", "\"etag\"", "other", 20, policy)).result);
+    try std.testing.expectEqual(@as(usize, 1), store.clearMatching("primary"));
+    try std.testing.expect(try store.fetch(std.testing.allocator, "primary", "\"etag\"", 20) == null);
+
+    const other_hit = (try store.fetch(std.testing.allocator, "other", "\"etag\"", 20)).?;
+    defer std.testing.allocator.free(other_hit);
+    try std.testing.expectEqualStrings("other", other_hit);
+    try std.testing.expect(try store.fetch(std.testing.allocator, "other", "\"etag\"", 2000) == null);
 }

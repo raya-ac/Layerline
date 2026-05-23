@@ -117,6 +117,25 @@ pub const Store = struct {
         return removed;
     }
 
+    pub fn clearMatching(self: *Store, needle: []const u8) usize {
+        if (needle.len == 0) return self.clear();
+
+        self.lock();
+        defer self.mutex.unlock();
+
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            if (std.mem.indexOf(u8, self.entries.items[index].key, needle) != null) {
+                self.removeAtLocked(index);
+                removed += 1;
+                continue;
+            }
+            index += 1;
+        }
+        return removed;
+    }
+
     fn lock(self: *Store) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -268,7 +287,11 @@ test "buffered microcache stores, hits, and expires responses" {
     try std.testing.expectEqualStrings("cache-status", hit.headers[hit.headers.len - 1].name);
     try std.testing.expectEqualStrings("Layerline; hit; ttl=1; detail=\"microcache\"", hit.headers[hit.headers.len - 1].value);
 
-    try std.testing.expect(try store.fetch(arena.allocator(), "api|host|/path", 2000, policy) == null);
+    try std.testing.expectEqual(StoreResult.stored, (try store.store("api|host|/other", response, 20, policy)).result);
+    try std.testing.expectEqual(@as(usize, 1), store.clearMatching("/path"));
+    try std.testing.expect(try store.fetch(arena.allocator(), "api|host|/path", 20, policy) == null);
+    try std.testing.expect(try store.fetch(arena.allocator(), "api|host|/other", 20, policy) != null);
+    try std.testing.expect(try store.fetch(arena.allocator(), "api|host|/other", 2000, policy) == null);
 }
 
 test "buffered microcache bypasses private request and response state" {
