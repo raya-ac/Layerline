@@ -21,7 +21,7 @@ fn staticResponseHeaders(allocator: std.mem.Allocator, etag: []const u8, last_mo
     headers[0] = .{ .name = "accept-ranges", .value = "bytes" };
     headers[1] = .{ .name = "etag", .value = etag };
     headers[2] = .{ .name = "last-modified", .value = last_modified };
-    headers[3] = .{ .name = "cache-control", .value = "public, max-age=60" };
+    headers[3] = .{ .name = "cache-control", .value = "public, max-age=3600" };
     headers[4] = .{ .name = "cache-status", .value = cache_status };
     headers[5] = .{ .name = "vary", .value = "Accept-Encoding" };
     return headers;

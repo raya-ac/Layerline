@@ -272,7 +272,7 @@ pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, las
             "Accept-Ranges: bytes\r\n" ++
                 "ETag: {s}\r\n" ++
                 "Last-Modified: {s}\r\n" ++
-                "Cache-Control: public, max-age=60\r\n" ++
+                "Cache-Control: public, max-age=3600\r\n" ++
                 "Cache-Status: {s}\r\n" ++
                 "Vary: Accept-Encoding\r\n" ++
                 "Content-Encoding: {s}\r\n",
@@ -285,7 +285,7 @@ pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, las
         "Accept-Ranges: bytes\r\n" ++
             "ETag: {s}\r\n" ++
             "Last-Modified: {s}\r\n" ++
-            "Cache-Control: public, max-age=60\r\n" ++
+            "Cache-Control: public, max-age=3600\r\n" ++
             "Cache-Status: {s}\r\n" ++
             "Vary: Accept-Encoding\r\n",
         .{ etag, last_modified, cache_status },
