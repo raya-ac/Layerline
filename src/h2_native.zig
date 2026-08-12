@@ -40,6 +40,10 @@ pub const DecodedHeaders = struct {
     headers: std.ArrayList(Header),
 
     pub fn deinit(self: *DecodedHeaders, allocator: std.mem.Allocator) void {
+        for (self.headers.items) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
         self.headers.deinit(allocator);
     }
 
@@ -283,7 +287,13 @@ pub const HpackDecoder = struct {
 
     pub fn decodeHeaderBlock(self: *HpackDecoder, allocator: std.mem.Allocator, block: []const u8) Error!DecodedHeaders {
         var headers = std.ArrayList(Header).empty;
-        errdefer headers.deinit(allocator);
+        errdefer {
+            for (headers.items) |header| {
+                allocator.free(header.name);
+                allocator.free(header.value);
+            }
+            headers.deinit(allocator);
+        }
 
         var offset: usize = 0;
         while (offset < block.len) {
@@ -291,7 +301,7 @@ pub const HpackDecoder = struct {
             if ((byte & 0x80) != 0) {
                 const decoded = try decodeInteger(block[offset..], 7);
                 const entry = try self.indexedEntry(decoded.value);
-                try appendDecoded(&headers, allocator, entry.name, entry.value);
+                try appendDecodedCopy(&headers, allocator, entry.name, entry.value);
                 offset += decoded.len;
                 continue;
             }
@@ -312,16 +322,21 @@ pub const HpackDecoder = struct {
             const name_index = try decodeInteger(block[offset..], prefix_bits);
             offset += name_index.len;
 
-            const name = if (name_index.value == 0) blk: {
+            const owned_name = if (name_index.value == 0) blk: {
                 const decoded_name = try decodeString(allocator, block[offset..]);
                 offset += decoded_name.len;
                 break :blk decoded_name.value;
-            } else try self.indexedName(name_index.value);
+            } else try allocator.dupe(u8, try self.indexedName(name_index.value));
+            errdefer allocator.free(owned_name);
 
             const decoded_value = try decodeString(allocator, block[offset..]);
+            errdefer allocator.free(decoded_value.value);
             offset += decoded_value.len;
-            try appendDecoded(&headers, allocator, name, decoded_value.value);
-            if (uses_incremental_indexing) try self.insertDynamic(name, decoded_value.value);
+            try appendDecodedOwned(&headers, allocator, owned_name, decoded_value.value);
+            errdefer headers.items.len -= 1;
+            if (uses_incremental_indexing) {
+                try self.insertDynamic(owned_name, decoded_value.value);
+            }
         }
 
         return .{ .headers = headers };
@@ -452,9 +467,17 @@ fn decodeString(allocator: std.mem.Allocator, input: []const u8) Error!struct { 
     return .{ .value = value, .len = end };
 }
 
-fn appendDecoded(headers: *std.ArrayList(Header), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+fn appendDecodedOwned(headers: *std.ArrayList(Header), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
     if (headers.items.len >= 128) return error.HeaderListTooLarge;
     try headers.append(allocator, .{ .name = name, .value = value });
+}
+
+fn appendDecodedCopy(headers: *std.ArrayList(Header), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    try appendDecodedOwned(headers, allocator, owned_name, owned_value);
 }
 
 pub fn decodeHeaderBlock(allocator: std.mem.Allocator, block: []const u8) Error!DecodedHeaders {
@@ -545,6 +568,31 @@ test "keeps HPACK dynamic table across header blocks" {
     var decoded_second = try decoder.decodeHeaderBlock(allocator, second.items);
     defer decoded_second.deinit(allocator);
     try std.testing.expectEqualStrings("example.test", decoded_second.get(":authority").?);
+}
+
+test "decoded dynamic headers survive same-block eviction" {
+    var decoder = HpackDecoder.init(std.testing.allocator);
+    defer decoder.deinit();
+    try decoder.setDynamicTableSize(96);
+
+    var seed = std.ArrayList(u8).empty;
+    defer seed.deinit(std.testing.allocator);
+    try encodeInteger(std.testing.allocator, &seed, 0x40, 6, 1);
+    try appendString(std.testing.allocator, &seed, "first.example");
+    var seeded = try decoder.decodeHeaderBlock(std.testing.allocator, seed.items);
+    seeded.deinit(std.testing.allocator);
+
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(std.testing.allocator);
+    try encodeInteger(std.testing.allocator, &block, 0x80, 7, STATIC_TABLE.len + 1);
+    try encodeInteger(std.testing.allocator, &block, 0x40, 6, 1);
+    try appendString(std.testing.allocator, &block, "second.example");
+
+    var decoded = try decoder.decodeHeaderBlock(std.testing.allocator, block.items);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("first.example", decoded.headers.items[0].value);
+    try std.testing.expectEqualStrings("second.example", decoded.headers.items[1].value);
+    try std.testing.expectEqualStrings("second.example", decoder.dynamic.items[0].value);
 }
 
 test "decodes HPACK Huffman string literals" {
