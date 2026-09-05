@@ -174,8 +174,13 @@ fn policyUsable(policy: Policy) bool {
 pub fn requestCanUse(req: request_mod.HttpRequest, policy: Policy) bool {
     if (!policyUsable(policy)) return false;
     if (!std.mem.eql(u8, req.method, "GET")) return false;
+    if (req.body.len != 0) return false;
     if (http_headers.findHeaderValue(req.headers, "Authorization") != null) return false;
     if (http_headers.findHeaderValue(req.headers, "Cookie") != null) return false;
+    // Conditional and partial responses need their own cache evaluation.
+    for ([_][]const u8{ "Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "Cache-Control", "Pragma" }) |name| {
+        if (http_headers.findHeaderValue(req.headers, name) != null) return false;
+    }
     return true;
 }
 
@@ -185,9 +190,25 @@ pub fn responseCanStore(response: BufferedResponse, policy: Policy) bool {
     if (response.body.len > policy.max_entry_bytes or response.body.len > policy.max_bytes) return false;
     if (findResponseHeader(response.headers, "set-cookie") != null) return false;
     if (findResponseHeader(response.headers, "vary") != null) return false;
-    if (findResponseHeader(response.headers, "cache-control")) |cache_control| {
-        if (http_headers.hasConnectionToken(cache_control, "no-store")) return false;
-        if (http_headers.hasConnectionToken(cache_control, "private")) return false;
+    if (findResponseHeader(response.headers, "content-encoding") != null) return false;
+    if (findResponseHeader(response.headers, "age") != null or findResponseHeader(response.headers, "expires") != null) return false;
+    for (response.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "cache-control")) continue;
+        var directives = std.mem.splitScalar(u8, header.value, ',');
+        while (directives.next()) |raw| {
+            const directive = http_headers.trimValue(raw);
+            const eq = std.mem.indexOfScalar(u8, directive, '=') orelse directive.len;
+            const name = http_headers.trimValue(directive[0..eq]);
+            if (std.ascii.eqlIgnoreCase(name, "no-store") or std.ascii.eqlIgnoreCase(name, "no-cache") or std.ascii.eqlIgnoreCase(name, "private")) return false;
+            if (std.ascii.eqlIgnoreCase(name, "max-age") or std.ascii.eqlIgnoreCase(name, "s-maxage")) {
+                if (eq == directive.len) return false;
+                const value = std.mem.trim(u8, http_headers.trimValue(directive[eq + 1 ..]), "\"");
+                const seconds = http_headers.parseDecimalLength(value) catch return false;
+                // Until entries carry origin freshness metadata, only cache
+                // when the configured lifetime fits inside the origin limit.
+                if (seconds == 0 or seconds < (@as(u64, policy.ttl_ms) + 999) / 1000) return false;
+            }
+        }
     }
     return true;
 }

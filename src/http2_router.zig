@@ -38,6 +38,24 @@ pub const Callbacks = struct {
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
 };
 
+fn configuredHeadersAllowMicrocache(allocator: std.mem.Allocator, cfg: *const ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig, policy: static_cache.Policy) !bool {
+    const configured = try config_mod.buildResponseHeaderContext(allocator, cfg, domain, route);
+    defer configured.deinit(allocator);
+    for (configured.items) |header| {
+        const headers = [_]h2_native.Header{.{ .name = header.name, .value = header.value }};
+        if (!buffered_cache.responseCanStore(.{ .status_code = 200, .content_type = "", .body = "", .headers = &headers }, policy)) return false;
+    }
+    return true;
+}
+
+fn microcacheKey(allocator: std.mem.Allocator, cfg: *const ServerConfig, scope: []const u8, req: HttpRequest) ![]u8 {
+    // Config snapshots remain allocated until shutdown. Their addresses keep
+    // in-flight fills from an old config out of the new config's cache.
+    const scoped = try std.fmt.allocPrint(allocator, "{x}:{s}", .{ @intFromPtr(cfg), scope });
+    defer allocator.free(scoped);
+    return buffered_cache.makeKey(allocator, scoped, req);
+}
+
 fn fetchBufferedMicrocache(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -50,8 +68,9 @@ fn fetchBufferedMicrocache(
 ) !?H2BufferedResponse {
     const policy = static_cache.policyForConfig(cfg, domain, route);
     if (!buffered_cache.requestCanUse(req, policy)) return null;
+    if (!try configuredHeadersAllowMicrocache(allocator, cfg, domain, route, policy)) return null;
 
-    const key = try buffered_cache.makeKey(allocator, scope, req);
+    const key = try microcacheKey(allocator, cfg, scope, req);
     defer allocator.free(key);
     const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     if (try callbacks.buffered_cache.fetch(allocator, key, now_ms, policy)) |cached| {
@@ -75,8 +94,9 @@ fn storeBufferedMicrocache(
 ) !H2BufferedResponse {
     const policy = static_cache.policyForConfig(cfg, domain, route);
     if (!buffered_cache.requestCanUse(req, policy)) return response;
+    if (!try configuredHeadersAllowMicrocache(allocator, cfg, domain, route, policy)) return response;
 
-    const key = try buffered_cache.makeKey(allocator, scope, req);
+    const key = try microcacheKey(allocator, cfg, scope, req);
     defer allocator.free(key);
     const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     const outcome = try callbacks.buffered_cache.store(key, response, now_ms, policy);

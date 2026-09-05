@@ -117,6 +117,8 @@ route_max_static_file_bytes.nocache = 2048
 route = verify_proxy /verify-proxy/* proxy
 route_proxy.verify_proxy = http://127.0.0.1:19000 http://127.0.0.1:19001
 route_upstream_policy.verify_proxy = least_connections
+route = verify_cache /verify-cache/* proxy
+route_proxy.verify_cache = http://127.0.0.1:19000
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT" "$SIGHUP_ROOT"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'

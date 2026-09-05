@@ -2,6 +2,8 @@
 """Wire-level regressions against a temporary verifier server; no dependencies."""
 import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
@@ -39,8 +41,8 @@ def literal(name, value):
     return b"\x00" + bytes([len(name)]) + name + bytes([len(value)]) + value
 
 
-def http2(extra):
-    fields = [(b":method", b"GET"), (b":scheme", b"http"), (b":authority", b"test"), (b":path", b"/health")]
+def http2(extra, path=b"/health"):
+    fields = [(b":method", b"GET"), (b":scheme", b"http"), (b":authority", b"test"), (b":path", path)]
     block = b"".join(literal(*field) for field in fields + extra)
     with socket.create_connection((HOST, PORT), timeout=3) as conn:
         conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, b"") + frame(1, 5, 1, block))
@@ -80,3 +82,42 @@ for extra in [
     assert http2(extra).startswith(b"\x8c"), ("HTTP/2 invalid fields were accepted", extra)
 
 print("ok: wire-level HTTP/1 framing, authority routing, and HTTP/2 header validation")
+
+counts = {}
+
+
+class Origin(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.path = self.path.removeprefix("/verify-cache")
+        counts[self.path] = counts.get(self.path, 0) + 1
+        body = b"origin response"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        directives = {"/private": 'private="x-user"', "/no-cache": "no-cache", "/short": "s-maxage=1"}
+        if self.path in directives:
+            self.send_header("Cache-Control", directives[self.path])
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+origin = ThreadingHTTPServer(("127.0.0.1", 19000), Origin)
+thread = threading.Thread(target=origin.serve_forever, daemon=True)
+thread.start()
+try:
+    for path in ["/public", "/private", "/no-cache", "/short"]:
+        for _ in range(2):
+            response = http2([], ("/verify-cache" + path).encode())
+            assert response.startswith(b"\x88"), (path, response)
+        assert counts[path] == (1 if path == "/public" else 2), (path, counts[path])
+    http2([(b"cache-control", b"no-cache")], b"/verify-cache/public")
+    assert counts["/public"] == 2, "request no-cache must reach the origin"
+finally:
+    origin.shutdown()
+    origin.server_close()
+    thread.join(timeout=3)
+print("ok: proxy microcache stores public responses and bypasses origin privacy/freshness restrictions")

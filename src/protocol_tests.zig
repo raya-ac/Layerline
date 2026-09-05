@@ -2,6 +2,22 @@ const std = @import("std");
 const request = @import("request.zig");
 const h2 = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
+const cache = @import("buffered_cache.zig");
+
+test "microcache obeys privacy across repeated Cache-Control fields" {
+    const policy: cache.Policy = .{ .enabled = true, .max_bytes = 4096, .max_entry_bytes = 1024, .ttl_ms = 60000 };
+    for ([_][]const u8{ "private", "private=\"x-user\"", "no-cache", "no-cache=\"etag\"", "no-store", "max-age=0", "s-maxage=30", "max-age=garbage" }) |value| {
+        const headers = [_]h2.Header{
+            .{ .name = "cache-control", .value = "public, max-age=3600" },
+            .{ .name = "Cache-Control", .value = value },
+        };
+        try std.testing.expect(!cache.responseCanStore(.{ .status_code = 200, .content_type = "text/plain", .body = "private", .headers = &headers }, policy));
+    }
+    try std.testing.expect(cache.responseCanStore(.{ .status_code = 200, .content_type = "text/plain", .body = "public" }, policy));
+    for ([_][]const u8{ "Range: bytes=0-1", "If-None-Match: x", "Cache-Control: no-cache", "Pragma: no-cache" }) |headers| {
+        try std.testing.expect(!cache.requestCanUse(.{ .method = "GET", .path = "/", .query = "", .headers = headers, .version = "HTTP/2.0", .body = "", .close_connection = false }, policy));
+    }
+}
 
 fn unexpectedRead(_: std.Io.net.Stream, _: []u8) !usize {
     return error.UnexpectedRead;
