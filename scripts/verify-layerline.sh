@@ -379,6 +379,8 @@ header_has "$CUSTOM_404_HEADERS" '^X-Request-Id: ll-' || die "domain custom 404 
 header_has "$CUSTOM_404_HEADERS" '^Cache-Control: stale-while-revalidate=45' || die "domain stale-while-revalidate Cache-Control header missing"
 ok "domain custom 404 document"
 
+python3 "$ROOT_DIR/scripts/verify-static.py" "$HOST" "$PORT"
+
 MIME_HEADERS="$TMP_DIR/mime.headers"
 curl -fsS -H 'Host: custom404.test' -D "$MIME_HEADERS" "http://$HOST:$PORT/font.woff2" >/dev/null
 header_has "$MIME_HEADERS" '^Content-Type: font/woff2' || die "woff2 static MIME type missing"

@@ -3,6 +3,16 @@ const request = @import("request.zig");
 const h2 = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
 const cache = @import("buffered_cache.zig");
+const static_files = @import("static_files.zig");
+
+test "static conditional precedence and weak ETags" {
+    const mtime = std.Io.Timestamp.fromNanoseconds(@as(i96, 784111777) * std.time.ns_per_s);
+    try std.testing.expect(!static_files.isNotModified("If-None-Match: \"old\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT", "\"new\"", mtime));
+    try std.testing.expect(static_files.isNotModified("If-None-Match: W/\"new\"", "\"new\"", mtime));
+    try std.testing.expect(static_files.etagMatches("\"a,b\", W/\"new\"", "\"new\""));
+    try std.testing.expect(!static_files.etagMatches("\"new\"garbage", "\"new\""));
+    try std.testing.expect(static_files.isNotModified("If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT", "\"new\"", mtime));
+}
 
 test "microcache obeys privacy across repeated Cache-Control fields" {
     const policy: cache.Policy = .{ .enabled = true, .max_bytes = 4096, .max_entry_bytes = 1024, .ttl_ms = 60000 };

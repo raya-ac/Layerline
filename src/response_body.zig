@@ -82,6 +82,7 @@ fn gzipCompressAlloc(allocator: std.mem.Allocator, body: []const u8, work_buffer
 pub fn prepare(allocator: std.mem.Allocator, options: PrepareOptions) !Prepared {
     const policy = options.compression_policy;
     if (!http_response.canSendBody(options.status_code, options.is_head) or
+        options.status_code == 206 or
         !policy.enabled or
         !policy.gzip_enabled or
         options.body.len < policy.min_bytes or

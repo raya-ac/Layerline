@@ -49,7 +49,7 @@ pub fn serveStatic(
         return err;
     };
 
-    const raw_range_header = http_headers.findHeaderValue(request_headers, "Range");
+    const raw_range_header = if (is_head) null else http_headers.findHeaderValue(request_headers, "Range");
     var selected_path = file_path;
     var encoded_path: ?[]const u8 = null;
     defer if (encoded_path) |path| allocator.free(path);
@@ -95,25 +95,13 @@ pub fn serveStatic(
         break :blk range_value;
     } else null;
 
-    if (http_headers.findHeaderValue(request_headers, "If-None-Match")) |if_none_match| {
-        if (static_files.etagMatches(if_none_match, etag)) {
-            const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
-            defer allocator.free(cache_status);
-            const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, last_modified, content_encoding, cache_status);
-            defer allocator.free(base_headers);
-            try callbacks.send_response_no_body_headers(stream, 304, "Not Modified", content_type, 0, close_connection, base_headers);
-            return;
-        }
-    }
-    if (http_headers.findHeaderValue(request_headers, "If-Modified-Since")) |if_modified_since| {
-        if (static_files.notModifiedSince(stat, if_modified_since)) {
-            const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
-            defer allocator.free(cache_status);
-            const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, last_modified, content_encoding, cache_status);
-            defer allocator.free(base_headers);
-            try callbacks.send_response_no_body_headers(stream, 304, "Not Modified", content_type, 0, close_connection, base_headers);
-            return;
-        }
+    if (static_files.isNotModified(request_headers, etag, stat.mtime)) {
+        const cache_status = try static_cache.cacheStatusStatic(allocator, content_encoding);
+        defer allocator.free(cache_status);
+        const base_headers = try static_files.makeStaticBaseHeaders(allocator, etag, last_modified, content_encoding, cache_status);
+        defer allocator.free(base_headers);
+        try callbacks.send_response_no_body_headers(stream, 304, "Not Modified", content_type, 0, close_connection, base_headers);
+        return;
     }
 
     if (range_header) |range_value| {

@@ -84,13 +84,18 @@ test "contentTypeFromPath recognizes common web assets" {
 // Single ranges cover the common browser/media case. Multi-range responses are
 // MIME multipart work, so they stay rejected until there is a real need.
 pub fn etagMatches(raw: []const u8, etag: []const u8) bool {
+    const expected = if (std.mem.startsWith(u8, etag, "W/")) etag[2..] else etag;
     var cursor = raw;
     while (cursor.len > 0) {
-        const comma_pos = std.mem.indexOfScalar(u8, cursor, ',') orelse cursor.len;
-        const item = http_headers.trimValue(cursor[0..comma_pos]);
-        if (std.mem.eql(u8, item, "*") or std.mem.eql(u8, item, etag)) return true;
-        if (comma_pos >= cursor.len) break;
-        cursor = cursor[comma_pos + 1 ..];
+        cursor = std.mem.trimStart(u8, cursor, " \t,");
+        if (std.mem.eql(u8, cursor, "*")) return true;
+        if (std.mem.startsWith(u8, cursor, "W/")) cursor = cursor[2..];
+        if (cursor.len < 2 or cursor[0] != '"') return false;
+        const end = (std.mem.indexOfScalar(u8, cursor[1..], '"') orelse return false) + 2;
+        const rest = std.mem.trimStart(u8, cursor[end..], " \t");
+        if (rest.len != 0 and rest[0] != ',') return false;
+        if (std.mem.eql(u8, cursor[0..end], expected)) return true;
+        cursor = rest;
     }
     return false;
 }
@@ -257,12 +262,23 @@ pub fn notModifiedSince(stat: std.Io.File.Stat, raw: []const u8) bool {
     return stat.mtime.toSeconds() <= requested_seconds;
 }
 
+pub fn isNotModified(headers: []const u8, etag: []const u8, mtime: std.Io.Timestamp) bool {
+    // Entity tags take precedence even when they do not match.
+    if (http_headers.findHeaderValue(headers, "If-None-Match")) |value| return etagMatches(value, etag);
+    if (http_headers.findHeaderValue(headers, "If-Modified-Since")) |value| {
+        const seconds = parseHttpDate(value) orelse return false;
+        return mtime.toSeconds() <= seconds;
+    }
+    return false;
+}
+
 pub fn ifRangeAllows(raw: []const u8, etag: []const u8, stat: std.Io.File.Stat) bool {
     const value = http_headers.trimValue(raw);
     if (value.len == 0) return false;
     if (std.mem.startsWith(u8, value, "W/")) return false;
     if (value[0] == '"') return std.mem.eql(u8, value, etag);
-    return notModifiedSince(stat, value);
+    const seconds = parseHttpDate(value) orelse return false;
+    return stat.mtime.toSeconds() == seconds;
 }
 
 pub fn makeStaticBaseHeaders(allocator: std.mem.Allocator, etag: []const u8, last_modified: []const u8, content_encoding: ?[]const u8, cache_status: []const u8) ![]const u8 {

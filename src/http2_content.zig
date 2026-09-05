@@ -45,6 +45,7 @@ pub fn readStaticFile(
     static_dir: []const u8,
     rel_path: []const u8,
     request_headers: []const u8,
+    is_head: bool,
     max_file_bytes: usize,
     metrics: *ServerMetrics,
     response_cache: *static_cache.Store,
@@ -72,19 +73,34 @@ pub fn readStaticFile(
     const file_len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
     const content_type = static_files.contentTypeFromPath(rel_path);
 
-    if (http_headers.findHeaderValue(request_headers, "if-none-match")) |if_none_match| {
-        if (static_files.etagMatches(if_none_match, etag)) {
-            const cache_status = try static_cache.cacheStatusStatic(allocator, null);
-            const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
-            return .{ .status_code = 304, .content_type = content_type, .body = "", .headers = headers };
-        }
+    if (static_files.isNotModified(request_headers, etag, stat.mtime)) {
+        const cache_status = try static_cache.cacheStatusStatic(allocator, null);
+        const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
+        return .{ .status_code = 304, .content_type = content_type, .body = "", .headers = headers };
     }
-    if (http_headers.findHeaderValue(request_headers, "if-modified-since")) |if_modified_since| {
-        if (static_files.notModifiedSince(stat, if_modified_since)) {
-            const cache_status = try static_cache.cacheStatusStatic(allocator, null);
-            const headers = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
-            return .{ .status_code = 304, .content_type = content_type, .body = "", .headers = headers };
-        }
+
+    const range_header = if (is_head) null else http_headers.findHeaderValue(request_headers, "Range");
+    const if_range = http_headers.findHeaderValue(request_headers, "If-Range");
+    if (range_header != null and (if_range == null or static_files.ifRangeAllows(if_range.?, etag, stat))) {
+        const range = static_files.parseByteRange(range_header.?, file_len) catch |err| {
+            if (err != error.RangeNotSatisfiable) return coolErrorResponse(allocator, server_name, server_tagline, 400, "Bad Request", "Invalid Range header.");
+            var response = try coolErrorResponse(allocator, server_name, server_tagline, 416, "Range Not Satisfiable", "Requested byte range cannot be served.");
+            const headers = try allocator.alloc(h2_native.Header, 1);
+            headers[0] = .{ .name = "content-range", .value = try std.fmt.allocPrint(allocator, "bytes */{d}", .{file_len}) };
+            response.headers = headers;
+            return response;
+        };
+        const data = try allocator.alloc(u8, range.end - range.start + 1);
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
+        defer file.close(io);
+        if (try file.readPositionalAll(io, data, range.start) != data.len) return error.UnexpectedEndOfFile;
+        const cache_status = try static_cache.cacheStatusStatic(allocator, null);
+        const base = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
+        const headers = try allocator.alloc(h2_native.Header, base.len + 1);
+        @memcpy(headers[0..base.len], base);
+        headers[base.len] = .{ .name = "content-range", .value = try std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, file_len }) };
+        metrics.staticBodySent(data.len, .buffered);
+        return .{ .status_code = 206, .content_type = content_type, .body = data, .headers = headers };
     }
 
     if (response_cache_policy.enabled and file_len <= response_cache_policy.max_entry_bytes) {

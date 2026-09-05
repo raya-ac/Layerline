@@ -24,19 +24,21 @@ pub fn statusClass(status_code: u16) u16 {
 }
 
 pub fn formatHttp1BaseHeaders(buffer: []u8, head: ResponseHead) ![]const u8 {
+    var length_buffer: [64]u8 = undefined;
+    const length_header = if (canSendBody(head.status_code, false)) try std.fmt.bufPrint(&length_buffer, "Content-Length: {d}\r\n", .{head.content_length}) else "";
     return std.fmt.bufPrint(
         buffer,
         "HTTP/1.1 {d} {s}\r\n" ++
             "Server: {s}\r\n" ++
             "Content-Type: {s}\r\n" ++
-            "Content-Length: {d}\r\n" ++
+            "{s}" ++
             "Connection: {s}\r\n",
         .{
             head.status_code,
             head.status_text,
             head.server,
             head.content_type,
-            head.content_length,
+            length_header,
             connectionValue(head.close_connection),
         },
     );

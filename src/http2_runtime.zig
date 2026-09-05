@@ -90,8 +90,10 @@ pub fn sendResponse(
 
     var len_buf: [32]u8 = undefined;
     const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
-    const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{body_len});
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
+    if (http_response.canSendBody(response.status_code, false)) {
+        const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{prepared.body.len});
+        try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
+    }
     if (ctx.request_id.len > 0) {
         try h2_support.appendHeader(allocator, &header_block, "x-request-id", ctx.request_id);
     }
