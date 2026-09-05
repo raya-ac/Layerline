@@ -137,9 +137,41 @@ pub fn textResponse(status_code: u16, content_type: []const u8, body: []const u8
 }
 
 pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.DecodedHeaders) !request_mod.HttpRequest {
+    var saw_regular = false;
+    var pseudo_seen: u4 = 0;
+    for (decoded.headers.items) |header| {
+        if (header.name.len == 0 or !http_headers.validFieldValue(header.value)) return error.BadRequest;
+        const pseudo = header.name[0] == ':';
+        for (header.name[@intFromBool(pseudo)..]) |byte| {
+            if (!http_headers.isHeaderNameByte(byte) or std.ascii.isUpper(byte)) return error.BadRequest;
+        }
+        if (pseudo) {
+            if (saw_regular) return error.BadRequest;
+            const bit: u4 = if (std.mem.eql(u8, header.name, ":method")) 1 else if (std.mem.eql(u8, header.name, ":scheme")) 2 else if (std.mem.eql(u8, header.name, ":authority")) 4 else if (std.mem.eql(u8, header.name, ":path")) 8 else return error.BadRequest;
+            if (pseudo_seen & bit != 0) return error.BadRequest;
+            pseudo_seen |= bit;
+        } else {
+            saw_regular = true;
+            for ([_][]const u8{ "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade" }) |forbidden| {
+                if (std.mem.eql(u8, header.name, forbidden)) return error.BadRequest;
+            }
+            if (std.mem.eql(u8, header.name, "te") and !std.ascii.eqlIgnoreCase(header.value, "trailers")) return error.BadRequest;
+        }
+    }
     const method = decoded.get(":method") orelse return error.BadRequest;
     const path_and_query = decoded.get(":path") orelse return error.BadRequest;
     const authority = decoded.get(":authority") orelse decoded.get("host") orelse "";
+    if (authority.len == 0 or method.len == 0 or path_and_query.len == 0) return error.BadRequest;
+    for (method) |byte| {
+        if (!http_headers.isHeaderNameByte(byte)) return error.BadRequest;
+    }
+    const target = request_mod.parseRequestTarget(path_and_query) catch return error.BadRequest;
+    if (target.authority != null or (std.mem.eql(u8, target.path, "*") and !std.mem.eql(u8, method, "OPTIONS"))) return error.BadRequest;
+    const scheme = decoded.get(":scheme") orelse return error.BadRequest;
+    if (!std.mem.eql(u8, scheme, "http") and !std.mem.eql(u8, scheme, "https")) return error.BadRequest;
+    if (decoded.get("host")) |host| {
+        if (!std.ascii.eqlIgnoreCase(host, authority)) return error.BadRequest;
+    }
 
     const query_pos = std.mem.indexOfScalar(u8, path_and_query, '?');
     const path = if (query_pos) |idx| path_and_query[0..idx] else path_and_query;
@@ -152,7 +184,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.Deco
     }
     for (decoded.headers.items) |header| {
         if (header.name.len > 0 and header.name[0] == ':') continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
         try headers.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
     }
 
@@ -222,7 +254,7 @@ pub fn parseRequestContentLength(headers: []const u8) !?usize {
         if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
 
         const value = http_headers.trimValue(trimmed[colon + 1 ..]);
-        const parsed = std.fmt.parseInt(usize, value, 10) catch return error.InvalidContentLength;
+        const parsed = try http_headers.parseDecimalLength(value);
         if (expected) |previous| {
             if (previous != parsed) return error.InvalidContentLength;
         } else {

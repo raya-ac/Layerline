@@ -133,6 +133,16 @@ pub fn build(b: *std.Build) void {
     const run_reactor_tests = b.addRunArtifact(reactor_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    // Unit roots do not analyze every runtime function in Zig.
+    test_step.dependOn(&exe.step);
+    const protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/protocol_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
     test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_config_loader_tests.step);
     test_step.dependOn(&run_h2_tests.step);

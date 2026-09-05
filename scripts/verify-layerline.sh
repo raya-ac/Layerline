@@ -217,6 +217,8 @@ printf 'GET not-a-target HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "
 grep -Fq '400 Bad Request' "$BAD_TARGET_RAW" || die "bad request target did not return 400"
 ok "HTTP/1 parser hardening"
 
+python3 "$ROOT_DIR/scripts/verify-protocol.py" "$HOST" "$PORT"
+
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
 header_has "$STATIC_HEADERS" '^Cache-Status: Layerline; fwd=uri-miss; stored; ttl=60; detail="response-cache"' || die "static Cache-Status store header missing"

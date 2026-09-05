@@ -93,6 +93,7 @@ pub fn isH2cUpgradeHeaders(headers: []const u8) bool {
 const RequestTarget = struct {
     path: []const u8,
     query: []const u8,
+    authority: ?[]const u8 = null,
 };
 
 fn splitPathAndQuery(value: []const u8) RequestTarget {
@@ -105,6 +106,9 @@ fn splitPathAndQuery(value: []const u8) RequestTarget {
 
 pub fn parseRequestTarget(value: []const u8) !RequestTarget {
     if (value.len == 0) return error.MalformedRequest;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f or byte == '#' or byte == '\\') return error.MalformedRequest;
+    }
     if (std.mem.eql(u8, value, "*")) return .{ .path = "*", .query = "" };
     if (value[0] == '/') return splitPathAndQuery(value);
 
@@ -120,17 +124,36 @@ pub fn parseRequestTarget(value: []const u8) !RequestTarget {
     const query_pos = std.mem.indexOfScalar(u8, rest, '?');
     const authority_end = @min(slash_pos orelse rest.len, query_pos orelse rest.len);
     if (authority_end == 0) return error.MalformedRequest;
+    const uri = std.Uri.parse(value) catch return error.MalformedRequest;
+    if (uri.host == null or uri.host.?.isEmpty() or uri.user != null or uri.password != null) return error.MalformedRequest;
+    var result = if (authority_end < rest.len and rest[authority_end] == '/')
+        splitPathAndQuery(rest[authority_end..])
+    else
+        RequestTarget{ .path = "/", .query = if (query_pos) |query| rest[query + 1 ..] else "" };
+    result.authority = rest[0..authority_end];
+    return result;
+}
 
-    if (slash_pos) |slash| {
-        if (query_pos) |query| {
-            if (query < slash) {
-                return .{ .path = "/", .query = if (query + 1 < rest.len) rest[query + 1 ..] else "" };
-            }
-        }
-        return splitPathAndQuery(rest[slash..]);
+fn normalizeTargetHost(allocator: std.mem.Allocator, headers: []const u8, target: RequestTarget) ![]const u8 {
+    const authority = target.authority orelse return headers;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "Host: {s}", .{authority});
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], "Host")) continue;
+        try out.print(allocator, "\r\n{s}", .{line});
     }
+    return out.toOwnedSlice(allocator);
+}
 
-    return .{ .path = "/", .query = if (query_pos) |query| if (query + 1 < rest.len) rest[query + 1 ..] else "" else "" };
+fn validateRequestLine(method: []const u8, target: []const u8, extra: ?[]const u8) !void {
+    if (method.len == 0 or extra != null) return error.MalformedRequest;
+    for (method) |byte| {
+        if (!http_headers.isHeaderNameByte(byte)) return error.MalformedRequest;
+    }
+    if (std.mem.eql(u8, target, "*") and !std.mem.eql(u8, method, "OPTIONS")) return error.MalformedRequest;
 }
 
 test "request target parser accepts origin, asterisk, and absolute forms" {
@@ -176,6 +199,7 @@ pub fn parse(
     }
 
     while (used < request_buffer.len) {
+        if (std.mem.indexOf(u8, request_buffer[0..used], "\r\n\r\n") != null) break;
         const n = try fns.read(stream, request_buffer[used..]);
         if (n == 0) return error.ConnectionClosed;
         used += n;
@@ -196,18 +220,21 @@ pub fn parse(
     const path_and_query = request_parts.next() orelse return error.MalformedRequest;
     const version = request_parts.next() orelse return error.MalformedRequest;
 
+    try validateRequestLine(method, path_and_query, request_parts.next());
     const target = try parseRequestTarget(path_and_query);
 
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
-    const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
+    var headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
     try http_headers.validateHeaderBlock(headers);
+    try http_headers.validateRequestFraming(headers);
 
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
     if (std.mem.startsWith(u8, version, "HTTP/1.1") and http_headers.findHeaderValue(headers, "Host") == null) {
         return error.MissingHostHeader;
     }
 
+    headers = try normalizeTargetHost(allocator, headers, target);
     if (isH2cUpgradeHeaders(headers)) {
         return HttpRequest{
             .method = method,
@@ -275,18 +302,21 @@ pub fn parseHeadersOnly(
     const path_and_query = request_parts.next() orelse return error.MalformedRequest;
     const version = request_parts.next() orelse return error.MalformedRequest;
 
+    try validateRequestLine(method, path_and_query, request_parts.next());
     const target = try parseRequestTarget(path_and_query);
 
     const headers_start = request_line_end + 2;
     const headers_end = if (header_end >= 4) header_end - 4 else 0;
-    const headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
+    var headers = if (headers_start <= headers_end) header_bytes[headers_start..headers_end] else "";
     try http_headers.validateHeaderBlock(headers);
+    try http_headers.validateRequestFraming(headers);
 
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return error.UnsupportedHttpVersion;
     if (std.mem.startsWith(u8, version, "HTTP/1.1") and http_headers.findHeaderValue(headers, "Host") == null) {
         return error.MissingHostHeader;
     }
 
+    headers = try normalizeTargetHost(allocator, headers, target);
     return HttpRequest{
         .method = method,
         .path = target.path,
