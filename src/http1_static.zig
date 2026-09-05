@@ -31,12 +31,14 @@ pub fn serveStatic(
     response_cache_policy: static_cache.Policy,
     callbacks: Callbacks,
 ) !void {
-    // Static paths are deliberately boring: no parent hops, no backslashes, no
-    // directory listings. If it is not a plain file, it is not served.
-    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null or std.mem.indexOfScalar(u8, rel_path, '\\') != null) {
+    static_files.validateStaticPath(rel_path) catch |err| {
+        if (err == error.PrivateStaticPath) {
+            try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
+            return;
+        }
         try callbacks.send_bad_request_for_method(allocator, stream, "Invalid static file path.", close_connection, is_head);
         return;
-    }
+    };
 
     const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
     defer allocator.free(file_path);

@@ -9,14 +9,14 @@ import tempfile
 with tempfile.TemporaryDirectory(prefix="layerline-static-") as directory:
     root = pathlib.Path(directory)
 
-    def fetch(protocol, fields=(), head=False):
+    def fetch(protocol, fields=(), head=False, path="/index.html", host="custom404.test"):
         (root / "body").write_bytes(b"")
-        command = ["curl", "-sS", "--max-time", "5", protocol, "-D", str(root / "headers"), "-o", str(root / "body"), "-w", "%{http_code}", "-H", "Host: custom404.test"]
+        command = ["curl", "-sS", "--max-time", "5", protocol, "-D", str(root / "headers"), "-o", str(root / "body"), "-w", "%{http_code}", "-H", f"Host: {host}"]
         if head:
             command.append("--head")
         for field in fields:
             command.extend(["-H", field])
-        command.append(f"http://{sys.argv[1]}:{sys.argv[2]}/index.html")
+        command.append(f"http://{sys.argv[1]}:{sys.argv[2]}{path}")
         status = int(subprocess.check_output(command))
         headers = {}
         for line in (root / "headers").read_text().splitlines():
@@ -48,3 +48,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-static-") as directory:
         assert status == 200 and headers["content-length"] == str(len(body))
         assert "content-range" not in headers
         print(f"ok: {protocol} validators, ranges, stale fallback, HEAD metadata, and bodyless 304")
+        for path, host in [("/nogzip/test.php", "localhost"), ("/.env", "custom404.test"), ("/.git/config", "custom404.test"), ("/source.PHP.bak", "custom404.test")]:
+            status, _, _ = fetch(protocol, path=path, host=host)
+            assert status == 404, (protocol, path, status)
+        status, _, document = fetch(protocol, path="/.well-known/security.txt")
+        assert status == 200 and document == b"public security contact\n"
+        print(f"ok: {protocol} blocks static PHP source and private files without blocking .well-known")

@@ -14,6 +14,43 @@ pub const ByteRange = struct {
     end: usize,
 };
 
+pub fn validateStaticPath(path: []const u8) !void {
+    if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, '\\') != null)
+        return error.InvalidStaticPath;
+    for (path) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidStaticPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    var index: usize = 0;
+    while (components.next()) |component| : (index += 1) {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return error.InvalidStaticPath;
+        if (component[0] == '.' and !(index == 0 and std.mem.eql(u8, component, ".well-known")))
+            return error.PrivateStaticPath;
+
+        // A static alias must never turn a PHP script into a source download.
+        // Check every suffix so compressed copies and backups stay private too.
+        var suffixes = std.mem.splitScalar(u8, component, '.');
+        _ = suffixes.next();
+        while (suffixes.next()) |suffix| {
+            if (std.ascii.eqlIgnoreCase(suffix, "php") or
+                std.ascii.eqlIgnoreCase(suffix, "phtml") or
+                std.ascii.eqlIgnoreCase(suffix, "phar") or
+                (suffix.len == 4 and std.ascii.eqlIgnoreCase(suffix[0..3], "php") and std.ascii.isDigit(suffix[3])))
+                return error.PrivateStaticPath;
+        }
+    }
+}
+
+test "static paths reject traversal, hidden files, and PHP source through aliases" {
+    for ([_][]const u8{ "", "/etc/passwd", "../file", "a/../file", "./file", "a\\file", "a//file", "a\x00b" }) |path|
+        try std.testing.expectError(error.InvalidStaticPath, validateStaticPath(path));
+    for ([_][]const u8{ ".env", ".git/config", "assets/.env", ".well-known/.secret", "test.php", "test.PHP", "test.php.gz", "test.php.bak", "test.php8", "test.phtml", "test.phar" }) |path|
+        try std.testing.expectError(error.PrivateStaticPath, validateStaticPath(path));
+    for ([_][]const u8{ "index.html", "assets/main.js", "release..txt", ".well-known/security.txt", ".well-known/acme-challenge/token", "php-logo.svg" }) |path|
+        try validateStaticPath(path);
+}
+
 pub fn contentTypeFromPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";

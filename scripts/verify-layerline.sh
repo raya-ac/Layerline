@@ -121,6 +121,11 @@ route = verify_cache /verify-cache/* proxy
 route_proxy.verify_cache = http://127.0.0.1:19000
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT" "$SIGHUP_ROOT"
+mkdir -p "$CUSTOM_ROOT/.git" "$CUSTOM_ROOT/.well-known"
+printf 'private fixture\n' >"$CUSTOM_ROOT/.env"
+printf 'private fixture\n' >"$CUSTOM_ROOT/.git/config"
+printf 'private fixture\n' >"$CUSTOM_ROOT/source.PHP.bak"
+printf 'public security contact\n' >"$CUSTOM_ROOT/.well-known/security.txt"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
 custom domain root
 HTML

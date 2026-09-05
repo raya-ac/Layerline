@@ -53,9 +53,11 @@ pub fn readStaticFile(
     server_name: []const u8,
     server_tagline: []const u8,
 ) !H2BufferedResponse {
-    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null or std.mem.indexOfScalar(u8, rel_path, '\\') != null) {
+    static_files.validateStaticPath(rel_path) catch |err| {
+        if (err == error.PrivateStaticPath)
+            return coolErrorResponse(allocator, server_name, server_tagline, 404, "Not Found", "The requested resource was not found on this server.");
         return coolErrorResponse(allocator, server_name, server_tagline, 400, "Bad Request", "Invalid static file path.");
-    }
+    };
 
     const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
     const stat = static_files.statRegularFile(io, file_path) catch |err| {
