@@ -1,4 +1,5 @@
 const std = @import("std");
+const hpack = @import("h2_native.zig");
 
 pub const Error = error{
     BufferTooSmall,
@@ -139,7 +140,9 @@ fn decodePrefixedInteger(input: []const u8, prefix_bits: u4) Error!PrefixedInteg
         if (offset >= input.len) return error.Truncated;
         const byte = input[offset];
         offset += 1;
-        value += @as(u64, byte & 0x7f) << shift;
+        const payload: u64 = byte & 0x7f;
+        if (payload > (std.math.maxInt(u64) - value) >> shift) return error.VarIntTooLarge;
+        value += payload << shift;
         if ((byte & 0x80) == 0) break;
         if (shift > 56) return error.VarIntTooLarge;
         shift += 7;
@@ -159,7 +162,7 @@ fn decodeStringLiteral(input: []const u8, prefix_bits: u4) Error!StringLiteral {
     const len_vi = try decodePrefixedInteger(input, prefix_bits);
     if (len_vi.value > std.math.maxInt(usize)) return error.VarIntTooLarge;
     const value_len: usize = @intCast(len_vi.value);
-    if (input.len < len_vi.len + value_len) return error.Truncated;
+    if (value_len > input.len - len_vi.len) return error.Truncated;
     return .{
         .value = input[len_vi.len .. len_vi.len + value_len],
         .len = len_vi.len + value_len,
@@ -269,8 +272,8 @@ fn appendLiteralHeader(
     value: []const u8,
 ) !void {
     // Literal Field Line With Literal Name, no Huffman, no indexing.
-    try out.append(allocator, 0x20);
-    try appendQpackString(allocator, out, name);
+    try hpack.encodeInteger(allocator, out, 0x20, 3, name.len);
+    try out.appendSlice(allocator, name);
     try appendQpackString(allocator, out, value);
 }
 
@@ -279,10 +282,7 @@ fn appendQpackString(
     out: *std.ArrayListUnmanaged(u8),
     value: []const u8,
 ) !void {
-    var len_buf: [8]u8 = undefined;
-    const len_len = try encodeVarInt(&len_buf, value.len);
-    len_buf[0] &= 0x7f;
-    try out.appendSlice(allocator, len_buf[0..len_len]);
+    try hpack.encodeInteger(allocator, out, 0, 7, value.len);
     try out.appendSlice(allocator, value);
 }
 
@@ -347,6 +347,33 @@ test "minimal QPACK literal header block starts with zero base state" {
     try std.testing.expect(encoded.len > 2);
     try std.testing.expectEqual(@as(u8, 0), encoded[0]);
     try std.testing.expectEqual(@as(u8, 0), encoded[1]);
+}
+
+test "QPACK literal fields use RFC9204 prefixed lengths" {
+    const encoded = try encodeLiteralHeaders(std.testing.allocator, &.{.{ .name = ":status", .value = "200" }});
+    defer std.testing.allocator.free(encoded);
+    // NameLen=7 saturates the 3-bit prefix and requires a zero continuation.
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x27\x00:status\x03200", encoded);
+}
+
+test "QPACK literal lengths cross prefix boundaries without QUIC varints" {
+    for ([_]usize{ 0, 6, 7, 8, 63, 64, 126, 127, 128, 255, 16384 }) |len| {
+        const value = try std.testing.allocator.alloc(u8, len);
+        defer std.testing.allocator.free(value);
+        @memset(value, 'a');
+        const encoded = try encodeLiteralHeaders(std.testing.allocator, &.{.{ .name = "x-test", .value = value }});
+        defer std.testing.allocator.free(encoded);
+        const decoded = try decodeHeaderBlock(std.testing.allocator, encoded);
+        defer std.testing.allocator.free(decoded);
+        try std.testing.expectEqualStrings("x-test", decoded[0].name);
+        try std.testing.expectEqualStrings(value, decoded[0].value);
+        if (len == 127) try std.testing.expectEqualSlices(u8, "\x7f\x00", encoded[9..11]);
+    }
+}
+
+test "QPACK rejects overflowing prefixed integers and truncated strings" {
+    try std.testing.expectError(error.VarIntTooLarge, decodePrefixedInteger("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f", 8));
+    try std.testing.expectError(error.Truncated, decodeHeaderBlock(std.testing.allocator, "\x00\x00\x27\x00short"));
 }
 
 test "minimal QPACK decoder reads static and literal request headers" {

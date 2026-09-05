@@ -136,10 +136,10 @@ pub fn textResponse(status_code: u16, content_type: []const u8, body: []const u8
     return .{ .status_code = status_code, .content_type = content_type, .body = body };
 }
 
-pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.DecodedHeaders) !request_mod.HttpRequest {
+pub fn validateRequestFields(fields: anytype) !void {
     var saw_regular = false;
     var pseudo_seen: u4 = 0;
-    for (decoded.headers.items) |header| {
+    for (fields) |header| {
         if (header.name.len == 0 or !http_headers.validFieldValue(header.value)) return error.BadRequest;
         const pseudo = header.name[0] == ':';
         for (header.name[@intFromBool(pseudo)..]) |byte| {
@@ -158,6 +158,10 @@ pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.Deco
             if (std.mem.eql(u8, header.name, "te") and !std.ascii.eqlIgnoreCase(header.value, "trailers")) return error.BadRequest;
         }
     }
+}
+
+pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.DecodedHeaders) !request_mod.HttpRequest {
+    try validateRequestFields(decoded.headers.items);
     const method = decoded.get(":method") orelse return error.BadRequest;
     const path_and_query = decoded.get(":path") orelse return error.BadRequest;
     const authority = decoded.get(":authority") orelse decoded.get("host") orelse "";

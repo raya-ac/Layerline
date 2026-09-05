@@ -264,6 +264,7 @@ fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, 
             if (saw_headers) continue;
             const headers = try h3_native.decodeHeaderBlock(allocator, frame_payload);
             defer allocator.free(headers);
+            try http2_support.validateRequestFields(headers);
 
             for (headers) |header| {
                 if (std.mem.eql(u8, header.name, ":method")) {
@@ -472,13 +473,14 @@ fn buildHttp3ResponseData(allocator: std.mem.Allocator, head: http_response.Resp
     const status = try std.fmt.bufPrint(&status_buf, "{d}", .{head.status_code});
     var length_buf: [32]u8 = undefined;
     const content_length = try std.fmt.bufPrint(&length_buf, "{d}", .{head.content_length});
-    const headers = try allocator.alloc(h3_native.Header, 4 + extra_headers.len);
+    const base_len: usize = if (http_response.canSendBody(head.status_code, false)) 4 else 3;
+    const headers = try allocator.alloc(h3_native.Header, base_len + extra_headers.len);
     defer allocator.free(headers);
     headers[0] = .{ .name = ":status", .value = status };
     headers[1] = .{ .name = "server", .value = head.server };
     headers[2] = .{ .name = "content-type", .value = head.content_type };
-    headers[3] = .{ .name = "content-length", .value = content_length };
-    if (extra_headers.len > 0) @memcpy(headers[4..], extra_headers);
+    if (base_len == 4) headers[3] = .{ .name = "content-length", .value = content_length };
+    if (extra_headers.len > 0) @memcpy(headers[base_len..], extra_headers);
 
     const headers_frame = try h3_native.buildHeadersFrame(allocator, headers);
     defer allocator.free(headers_frame);
@@ -488,7 +490,7 @@ fn buildHttp3ResponseData(allocator: std.mem.Allocator, head: http_response.Resp
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, headers_frame);
-    try out.appendSlice(allocator, data_frame);
+    if (body.len != 0) try out.appendSlice(allocator, data_frame);
     return out.toOwnedSlice(allocator);
 }
 
@@ -566,7 +568,7 @@ fn buildHttp3BufferedResponseData(
         .status_text = statusText(response.status_code),
         .server = server_header,
         .content_type = response.content_type,
-        .content_length = body.len,
+        .content_length = response.body.len,
         .close_connection = true,
     }, body, extra_headers[0..extra_len]);
 }
@@ -581,6 +583,32 @@ fn buildHttp3ErrorResponseData(
 ) ![]u8 {
     const response = try http2_content.coolErrorResponse(allocator, server_identity.name, server_identity.tagline, status_code, status_text, detail);
     return buildHttp3BufferedResponseData(allocator, server_header, response, is_head);
+}
+
+test "HTTP3 HEAD and 304 carry no DATA frames" {
+    for ([_]u16{ 200, 304 }) |status| {
+        const wire = try buildHttp3BufferedResponseData(std.testing.allocator, "Layerline", .{ .status_code = status, .content_type = "text/plain", .body = "hello" }, status == 200);
+        defer std.testing.allocator.free(wire);
+        const frame = try h3_native.decodeFrameHeader(wire);
+        try std.testing.expectEqual(wire.len, frame.len + frame.length);
+        const fields = try h3_native.decodeHeaderBlock(std.testing.allocator, wire[frame.len..]);
+        defer std.testing.allocator.free(fields);
+        var length: ?[]const u8 = null;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, "content-length")) length = field.value;
+        }
+        if (status == 200) try std.testing.expectEqualStrings("5", length.?) else try std.testing.expect(length == null);
+    }
+}
+
+test "HTTP3 refuses field values that would inject upstream headers" {
+    const frame = try h3_native.buildHeadersFrame(std.testing.allocator, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "x-test", .value = "value\r\nContent-Length: 20" },
+    });
+    defer std.testing.allocator.free(frame);
+    try std.testing.expectError(error.BadRequest, parseHttp3RequestStreamPayload(std.testing.allocator, 0, frame));
 }
 
 fn http3MethodCanUseBufferedRouter(method: []const u8, body_available: bool, declared_content_length: ?usize) bool {
@@ -1000,10 +1028,12 @@ fn testHttp3BodyRouterCallback(
 }
 
 test "HTTP/3 routed responses delegate to the buffered route builder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var cfg = config_mod.defaultServerConfig();
     const data = try buildHttp3RoutedResponseData(
         undefined,
-        std.testing.allocator,
+        arena.allocator(),
         &cfg,
         undefined,
         "Layerline",
@@ -1015,16 +1045,17 @@ test "HTTP/3 routed responses delegate to the buffered route builder" {
         },
         .{ .build_response_for_request = testHttp3BufferedRouterCallback },
     );
-    defer std.testing.allocator.free(data);
 
     try std.testing.expect(std.mem.indexOf(u8, data, "routed over h3\n") != null);
 }
 
 test "HTTP/3 routed responses accept parsed DATA bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var cfg = config_mod.defaultServerConfig();
     const data = try buildHttp3RoutedResponseData(
         undefined,
-        std.testing.allocator,
+        arena.allocator(),
         &cfg,
         undefined,
         "Layerline",
@@ -1039,7 +1070,6 @@ test "HTTP/3 routed responses accept parsed DATA bodies" {
         },
         .{ .build_response_for_request = testHttp3BodyRouterCallback },
     );
-    defer std.testing.allocator.free(data);
 
     try std.testing.expect(std.mem.indexOf(u8, data, "hello") != null);
 }
