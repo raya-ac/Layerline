@@ -4,7 +4,7 @@ Layerline is already the public edge for the controlled `layerline.dev` deployme
 
 ## Replacement Gate
 
-Layerline can replace Caddy for controlled sites now when the deployment accepts the current HTTP/3 limits and the set of config changes that still require a listener restart. For a broader drop-in replacement story, these gates need to pass:
+The [September 5 audit](audit-2026-09-05.md) found blockers beyond HTTP/3: HTTP/2 outbound flow control, admin bootstrap/session security, filesystem containment, and cache/snapshot memory bounds. Historical deployments are not general replacement acceptance, and their live state was not checked in this audit. These gates still need to pass:
 
 - Static files, PHP/FastCGI, reverse proxy routes, and HEAD/error response framing work from nginx-style per-domain config files.
 - TLS can load configured certs and keep serving HTTP/1.1 and HTTP/2 through ALPN.
@@ -38,4 +38,4 @@ Commit each section independently after tests and at least one live smoke where 
 
 ## Not Ready Means Not Ready
 
-Layerline is ready for narrow controlled services where the current HTTP/3 client matrix is acceptable and listener-bound changes can go through the managed restart bridge. It should not be described as a full Caddy/nginx replacement while HTTP/3 full protocol conformance, automated live certificate activation, and broader mutating operational admin controls are incomplete.
+Layerline should not be described as a general Caddy/nginx replacement while the audit blockers remain. Existing deployments need an explicit risk assessment and tested rollback; successful small HTTP requests alone do not establish HTTP/2 flow-control correctness, safe admin exposure, or resource bounds. HTTP/3 remains experimental until the configured-certificate and external-client gates pass.

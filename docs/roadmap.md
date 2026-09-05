@@ -2,6 +2,12 @@
 
 Layerline should become a production web server, not a demo binary. The target is broad compatibility with the useful nginx and Caddy surface area, then a set of Layerline-native features that make the server worth choosing on its own.
 
+## September 2026 Audit Gate
+
+The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
+
+The next work is HTTP/2 send-window accounting and bounded scheduling, followed by frame/stream conformance, admin bootstrap/session security, root-relative file containment, and cache/snapshot memory bounds. HTTP/3 remains experimental: configured certificate integration, Huffman decoding, flow control, and external client acceptance are incomplete. Disk caching and broad feature expansion follow these gates, not precede them.
+
 This plan is based on the current local code plus the public feature surfaces documented by Caddy and NGINX:
 
 - Caddy: automatic HTTPS, config API, pluggable modules, static file server, reverse proxy, HTTP/1.1, HTTP/2, HTTP/3, and FastCGI transport.
@@ -119,4 +125,4 @@ Sources:
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers CLI doctor/certs, HTTP/1, parser hardening for malformed headers and conflicting content lengths, HEAD 404 framing, static files, static conditional validators, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, redacted config inspection, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin UI cache purge, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone should be broader HTTP/3 client conformance, deeper parser/directive-table cleanup, and then disk-cache plus structured purge mechanics. The route-local policy layer is now in place, so new production features should hang from that effective policy path instead of adding global-only toggles.
+The next engineering milestone is the September audit gate above, beginning with HTTP/2 outbound flow control. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.
