@@ -14,6 +14,7 @@ const ResponseHeaderRule = config_mod.ResponseHeaderRule;
 const ServerConfig = config_mod.ServerConfig;
 
 pub const Context = struct {
+    read_error_document: ?*const fn (std.mem.Allocator, u16) anyerror!?[]u8 = null,
     server_name: []const u8,
     server_tagline: []const u8,
     server_header: []const u8,
@@ -62,7 +63,8 @@ pub fn sendCoolErrorWithConnection(
     extra_headers: ?[]const u8,
     ctx: Context,
 ) !void {
-    const body = try error_pages.render(allocator, ctx.server_name, ctx.server_tagline, status_code, status_text, detail);
+    const custom_body = if (ctx.read_error_document) |read| read(allocator, status_code) catch null else null;
+    const body = custom_body orelse try error_pages.render(allocator, ctx.server_name, ctx.server_tagline, status_code, status_text, detail);
     defer allocator.free(body);
 
     if (is_head) {

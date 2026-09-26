@@ -6,6 +6,7 @@ const http1_responses = @import("http1_responses.zig");
 const metrics_mod = @import("metrics.zig");
 const request_mod = @import("request.zig");
 const runtime_state = @import("runtime_state.zig");
+const routing_mod = @import("routing.zig");
 const server_assets = @import("server_assets.zig");
 const server_identity = @import("server_identity.zig");
 const stream_runtime = @import("stream_runtime.zig");
@@ -19,6 +20,7 @@ pub const compression_work_buffer_bytes = std.compress.flate.max_window_len;
 
 pub fn context() http1_responses.Context {
     return .{
+        .read_error_document = readErrorDocument,
         .server_name = server_identity.name,
         .server_tagline = server_identity.tagline,
         .server_header = server_identity.header,
@@ -31,6 +33,14 @@ pub fn context() http1_responses.Context {
         .emit_access_log = emitAccessLog,
         .stream_write_all = stream_runtime.streamWriteAll,
     };
+}
+
+pub fn readErrorDocument(allocator: std.mem.Allocator, code: u16) !?[]u8 {
+    if (code < 400 or code > 599 or runtime_state.current_request_headers.len == 0) return null;
+    if (runtime_state.config_store.active.load(.acquire) == 0) return null;
+    const cfg = runtime_state.activeConfig();
+    const domain = routing_mod.findDomainForRequest(cfg, runtime_state.current_request_headers) orelse return null;
+    return custom_errors.readDomainDocument(stream_runtime.activeIo(), allocator, cfg, domain, code) catch null;
 }
 
 pub fn streamWriteRequestIdHeader(stream: std.Io.net.Stream) !void {

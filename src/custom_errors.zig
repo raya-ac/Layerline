@@ -15,8 +15,9 @@ pub const Http1Callbacks = struct {
 };
 
 pub fn documentName(status_code: u16) ?[]const u8 {
+    @setEvalBranchQuota(100000);
     return switch (status_code) {
-        404 => "404.html",
+        inline 400...599 => |code| std.fmt.comptimePrint("{d}.html", .{code}),
         else => null,
     };
 }
@@ -38,7 +39,7 @@ pub fn readDomainDocument(
         if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
         return err;
     };
-    const max_document_bytes = config_mod.maxStaticFileBytesFor(cfg, domain, null);
+    const max_document_bytes = @min(64 * 1024, config_mod.maxStaticFileBytesFor(cfg, domain, null));
     if (stat.size > max_document_bytes) return null;
 
     return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_document_bytes)) catch |err| {

@@ -486,6 +486,7 @@ fn handleTlsClientHelloProbe(
 
 fn http2SendContext() http2_runtime.SendContext {
     return .{
+        .read_error_document = http1_response_bridge.readErrorDocument,
         .server_header = SERVER_HEADER,
         .request_id = runtime_state.current_request_id,
         .request_headers = runtime_state.current_request_headers,

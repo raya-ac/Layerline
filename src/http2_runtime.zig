@@ -20,6 +20,7 @@ const ResponseHeaderRule = config_mod.ResponseHeaderRule;
 const ServerConfig = config_mod.ServerConfig;
 
 pub const SendContext = struct {
+    read_error_document: ?*const fn (std.mem.Allocator, u16) anyerror!?[]u8 = null,
     server_header: []const u8,
     request_id: []const u8,
     request_headers: []const u8,
@@ -70,10 +71,18 @@ pub fn sendResponse(
     var header_block = std.ArrayList(u8).empty;
     defer header_block.deinit(allocator);
 
+    // Preserve upstream JSON and protocol headers; only replace HTML error bodies.
+    const custom_body = if (response.status_code >= 400 and response.status_code <= 599 and
+        std.mem.startsWith(u8, response.content_type, "text/html")) blk: {
+        if (ctx.read_error_document) |read| break :blk read(allocator, response.status_code) catch null;
+        break :blk null;
+    } else null;
+    defer if (custom_body) |body| allocator.free(body);
+
     const prepared = try response_body.prepare(allocator, .{
         .status_code = response.status_code,
         .content_type = response.content_type,
-        .body = response.body,
+        .body = custom_body orelse response.body,
         .is_head = is_head,
         .h2_headers = response.headers,
         .request_headers = ctx.request_headers,
