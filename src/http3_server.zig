@@ -8,6 +8,7 @@ const http2_content = @import("http2_content.zig");
 const http2_support = @import("http2_support.zig");
 const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
+const proxy_utils = @import("proxy_utils.zig");
 const quic_native = @import("quic_native.zig");
 const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
@@ -469,30 +470,18 @@ fn buildHttp3ControlStreamData(allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn buildHttp3ResponseData(allocator: std.mem.Allocator, head: http_response.ResponseHead, body: []const u8, extra_headers: []const h3_native.Header) ![]u8 {
-    var status_buf: [8]u8 = undefined;
-    const status = try std.fmt.bufPrint(&status_buf, "{d}", .{head.status_code});
-    var length_buf: [32]u8 = undefined;
-    const content_length = try std.fmt.bufPrint(&length_buf, "{d}", .{head.content_length});
-    const base_len: usize = if (http_response.canSendBody(head.status_code, false)) 4 else 3;
-    const headers = try allocator.alloc(h3_native.Header, base_len + extra_headers.len);
+fn appendHttp3HeaderFrame(allocator: std.mem.Allocator, out: *std.ArrayList(u8), fields: anytype) !void {
+    const headers = try allocator.alloc(h3_native.Header, fields.len);
     defer allocator.free(headers);
-    headers[0] = .{ .name = ":status", .value = status };
-    headers[1] = .{ .name = "server", .value = head.server };
-    headers[2] = .{ .name = "content-type", .value = head.content_type };
-    if (base_len == 4) headers[3] = .{ .name = "content-length", .value = content_length };
-    if (extra_headers.len > 0) @memcpy(headers[base_len..], extra_headers);
-
-    const headers_frame = try h3_native.buildHeadersFrame(allocator, headers);
-    defer allocator.free(headers_frame);
-    const data_frame = try h3_native.buildDataFrame(allocator, body);
-    defer allocator.free(data_frame);
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, headers_frame);
-    if (body.len != 0) try out.appendSlice(allocator, data_frame);
-    return out.toOwnedSlice(allocator);
+    var initialized: usize = 0;
+    defer for (headers[0..initialized]) |header| allocator.free(header.name);
+    for (fields, 0..) |field, i| {
+        headers[i] = .{ .name = try http2_support.lowerHeaderName(allocator, field.name), .value = field.value };
+        initialized += 1;
+    }
+    const frame = try h3_native.buildHeadersFrame(allocator, headers);
+    defer allocator.free(frame);
+    try out.appendSlice(allocator, frame);
 }
 
 fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator, server_header: []const u8, is_head: bool) ![]u8 {
@@ -520,32 +509,17 @@ fn buildHttp3DefaultResponseData(allocator: std.mem.Allocator, server_header: []
         \\</html>
     ;
 
-    return buildHttp3ResponseData(allocator, .{
+    return buildHttp3BufferedResponseData(allocator, server_header, .{
         .status_code = 200,
-        .status_text = "OK",
-        .server = server_header,
         .content_type = "text/html; charset=utf-8",
-        .content_length = if (is_head) 0 else body.len,
-        .close_connection = true,
-    }, if (is_head) "" else body, &.{});
-}
-
-fn statusText(status_code: u16) []const u8 {
-    return switch (status_code) {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        501 => "Not Implemented",
-        else => "OK",
-    };
+        .body = body,
+    }, is_head);
 }
 
 fn skipForwardedH3Header(name: []const u8) bool {
     return std.mem.startsWith(u8, name, ":") or
         std.ascii.eqlIgnoreCase(name, "server") or
-        std.ascii.eqlIgnoreCase(name, "content-type") or
-        std.ascii.eqlIgnoreCase(name, "content-length");
+        http2_support.isSkippedResponseHeader(name);
 }
 
 fn buildHttp3BufferedResponseData(
@@ -554,24 +528,60 @@ fn buildHttp3BufferedResponseData(
     response: H2BufferedResponse,
     is_head: bool,
 ) ![]u8 {
-    const extra_headers = try allocator.alloc(h3_native.Header, response.headers.len);
-    defer allocator.free(extra_headers);
-    var extra_len: usize = 0;
-    for (response.headers) |header| {
-        if (skipForwardedH3Header(header.name)) continue;
-        extra_headers[extra_len] = .{ .name = header.name, .value = header.value };
-        extra_len += 1;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (response.informational) |reply| {
+        if (reply.status_code == 100) continue;
+        if (reply.status_code < 102 or reply.status_code >= 200) return error.BadGateway;
+        const fields = try allocator.alloc(h3_native.Header, reply.headers.len + 1);
+        defer allocator.free(fields);
+        var status_buf: [8]u8 = undefined;
+        fields[0] = .{ .name = ":status", .value = try std.fmt.bufPrint(&status_buf, "{d}", .{reply.status_code}) };
+        var count: usize = 1;
+        for (reply.headers) |header| {
+            if (skipForwardedH3Header(header.name)) continue;
+            fields[count] = .{ .name = header.name, .value = header.value };
+            count += 1;
+        }
+        try appendHttp3HeaderFrame(allocator, &out, fields[0..count]);
     }
 
-    const body = if (http_response.canSendBody(response.status_code, is_head)) response.body else "";
-    return buildHttp3ResponseData(allocator, .{
-        .status_code = response.status_code,
-        .status_text = statusText(response.status_code),
-        .server = server_header,
-        .content_type = response.content_type,
-        .content_length = response.body.len,
-        .close_connection = true,
-    }, body, extra_headers[0..extra_len]);
+    const headers = try allocator.alloc(h3_native.Header, response.headers.len + 4);
+    defer allocator.free(headers);
+    var status_buf: [8]u8 = undefined;
+    var length_buf: [32]u8 = undefined;
+    headers[0] = .{ .name = ":status", .value = try std.fmt.bufPrint(&status_buf, "{d}", .{response.status_code}) };
+    headers[1] = .{ .name = "server", .value = server_header };
+    headers[2] = .{ .name = "content-type", .value = response.content_type };
+    var count: usize = 3;
+    const length: ?usize = if (response.omit_content_length) null else if (response.status_code == 304)
+        response.content_length
+    else if (http_response.canSendBody(response.status_code, false))
+        if (is_head) response.content_length orelse response.body.len else response.body.len
+    else
+        null;
+    if (length) |known| {
+        headers[count] = .{ .name = "content-length", .value = try std.fmt.bufPrint(&length_buf, "{d}", .{known}) };
+        count += 1;
+    }
+    for (response.headers) |header| {
+        if (skipForwardedH3Header(header.name)) continue;
+        headers[count] = .{ .name = header.name, .value = header.value };
+        count += 1;
+    }
+    try appendHttp3HeaderFrame(allocator, &out, headers[0..count]);
+    if (http_response.canSendBody(response.status_code, is_head)) {
+        if (response.body.len > 0) {
+            const data = try h3_native.buildDataFrame(allocator, response.body);
+            defer allocator.free(data);
+            try out.appendSlice(allocator, data);
+        }
+        if (response.trailers.len > 0) {
+            for (response.trailers) |header| if (proxy_utils.isForbiddenTrailer(header.name)) return error.BadGateway;
+            try appendHttp3HeaderFrame(allocator, &out, response.trailers);
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn buildHttp3ErrorResponseData(
@@ -588,7 +598,7 @@ fn buildHttp3ErrorResponseData(
 
 test "HTTP3 HEAD and 304 carry no DATA frames" {
     for ([_]u16{ 200, 304 }) |status| {
-        const wire = try buildHttp3BufferedResponseData(std.testing.allocator, "Layerline", .{ .status_code = status, .content_type = "text/plain", .body = "hello" }, status == 200);
+        const wire = try buildHttp3BufferedResponseData(std.testing.allocator, "Layerline", .{ .status_code = status, .content_type = "text/plain", .body = "hello", .trailers = &.{.{ .name = "digest", .value = "sha-test" }} }, status == 200);
         defer std.testing.allocator.free(wire);
         const frame = try h3_native.decodeFrameHeader(wire);
         try std.testing.expectEqual(wire.len, frame.len + frame.length);
@@ -599,6 +609,77 @@ test "HTTP3 HEAD and 304 carry no DATA frames" {
             if (std.mem.eql(u8, field.name, "content-length")) length = field.value;
         }
         if (status == 200) try std.testing.expectEqualStrings("5", length.?) else try std.testing.expect(length == null);
+    }
+}
+
+test "HTTP3 preserves known HEAD and 304 lengths without inventing unknown metadata" {
+    for ([_]H2BufferedResponse{
+        .{ .status_code = 200, .content_type = "text/plain", .body = "", .content_length = 77 },
+        .{ .status_code = 200, .content_type = "text/plain", .body = "", .omit_content_length = true },
+        .{ .status_code = 304, .content_type = "text/plain", .body = "", .content_length = 77 },
+    }) |response| {
+        const wire = try buildHttp3BufferedResponseData(std.testing.allocator, "Layerline", response, true);
+        defer std.testing.allocator.free(wire);
+        const frame = try h3_native.decodeFrameHeader(wire);
+        try std.testing.expectEqual(wire.len, frame.len + frame.length);
+        const fields = try h3_native.decodeHeaderBlock(std.testing.allocator, wire[frame.len..]);
+        defer std.testing.allocator.free(fields);
+        var length: ?[]const u8 = null;
+        for (fields) |field| if (std.mem.eql(u8, field.name, "content-length")) {
+            length = field.value;
+        };
+        if (response.omit_content_length) try std.testing.expect(length == null) else try std.testing.expectEqualStrings("77", length.?);
+    }
+}
+
+fn h3MetadataAllocationCheck(allocator: std.mem.Allocator) !void {
+    const response: H2BufferedResponse = .{
+        .status_code = 200,
+        .content_type = "text/plain",
+        .body = "okay",
+        .informational = &.{.{ .status_code = 103, .headers = &.{.{ .name = "Link", .value = "</a.css>; rel=preload" }} }},
+        .trailers = &.{.{ .name = "Digest", .value = "sha-test" }},
+    };
+    const wire = try buildHttp3BufferedResponseData(allocator, "Layerline", response, false);
+    defer allocator.free(wire);
+    var cursor: usize = 0;
+    for ([_]h3_native.FrameType{ .headers, .headers, .data, .headers }, 0..) |kind, i| {
+        const frame = try h3_native.decodeFrameHeader(wire[cursor..]);
+        try std.testing.expectEqual(@intFromEnum(kind), frame.frame_type);
+        const payload = wire[cursor + frame.len ..][0..frame.length];
+        if (kind == .data) {
+            try std.testing.expectEqualStrings("okay", payload);
+        } else {
+            const fields = try h3_native.decodeHeaderBlock(allocator, payload);
+            defer allocator.free(fields);
+            if (i == 0) {
+                try std.testing.expectEqualStrings("103", fields[0].value);
+                try std.testing.expectEqualStrings("link", fields[1].name);
+            } else if (i == 1) {
+                try std.testing.expectEqualStrings("200", fields[0].value);
+            } else {
+                try std.testing.expectEqual(1, fields.len);
+                try std.testing.expectEqualStrings("digest", fields[0].name);
+                try std.testing.expectEqualStrings("sha-test", fields[0].value);
+            }
+        }
+        cursor += frame.len + frame.length;
+    }
+    try std.testing.expectEqual(wire.len, cursor);
+}
+
+test "HTTP3 informational final DATA and trailer frames retain metadata under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, h3MetadataAllocationCheck, .{});
+}
+
+test "HTTP3 buffered responses cannot hide backend versions in trailer frames" {
+    for ([_][]const u8{ "Server", "X-Powered-By", "Content-Length" }) |name| {
+        try std.testing.expectError(error.BadGateway, buildHttp3BufferedResponseData(std.testing.allocator, "Layerline", .{
+            .status_code = 200,
+            .content_type = "text/plain",
+            .body = "body",
+            .trailers = &.{.{ .name = name, .value = "PHP/8.4.26" }},
+        }, false));
     }
 }
 

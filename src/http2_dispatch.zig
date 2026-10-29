@@ -6,6 +6,8 @@ const support = @import("http2_support.zig");
 const request = @import("request.zig");
 const read_interrupt = @import("read_interrupt.zig");
 const resource_budget = @import("resource_budget.zig");
+const h2 = @import("h2_native.zig");
+const write_deadline = @import("write_deadline.zig");
 
 pub const Result = struct {
     response: support.BufferedResponse,
@@ -31,6 +33,10 @@ const Job = struct {
     bytes: usize,
     canceled: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
+    progress_mutex: std.atomic.Mutex = .unlocked,
+    progress: std.ArrayList([]u8) = .empty,
+    progress_count: usize = 0,
+    progress_bytes: usize = 0,
     result: anyerror!Result = undefined,
 };
 
@@ -99,12 +105,18 @@ pub const Dispatcher = struct {
     }
 
     fn run(self: *Dispatcher, job: *Job) void {
+        var sink = ProgressContext{ .dispatcher = self, .job = job };
+        const previous = support.informational_sink;
+        support.informational_sink = .{ .context = &sink, .emit = publishInformational };
+        defer support.informational_sink = previous;
         job.result = if (job.canceled.load(.acquire)) error.Canceled else self.callbacks.prepare(self.io, job.arena.allocator(), self.cfg, job.req, self.env);
         job.done.store(true, .release);
         self.wake.signal();
     }
 
     fn destroy(self: *Dispatcher, job: *Job) void {
+        for (job.progress.items) |block| self.allocator.free(block);
+        job.progress.deinit(self.allocator);
         self.request_bytes -= job.bytes;
         job.arena.deinit();
         self.allocator.destroy(job);
@@ -120,7 +132,11 @@ pub const Dispatcher = struct {
     pub fn pump(self: *Dispatcher, stream: std.Io.net.Stream, flow: *flow_mod.State, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
         for (&self.jobs) |*maybe| {
             const job = maybe.* orelse continue;
+            try self.drainInformational(job, stream, flow, write);
             if (!job.done.load(.acquire)) continue;
+            // A final publication can race the first drain. The done acquire
+            // makes every preceding informational publication visible now.
+            try self.drainInformational(job, stream, flow, write);
             maybe.* = null;
             defer self.destroy(job);
             if (job.canceled.load(.acquire) or flow.find(job.stream_id) == null) continue;
@@ -131,6 +147,53 @@ pub const Dispatcher = struct {
             };
             try self.callbacks.deliver(stream, job.arena.allocator(), job.stream_id, job.req, result);
         }
+    }
+
+    const ProgressContext = struct { dispatcher: *Dispatcher, job: *Job };
+
+    fn publishInformational(pointer: *anyopaque, reply: support.Informational) !void {
+        if (reply.status_code < 102 or reply.status_code >= 200) return error.BadGateway;
+        const context: *ProgressContext = @ptrCast(@alignCast(pointer));
+        const self = context.dispatcher;
+        const job = context.job;
+        if (job.canceled.load(.acquire)) return error.Canceled;
+        var encoded = std.ArrayList(u8).empty;
+        defer encoded.deinit(self.allocator);
+        try h2.appendStatus(self.allocator, &encoded, reply.status_code);
+        for (reply.headers) |header| try support.appendHeader(self.allocator, &encoded, header.name, header.value);
+        lockProgress(job);
+        defer job.progress_mutex.unlock();
+        if (job.progress_count >= 16 or encoded.items.len > 128 * 1024 - job.progress_bytes) return error.BadGateway;
+        const block = try encoded.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(block);
+        try job.progress.append(self.allocator, block);
+        job.progress_count += 1;
+        job.progress_bytes += block.len;
+        self.wake.signal();
+    }
+
+    fn drainInformational(self: *Dispatcher, job: *Job, stream: std.Io.net.Stream, flow: *flow_mod.State, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+        while (true) {
+            lockProgress(job);
+            const block = if (job.progress.items.len > 0) job.progress.orderedRemove(0) else null;
+            job.progress_mutex.unlock();
+            const bytes = block orelse return;
+            defer self.allocator.free(bytes);
+            if (job.canceled.load(.acquire) or flow.find(job.stream_id) == null) continue;
+            const previous = write_deadline.push(.{
+                .io = self.io,
+                .handle = stream.socket.handle,
+                .deadline = .after(.now(self.io, .awake), flow.write_timeout_ms),
+                .restore_timeout_ms = flow.write_timeout_ms,
+                .stream_id = job.stream_id,
+            });
+            defer write_deadline.restore(previous);
+            try support.sendHeaderBlock(stream, job.stream_id, bytes, false, write);
+        }
+    }
+
+    fn lockProgress(job: *Job) void {
+        while (!job.progress_mutex.tryLock()) std.atomic.spinLoopHint();
     }
 };
 
@@ -166,4 +229,58 @@ test "global routing admission refuses new work before allocating" {
     defer admitted.store(0, .release);
     try std.testing.expectError(error.DispatchLimit, jobs.submit(1, .{ .method = "GET", .path = "/", .query = "", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true }));
     try std.testing.expectEqual(0, jobs.count());
+}
+
+fn progressAllocationCheck(allocator: std.mem.Allocator) !void {
+    var cfg = config.defaultServerConfig();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var dispatcher = try Dispatcher.init(std.testing.io, allocator, &cfg, &env, .{ .prepare = testPrepare, .deliver = testDeliver });
+    defer dispatcher.deinit();
+    var job = Job{ .arena = std.heap.ArenaAllocator.init(allocator), .stream_id = 1, .bytes = 0, .req = undefined };
+    defer {
+        for (job.progress.items) |block| allocator.free(block);
+        job.progress.deinit(allocator);
+        job.arena.deinit();
+    }
+    var context = Dispatcher.ProgressContext{ .dispatcher = &dispatcher, .job = &job };
+    try Dispatcher.publishInformational(&context, .{ .status_code = 103, .headers = &.{.{ .name = "link", .value = "</app.css>; rel=preload" }} });
+    try std.testing.expectEqual(1, job.progress.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, job.progress.items[0], "/app.css") != null);
+    job.canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, Dispatcher.publishInformational(&context, .{ .status_code = 103, .headers = &.{} }));
+}
+
+test "informational publications own their bytes and refund every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, progressAllocationCheck, .{});
+}
+
+test "informational publications enforce a per-job count and byte ceiling" {
+    var cfg = config.defaultServerConfig();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var dispatcher = try Dispatcher.init(std.testing.io, std.testing.allocator, &cfg, &env, .{ .prepare = testPrepare, .deliver = testDeliver });
+    defer dispatcher.deinit();
+    var job = Job{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .stream_id = 1, .bytes = 0, .req = undefined };
+    defer {
+        for (job.progress.items) |block| std.testing.allocator.free(block);
+        job.progress.deinit(std.testing.allocator);
+        job.arena.deinit();
+    }
+    var context = Dispatcher.ProgressContext{ .dispatcher = &dispatcher, .job = &job };
+    const reply = support.Informational{ .status_code = 103, .headers = &.{} };
+    for (0..16) |_| try Dispatcher.publishInformational(&context, reply);
+    try std.testing.expectError(error.BadGateway, Dispatcher.publishInformational(&context, reply));
+    job.progress_count = 0;
+    job.progress_bytes = 128 * 1024;
+    try std.testing.expectError(error.BadGateway, Dispatcher.publishInformational(&context, reply));
+    var flow = flow_mod.State{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer flow.deinit();
+    // A refused/reset stream discards queued hints without writing any frames.
+    try dispatcher.drainInformational(&job, .{ .socket = .{ .handle = 123, .address = undefined } }, &flow, noInformationalWrite);
+    try std.testing.expectEqual(0, job.progress.items.len);
+}
+
+fn noInformationalWrite(_: std.Io.net.Stream, _: []const u8) !void {
+    return error.UnexpectedFrame;
 }

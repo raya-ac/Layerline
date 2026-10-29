@@ -9,7 +9,7 @@ admin bootstrap/session/origin controls, static handle containment, PHP alias
 diagnostic gating, cache metadata accounting, and config reader-lease reclamation
 are implemented. Native PHP2Shell input controls and exposed-version update
 notices are covered by [the security policy and tests](security.md). Remaining
-work includes wider HTTP/2 conformance and trailer forwarding, process-wide
+work includes wider HTTP/2 conformance and request-trailer forwarding, process-wide
 resource budgets, and full HTTP/3 interoperability.
 
 Reloads reclaim retired arenas and HTTP idle pools after their last reader exits;
@@ -23,6 +23,18 @@ them into request headers, keeps HPACK synchronized on refused streams, bounds
 decoded header bytes, advertises actual stream/header limits, restores connection
 credit for discarded DATA, and reports frame-size errors with the correct code.
 Raw wire tests cover these paths; this is not a claim of full HTTP/2 conformance.
+
+Both proxy paths now use bounded message framing rather than treating EOF as the
+only response boundary. HTTP/2 checks edge whitespace and preserves HEAD/304
+length metadata. Hop-field nominations across repeated Connection headers are
+scrubbed. Informational replies are forwarded while upstream work is in progress,
+and validated response trailers end HTTP/2 streams after flow-controlled DATA.
+Trailer responses bypass microcache/recompression until those features preserve
+their metadata; request trailer forwarding and streaming final HTTP/2 upstream
+bodies remain separate work.
+The experimental HTTP/3 buffered encoder preserves the same section ordering and
+HEAD/304 length metadata, with codec and allocation-failure tests; this does not
+close its external interoperability, flow-control or live streaming gaps.
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 

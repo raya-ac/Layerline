@@ -20,8 +20,26 @@ pub const BufferedResponse = struct {
     content_type: []const u8,
     body: []const u8,
     headers: []const h2_native.Header = &.{},
+    trailers: []const h2_native.Header = &.{},
+    informational: []const Informational = &.{},
+    content_length: ?usize = null,
+    omit_content_length: bool = false,
     apply_custom_errors: bool = true,
 };
+
+pub const Informational = struct {
+    status_code: u16,
+    headers: []const h2_native.Header,
+};
+
+pub const InformationalSink = struct {
+    context: *anyopaque,
+    emit: *const fn (*anyopaque, Informational) anyerror!void,
+};
+
+// Routing workers publish through their owning dispatcher; only the connection
+// thread writes TLS records, HPACK blocks and frames.
+pub threadlocal var informational_sink: ?InformationalSink = null;
 
 pub const Frame = struct {
     header: h2_native.FrameHeader,
@@ -200,6 +218,7 @@ fn headerNameIndex(name: []const u8) ?u64 {
 
 pub fn isSkippedResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "content-type") or
         std.ascii.eqlIgnoreCase(name, "keep-alive") or
@@ -227,6 +246,7 @@ pub fn appendHeader(allocator: std.mem.Allocator, block: *std.ArrayList(u8), nam
     }
 
     const lowered = try lowerHeaderName(allocator, name);
+    defer allocator.free(lowered);
     try h2_native.appendHeaderLiteralName(allocator, block, lowered, value);
 }
 
@@ -263,6 +283,8 @@ pub fn validateRequestFields(fields: anytype) !void {
     var pseudo_seen: u4 = 0;
     for (fields) |header| {
         if (header.name.len == 0 or !http_headers.validFieldValue(header.value)) return error.BadRequest;
+        if (header.value.len > 0 and (header.value[0] == ' ' or header.value[0] == '\t' or
+            header.value[header.value.len - 1] == ' ' or header.value[header.value.len - 1] == '\t')) return error.BadRequest;
         const pseudo = header.name[0] == ':';
         for (header.name[@intFromBool(pseudo)..]) |byte| {
             if (!http_headers.isHeaderNameByte(byte) or std.ascii.isUpper(byte)) return error.BadRequest;
@@ -409,6 +431,17 @@ pub fn sendRst(stream: std.Io.net.Stream, stream_id: u32, code: u32, write_all: 
     try sendFrame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload, write_all);
 }
 
+pub fn sendHeaderBlock(stream: std.Io.net.Stream, stream_id: u32, block: []const u8, end_stream: bool, write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+    var offset: usize = 0;
+    while (offset < block.len) {
+        const end = @min(offset + 16384, block.len);
+        const flags: u8 = (if (end == block.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
+            (if (offset == 0 and end_stream) h2_native.FLAG_END_STREAM else @as(u8, 0));
+        try sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, block[offset..end], write_all);
+        offset = end;
+    }
+}
+
 pub fn sendSettings(stream: std.Io.net.Stream, max_streams: u32, header_bytes: usize, write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
     var payload: [12]u8 = undefined;
     std.mem.writeInt(u16, payload[0..2], 3, .big);
@@ -507,25 +540,7 @@ test "HTTP2 frame header and payload survive read budget interrupts" {
     try std.testing.expectEqualStrings("pingpong", frame.payload);
 }
 
-pub fn decodeChunkedBuffer(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var cursor = bytes;
-    while (true) {
-        const line_end = std.mem.indexOf(u8, cursor, "\r\n") orelse return error.BadGateway;
-        const line = cursor[0..line_end];
-        const ext = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
-        const size = std.fmt.parseInt(usize, http_headers.trimValue(line[0..ext]), 16) catch return error.BadGateway;
-        cursor = cursor[line_end + 2 ..];
-        if (size == 0) return out.toOwnedSlice(allocator);
-        if (cursor.len < size + 2) return error.BadGateway;
-        try out.appendSlice(allocator, cursor[0..size]);
-        if (!std.mem.eql(u8, cursor[size .. size + 2], "\r\n")) return error.BadGateway;
-        cursor = cursor[size + 2 ..];
-    }
-}
-
-pub fn collectUpstreamHeaders(allocator: std.mem.Allocator, response_headers: []const u8) ![]h2_native.Header {
+pub fn collectUpstreamHeaders(allocator: std.mem.Allocator, response_headers: []const u8, connection_fields: []const u8) ![]h2_native.Header {
     var out = std.ArrayList(h2_native.Header).empty;
     errdefer out.deinit(allocator);
 
@@ -535,9 +550,8 @@ pub fn collectUpstreamHeaders(allocator: std.mem.Allocator, response_headers: []
         if (trimmed.len == 0) continue;
         const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
         const name = http_headers.trimValue(trimmed[0..colon]);
-        if (isSkippedResponseHeader(name)) continue;
+        if (isSkippedResponseHeader(name) or proxy_utils.isConnectionField(connection_fields, name)) continue;
         const value = http_headers.trimValue(trimmed[colon + 1 ..]);
-        if (value.len == 0) continue;
         const lowered = try lowerHeaderName(allocator, name);
         try out.append(allocator, .{ .name = lowered, .value = try allocator.dupe(u8, value) });
     }

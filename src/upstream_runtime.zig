@@ -11,8 +11,8 @@ const upstream_idle = @import("upstream_idle.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const backend_deadline = @import("backend_deadline.zig");
+const upstream_reader = @import("upstream_reader.zig");
 
-const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
 const HttpRequest = request_mod.HttpRequest;
 const ServerConfig = config_mod.ServerConfig;
 const UpstreamConfig = config_mod.UpstreamConfig;
@@ -192,108 +192,59 @@ fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease:
     callbacks.metrics.upstreamConnectionPooled();
 }
 
-fn forwardFixedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, content_length: usize, callbacks: Callbacks) !bool {
-    const initial = @min(body_tail.len, content_length);
-    if (initial > 0) callbacks.stream_write_all(stream, body_tail[0..initial]) catch return error.DownstreamClosed;
-    if (body_tail.len > content_length) return false;
-
-    var remaining = content_length - initial;
-    var buf: [8192]u8 = undefined;
-    while (remaining > 0) {
-        const max_read = @min(remaining, buf.len);
-        const n = try callbacks.stream_read(upstream_conn, buf[0..max_read]);
-        if (n == 0) return error.BadGateway;
-        remaining -= n;
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
-    }
-    return true;
-}
-
-fn forwardChunkedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, callbacks: Callbacks) !void {
-    var scanner = ChunkedBodyScanner{};
-
-    if (body_tail.len > 0) {
-        var consumed: usize = 0;
-        while (consumed < body_tail.len) : (consumed += 1) {
-            if (try scanner.consume(body_tail[consumed])) {
-                callbacks.stream_write_all(stream, body_tail[0 .. consumed + 1]) catch return error.DownstreamClosed;
-                return;
-            }
-        }
-        callbacks.stream_write_all(stream, body_tail) catch return error.DownstreamClosed;
-    }
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try callbacks.stream_read(upstream_conn, &buf);
-        if (n == 0) return error.BadGateway;
-
-        var consumed: usize = 0;
-        while (consumed < n) : (consumed += 1) {
-            if (try scanner.consume(buf[consumed])) {
-                callbacks.stream_write_all(stream, buf[0 .. consumed + 1]) catch return error.DownstreamClosed;
-                return;
-            }
-        }
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
-    }
-}
-
-fn forwardUnknownLengthBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, callbacks: Callbacks) !void {
-    if (body_tail.len > 0) callbacks.stream_write_all(stream, body_tail) catch return error.DownstreamClosed;
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try callbacks.stream_read(upstream_conn, &buf);
-        if (n == 0) break;
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
-    }
-}
-
-fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, timeout_ms: u32, callbacks: Callbacks) !UpstreamResponseForwardResult {
-    var response_buffer: [16 * 1024]u8 = undefined;
-    var used: usize = 0;
-
-    // Buffer only the upstream headers so we can scrub hop-by-hop fields, then
-    // stream the body straight through.
-    while (used < response_buffer.len) {
-        const n = try callbacks.stream_read(upstream_conn, response_buffer[used..]);
-        if (n == 0) return error.BadGateway;
-        used += n;
-        if (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") != null) break;
-    }
-
-    const header_end = (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = response_buffer[0..header_end];
-    const body_tail = response_buffer[header_end..used];
-    const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
-
-    const headers_start = status_line_end + 2;
-    const headers_end = header_end - 4;
-    const response_headers = header_bytes[headers_start..headers_end];
-    if (php_version.exposedHeaders(response_headers)) |version| {
-        php_version.log(version);
-        const message = try php_version.updateMessage(std.heap.page_allocator, version);
-        defer std.heap.page_allocator.free(message);
-        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
-        if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
-        return .{ .reusable = false };
-    }
-    const framing = try proxy_utils.parseUpstreamResponseFraming(header_bytes, response_headers);
-
-    callbacks.stream_write_all(stream, header_bytes[0..status_line_end]) catch return error.DownstreamClosed;
-    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
-
-    var headers = std.mem.splitSequence(u8, response_headers, "\r\n");
-    while (headers.next()) |line| {
-        const trimmed = http_headers.trimValue(line);
-        if (trimmed.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-            const name = http_headers.trimValue(trimmed[0..colon]);
-            if (proxy_utils.isSkippedProxyResponseHeader(name)) continue;
-        }
-        callbacks.stream_write_all(stream, trimmed) catch return error.DownstreamClosed;
+fn forwardFields(stream: std.Io.net.Stream, fields: []const u8, connection_fields: []const u8, callbacks: Callbacks) !void {
+    var lines = std.mem.splitSequence(u8, fields, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadGateway;
+        if (proxy_utils.skipResponseField(connection_fields, line[0..colon])) continue;
+        callbacks.stream_write_all(stream, http_headers.trimValue(line)) catch return error.DownstreamClosed;
         callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+    }
+}
+
+fn forwardInterim(stream: std.Io.net.Stream, head: upstream_reader.Head, callbacks: Callbacks) !void {
+    if (head.framing.status_code.? == 100) return;
+    callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+    try forwardFields(stream, head.fields, head.fields, callbacks);
+    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+    // A complete interim reply is not the start of the final response.
+    write_deadline.restart(stream);
+}
+
+fn forwardResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, timeout_ms: u32, callbacks: Callbacks) !UpstreamResponseForwardResult {
+    const reader = try upstream_reader.Reader.create(allocator, upstream_conn, callbacks.stream_read);
+    defer allocator.destroy(reader);
+    const head = final: while (true) {
+        const head = try reader.nextHead();
+        if (php_version.exposedHeaders(head.fields)) |version| {
+            php_version.log(version);
+            const message = try php_version.updateMessage(std.heap.page_allocator, version);
+            defer std.heap.page_allocator.free(message);
+            try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
+            if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
+            return .{ .reusable = false };
+        }
+        const status = head.framing.status_code.?;
+        if (status == 101) return error.BadGateway;
+        if (status >= 200) break :final head;
+        try forwardInterim(stream, head, callbacks);
+    };
+    const framing = head.framing;
+    try reader.beginBody(req.method, framing, null);
+    callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+    try forwardFields(stream, head.fields, head.fields, callbacks);
+    if (framing.status_code.? != 204) {
+        // Regenerate message framing even if the origin nominated those fields
+        // as hop-by-hop. The bytes sent below must match our own framing.
+        if (framing.transfer_chunked) {
+            try callbacks.stream_write_all(stream, "Transfer-Encoding: chunked\r\n");
+        } else if (framing.content_length) |length| {
+            var buffer: [64]u8 = undefined;
+            try callbacks.stream_write_all(stream, try std.fmt.bufPrint(&buffer, "Content-Length: {d}\r\n", .{length}));
+        }
     }
 
     if (sticky_cookie_header) |header| try callbacks.stream_write_all(stream, header);
@@ -311,58 +262,70 @@ fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
     }) else null;
     defer if (budget != null) read_deadline.restore(previous_read);
 
-    if (proxy_utils.responseHasNoBody(req.method, framing.status_code)) {
-        return .{ .reusable = !framing.connection_close and body_tail.len == 0 };
+    const chunked = framing.transfer_chunked and !proxy_utils.responseHasNoBody(req.method, framing.status_code);
+    while (try reader.nextData()) |data| {
+        if (chunked) {
+            var buffer: [32]u8 = undefined;
+            callbacks.stream_write_all(stream, try std.fmt.bufPrint(&buffer, "{x}\r\n", .{data.len})) catch return error.DownstreamClosed;
+        }
+        callbacks.stream_write_all(stream, data) catch return error.DownstreamClosed;
+        if (chunked) callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     }
-    if (framing.content_length) |content_length| {
-        const completed = try forwardFixedBody(stream, upstream_conn, body_tail, content_length, callbacks);
-        return .{ .reusable = completed and !framing.connection_close };
+    if (chunked) {
+        callbacks.stream_write_all(stream, "0\r\n") catch return error.DownstreamClosed;
+        try forwardFields(stream, reader.trailers(), head.fields, callbacks);
+        callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     }
-    if (framing.transfer_chunked) {
-        try forwardChunkedBody(stream, upstream_conn, body_tail, callbacks);
-        return .{ .reusable = !framing.connection_close };
-    }
-
-    try forwardUnknownLengthBody(stream, upstream_conn, body_tail, callbacks);
-    return .{ .reusable = false };
+    return .{ .reusable = reader.reusable(framing) };
 }
 
-fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, callbacks: Callbacks) !void {
-    var response_buffer: [16 * 1024]u8 = undefined;
-    var used: usize = 0;
-
-    while (used < response_buffer.len) {
-        const n = try callbacks.stream_read(upstream_conn, response_buffer[used..]);
-        if (n == 0) return error.BadGateway;
-        used += n;
-        if (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") != null) break;
-    }
-
-    const header_end = (std.mem.indexOf(u8, response_buffer[0..used], "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = response_buffer[0..header_end];
-    const body_tail = response_buffer[header_end..used];
-    const status_code = proxy_utils.parseHttpStatusCode(header_bytes) orelse return error.BadGateway;
-    if (php_version.exposedHeaders(header_bytes)) |version| {
-        php_version.log(version);
-        const message = try php_version.updateMessage(std.heap.page_allocator, version);
-        defer std.heap.page_allocator.free(message);
-        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
-        try callbacks.stream_write_all(stream, message);
-        return;
-    }
-    if (status_code != 101) return error.BadGateway;
-
-    callbacks.stream_write_all(stream, header_bytes) catch return error.DownstreamClosed;
+fn forwardUpgradeResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, req: HttpRequest, callbacks: Callbacks) !void {
+    const reader = try upstream_reader.Reader.create(allocator, upstream_conn, callbacks.stream_read);
+    defer allocator.destroy(reader);
+    const head = final: while (true) {
+        const head = try reader.nextHead();
+        if (php_version.exposedHeaders(head.fields)) |version| {
+            php_version.log(version);
+            const message = try php_version.updateMessage(std.heap.page_allocator, version);
+            defer std.heap.page_allocator.free(message);
+            try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
+            if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
+            return;
+        }
+        const status = head.framing.status_code.?;
+        if (status == 101) break :final head;
+        if (status >= 200) return error.BadGateway;
+        try forwardInterim(stream, head, callbacks);
+    };
+    if (!proxy_utils.isHttpUpgradeHeaders(head.fields)) return error.BadGateway;
+    const protocol = http_headers.findHeaderValue(head.fields, "Upgrade").?;
+    if (!http_headers.hasConnectionToken(http_headers.findHeaderValue(req.headers, "Upgrade").?, protocol)) return error.BadGateway;
+    callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+    try forwardFields(stream, head.fields, head.fields, callbacks);
+    callbacks.stream_write_all(stream, "Connection: Upgrade\r\nUpgrade: ") catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, protocol) catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, "\r\n\r\n") catch return error.DownstreamClosed;
     write_deadline.clear(stream);
     backend_deadline.clear(upstream_conn);
-    callbacks.proxy_raw_bidirectional(upstream_conn, stream, body_tail) catch return error.DownstreamClosed;
+    callbacks.proxy_raw_bidirectional(upstream_conn, stream, reader.pending) catch return error.DownstreamClosed;
 }
 
-fn responseFailure(stream: std.Io.net.Stream, err: anyerror, callbacks: Callbacks) anyerror {
+fn responseDeadlineOwnsTimeout(response: read_deadline.Deadline, attempt: read_deadline.Deadline) bool {
+    const limit = response.at orelse return false;
+    return if (attempt.at) |other| limit.nanoseconds <= other.nanoseconds else true;
+}
+
+fn responseFailure(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, err: anyerror, callbacks: Callbacks) anyerror {
     if (err == error.DownstreamClosed or err == error.WriteTimeout) return error.DownstreamClosed;
     if (write_deadline.forStream(stream)) |budget| {
         if (write_deadline.started(stream)) {
-            if (budget.deadline.expired(.now(callbacks.active_io(), .awake))) {
+            const attempt = if (backend_deadline.forStream(upstream_conn)) |state| state.deadline else read_deadline.Deadline{};
+            // Socket timers can fire before a second clock sample crosses the
+            // exact boundary. Attribute the timeout to the controlling budget.
+            if (budget.deadline.expired(.now(callbacks.active_io(), .awake)) or
+                (err == error.RequestTimeout and responseDeadlineOwnsTimeout(budget.deadline, attempt)))
+            {
                 budget.logTimeoutPhase("upstream");
                 return error.DownstreamClosed;
             }
@@ -403,7 +366,8 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         http_headers.trimValue(host)
     else
         upstream.host;
-    const forwarded_proto = if (http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
+    const client_proto = if (proxy_utils.isConnectionField(req.headers, "X-Forwarded-Proto")) null else http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto");
+    const forwarded_proto = if (client_proto) |proto|
         http_headers.trimValue(proto)
     else if (cfg.tls_enabled)
         "https"
@@ -432,9 +396,8 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         if (trimmed.len == 0) continue;
         if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
             const name = http_headers.trimValue(trimmed[0..colon]);
-            if (proxy_utils.isSkippedProxyHeader(name)) continue;
+            if (proxy_utils.skipRequestField(req.headers, name)) continue;
             const value = http_headers.trimValue(trimmed[colon + 1 ..]);
-            if (value.len == 0) continue;
             if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
             if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
             try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
@@ -465,12 +428,12 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     }
 
     if (upgrade_request) {
-        forwardUpgradeResponse(stream, lease.stream, callbacks) catch |err| return responseFailure(stream, err, callbacks);
+        forwardUpgradeResponse(stream, allocator, lease.stream, req, callbacks) catch |err| return responseFailure(stream, lease.stream, err, callbacks);
         return error.CloseConnection;
     }
 
-    const result = forwardResponse(stream, lease.stream, req, sticky_cookie_header, timeout_ms, callbacks) catch |err| {
-        return responseFailure(stream, err, callbacks);
+    const result = forwardResponse(stream, allocator, lease.stream, req, sticky_cookie_header, timeout_ms, callbacks) catch |err| {
+        return responseFailure(stream, lease.stream, err, callbacks);
     };
     releaseConnection(upstream, cfg, lease, result.reusable, callbacks.upstream_now_ms(), callbacks);
     lease_released = true;
@@ -761,6 +724,19 @@ pub fn forwardToPool(
     };
 
     try callbacks.send_cool_error(stream, allocator, 502, "Bad Gateway", "All configured upstream attempts failed.", true, is_head, null);
+}
+
+test "response read timeout attribution follows deadline ordering including coarse socket wakeups" {
+    const now = std.Io.Timestamp.fromNanoseconds(0);
+    const response = read_deadline.Deadline.after(now, 350);
+    const backend = read_deadline.Deadline.after(now, 2000);
+    try std.testing.expect(!response.expired(.fromNanoseconds(349_000_000)));
+    try std.testing.expect(responseDeadlineOwnsTimeout(response, backend));
+    try std.testing.expect(!responseDeadlineOwnsTimeout(backend, response));
+    try std.testing.expect(responseDeadlineOwnsTimeout(response, response));
+    try std.testing.expect(responseDeadlineOwnsTimeout(response, .{}));
+    try std.testing.expect(!responseDeadlineOwnsTimeout(.{}, backend));
+    try std.testing.expect(!responseDeadlineOwnsTimeout(.{}, .{}));
 }
 
 test "local dial pressure and cancellation never retry or eject healthy upstreams" {

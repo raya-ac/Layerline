@@ -96,7 +96,7 @@ pub fn sendResponse(
         .h2_headers = response.headers,
         .request_headers = ctx.request_headers,
         .response_headers = ctx.response_headers,
-        .compression_policy = ctx.compression_policy,
+        .compression_policy = if (response.trailers.len == 0) ctx.compression_policy else .disabled,
         .compression_work_buffer_bytes = ctx.compression_work_buffer_bytes,
         .metrics = ctx.metrics,
     });
@@ -108,8 +108,11 @@ pub fn sendResponse(
 
     var len_buf: [32]u8 = undefined;
     const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
-    if (http_response.canSendBody(response.status_code, false)) {
-        const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{prepared.body.len});
+    if ((http_response.canSendBody(response.status_code, false) or (response.status_code == 304 and response.content_length != null)) and
+        (!response.omit_content_length or custom_body != null))
+    {
+        const length = if ((is_head or response.status_code == 304) and custom_body == null) response.content_length orelse prepared.body.len else prepared.body.len;
+        const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{length});
         try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
     }
     if (ctx.request_id.len > 0) {
@@ -131,7 +134,13 @@ pub fn sendResponse(
     }
 
     const flow = flow_mod.active orelse return error.MissingHttp2Connection;
-    if (body_len > 0) flow.queue(stream_id, prepared.body) catch |err| {
+    var trailer_block = std.ArrayList(u8).empty;
+    defer trailer_block.deinit(allocator);
+    if (custom_body == null and http_response.canSendBody(response.status_code, is_head)) {
+        for (response.trailers) |header| try h2_support.appendHeader(allocator, &trailer_block, header.name, header.value);
+    }
+    const queued = body_len > 0 or trailer_block.items.len > 0;
+    if (queued) flow.queueResponse(stream_id, prepared.body, trailer_block.items) catch |err| {
         if (err != error.QueueLimit) return err;
         try h2_support.sendRst(stream, stream_id, 0xb, ctx.stream_write_all);
         flow.cancel(stream_id);
@@ -141,16 +150,16 @@ pub fn sendResponse(
         const deadline = try flow.startResponse(stream_id);
         const previous = write_deadline.push(.{ .io = flow.io, .handle = stream.socket.handle, .deadline = deadline, .restore_timeout_ms = flow.write_timeout_ms, .stream_id = stream_id });
         defer write_deadline.restore(previous);
-        var offset: usize = 0;
-        while (offset < header_block.items.len) {
-            const end = @min(offset + 16384, header_block.items.len);
-            const flags: u8 = (if (end == header_block.items.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
-                (if (offset == 0 and body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0));
-            try h2_support.sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, header_block.items[offset..end], ctx.stream_write_all);
-            offset = end;
+        for (response.informational) |reply| {
+            var interim = std.ArrayList(u8).empty;
+            defer interim.deinit(allocator);
+            try h2_native.appendStatus(allocator, &interim, reply.status_code);
+            for (reply.headers) |header| try h2_support.appendHeader(allocator, &interim, header.name, header.value);
+            try h2_support.sendHeaderBlock(stream, stream_id, interim.items, false, ctx.stream_write_all);
         }
+        try h2_support.sendHeaderBlock(stream, stream_id, header_block.items, !queued, ctx.stream_write_all);
     }
-    if (body_len == 0) flow.cancel(stream_id);
+    if (!queued) flow.cancel(stream_id);
     try flow.flush(stream, ctx.stream_write_all);
 
     ctx.record_response_sent(response.status_code, body_len);

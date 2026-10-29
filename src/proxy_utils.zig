@@ -3,7 +3,6 @@ const std = @import("std");
 const http_headers = @import("http_headers.zig");
 
 const findHeaderValue = http_headers.findHeaderValue;
-const hasConnectionToken = http_headers.hasConnectionToken;
 const trimValue = http_headers.trimValue;
 
 // Build a target path for proxying while avoiding `//` and leading path glitches.
@@ -40,12 +39,14 @@ pub fn isSkippedProxyHeader(name: []const u8) bool {
     // Request bodies are already buffered and 100-continue was handled locally.
     if (std.ascii.eqlIgnoreCase(name, "Expect")) return true;
     return std.ascii.eqlIgnoreCase(name, "Connection") or
+        std.ascii.eqlIgnoreCase(name, "Proxy-Connection") or
         std.ascii.eqlIgnoreCase(name, "Content-Length") or
         std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
         std.ascii.eqlIgnoreCase(name, "Proxy-Authenticate") or
         std.ascii.eqlIgnoreCase(name, "Proxy-Authorization") or
         std.ascii.eqlIgnoreCase(name, "TE") or
         std.ascii.eqlIgnoreCase(name, "Trailers") or
+        std.ascii.eqlIgnoreCase(name, "Trailer") or
         std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
         std.ascii.eqlIgnoreCase(name, "Upgrade") or
         std.ascii.eqlIgnoreCase(name, "Host") or
@@ -60,19 +61,42 @@ test "buffered proxy requests do not forward an already handled expectation" {
 
 pub fn isHttpUpgradeHeaders(headers: []const u8) bool {
     const upgrade = findHeaderValue(headers, "Upgrade") orelse return false;
-    const connection = findHeaderValue(headers, "Connection") orelse return false;
-    return trimValue(upgrade).len > 0 and hasConnectionToken(connection, "upgrade");
+    return trimValue(upgrade).len > 0 and http_headers.hasHeaderToken(headers, "Connection", "upgrade");
 }
 
 pub fn isSkippedProxyResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "Connection") or
+        std.ascii.eqlIgnoreCase(name, "Proxy-Connection") or
+        std.ascii.eqlIgnoreCase(name, "Content-Length") or
+        std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or
         std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
         std.ascii.eqlIgnoreCase(name, "Proxy-Authenticate") or
         std.ascii.eqlIgnoreCase(name, "Proxy-Authorization") or
         std.ascii.eqlIgnoreCase(name, "TE") or
         std.ascii.eqlIgnoreCase(name, "Trailers") or
+        std.ascii.eqlIgnoreCase(name, "Trailer") or
         std.ascii.eqlIgnoreCase(name, "Upgrade") or
         std.ascii.eqlIgnoreCase(name, "X-Request-Id");
+}
+
+pub fn isConnectionField(fields: []const u8, name: []const u8) bool {
+    return http_headers.hasHeaderToken(fields, "Connection", name);
+}
+
+pub fn skipRequestField(fields: []const u8, name: []const u8) bool {
+    return isSkippedProxyHeader(name) or isConnectionField(fields, name);
+}
+
+pub fn skipResponseField(fields: []const u8, name: []const u8) bool {
+    return isSkippedProxyResponseHeader(name) or isConnectionField(fields, name);
+}
+
+pub fn isForbiddenTrailer(name: []const u8) bool {
+    if (isSkippedProxyHeader(name) or std.ascii.startsWithIgnoreCase(name, "if-")) return true;
+    for ([_][]const u8{ "content-type", "content-encoding", "content-range", "authorization", "cookie", "set-cookie", "cache-control", "expires", "vary", "location", "range", "server", "x-powered-by" }) |forbidden| {
+        if (std.ascii.eqlIgnoreCase(name, forbidden)) return true;
+    }
+    return false;
 }
 
 pub const UpstreamResponseForwardResult = struct {
@@ -84,102 +108,6 @@ pub const UpstreamResponseFraming = struct {
     content_length: ?usize,
     transfer_chunked: bool,
     connection_close: bool,
-};
-
-const ChunkScanState = enum {
-    size,
-    size_lf,
-    data,
-    data_cr,
-    data_lf,
-    trailer,
-    trailer_lf,
-    done,
-};
-
-pub const ChunkedBodyScanner = struct {
-    state: ChunkScanState = .size,
-    chunk_size: usize = 0,
-    remaining: usize = 0,
-    saw_size_digit: bool = false,
-    in_extension: bool = false,
-    trailer_line_start: bool = true,
-
-    fn resetSize(self: *ChunkedBodyScanner) void {
-        self.chunk_size = 0;
-        self.saw_size_digit = false;
-        self.in_extension = false;
-    }
-
-    pub fn consume(self: *ChunkedBodyScanner, byte: u8) !bool {
-        switch (self.state) {
-            .size => {
-                if (byte == ';') {
-                    if (!self.saw_size_digit) return error.BadGateway;
-                    self.in_extension = true;
-                    return false;
-                }
-                if (byte == '\r') {
-                    if (!self.saw_size_digit) return error.BadGateway;
-                    self.state = .size_lf;
-                    return false;
-                }
-                if (self.in_extension) return false;
-
-                const digit = std.fmt.charToDigit(byte, 16) catch return error.BadGateway;
-                self.saw_size_digit = true;
-                self.chunk_size = std.math.mul(usize, self.chunk_size, 16) catch return error.BadGateway;
-                self.chunk_size = std.math.add(usize, self.chunk_size, digit) catch return error.BadGateway;
-                return false;
-            },
-            .size_lf => {
-                if (byte != '\n') return error.BadGateway;
-                if (self.chunk_size == 0) {
-                    self.trailer_line_start = true;
-                    self.state = .trailer;
-                } else {
-                    self.remaining = self.chunk_size;
-                    self.state = .data;
-                }
-                self.resetSize();
-                return false;
-            },
-            .data => {
-                self.remaining -= 1;
-                if (self.remaining == 0) self.state = .data_cr;
-                return false;
-            },
-            .data_cr => {
-                if (byte != '\r') return error.BadGateway;
-                self.state = .data_lf;
-                return false;
-            },
-            .data_lf => {
-                if (byte != '\n') return error.BadGateway;
-                self.state = .size;
-                return false;
-            },
-            .trailer => {
-                if (byte == '\r') {
-                    self.state = .trailer_lf;
-                } else {
-                    self.trailer_line_start = false;
-                }
-                return false;
-            },
-            .trailer_lf => {
-                if (byte != '\n') return error.BadGateway;
-                if (self.trailer_line_start) {
-                    self.state = .done;
-                    return true;
-                }
-                self.trailer_line_start = true;
-                self.state = .trailer;
-                return false;
-            },
-            .done => return true,
-        }
-    }
 };
 
 pub fn parseOptionalContentLength(headers: []const u8) !?usize {
@@ -197,7 +125,7 @@ pub fn parseUpstreamResponseFraming(header_bytes: []const u8, response_headers: 
     const http10 = std.mem.startsWith(u8, header_bytes, "HTTP/1.0 ");
     if (!http10 and !std.mem.startsWith(u8, header_bytes, "HTTP/1.1 ")) return error.BadGateway;
     return .{
-        .status_code = parseHttpStatusCode(header_bytes),
+        .status_code = parseHttpStatusCode(header_bytes) orelse return error.BadGateway,
         .content_length = try parseOptionalContentLength(response_headers),
         .transfer_chunked = http_headers.hasHeaderToken(response_headers, "Transfer-Encoding", "chunked"),
         .connection_close = http_headers.hasHeaderToken(response_headers, "Connection", "close") or
@@ -221,11 +149,22 @@ pub fn responseHasNoBody(method: []const u8, status_code: ?u16) bool {
 pub fn parseHttpStatusCode(response_head: []const u8) ?u16 {
     const first_line_end = std.mem.indexOf(u8, response_head, "\r\n") orelse response_head.len;
     const first_line = response_head[0..first_line_end];
-    if (!std.mem.startsWith(u8, first_line, "HTTP/")) return null;
+    if (first_line.len < 13 or (!std.mem.startsWith(u8, first_line, "HTTP/1.1 ") and !std.mem.startsWith(u8, first_line, "HTTP/1.0 "))) return null;
+    const code_raw = first_line[9..12];
+    for (code_raw) |value| if (!std.ascii.isDigit(value)) return null;
+    if (first_line[12] != ' ' or !http_headers.validFieldValue(first_line[13..])) return null;
+    const code = std.fmt.parseInt(u16, code_raw, 10) catch return null;
+    return if (code >= 100 and code <= 599) code else null;
+}
 
-    var parts = std.mem.tokenizeAny(u8, first_line, " \t");
-    _ = parts.next() orelse return null;
-    const code_raw = parts.next() orelse return null;
-    if (code_raw.len != 3) return null;
-    return std.fmt.parseInt(u16, code_raw, 10) catch null;
+test "connection nominations cover repeated fields without swallowing similarly named headers" {
+    const fields = "Connection: keep-alive, X-Local\r\nconnection: x-other";
+    try std.testing.expect(skipRequestField(fields, "X-LOCAL"));
+    try std.testing.expect(skipResponseField(fields, "x-other"));
+    try std.testing.expect(!skipResponseField(fields, "x-localized"));
+    try std.testing.expect(isSkippedProxyHeader("Trailer"));
+    try std.testing.expect(isSkippedProxyResponseHeader("proxy-connection"));
+    for ([_][]const u8{ "HTTP/1.1 +20 OK", "HTTP/1.1 099 Odd", "HTTP/1.1 600 Odd", "HTTP/1.1 200x", "HTTP/1.1 200", "HTTP/1.1  200 OK", "HTTP/1.1 200 OK\x00" }) |line|
+        try std.testing.expect(parseHttpStatusCode(line) == null);
+    try std.testing.expectEqual(200, parseHttpStatusCode("HTTP/1.1 200 ").?);
 }

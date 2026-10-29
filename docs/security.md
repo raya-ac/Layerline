@@ -213,11 +213,16 @@ retryable zero-progress results. TLS continues through the encrypted writer.
 A forwarded proxy body spends the remaining response budget while waiting for
 the upstream as well as while writing to the client. This applies to fixed,
 chunked, and close-delimited bodies, without extending a shorter upstream socket
-timeout. Once any response write has started, upstream errors close the client
+timeout. A response-controlled read timeout is logged even if a coarse socket
+timer fires before the next exact clock sample; a shorter backend budget is not
+relabeled as a response timeout. Once the final response has started, upstream
+errors close the client
 connection: they cannot trigger another attempt or append a second status line.
-Only an upstream failure before visible response bytes can use failover.
+Only an upstream failure before final response bytes can use failover, subject
+to the request's retry policy. A completed informational reply is not a final
+response and never extends the original backend attempt budget.
 
-Completed `100 Continue` responses leave a fresh budget for the final response;
+Completed informational responses leave a fresh budget for the final response;
 keep-alive requests also get independent budgets. A successful Upgrade handshake
 disarms the HTTP response budget before tunnel traffic begins. Tunnel socket
 timeouts and the server's shutdown deadline still apply. If starting the second
@@ -314,7 +319,54 @@ privacy, backend version notices, admin bootstrap/logout/origin behavior,
 symlink escapes, encrypted static responses, and config reload. The raw HTTP/2
 tests include padded/split trailers, refused-stream HPACK synchronization,
 compressed header budget bypass attempts, discarded DATA credit, and GOAWAY
-error codes. Request trailer forwarding and response trailers are not implemented.
+error codes. Request trailer forwarding is still not implemented; validated
+request trailers remain separate from routing/authentication headers.
+
+Proxy responses now share a bounded upstream reader. Fixed-length, chunked,
+HEAD, 204 and 304 replies finish at their message boundary without waiting for
+origin EOF. Close-delimited bodies still require EOF. Reader buffers live in
+request-owned storage rather than large worker-stack objects. Heads are limited to
+16 KiB each, 64 KiB total and at most 16 informational replies before the final
+response. Status syntax, chunk sizes/extensions, CRLF, the complete chunk
+terminator and trailers are validated; premature EOF does not complete a body.
+Trailers have a 16 KiB / 100-field budget with 4 KiB lines. Framing, routing,
+authentication and response-control trailer fields are rejected. Layerline also
+rejects backend version fields (`Server`, `X-Powered-By`) in trailers, so they
+cannot bypass the header-phase PHP version policy. If a streamed HTTP/1 body
+is already visible, a late trailer failure aborts it without a second response.
+
+Connection-nominated fields are removed across repeated `Connection` headers,
+case-insensitively, from forwarded request/response fields and response trailers.
+`Proxy-Connection`, `Trailer` and other fixed hop fields are also removed. HTTP/1
+regenerates framing for the bytes it actually sends. Valid empty end-to-end fields
+are preserved in both proxy paths and in response trailers. Upgrade responses must
+select an offered protocol and carry a valid Upgrade handshake; ordinary proxy
+requests cannot switch protocols unexpectedly. HTTP/2 rejects SP/HTAB at either
+edge of request and trailer values rather than trimming malformed input, following
+[RFC 9113 section 8.2.1](https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.1).
+
+Informational replies other than locally handled 100 Continue are forwarded before
+the final response. HTTP/2 routing tasks publish them to the connection thread
+through a per-job queue capped at 16 blocks / 128 KiB, charged to its shared HTTP/2
+allocator. Cancellation, connection teardown and allocation failure reclaim queued
+blocks. The connection thread remains the only frame/TLS writer; each informational
+write has its own write budget and does not spend the final body-transfer budget.
+This does not make the final HTTP/2 upstream body streaming: that body is still
+buffered within its configured limit before final headers are sent.
+
+Valid response trailers remain separate from headers. HTTP/1 rechunks payloads
+and forwards scrubbed trailers only after validation; native HTTP/2 queues an
+owned trailing HEADERS block after DATA, ending the stream there. Trailers do not
+consume flow credit, but cannot overtake unsent DATA. Reset/expiry cleanup charges
+and frees both body and trailer buffers. Responses with trailers bypass the current
+microcache and recompression so metadata is not silently discarded or invalidated.
+HEAD/304 retain known representation lengths without reading nonexistent bodies;
+an unknown upstream HEAD length stays absent rather than becoming a false zero.
+The experimental HTTP/3 buffered encoder also retains known/unknown lengths and
+encodes informational, final, DATA and trailer sections in order. These are
+codec/allocation checks, not external QUIC interoperability or live early-hint
+streaming guarantees.
+`scripts/verify-upstream-framing.py` checks these paths over plain and native TLS.
 
 `scripts/verify-shutdown.py` starts isolated loopback instances with admin, QUIC,
 health, and reload workers. It checks idle shutdown, in-flight HTTP/1 uploads,

@@ -10,6 +10,7 @@ const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
 const backend_deadline = @import("backend_deadline.zig");
+const upstream_reader = @import("upstream_reader.zig");
 
 const H2BufferedResponse = h2_support.BufferedResponse;
 const ServerConfig = config_mod.ServerConfig;
@@ -18,8 +19,6 @@ const UpstreamConfig = config_mod.UpstreamConfig;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
-
-const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024;
 
 pub const Callbacks = struct {
     access_log_set_upstream: *const fn ([]const u8) void,
@@ -44,7 +43,8 @@ fn appendForwardedRequestHeaders(
     callbacks: Callbacks,
 ) !void {
     const forwarded_host = http_headers.findHeaderValue(req.headers, "Host") orelse upstream.host;
-    const forwarded_proto = if (http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto")) |proto|
+    const client_proto = if (proxy_utils.isConnectionField(req.headers, "X-Forwarded-Proto")) null else http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto");
+    const forwarded_proto = if (client_proto) |proto|
         http_headers.trimValue(proto)
     else if (cfg.tls_enabled)
         "https"
@@ -61,9 +61,8 @@ fn appendForwardedRequestHeaders(
         if (trimmed.len == 0) continue;
         if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
             const name = http_headers.trimValue(trimmed[0..colon]);
-            if (proxy_utils.isSkippedProxyHeader(name)) continue;
+            if (proxy_utils.skipRequestField(req.headers, name)) continue;
             const value = http_headers.trimValue(trimmed[colon + 1 ..]);
-            if (value.len == 0) continue;
             if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Host")) saw_forwarded_host = true;
             if (std.ascii.eqlIgnoreCase(name, "X-Forwarded-Proto")) saw_forwarded_proto = true;
             try out.print(allocator, "{s}: {s}\r\n", .{ name, value });
@@ -73,20 +72,6 @@ fn appendForwardedRequestHeaders(
     if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
     const request_id = callbacks.current_request_id();
     if (request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{request_id});
-}
-
-fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, max_bytes: usize, callbacks: Callbacks) ![]u8 {
-    var raw = std.ArrayList(u8).empty;
-    errdefer raw.deinit(allocator);
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try callbacks.stream_read(upstream_conn, &buf);
-        if (n == 0) break;
-        if (raw.items.len + n > max_bytes) return error.PayloadTooLarge;
-        try raw.appendSlice(allocator, buf[0..n]);
-    }
-    return raw.toOwnedSlice(allocator);
 }
 
 fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
@@ -115,34 +100,46 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     try request.appendSlice(allocator, req.body);
     try callbacks.stream_write_all(upstream_conn, request.items);
 
-    const raw = try readHttp1ResponseToBuffer(allocator, upstream_conn, cfg.max_static_file_bytes + DEFAULT_MAX_REQUEST_BYTES, callbacks);
-    const header_end = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadGateway) + 4;
-    const header_bytes = raw[0..header_end];
-    const body_tail = raw[header_end..];
-    const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
-    const response_headers = header_bytes[status_line_end + 2 .. header_end - 4];
-    if (php_version.exposedHeaders(response_headers)) |version| {
-        php_version.log(version);
-        return .{ .status_code = 503, .content_type = "text/plain; charset=utf-8", .body = try php_version.updateMessage(allocator, version), .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
-    }
-    const framing = try proxy_utils.parseUpstreamResponseFraming(header_bytes, response_headers);
-    const status_code = framing.status_code orelse 502;
-
-    const body = if (proxy_utils.responseHasNoBody(req.method, status_code))
-        try allocator.dupe(u8, "")
-    else if (framing.transfer_chunked)
-        try h2_support.decodeChunkedBuffer(allocator, body_tail)
-    else if (framing.content_length) |content_length| blk: {
-        if (body_tail.len < content_length) return error.BadGateway;
-        break :blk try allocator.dupe(u8, body_tail[0..content_length]);
-    } else try allocator.dupe(u8, body_tail);
-
-    const content_type = if (http_headers.findHeaderValue(response_headers, "Content-Type")) |ctype|
-        try allocator.dupe(u8, http_headers.trimValue(ctype))
+    const reader = try upstream_reader.Reader.create(allocator, upstream_conn, callbacks.stream_read);
+    defer allocator.destroy(reader);
+    var informational = std.ArrayList(h2_support.Informational).empty;
+    defer informational.deinit(allocator);
+    const head = final: while (true) {
+        const head = try reader.nextHead();
+        if (php_version.exposedHeaders(head.fields)) |version| {
+            php_version.log(version);
+            return .{ .status_code = 503, .content_type = "text/plain; charset=utf-8", .body = try php_version.updateMessage(allocator, version), .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
+        }
+        const status = head.framing.status_code.?;
+        if (status == 101) return error.BadGateway;
+        if (status >= 200) break :final head;
+        // Layerline already handled the client's expectation and buffered its
+        // body. Other informational replies belong to this response, not cache.
+        if (status != 100) {
+            const reply = h2_support.Informational{ .status_code = status, .headers = try h2_support.collectUpstreamHeaders(allocator, head.fields, head.fields) };
+            if (h2_support.informational_sink) |sink| {
+                try sink.emit(sink.context, reply);
+            } else try informational.append(allocator, reply);
+        }
+    };
+    try reader.beginBody(req.method, head.framing, cfg.max_static_file_bytes);
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    while (try reader.nextData()) |data| try body.appendSlice(allocator, data);
+    const content_type = if (!proxy_utils.isConnectionField(head.fields, "Content-Type"))
+        if (http_headers.findHeaderValue(head.fields, "Content-Type")) |value| try allocator.dupe(u8, value) else "application/octet-stream"
     else
         "application/octet-stream";
-    const headers = try h2_support.collectUpstreamHeaders(allocator, response_headers);
-    return .{ .status_code = status_code, .content_type = content_type, .body = body, .headers = headers };
+    return .{
+        .status_code = head.framing.status_code.?,
+        .content_type = content_type,
+        .body = try body.toOwnedSlice(allocator),
+        .headers = try h2_support.collectUpstreamHeaders(allocator, head.fields, head.fields),
+        .trailers = try h2_support.collectUpstreamHeaders(allocator, reader.trailers(), head.fields),
+        .informational = try informational.toOwnedSlice(allocator),
+        .content_length = if (proxy_utils.responseHasNoBody(req.method, head.framing.status_code)) head.framing.content_length else null,
+        .omit_content_length = std.mem.eql(u8, req.method, "HEAD") and head.framing.content_length == null,
+    };
 }
 
 pub fn fetchPoolResponse(

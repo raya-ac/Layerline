@@ -8,6 +8,7 @@ const Pending = struct {
     id: u32,
     window: i64,
     body: ?[]u8 = null,
+    trailers: ?[]u8 = null,
     sent: usize = 0,
     deadline: Deadline = .{},
 };
@@ -29,7 +30,10 @@ pub const State = struct {
     pub const max_queued_bytes = 64 * 1024 * 1024;
 
     pub fn deinit(self: *State) void {
-        for (self.streams.items) |item| if (item.body) |body| self.allocator.free(body);
+        for (self.streams.items) |item| {
+            if (item.body) |body| self.allocator.free(body);
+            if (item.trailers) |trailers| self.allocator.free(trailers);
+        }
         self.streams.deinit(self.allocator);
     }
 
@@ -51,6 +55,10 @@ pub const State = struct {
         if (item.body) |body| {
             self.queued_bytes -= body.len;
             self.allocator.free(body);
+        }
+        if (item.trailers) |trailers| {
+            self.queued_bytes -= trailers.len;
+            self.allocator.free(trailers);
         }
     }
 
@@ -89,12 +97,22 @@ pub const State = struct {
     }
 
     pub fn queue(self: *State, id: u32, body: []const u8) !void {
+        try self.queueResponse(id, body, "");
+    }
+
+    pub fn queueResponse(self: *State, id: u32, body: []const u8, trailers: []const u8) !void {
         const i = self.find(id) orelse return error.BadRequest;
         if (self.streams.items[i].body != null) return error.BadRequest;
         if (body.len > max_queued_bytes - self.queued_bytes) return error.QueueLimit;
+        if (trailers.len > max_queued_bytes - self.queued_bytes - body.len) return error.QueueLimit;
+        const owned_body = try self.allocator.dupe(u8, body);
+        errdefer self.allocator.free(owned_body);
+        const owned_trailers = if (trailers.len > 0) try self.allocator.dupe(u8, trailers) else null;
+        errdefer if (owned_trailers) |bytes| self.allocator.free(bytes);
         _ = try self.startResponse(id);
-        self.streams.items[i].body = try self.allocator.dupe(u8, body);
-        self.queued_bytes += body.len;
+        self.streams.items[i].body = owned_body;
+        self.streams.items[i].trailers = owned_trailers;
+        self.queued_bytes += body.len + trailers.len;
     }
 
     pub fn startResponse(self: *State, id: u32) !Deadline {
@@ -132,26 +150,31 @@ pub const State = struct {
         try self.expire(stream, write);
         // One frame per eligible stream per round keeps a stalled stream from
         // consuming the connection's remaining credit ahead of its neighbours.
-        while (self.connection_window > 0) {
+        while (true) {
             var progressed = false;
             var i: usize = 0;
-            while (i < self.streams.items.len and self.connection_window > 0) {
+            while (i < self.streams.items.len) {
                 if (try self.expireAt(i, .now(self.io, .awake), stream, write)) continue;
                 const item = &self.streams.items[i];
                 const body = item.body orelse {
                     i += 1;
                     continue;
                 };
-                if (item.window <= 0) {
+                if (item.sent < body.len and (item.window <= 0 or self.connection_window <= 0)) {
                     i += 1;
                     continue;
                 }
-                const count = @min(body.len - item.sent, 16384, @as(usize, @intCast(@min(item.window, self.connection_window))));
+                const count = if (item.sent == body.len) 0 else @min(body.len - item.sent, 16384, @as(usize, @intCast(@min(item.window, self.connection_window))));
                 const end = item.sent + count;
                 {
                     const previous = write_deadline.push(.{ .io = self.io, .handle = stream.socket.handle, .deadline = item.deadline, .restore_timeout_ms = self.write_timeout_ms, .stream_id = item.id });
                     defer write_deadline.restore(previous);
-                    try support.sendFrame(stream, h2.FRAME_DATA, if (end == body.len) h2.FLAG_END_STREAM else 0, item.id, body[item.sent..end], write);
+                    if (count > 0 or item.trailers == null) {
+                        try support.sendFrame(stream, h2.FRAME_DATA, if (end == body.len and item.trailers == null) h2.FLAG_END_STREAM else 0, item.id, body[item.sent..end], write);
+                    }
+                    if (end == body.len) if (item.trailers) |trailers| {
+                        try support.sendHeaderBlock(stream, item.id, trailers, true, write);
+                    };
                 }
                 item.sent = end;
                 item.window -= @intCast(count);
@@ -229,4 +252,40 @@ test "zero connection credit does not prevent response expiry" {
     try std.testing.expectEqual(13, test_output_used);
     try std.testing.expectEqual(0, state.streams.items.len);
     try std.testing.expectEqual(0, state.queued_bytes);
+}
+
+test "trailers wait for DATA but need no flow credit once the body is complete" {
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    var state = State{ .allocator = std.testing.allocator, .io = std.testing.io, .connection_window = 0, .initial_window = 0 };
+    defer state.deinit();
+    try state.open(1);
+    try state.queueResponse(1, "ok", "trailer");
+    test_output_used = 0;
+    try state.flush(stream, captureWrite);
+    try std.testing.expectEqual(0, test_output_used);
+    try std.testing.expectEqual(9, state.queued_bytes);
+    try state.update(0, 2);
+    try state.update(1, 2);
+    try state.flush(stream, captureWrite);
+    try std.testing.expectEqualStrings("\x00\x00\x02\x00\x00\x00\x00\x00\x01ok\x00\x00\x07\x01\x05\x00\x00\x00\x01trailer", test_output[0..test_output_used]);
+    try std.testing.expectEqual(0, state.queued_bytes);
+    try state.open(3);
+    try state.queueResponse(3, "", "trailer");
+    test_output_used = 0;
+    try state.flush(stream, captureWrite);
+    try std.testing.expectEqualStrings("\x00\x00\x07\x01\x05\x00\x00\x00\x03trailer", test_output[0..test_output_used]);
+    try std.testing.expectEqual(0, state.streams.items.len);
+}
+
+fn trailerAllocationCheck(allocator: std.mem.Allocator) !void {
+    var state = State{ .allocator = allocator, .io = std.testing.io };
+    defer state.deinit();
+    try state.open(1);
+    try state.queueResponse(1, "body", "owned trailers");
+    state.cancel(1);
+    try std.testing.expectEqual(0, state.queued_bytes);
+}
+
+test "queued trailers are reclaimed on allocation failure and cancellation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, trailerAllocationCheck, .{});
 }

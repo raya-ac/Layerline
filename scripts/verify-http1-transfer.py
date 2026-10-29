@@ -102,6 +102,10 @@ def wire_timeouts(server):
     return sum('"phase":"' + phase + '"' in line for line in server.log.read_text().splitlines() for phase in ["wire", "sendfile"])
 
 
+def timeout_events(server):
+    return [json.loads(line) for line in server.log.read_text().splitlines() if line.startswith('{"event":"server.write_timeout"')]
+
+
 class Server:
     def __init__(self, folder, secure):
         self.secure = secure
@@ -135,6 +139,7 @@ write_timeout_ms = 350
 read_header_timeout_ms = 500
 read_body_timeout_ms = 1000
 idle_timeout_ms = 1500
+worker_stack_size = 65536
 upstream_timeout_ms = 2000
 upstream_retries = 1
 graceful_shutdown_timeout_ms = 1000
@@ -201,11 +206,18 @@ with tempfile.TemporaryDirectory(prefix="layerline-http1-transfer-") as temporar
         try:
             for kind in ["broken", "fixed", "chunked", "unknown", "stall"]:
                 with server.connect() as conn:
+                    before = len(timeout_events(server))
                     started = time.monotonic()
                     conn.sendall(f"GET /{kind}/run HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n".encode())
-                    response = header(conn) + drain(conn)
+                    try:
+                        response = header(conn) + drain(conn)
+                    except BaseException:
+                        print(("proxy transfer failed", kind, secure, time.monotonic() - started), file=sys.stderr)
+                        raise
                     assert response.startswith(b"HTTP/1.1 200 ") and response.count(b"HTTP/1.1 ") == 1 and b"fallback" not in response, (kind, response)
                     assert time.monotonic() - started < 0.9, (kind, "backend body waits renewed the transfer budget")
+                    if kind != "broken":
+                        assert len(timeout_events(server)) == before + 1, ("missing transfer timeout event", kind, secure, time.monotonic() - started, timeout_events(server))
                 assert not server.backends[1].requests, ("retried after visible response bytes", server.backends[1].requests)
             with server.connect() as conn:
                 started = time.monotonic()
@@ -259,9 +271,13 @@ with tempfile.TemporaryDirectory(prefix="layerline-http1-transfer-") as temporar
                 time.sleep(0.6)
                 conn.sendall(b"tunnel remains open")
                 assert conn.recv(100) == b"tunnel remains open", "response budget leaked into an upgraded connection"
-            events = [json.loads(line) for line in server.log.read_text().splitlines() if line.startswith('{"event":"server.write_timeout"')]
-            assert len(events) >= 6 and all(row["protocol"] == "h1" and row["stream_id"] == 0 for row in events)
+            events = timeout_events(server)
+            assert len(events) >= 6 and all(row["protocol"] == "h1" and row["stream_id"] == 0 for row in events), (events, server.log.read_text())
             server.health()
             print(f"ok: {'TLS' if secure else 'plain'} interim responses, keep-alive and upgraded tunnels have separate lifetimes")
+        except BaseException:
+            print(("server exit code", server.process.poll()), file=sys.stderr)
+            print(server.log.read_text()[-24000:], file=sys.stderr)
+            raise
         finally:
             server.close()

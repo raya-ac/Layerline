@@ -8,6 +8,7 @@ const static_files = @import("static_files.zig");
 test {
     _ = @import("backend_deadline.zig");
     _ = @import("upstream_runtime.zig");
+    _ = @import("upstream_reader.zig");
     _ = @import("http3_server.zig");
     _ = @import("http2_flow.zig");
     _ = @import("http2_dispatch.zig");
@@ -37,6 +38,30 @@ test "HTTP2 trailers stay separate from routing and authentication fields" {
     const fields = [_]Header{.{ .name = "x-test", .value = "value" }};
     try std.testing.expect(h2_support.headerListFits(&fields, 43));
     try std.testing.expect(!h2_support.headerListFits(&fields, 42));
+}
+
+test "HTTP2 field values reject edge whitespace but preserve legal empty and internal whitespace" {
+    const Header = h2.Header;
+    for ([_][]const u8{ " value", "value ", "\tvalue", "value\t", " ", "\t" }) |value| {
+        try std.testing.expectError(error.BadRequest, h2_support.validateRequestFields(&[_]Header{.{ .name = "x-test", .value = value }}));
+        try std.testing.expectError(error.BadRequest, h2_support.validateTrailerFields(&[_]Header{.{ .name = "digest", .value = value }}));
+    }
+    for ([_][]const u8{ "", "value with spaces", "value\tinside", "\x80opaque" }) |value|
+        try h2_support.validateRequestFields(&[_]Header{.{ .name = "x-test", .value = value }});
+}
+
+test "microcache decoration preserves informational and trailer ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const info = [_]h2_support.Informational{.{ .status_code = 103, .headers = &.{} }};
+    const trailers = [_]h2.Header{.{ .name = "digest", .value = "sha-test" }};
+    const response: h2_support.BufferedResponse = .{ .status_code = 200, .content_type = "text/plain", .body = "okay", .trailers = &trailers, .informational = &info, .content_length = 4, .omit_content_length = true };
+    const decorated = try cache.withCacheStatus(arena.allocator(), response, "miss");
+    try std.testing.expectEqual(103, decorated.informational[0].status_code);
+    try std.testing.expectEqualStrings("sha-test", decorated.trailers[0].value);
+    try std.testing.expectEqual(4, decorated.content_length.?);
+    try std.testing.expect(decorated.omit_content_length);
+    try std.testing.expect(!cache.responseCanStore(response, .{ .enabled = true, .max_bytes = 4096, .max_entry_bytes = 1024, .ttl_ms = 1000 }));
 }
 
 fn splitCookieAllocationCheck(allocator: std.mem.Allocator) !void {

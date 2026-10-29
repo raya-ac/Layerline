@@ -203,6 +203,9 @@ pub fn requestCanUse(req: request_mod.HttpRequest, policy: Policy) bool {
 pub fn responseCanStore(response: BufferedResponse, policy: Policy) bool {
     if (!policyUsable(policy)) return false;
     if (response.status_code != 200) return false;
+    // Entries currently retain only the final header block and body. Do not
+    // cache a representation while silently dropping its trailer metadata.
+    if (response.trailers.len > 0) return false;
     if (response.body.len > policy.max_entry_bytes or response.body.len > policy.max_bytes) return false;
     if (findResponseHeader(response.headers, "set-cookie") != null) return false;
     if (findResponseHeader(response.headers, "vary") != null) return false;
@@ -249,12 +252,9 @@ pub fn withCacheStatus(allocator: std.mem.Allocator, response: BufferedResponse,
     const headers = try allocator.alloc(Header, response.headers.len + 1);
     if (response.headers.len > 0) @memcpy(headers[0..response.headers.len], response.headers);
     headers[response.headers.len] = .{ .name = "cache-status", .value = cache_status };
-    return .{
-        .status_code = response.status_code,
-        .content_type = response.content_type,
-        .body = response.body,
-        .headers = headers,
-    };
+    var result = response;
+    result.headers = headers;
+    return result;
 }
 
 fn ttlSeconds(policy: Policy) u32 {

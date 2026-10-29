@@ -26,7 +26,6 @@ const appendServerNames = config_mod.appendServerNames;
 const buildAcmeChallengeFilePath = acme_mod.buildAcmeChallengeFilePath;
 const buildResponseHeaderContext = config_mod.buildResponseHeaderContext;
 const certbotWebrootFromAcmeConfig = acme_mod.certbotWebrootFromAcmeConfig;
-const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
 const compressionPolicyFor = config_mod.compressionPolicyFor;
 const DEFAULT_COMPRESSION_WORKER_STACK_BYTES = config_mod.DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
 const DEFAULT_PHP_INDEX = config_mod.DEFAULT_PHP_INDEX;
@@ -717,13 +716,28 @@ test "static HTTP dates use IMF fixdate format" {
     try std.testing.expect(static_files.parseHttpDate("not a date") == null);
 }
 
-test "chunked upstream body scanner detects trailers and terminator" {
-    var scanner = ChunkedBodyScanner{};
-    var completed = false;
-    for ("4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Upstream: yes\r\n\r\n") |byte| {
-        completed = try scanner.consume(byte);
+test "chunked upstream reader detects trailers and terminator across single-byte reads" {
+    const Fake = struct {
+        threadlocal var input: []const u8 = "";
+        fn read(_: std.Io.net.Stream, out: []u8) !usize {
+            if (input.len == 0) return error.UnexpectedReadPastTerminator;
+            out[0] = input[0];
+            input = input[1..];
+            return 1;
+        }
+    };
+    Fake.input = "4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Upstream: yes\r\n\r\n";
+    var reader = @import("upstream_reader.zig").Reader{ .stream = .{ .socket = .{ .handle = 123, .address = undefined } }, .read = Fake.read };
+    try reader.beginBody("GET", .{ .status_code = 200, .content_length = null, .transfer_chunked = true, .connection_close = false }, null);
+    var body: [9]u8 = undefined;
+    var count: usize = 0;
+    while (try reader.nextData()) |data| {
+        @memcpy(body[count..][0..data.len], data);
+        count += data.len;
     }
-    try std.testing.expect(completed);
+    try std.testing.expectEqualStrings("Wikipedia", &body);
+    try std.testing.expectEqualStrings("X-Upstream: yes", reader.trailers());
+    try std.testing.expectEqual(0, Fake.input.len);
 }
 
 test "upstream response framing parser keeps keep-alive candidates explicit" {

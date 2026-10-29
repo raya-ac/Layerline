@@ -308,7 +308,8 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                         received = h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
                     assert (3, 0, 1, (8).to_bytes(4, "big")) in received, "PING/window traffic renewed a queued response deadline"
                     assert not any(k == 7 for k, _, _, _ in received)
-                    assert time.monotonic() - started < 0.9, "zero-window output survived its response budget"
+                    elapsed = time.monotonic() - started
+                    assert elapsed < 0.9, ("zero-window output survived its response budget", elapsed, progress, received, server.log.read_text())
                     h2.send(8, 0, 1, (65535).to_bytes(4, "big"))
                     assert not any(k == 0 and s == 1 for k, _, s, _ in h2.barrier()), "expired response resumed sending"
                 finally:
