@@ -204,6 +204,8 @@ for kind, flags, stream, payload, code in [
     (7, 0, 0, bytes(7), 6),
     (1, 5 | 32, 1, bytes(4), 6),
     (1, 5 | 8, 1, b"\x10", 1),
+    (1, 5, 1, headers(b"/health") + b"\x20", 9),
+    (1, 5, 1, b"\x00\x01x\x7f\x80\x80\x80\x80\x10", 9),
     (0, 1, 1, b"idle", 1),
     (1, 5, 1, bytes(16385), 6),
 ]:

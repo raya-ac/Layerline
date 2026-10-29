@@ -63,15 +63,34 @@ pub const PendingReader = struct {
 };
 
 pub fn cloneRequest(allocator: std.mem.Allocator, req: request_mod.HttpRequest) !request_mod.HttpRequest {
+    const method = try allocator.dupe(u8, req.method);
+    errdefer allocator.free(method);
+    const path = try allocator.dupe(u8, req.path);
+    errdefer allocator.free(path);
+    const query = try allocator.dupe(u8, req.query);
+    errdefer allocator.free(query);
+    const headers = try allocator.dupe(u8, req.headers);
     return .{
-        .method = try allocator.dupe(u8, req.method),
-        .path = try allocator.dupe(u8, req.path),
-        .query = try allocator.dupe(u8, req.query),
-        .headers = try allocator.dupe(u8, req.headers),
+        .method = method,
+        .path = path,
+        .query = query,
+        .headers = headers,
         .version = req.version,
         .body = "",
         .close_connection = true,
     };
+}
+
+fn cloneWithAllocationFailures(allocator: std.mem.Allocator) !void {
+    const req = try cloneRequest(allocator, .{ .method = "POST", .path = "/upload", .query = "x=y", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true });
+    allocator.free(req.method);
+    allocator.free(req.path);
+    allocator.free(req.query);
+    allocator.free(req.headers);
+}
+
+test "HTTP2 request cloning cleans up when an allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneWithAllocationFailures, .{});
 }
 
 fn headerNameIndex(name: []const u8) ?u64 {

@@ -92,8 +92,10 @@ request trailers may finish buffered uploads; optional trailer metadata is
 validated and discarded, never merged into routing or authentication headers.
 Pseudo-headers, framing/routing/authentication fields, and non-terminal trailers
 reset only that stream. Decoded header bytes have the configured header budget,
-including HPACK's 32-byte field accounting overhead. DATA discarded on closed or
-rejected streams still restores connection credit. Cache budgets charge keys, headers and
+including HPACK's 32-byte field accounting overhead. HPACK table-size updates
+must precede fields, and literal lengths are checked before offset arithmetic.
+DATA discarded on closed or rejected streams still restores connection credit.
+Cache budgets charge keys, headers and
 entry metadata as well as bodies, and each cache has a 4096-entry ceiling.
 These are live-data budgets, not exact process RSS limits.
 
@@ -106,7 +108,9 @@ count while preserving old connections; it is not automatic snapshot reclamation
 ## Verification scope
 
 `zig build test` includes the native guard, session lifecycle, cache accounting,
-reload cap, and exposed-version checks. `scripts/verify-layerline.sh` exercises
+reload cap, and exposed-version checks. Allocation-failure injection covers
+HPACK table insertion and pending request cloning, including cleanup after every
+failed allocation. `scripts/verify-layerline.sh` exercises
 wire-level HTTP/1 and HTTP/2, normal and abusive multipart fixtures, denial log
 privacy, backend version notices, admin bootstrap/logout/origin behavior,
 symlink escapes, encrypted static responses, and config reload. The raw HTTP/2

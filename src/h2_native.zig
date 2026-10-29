@@ -241,14 +241,11 @@ pub const HpackDecoder = struct {
             return;
         }
 
-        const entry = DynamicEntry{
-            .name = try self.allocator.dupe(u8, name),
-            .value = try self.allocator.dupe(u8, value),
-        };
-        errdefer {
-            self.allocator.free(entry.name);
-            self.allocator.free(entry.value);
-        }
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+        const entry = DynamicEntry{ .name = owned_name, .value = owned_value };
 
         try self.dynamic.append(self.allocator, entry);
         var i = self.dynamic.items.len - 1;
@@ -296,17 +293,20 @@ pub const HpackDecoder = struct {
         }
 
         var offset: usize = 0;
+        var saw_field = false;
         while (offset < block.len) {
             const byte = block[offset];
             if ((byte & 0x80) != 0) {
                 const decoded = try decodeInteger(block[offset..], 7);
                 const entry = try self.indexedEntry(decoded.value);
                 try appendDecodedCopy(&headers, allocator, entry.name, entry.value);
+                saw_field = true;
                 offset += decoded.len;
                 continue;
             }
 
             if ((byte & 0xe0) == 0x20) {
+                if (saw_field) return error.BadHeaderBlock;
                 const decoded_size = try decodeInteger(block[offset..], 5);
                 try self.setDynamicTableSize(decoded_size.value);
                 offset += decoded_size.len;
@@ -333,6 +333,7 @@ pub const HpackDecoder = struct {
             errdefer allocator.free(decoded_value.value);
             offset += decoded_value.len;
             try appendDecodedOwned(&headers, allocator, owned_name, decoded_value.value);
+            saw_field = true;
             errdefer headers.items.len -= 1;
             if (uses_incremental_indexing) {
                 try self.insertDynamic(owned_name, decoded_value.value);
@@ -458,8 +459,8 @@ fn decodeString(allocator: std.mem.Allocator, input: []const u8) Error!struct { 
     const decoded_len = try decodeInteger(input, 7);
     const start = decoded_len.len;
     const value_len = std.math.cast(usize, decoded_len.value) orelse return error.IntegerOverflow;
+    if (value_len > input.len - start) return error.Truncated;
     const end = start + value_len;
-    if (end > input.len) return error.Truncated;
     const value = if (is_huffman)
         try decodeHuffmanString(allocator, input[start..end])
     else
@@ -568,6 +569,30 @@ test "keeps HPACK dynamic table across header blocks" {
     var decoded_second = try decoder.decodeHeaderBlock(allocator, second.items);
     defer decoded_second.deinit(allocator);
     try std.testing.expectEqualStrings("example.test", decoded_second.get(":authority").?);
+}
+
+fn decodeWithAllocationFailures(allocator: std.mem.Allocator) !void {
+    var decoder = HpackDecoder.init(allocator);
+    defer decoder.deinit();
+    var decoded = try decoder.decodeHeaderBlock(allocator, "\x40\x06x-test\x05value");
+    defer decoded.deinit(allocator);
+}
+
+test "HPACK allocation failure releases partially copied table entries" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeWithAllocationFailures, .{});
+}
+
+test "HPACK table size updates precede fields and huge string lengths are bounded" {
+    var decoder = HpackDecoder.init(std.testing.allocator);
+    defer decoder.deinit();
+    try std.testing.expectError(error.BadHeaderBlock, decoder.decodeHeaderBlock(std.testing.allocator, "\x82\x20"));
+    var decoded = try decoder.decodeHeaderBlock(std.testing.allocator, "\x20\x82");
+    decoded.deinit(std.testing.allocator);
+    var block = std.ArrayList(u8).empty;
+    defer block.deinit(std.testing.allocator);
+    try block.appendSlice(std.testing.allocator, "\x00\x01x");
+    try encodeInteger(std.testing.allocator, &block, 0, 7, std.math.maxInt(u32));
+    try std.testing.expectError(error.Truncated, decoder.decodeHeaderBlock(std.testing.allocator, block.items));
 }
 
 test "decoded dynamic headers survive same-block eviction" {
