@@ -215,7 +215,11 @@ python3 "$ROOT_DIR/scripts/verify-admin-socket.py" "$SOCKET"
 
 ROOT_BODY="$TMP_DIR/root.body"
 curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
-grep -Fq 'Layerline' "$ROOT_BODY" || die "root page did not contain Layerline"
+cmp -s "$ROOT_DIR/public/index.html" "$ROOT_BODY" || die "HTTP/1 root did not match the published website"
+for asset in site.css site.js laina-v2.png icons/copy.svg icons/check.svg icons/arrow-up-right.svg; do
+  curl -fsS "http://$HOST:$PORT/static/$asset" -o "$TMP_DIR/website-asset.body"
+  cmp -s "$ROOT_DIR/public/$asset" "$TMP_DIR/website-asset.body" || die "HTTP/1 website asset mismatch: $asset"
+done
 ok "HTTP/1 root page"
 
 REQUEST_ID_HEADERS="$TMP_DIR/request-id.headers"
@@ -309,7 +313,11 @@ ok "HTTP/1 route compression override"
 if curl --help all 2>/dev/null | grep -q -- '--http2-prior-knowledge'; then
   H2_ROOT_BODY="$TMP_DIR/h2-root.body"
   curl -fsS --http2-prior-knowledge "http://$HOST:$PORT/" -o "$H2_ROOT_BODY"
-  grep -Fq 'Origin Surface Web Server' "$H2_ROOT_BODY" || die "h2 root page did not serve static website"
+  cmp -s "$ROOT_DIR/public/index.html" "$H2_ROOT_BODY" || die "HTTP/2 root did not match the published website"
+  for asset in site.css site.js laina-v2.png icons/copy.svg icons/check.svg icons/arrow-up-right.svg; do
+    curl -fsS --http2-prior-knowledge "http://$HOST:$PORT/static/$asset" -o "$TMP_DIR/h2-website-asset.body"
+    cmp -s "$ROOT_DIR/public/$asset" "$TMP_DIR/h2-website-asset.body" || die "HTTP/2 website asset mismatch: $asset"
+  done
   ok "h2c root static website"
 
   H2_STATIC_HEADERS="$TMP_DIR/h2-static.headers"

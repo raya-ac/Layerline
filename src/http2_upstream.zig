@@ -179,6 +179,7 @@ pub fn fetchPoolResponse(
         callbacks.metrics.upstreamRequestStarted();
         var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory or err == error.BackendCapacity) return err;
+            if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.upstream_failure\",\"protocol\":\"h2\",\"error\":\"{s}\"}}\n", .{@errorName(err)});
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
             if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
