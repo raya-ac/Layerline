@@ -6,6 +6,7 @@ const native_tls = @import("native_tls_runtime.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const read_interrupt = @import("read_interrupt.zig");
+const backend_deadline = @import("backend_deadline.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -51,16 +52,36 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     if (read_interrupt.active) |scope| {
         if (scope.stream.socket.handle == stream.socket.handle) try scope.wait();
     }
+    var timeout: ?u32 = null;
+    var restore_timeout: ?u32 = null;
     if (read_deadline.forStream(stream)) |budget| {
         if (try budget.remaining()) |remaining| {
-            try setStreamReadTimeout(stream, if (budget.restore_timeout_ms == 0) remaining else @min(remaining, budget.restore_timeout_ms));
+            timeout = if (budget.restore_timeout_ms == 0) remaining else @min(remaining, budget.restore_timeout_ms);
         }
+        restore_timeout = budget.restore_timeout_ms;
     }
-    defer if (read_deadline.forStream(stream)) |budget| {
-        setStreamReadTimeout(stream, budget.restore_timeout_ms) catch {};
+    if (backend_deadline.forStream(stream)) |budget| {
+        const remaining = budget.remaining() catch |err| {
+            backend_deadline.logTimeout("read");
+            return err;
+        };
+        if (remaining) |ms| timeout = @min(timeout orelse ms, ms);
+        if (restore_timeout == null) restore_timeout = budget.timeout_ms;
+    }
+    if (timeout) |ms| try setStreamReadTimeout(stream, ms);
+    defer if (restore_timeout) |ms| {
+        setStreamReadTimeout(stream, ms) catch {};
     };
     var data: [1][]u8 = .{out};
-    const n = io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
+    const n = io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| {
+        const normalized = normalizeSocketIoError(err);
+        if (normalized == error.RequestTimeout) {
+            if (backend_deadline.forStream(stream)) |state| {
+                if (state.deadline.expired(.now(io, .awake))) backend_deadline.logTimeout("read");
+            }
+        }
+        return normalized;
+    };
     if (n > 0) read_deadline.noteProgress(stream);
     return n;
 }
@@ -80,19 +101,31 @@ pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
 pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
     const io = activeIo();
     const budget = write_deadline.startWrite(stream);
+    const backend = backend_deadline.forStream(stream);
     defer if (budget) |state| {
         state.restoreSocketTimeout(stream);
+    };
+    defer if (backend) |state| {
+        setStreamWriteTimeout(stream, state.timeout_ms) catch {};
     };
     var written: usize = 0;
     while (written < bytes.len) {
         if (budget) |state| {
             try state.prepare(stream);
         }
+        if (backend) |state| {
+            const remaining = state.remaining() catch |err| {
+                backend_deadline.logTimeout("write");
+                return err;
+            };
+            if (remaining) |ms| try setStreamWriteTimeout(stream, ms);
+        }
         // netWrite expects a real scatter list here. Passing an empty one
         // looked tidy, then crashed in the vtable path.
         const empty: [1][]const u8 = .{""};
         const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| {
             const normalized = normalizeSocketIoError(err);
+            if (normalized == error.RequestTimeout and backend != null) backend_deadline.logTimeout("write");
             if (budget) |state| {
                 if (normalized == error.RequestTimeout) {
                     state.logTimeout();
@@ -151,11 +184,11 @@ pub fn connectTcpHost(allocator: std.mem.Allocator, host: []const u8, port: u16)
     _ = allocator;
     if (std.Io.net.IpAddress.parse(host, port)) |address| {
         var addr = address;
-        return addr.connect(activeIo(), .{ .mode = .stream });
+        return backend_deadline.connect(activeIo(), std.Io.net.IpAddress.connect, .{ &addr, activeIo(), std.Io.net.IpAddress.ConnectOptions{ .mode = .stream } });
     } else |_| {}
 
     const host_name = try std.Io.net.HostName.init(host);
-    return host_name.connect(activeIo(), port, .{ .mode = .stream });
+    return backend_deadline.connect(activeIo(), std.Io.net.HostName.connect, .{ host_name, activeIo(), port, std.Io.net.IpAddress.ConnectOptions{ .mode = .stream } });
 }
 
 pub fn listenerWakeHost(host: []const u8) []const u8 {
@@ -169,7 +202,7 @@ pub fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgi
         .tcp => |tcp| try connectTcpHost(allocator, tcp.host, tcp.port),
         .unix => |path| blk: {
             const unix_addr = try std.Io.net.UnixAddress.init(path);
-            break :blk try unix_addr.connect(activeIo());
+            break :blk try backend_deadline.connect(activeIo(), std.Io.net.UnixAddress.connect, .{ &unix_addr, activeIo() });
         },
     };
 }

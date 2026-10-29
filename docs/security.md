@@ -230,8 +230,7 @@ frame/record bytes. Wire timeouts log phase `wire`; HTTP/1 also identifies
 `sendfile` and forwarded-body `upstream` waits. These events do not include
 request paths, cookies, headers, or bodies.
 
-Pre-response upstream operations and external PHP execution still have separate
-limits, not an end-to-end application deadline. HTTP/2 backend routing runs in
+HTTP/2 backend routing runs in
 bounded concurrent tasks; the connection thread alone owns frame parsing, HPACK,
 TLS output, and response flow control. Completion wakes the reader without
 requiring another client frame. A blocked backend therefore does not prevent
@@ -245,6 +244,41 @@ their arenas, wake descriptors, or borrowed config/TLS state. Local cancellation
 and allocation failure release upstream attempt leases without retrying or
 ejecting a healthy target. This is not a fully evented socket scheduler:
 downstream writes can still occupy the connection thread until their deadline.
+
+## Backend deadlines
+
+`upstream_timeout_ms` and its domain/route overrides now bound a complete proxy
+attempt: dialing, request writes, and response reads share one monotonic budget.
+FastCGI uses the same mechanism, including TCP and Unix sockets, PARAMS/STDIN
+writes, record headers, and output reads. Health probes use their own configured
+budget. Bytes arriving periodically do not renew these clocks. A timeout of zero
+disables the absolute backend budget as well as the existing socket idle limit.
+
+Dialing races an owned IO task against the deadline and cancels/joins it before
+returning; even a successful late connection is closed. Linux uses Zig's
+cancellable resolver. Darwin's libc resolver can delay cancellation while inside
+`getaddrinfo`, so a hard DNS deadline there is not yet guaranteed. External CGI
+process execution is still outside these socket budgets. This is not a full
+end-to-end application execution deadline on every platform/path.
+
+Each permitted retry receives a fresh attempt budget, within the configured
+attempt limit. Automatic retries are restricted to known idempotent methods
+(GET, HEAD, OPTIONS, TRACE, PUT, DELETE), following
+[RFC 9110 section 9.2.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2).
+POST, PATCH, CONNECT, and unknown methods are never automatically replayed.
+Already-started HTTP/1 replies still close without retries or a second status
+line. Their total elapsed budget includes downstream forwarding time; timeout
+closure after output starts does not count as passive backend failure, since
+slow clients can consume that time too. Other backend failures and pre-response
+timeouts retain passive failure accounting.
+
+Buffered HTTP/2 and FastCGI timeouts return 504 before response output. FastCGI
+transport/protocol failures return 502 and discard the connection, rather than
+turning a stale worker socket into an internal 500. Reused connections start a
+fresh budget. A successful HTTP/1 Upgrade handshake disarms the attempt deadline
+before tunnel traffic begins; normal tunnel idle/shutdown rules still apply.
+`server.backend_timeout` events identify only `connect`, `read`, or `write`, not
+request paths, query strings, headers, bodies, or credentials.
 
 ## Verification scope
 
@@ -279,6 +313,14 @@ healthy streams, upload/response expiry, idle rearming, and per-request log/head
 isolation on plain and native TLS HTTP/2. It also covers h2c Upgrade dispatch,
 eight-job admission, reset suppression, and disconnect cancellation with zero
 remaining jobs/tracked HTTP/2 bytes. It runs in the main verifier too.
+
+`scripts/verify-backend-deadlines.py` covers trickling headers and fixed/chunked/
+close-delimited bodies, shared header/body timing, blocked upstream request
+writes, FastCGI record-header/output trickles over TCP and Unix sockets, stale
+FastCGI failure/recovery, fresh pooled budgets, safe GET fallback, non-replayed
+POSTs, and tunnel lifetimes. It checks plain and native TLS HTTP/1 and HTTP/2 and
+runs in the main verifier. Unit tests cover joined dial cancellation, late socket
+cleanup, deadline scoping, and the method retry gate.
 
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do

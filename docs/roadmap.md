@@ -42,8 +42,13 @@ the connection thread. A blocked backend no longer stalls PINGs or independent
 stream deadlines. Shared HTTP/2 allocator requests have a 256 MiB cap; this does
 not cover TLS, caches, stacks, kernel memory, or other protocols. Plain/TLS wire
 tests cover admission, idle rearming, resets, and joined disconnect cleanup.
-The next work is wider HTTP/2 frame/stream conformance, end-to-end backend
-deadlines, full process resource budgets, and config reader leases/reclamation.
+Proxy/FastCGI attempts and health probes now use absolute backend budgets across
+dialing, writes, and reads. Automatic proxy retries exclude non-idempotent
+methods; each permitted attempt has a fresh budget. Plain/TLS wire tests cover
+trickling backends, FastCGI TCP/Unix records, stale sockets, and tunnel lifetimes.
+Darwin resolver cancellation and external CGI execution still need stronger
+deadline guarantees. The next work also includes wider HTTP/2 frame/stream
+conformance, full process resource budgets, and config reader leases/reclamation.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

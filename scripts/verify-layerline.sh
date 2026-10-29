@@ -774,4 +774,7 @@ python3 "$ROOT_DIR/scripts/verify-admin-http2.py" "$SERVER_BINARY"
 log "verifying HTTP/2 backend isolation and resource cleanup"
 python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
 
+log "verifying absolute backend attempt deadlines and retry safety"
+python3 "$ROOT_DIR/scripts/verify-backend-deadlines.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

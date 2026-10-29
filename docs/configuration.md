@@ -615,6 +615,15 @@ route_php_fastcgi.app = 127.0.0.1:9000
 route_php_timeout_ms.app = 10000
 ```
 
+For proxy and FastCGI requests, the selected timeout is an absolute per-attempt
+budget shared by connection setup, backend writes, and response reads, not an
+idle timer renewed by each byte. Reused connections get a fresh budget. Zero
+disables the budget. Only known idempotent methods can automatically retry;
+POST/PATCH and unknown methods do not replay even when `upstream_retries` is set.
+Each allowed retry gets its own budget, so the configured attempt limit also
+matters. Successful WebSocket upgrades leave this HTTP attempt clock behind.
+See [backend deadlines](security.md#backend-deadlines) for platform and CGI limits.
+
 If the PHP worker is missing or cannot start, Layerline returns `502 Bad Gateway` instead of dropping the connection.
 
 For framework-style apps, enable the front controller. Layerline will still serve real static files first when `serve_static_root = true`, then run `php_index` and set `SCRIPT_NAME`, `SCRIPT_FILENAME`, `PATH_INFO`, `PATH_TRANSLATED`, and `REQUEST_URI` for the original request.

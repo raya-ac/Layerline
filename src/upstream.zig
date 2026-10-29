@@ -317,6 +317,22 @@ pub fn upstreamAttemptLimit(pool: *const UpstreamPoolConfig, retry_budget: usize
     return retry_budget + 1;
 }
 
+pub fn requestRetryBudget(method: []const u8, retry_budget: usize) usize {
+    for ([_][]const u8{ "GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE" }) |idempotent| {
+        if (std.mem.eql(u8, method, idempotent)) return retry_budget;
+    }
+    return 0;
+}
+
+test "automatic retries require a known idempotent request method" {
+    for ([_][]const u8{ "GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE" }) |method| {
+        try std.testing.expectEqual(3, requestRetryBudget(method, 3));
+    }
+    for ([_][]const u8{ "POST", "PATCH", "CONNECT", "CUSTOM", "get", "" }) |method| {
+        try std.testing.expectEqual(0, requestRetryBudget(method, 3));
+    }
+}
+
 pub fn upstreamAtAttempt(pool: *UpstreamPoolConfig, start_ticket: usize, attempt: usize) *UpstreamConfig {
     return &pool.targets.items[upstreamAttemptIndex(pool, start_ticket, attempt)];
 }

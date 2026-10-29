@@ -8,6 +8,7 @@ const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
+const backend_deadline = @import("backend_deadline.zig");
 
 const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
 const HttpRequest = request_mod.HttpRequest;
@@ -85,6 +86,7 @@ fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cf
     }
 
     const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
+    errdefer callbacks.stream_close(upstream_conn);
     try callbacks.set_stream_timeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
     callbacks.metrics.upstreamConnectionOpened();
     return .{
@@ -291,6 +293,7 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.S
 
     callbacks.stream_write_all(stream, header_bytes) catch return error.DownstreamClosed;
     write_deadline.clear(stream);
+    backend_deadline.clear(upstream_conn);
     callbacks.proxy_raw_bidirectional(upstream_conn, stream, body_tail) catch return error.DownstreamClosed;
 }
 
@@ -302,6 +305,9 @@ fn responseFailure(stream: std.Io.net.Stream, err: anyerror, callbacks: Callback
                 budget.logTimeoutPhase("upstream");
                 return error.DownstreamClosed;
             }
+            // A total attempt budget also elapses while forwarding to a slow
+            // client. After output starts, it is not reliable backend health evidence.
+            if (err == error.RequestTimeout) return error.DownstreamClosed;
             return error.ResponseAborted;
         }
     }
@@ -315,6 +321,8 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
 
     const upgrade_request = proxy_utils.isHttpUpgradeHeaders(req.headers);
     const keepalive_enabled = keepaliveConfigured(cfg) and !upgrade_request;
+    const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
+    defer backend_deadline.restore(previous_backend);
     const lease = try acquireConnection(allocator, upstream, cfg, callbacks.upstream_now_ms(), callbacks);
     var lease_released = false;
     defer if (!lease_released) {
@@ -322,6 +330,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         callbacks.metrics.upstreamConnectionDiscarded();
     };
     try callbacks.set_stream_timeouts(lease.stream, timeout_ms, timeout_ms);
+    try backend_deadline.attach(lease.stream);
 
     const proxy_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, req.path, req.query);
     defer allocator.free(proxy_path);
@@ -428,8 +437,11 @@ fn readHealthStatus(upstream_conn: std.Io.net.Stream, callbacks: Callbacks) !u16
 fn checkHealth(allocator: std.mem.Allocator, upstream: *const UpstreamConfig, health_path: []const u8, timeout_ms: u32, callbacks: Callbacks) !bool {
     if (upstream.https) return error.UnsupportedUpstreamScheme;
 
+    const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
+    defer backend_deadline.restore(previous_backend);
     const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
     defer callbacks.stream_close(upstream_conn);
+    try backend_deadline.attach(upstream_conn);
     try callbacks.set_stream_timeouts(upstream_conn, timeout_ms, timeout_ms);
 
     const probe_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, health_path, "");
@@ -541,7 +553,7 @@ pub fn forwardToPool(
         return;
     }
 
-    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, runtime_policy.retries);
+    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, upstream_mod.requestRetryBudget(req.method, runtime_policy.retries));
     const now_ms = callbacks.upstream_now_ms();
     const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, now_ms, request_mod.upstreamHashInput(req), &runtime_policy);
     var considered: usize = 0;
@@ -557,6 +569,7 @@ pub fn forwardToPool(
             callbacks.metrics.upstreamEjectedSkip();
             continue :attempt_loop;
         };
+        defer upstream_mod.upstreamEndAttempt(upstream, lease);
 
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
@@ -575,26 +588,21 @@ pub fn forwardToPool(
 
         forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, sticky_cookie, callbacks) catch |err| switch (err) {
             error.DownstreamClosed => {
-                upstream_mod.upstreamEndAttempt(upstream, lease);
                 return error.CloseConnection;
             },
             error.ResponseAborted => {
-                upstream_mod.upstreamEndAttempt(upstream, lease);
                 callbacks.metrics.upstreamRequestFailed();
                 if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) callbacks.metrics.upstreamEjected();
                 return error.CloseConnection;
             },
             error.CloseConnection => {
-                upstream_mod.upstreamEndAttempt(upstream, lease);
                 upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
                 return err;
             },
-            error.OutOfMemory => {
-                upstream_mod.upstreamEndAttempt(upstream, lease);
+            error.OutOfMemory, error.Canceled => {
                 return err;
             },
             else => {
-                upstream_mod.upstreamEndAttempt(upstream, lease);
                 last_error = err;
                 callbacks.metrics.upstreamRequestFailed();
                 if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
@@ -603,7 +611,6 @@ pub fn forwardToPool(
                 continue :attempt_loop;
             },
         };
-        upstream_mod.upstreamEndAttempt(upstream, lease);
         upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return;
     }

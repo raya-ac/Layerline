@@ -9,6 +9,7 @@ const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
+const backend_deadline = @import("backend_deadline.zig");
 
 const H2BufferedResponse = h2_support.BufferedResponse;
 const ServerConfig = config_mod.ServerConfig;
@@ -31,6 +32,7 @@ pub const Callbacks = struct {
     stream_read: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     stream_write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
     upstream_now_ms: *const fn () i64,
+    active_io: *const fn () std.Io,
 };
 
 fn appendForwardedRequestHeaders(
@@ -89,6 +91,8 @@ fn readHttp1ResponseToBuffer(allocator: std.mem.Allocator, upstream_conn: std.Io
 
 fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
     if (upstream.https) return error.UnsupportedUpstreamScheme;
+    const previous_backend = backend_deadline.push(callbacks.active_io(), runtime_policy.timeout_ms);
+    defer backend_deadline.restore(previous_backend);
 
     const upstream_label = try std.fmt.allocPrint(
         allocator,
@@ -99,6 +103,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
 
     const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
     defer callbacks.stream_close(upstream_conn);
+    try backend_deadline.attach(upstream_conn);
     try callbacks.set_stream_timeouts(upstream_conn, runtime_policy.timeout_ms, runtime_policy.timeout_ms);
 
     const proxy_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, req.path, req.query);
@@ -151,7 +156,7 @@ pub fn fetchPoolResponse(
 ) !H2BufferedResponse {
     if (pool.targets.items.len == 0) return callbacks.error_response(allocator, 502, "Bad Gateway", "Proxy upstream pool is empty.");
 
-    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, runtime_policy.retries);
+    const attempt_limit = upstream_mod.upstreamAttemptLimit(pool, upstream_mod.requestRetryBudget(req.method, runtime_policy.retries));
     const start_ms = callbacks.upstream_now_ms();
     const start_ticket = upstream_mod.upstreamStartTicket(pool, policy, start_ms, request_mod.upstreamHashInput(req), &runtime_policy);
     var considered: usize = 0;
@@ -230,6 +235,9 @@ test "canceling a client or exhausting local memory never ejects an upstream" {
         fn now() i64 {
             return 1000;
         }
+        fn io() std.Io {
+            return std.testing.io;
+        }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -249,6 +257,7 @@ test "canceling a client or exhausting local memory never ejects an upstream" {
         .stream_read = Fake.read,
         .stream_write_all = Fake.write,
         .upstream_now_ms = Fake.now,
+        .active_io = Fake.io,
     };
     const req: request_mod.HttpRequest = .{ .method = "GET", .path = "/", .query = "", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true };
     for ([_]anyerror{ error.Canceled, error.OutOfMemory }) |failure| {

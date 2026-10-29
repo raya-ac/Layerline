@@ -586,6 +586,7 @@ fn http3Callbacks() http3_server.Callbacks {
 
 fn http2UpstreamCallbacks() http2_upstream.Callbacks {
     return .{
+        .active_io = activeIo,
         .access_log_set_upstream = runtime_state.accessLogSetUpstream,
         .connect_tcp_host = connectTcpHost,
         .current_request_id = runtime_state.currentRequestId,

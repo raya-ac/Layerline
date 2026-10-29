@@ -11,6 +11,7 @@ const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
 const request_mod = @import("request.zig");
+const backend_deadline = @import("backend_deadline.zig");
 
 const FastcgiIdleConnection = config_mod.FastcgiIdleConnection;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
@@ -95,6 +96,7 @@ fn fastcgiAcquireConnection(allocator: std.mem.Allocator, endpoint_name: []const
     }
 
     const conn = try callbacks.connect_fastcgi_endpoint(allocator, endpoint);
+    errdefer callbacks.stream_close(conn);
     try callbacks.set_stream_timeouts(conn, timeout_ms, timeout_ms);
     callbacks.metrics.fastcgiConnectionOpened();
     return .{
@@ -235,6 +237,22 @@ test "FastCGI version warning withholds an affected backend body" {
     try std.testing.expect(std.mem.indexOf(u8, response.body, "backend secret") == null);
 }
 
+fn fastcgiIoError(err: anyerror) anyerror {
+    return switch (err) {
+        error.Canceled, error.OutOfMemory, error.RequestTimeout, error.StreamTooLong => err,
+        else => error.FastcgiProtocolFailed,
+    };
+}
+
+test "FastCGI transport failures are backend errors, not internal server errors" {
+    for ([_]anyerror{ error.BadGateway, error.BrokenPipe, error.ConnectionResetByPeer }) |err| {
+        try std.testing.expectEqual(error.FastcgiProtocolFailed, fastcgiIoError(err));
+    }
+    for ([_]anyerror{ error.Canceled, error.OutOfMemory, error.RequestTimeout, error.StreamTooLong }) |err| {
+        try std.testing.expectEqual(err, fastcgiIoError(err));
+    }
+}
+
 fn runFastcgiRequest(
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
@@ -249,14 +267,20 @@ fn runFastcgiRequest(
 ) !fastcgi.RunResult {
     const endpoint = config_mod.parseFastcgiEndpoint(php_fastcgi) catch return error.InvalidFastcgiEndpoint;
 
-    const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, callbacks.now_ms(), callbacks) catch return error.FastcgiConnectFailed;
+    const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
+    defer backend_deadline.restore(previous_backend);
+    const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, callbacks.now_ms(), callbacks) catch |err| switch (err) {
+        error.RequestTimeout, error.Canceled, error.OutOfMemory => return err,
+        else => return error.FastcgiConnectFailed,
+    };
     const conn = lease.stream;
     var reusable_fastcgi_conn = false;
     defer fastcgiReleaseConnection(php_fastcgi, cfg, lease, reusable_fastcgi_conn, callbacks.now_ms(), callbacks);
+    try backend_deadline.attach(conn);
 
     const request_id: u16 = 1;
     const begin_body = [_]u8{ 0, @intCast(fastcgi.RESPONDER), if (fastcgiKeepaliveConfigured(cfg)) fastcgi.KEEP_CONN else 0, 0, 0, 0, 0, 0 };
-    try fastcgi.writeRecord(conn, fastcgi.BEGIN_REQUEST, request_id, &begin_body, callbacks.stream_write_all);
+    fastcgi.writeRecord(conn, fastcgi.BEGIN_REQUEST, request_id, &begin_body, callbacks.stream_write_all) catch |err| return fastcgiIoError(err);
 
     const params = try fastcgi.buildParams(allocator, .{
         .server_header = callbacks.server_header,
@@ -271,12 +295,12 @@ fn runFastcgiRequest(
         .body_len = req.body.len,
     }, php_root, script_path, script_name, path_info);
     defer allocator.free(params);
-    try fastcgi.writeRecord(conn, fastcgi.PARAMS, request_id, params, callbacks.stream_write_all);
-    try fastcgi.writeRecord(conn, fastcgi.PARAMS, request_id, "", callbacks.stream_write_all);
-    if (req.body.len > 0) try fastcgi.writeRecord(conn, fastcgi.STDIN, request_id, req.body, callbacks.stream_write_all);
-    try fastcgi.writeRecord(conn, fastcgi.STDIN, request_id, "", callbacks.stream_write_all);
+    fastcgi.writeRecord(conn, fastcgi.PARAMS, request_id, params, callbacks.stream_write_all) catch |err| return fastcgiIoError(err);
+    fastcgi.writeRecord(conn, fastcgi.PARAMS, request_id, "", callbacks.stream_write_all) catch |err| return fastcgiIoError(err);
+    if (req.body.len > 0) fastcgi.writeRecord(conn, fastcgi.STDIN, request_id, req.body, callbacks.stream_write_all) catch |err| return fastcgiIoError(err);
+    fastcgi.writeRecord(conn, fastcgi.STDIN, request_id, "", callbacks.stream_write_all) catch |err| return fastcgiIoError(err);
 
-    const result = try fastcgi.readResponse(allocator, conn, request_id, cfg.max_php_output_bytes, callbacks.stderr_limit, callbacks.stream_read);
+    const result = fastcgi.readResponse(allocator, conn, request_id, cfg.max_php_output_bytes, callbacks.stderr_limit, callbacks.stream_read) catch |err| return fastcgiIoError(err);
     errdefer result.deinit(allocator);
 
     if (result.protocol_status != fastcgi.REQUEST_COMPLETE) return error.FastcgiProtocolFailed;
@@ -302,6 +326,10 @@ fn handleFastcgi(
     callbacks: Callbacks,
 ) !void {
     const result = runFastcgiRequest(allocator, cfg, req, php_root, php_fastcgi, script_path, script_name, path_info, timeout_ms, callbacks) catch |err| switch (err) {
+        error.RequestTimeout => {
+            try callbacks.send_cool_error(stream, allocator, 504, "Gateway Timeout", "PHP FastCGI request exceeded its backend deadline.", close_connection, is_head, null);
+            return;
+        },
         error.InvalidFastcgiEndpoint => {
             try callbacks.send_cool_error(stream, allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid.", close_connection, is_head, null);
             return;
@@ -365,6 +393,7 @@ pub fn buildHttp2FastcgiResponse(
     defer script.close(io);
 
     const result = runFastcgiRequest(allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, timeout_ms, callbacks) catch |err| switch (err) {
+        error.RequestTimeout => return callbacks.h2_error_response(allocator, 504, "Gateway Timeout", "PHP FastCGI request exceeded its backend deadline."),
         error.InvalidFastcgiEndpoint => return callbacks.h2_error_response(allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid."),
         error.FastcgiConnectFailed => return callbacks.h2_error_response(allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached."),
         error.StreamTooLong => return callbacks.h2_error_response(allocator, 502, "Bad Gateway", "PHP FastCGI response exceeded max_php_output_bytes."),
