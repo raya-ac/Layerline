@@ -3,6 +3,7 @@ const std = @import("std");
 const access_log_mod = @import("access_log.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
+const config_store = @import("config_store.zig");
 const h2_support = @import("http2_support.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
@@ -24,7 +25,7 @@ const MAX_CHUNK_LINE_BYTES = 4096;
 pub const Callbacks = struct {
     access_log_set_error: *const fn ([]const u8) void,
     access_log_set_handler: *const fn ([]const u8) void,
-    active_config: *const fn () *ServerConfig,
+    acquire_config: *const fn () config_store.Lease,
     bind_thread_io: *const fn (std.Io) void,
     clear_access_context: *const fn () void,
     clear_request_context: *const fn () void,
@@ -46,6 +47,7 @@ pub const Callbacks = struct {
     set_access_context: *const fn (*access_log_mod.Context, []const u8) void,
     set_request_context: *const fn ([]const u8, CompressionPolicy) void,
     set_response_headers: *const fn ([]const ResponseHeaderRule) void,
+    set_response_config: *const fn (?*const ServerConfig) void,
     set_stream_read_timeout: *const fn (std.Io.net.Stream, u32) anyerror!void,
     set_stream_timeouts: *const fn (std.Io.net.Stream, u32, u32) anyerror!void,
     set_stream_write_timeout: *const fn (std.Io.net.Stream, u32) anyerror!void,
@@ -228,17 +230,22 @@ fn handleHttpRedirectConnection(
 fn serveHttpRedirectConnectionTask(
     io: std.Io,
     stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
+    config_lease: config_store.Lease,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
     callbacks: Callbacks,
 ) void {
     callbacks.bind_thread_io(io);
+    var lease = config_lease;
+    const cfg = lease.cfg;
+    callbacks.set_response_config(cfg);
     var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
     state.register(io, &registration);
     defer {
         state.unregister(io, &registration);
         callbacks.stream_close(stream);
+        callbacks.set_response_config(null);
+        lease.deinit();
         state.release();
     }
 
@@ -271,7 +278,8 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
             break;
         }
 
-        const active_cfg = ctx.callbacks.active_config();
+        var lease = ctx.callbacks.acquire_config();
+        const active_cfg = lease.cfg;
         if (!ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.callbacks.metrics.connectionRejected();
             ctx.callbacks.send_cool_error(
@@ -282,17 +290,19 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
                 "Maximum concurrent connections reached. Try again in a moment.",
             ) catch {};
             ctx.callbacks.stream_close(conn);
+            lease.deinit();
             continue;
         }
 
         const worker = std.Thread.spawn(
             .{ .stack_size = active_cfg.worker_stack_size },
             serveHttpRedirectConnectionTask,
-            .{ ctx.io, conn, active_cfg, ctx.allocator, ctx.state, ctx.callbacks },
+            .{ ctx.io, conn, lease, ctx.allocator, ctx.state, ctx.callbacks },
         ) catch |err| {
             std.debug.print("Failed to start HTTP redirect worker: {}\n", .{err});
-            ctx.state.release();
             ctx.callbacks.stream_close(conn);
+            lease.deinit();
+            ctx.state.release();
             continue;
         };
         worker.detach();
@@ -571,13 +581,16 @@ pub fn handleConnection(
 pub fn serveConnectionTask(
     io: std.Io,
     stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
+    config_lease: config_store.Lease,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
     process_env: *const std.process.Environ.Map,
     callbacks: Callbacks,
 ) void {
     callbacks.bind_thread_io(io);
+    var lease = config_lease;
+    const cfg = lease.cfg;
+    callbacks.set_response_config(cfg);
     var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
     state.register(io, &registration);
 
@@ -585,6 +598,8 @@ pub fn serveConnectionTask(
     defer {
         state.unregister(io, &registration);
         callbacks.stream_close(stream);
+        callbacks.set_response_config(null);
+        lease.deinit();
         state.release();
     }
 

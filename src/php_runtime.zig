@@ -63,7 +63,65 @@ fn fastcgiKeepaliveConfigured(cfg: *const ServerConfig) bool {
 
 fn closeIdleFastcgiConnection(conn: FastcgiIdleConnection, callbacks: Callbacks) void {
     callbacks.stream_close(conn.stream);
+    std.heap.page_allocator.free(conn.endpoint_name);
     callbacks.metrics.fastcgiConnectionDiscarded();
+}
+
+pub fn deinitKeepalivePool(callbacks: Callbacks) void {
+    const io = callbacks.active_io();
+    callbacks.fastcgi_pool.mutex.lockUncancelable(io);
+    defer callbacks.fastcgi_pool.mutex.unlock(io);
+    while (callbacks.fastcgi_pool.idle.pop()) |conn| closeIdleFastcgiConnection(conn, callbacks);
+    callbacks.fastcgi_pool.idle.deinit(std.heap.page_allocator);
+    callbacks.fastcgi_pool.idle = .empty;
+}
+
+test "shared FastCGI idle entries own their endpoint keys through reuse and eviction" {
+    const Fake = struct {
+        var closed: usize = 0;
+        fn io() std.Io {
+            return std.testing.io;
+        }
+        fn close(_: std.Io.net.Stream) void {
+            closed += 1;
+        }
+        fn timeouts(_: std.Io.net.Stream, _: u32, _: u32) !void {}
+        fn connect(_: std.mem.Allocator, _: PhpFastcgiEndpoint) !std.Io.net.Stream {
+            return error.UnexpectedConnection;
+        }
+    };
+    Fake.closed = 0;
+    var metrics = metrics_mod.ServerMetrics.init();
+    var pool = FastcgiKeepAlivePool.init();
+    var callbacks: Callbacks = undefined;
+    callbacks.active_io = Fake.io;
+    callbacks.stream_close = Fake.close;
+    callbacks.set_stream_timeouts = Fake.timeouts;
+    callbacks.connect_fastcgi_endpoint = Fake.connect;
+    callbacks.metrics = &metrics;
+    callbacks.fastcgi_pool = &pool;
+    defer deinitKeepalivePool(callbacks);
+    var cfg = config_mod.defaultServerConfig();
+    cfg.fastcgi_keepalive_enabled = true;
+    cfg.fastcgi_keepalive_max_idle = 1;
+    const conn = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const name = try arena.allocator().dupe(u8, "127.0.0.1:9000");
+        fastcgiReleaseConnection(name, &cfg, .{ .stream = conn, .requests_served = 0 }, true, 0, callbacks);
+        try std.testing.expect(pool.idle.items[0].endpoint_name.ptr != name.ptr);
+    }
+    const reused = try fastcgiAcquireConnection(std.testing.allocator, "127.0.0.1:9000", .{ .tcp = .{ .host = "127.0.0.1", .port = 9000 } }, &cfg, 1000, 1, callbacks);
+    try std.testing.expectEqual(123, reused.stream.socket.handle);
+    try std.testing.expectEqual(0, Fake.closed);
+    fastcgiReleaseConnection("127.0.0.1:9000", &cfg, reused, true, 1, callbacks);
+    const second = std.Io.net.Stream{ .socket = .{ .handle = 124, .address = undefined } };
+    fastcgiReleaseConnection("127.0.0.1:9001", &cfg, .{ .stream = second, .requests_served = 0 }, true, 2, callbacks);
+    try std.testing.expectEqual(1, Fake.closed);
+    deinitKeepalivePool(callbacks);
+    try std.testing.expectEqual(2, Fake.closed);
+    try std.testing.expectEqual(0, pool.idle.capacity);
 }
 
 fn fastcgiAcquireConnection(allocator: std.mem.Allocator, endpoint_name: []const u8, endpoint: PhpFastcgiEndpoint, cfg: *const ServerConfig, timeout_ms: u32, now_ms: i64, callbacks: Callbacks) !FastcgiConnectionLease {
@@ -85,6 +143,7 @@ fn fastcgiAcquireConnection(allocator: std.mem.Allocator, endpoint_name: []const
                     closeIdleFastcgiConnection(reused, callbacks);
                     return err;
                 };
+                std.heap.page_allocator.free(reused.endpoint_name);
                 callbacks.metrics.fastcgiConnectionReused();
                 return .{
                     .stream = reused.stream,
@@ -119,9 +178,14 @@ fn fastcgiReleaseConnection(endpoint_name: []const u8, cfg: *const ServerConfig,
         return;
     }
 
+    const owned_endpoint = std.heap.page_allocator.dupe(u8, endpoint_name) catch {
+        callbacks.stream_close(lease.stream);
+        callbacks.metrics.fastcgiConnectionDiscarded();
+        return;
+    };
     const idle_conn = FastcgiIdleConnection{
         .stream = lease.stream,
-        .endpoint_name = endpoint_name,
+        .endpoint_name = owned_endpoint,
         .expires_at_ms = now_ms + @as(i64, @intCast(cfg.fastcgi_keepalive_idle_timeout_ms)),
         .requests_served = served,
     };
@@ -135,8 +199,7 @@ fn fastcgiReleaseConnection(endpoint_name: []const u8, cfg: *const ServerConfig,
     }
 
     callbacks.fastcgi_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
-        callbacks.stream_close(idle_conn.stream);
-        callbacks.metrics.fastcgiConnectionDiscarded();
+        closeIdleFastcgiConnection(idle_conn, callbacks);
         return;
     };
     callbacks.metrics.fastcgiConnectionPooled();

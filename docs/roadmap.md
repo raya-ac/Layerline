@@ -6,11 +6,17 @@ Layerline should become a production web server, not a demo binary. The target i
 
 October follow-up: HTTP/2 send windows and bounded queues, split header blocks,
 admin bootstrap/session/origin controls, static handle containment, PHP alias
-diagnostic gating, cache metadata accounting, and a 32-snapshot reload ceiling
+diagnostic gating, cache metadata accounting, and config reader-lease reclamation
 are implemented. Native PHP2Shell input controls and exposed-version update
 notices are covered by [the security policy and tests](security.md). Remaining
-work includes config reader leases/reclamation, wider HTTP/2 conformance and
-trailer forwarding, process-wide resource budgets, and full HTTP/3 interoperability.
+work includes wider HTTP/2 conformance and trailer forwarding, process-wide
+resource budgets, and full HTTP/3 interoperability.
+
+Reloads reclaim retired arenas and HTTP idle pools after their last reader exits;
+the 32-generation ceiling now bounds simultaneous readers/cleanup rather than
+lifetime reload count. Health checks and certificate renewal use current config.
+Wire tests hold HTTP/1, HTTP/2, flow-blocked output and a backend job across 96
+replacements, including TLS, pool cleanup and immediate admin revocation.
 
 The HTTP/2 follow-up accepts validated terminal request trailers without merging
 them into request headers, keeps HPACK synchronized on refused streams, bounds
@@ -48,7 +54,7 @@ methods; each permitted attempt has a fresh budget. Plain/TLS wire tests cover
 trickling backends, FastCGI TCP/Unix records, stale sockets, and tunnel lifetimes.
 Darwin resolver cancellation and external CGI execution still need stronger
 deadline guarantees. The next work also includes wider HTTP/2 frame/stream
-conformance, full process resource budgets, and config reader leases/reclamation.
+conformance, listener readiness and full process resource budgets.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

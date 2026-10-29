@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const config_store = @import("config_store.zig");
 const h3_native = @import("h3_native.zig");
 const h3_state = @import("h3_state.zig");
 const http2_content = @import("http2_content.zig");
@@ -1074,7 +1075,7 @@ test "HTTP/3 routed responses accept parsed DATA bodies" {
     try std.testing.expect(std.mem.indexOf(u8, data, "hello") != null);
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig, shutdown_requested: *std.atomic.Value(bool), callbacks: Callbacks) void {
+pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, acquire_config: *const fn () config_store.Lease, shutdown_requested: *std.atomic.Value(bool), callbacks: Callbacks) void {
     var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
         std.debug.print("HTTP/3 bind address error: {}\n", .{err});
         return;
@@ -1250,7 +1251,9 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
                         continue;
                     };
                     if (request_opt) |request| {
-                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, active_config(), process_env, server_header, callbacks) catch |err| {
+                        var lease = acquire_config();
+                        defer lease.deinit();
+                        const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, lease.cfg, process_env, server_header, callbacks) catch |err| {
                             std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                             continue;
                         };
@@ -1292,7 +1295,9 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
             };
             if (request_opt) |request| {
                 if (!assembly.h3_response_sent) {
-                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, active_config(), process_env, server_header, callbacks) catch |err| {
+                    var lease = acquire_config();
+                    defer lease.deinit();
+                    const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, decrypted.packet_number, request, lease.cfg, process_env, server_header, callbacks) catch |err| {
                         std.debug.print("HTTP/3 response send failed for {f}: {}\n", .{ msg.from, err });
                         continue;
                     };

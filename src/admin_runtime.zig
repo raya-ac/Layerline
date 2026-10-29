@@ -8,6 +8,7 @@ const session_mod = @import("admin_sessions.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
 const config_loader = @import("config_loader.zig");
 const config_mod = @import("config.zig");
+const config_store = @import("config_store.zig");
 const http_headers = @import("http_headers.zig");
 const request_mod = @import("request.zig");
 
@@ -20,7 +21,7 @@ const isDomainConfigFileName = config_loader.isDomainConfigFileName;
 const trimValue = http_headers.trimValue;
 
 pub const Callbacks = struct {
-    active_config: *const fn () *ServerConfig,
+    acquire_config: *const fn () config_store.Lease,
     active_io: *const fn () std.Io,
     bind_thread_io: *const fn (std.Io) void,
     close_stream: *const fn (std.Io.net.Stream) void,
@@ -151,8 +152,9 @@ fn handleReloadPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg
         return;
     };
 
-    const active_cfg = callbacks.active_config();
-    try callbacks.send_dashboard_page(io, reply, allocator, active_cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK");
+    var lease = callbacks.acquire_config();
+    defer lease.deinit();
+    try callbacks.send_dashboard_page(io, reply, allocator, lease.cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK");
 }
 
 fn handleCertRenewPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
@@ -167,7 +169,9 @@ fn handleCertRenewPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, 
         return;
     };
 
-    try callbacks.send_dashboard_page(io, reply, allocator, callbacks.active_config(), credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK");
+    var lease = callbacks.acquire_config();
+    defer lease.deinit();
+    try callbacks.send_dashboard_page(io, reply, allocator, lease.cfg, credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK");
 }
 
 fn handleCachePurgePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, callbacks: Callbacks) !void {
@@ -186,7 +190,9 @@ fn handleCachePurgePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator,
         try std.fmt.allocPrint(allocator, "Purged {d} cache entries matching {s}.", .{ removed, target });
     defer allocator.free(message);
 
-    try callbacks.send_dashboard_page(io, reply, allocator, callbacks.active_config(), credentials, message, null, 200, "OK");
+    var lease = callbacks.acquire_config();
+    defer lease.deinit();
+    try callbacks.send_dashboard_page(io, reply, allocator, lease.cfg, credentials, message, null, 200, "OK");
 }
 
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
@@ -912,7 +918,9 @@ fn handleConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg
     };
     read_deadline.clear(stream);
     _ = cfg;
-    try handleCommand(stream, allocator, callbacks.active_config(), command, callbacks);
+    var lease = callbacks.acquire_config();
+    defer lease.deinit();
+    try handleCommand(stream, allocator, lease.cfg, command, callbacks);
 }
 
 test "admin command framing waits for a newline across arbitrary reads" {

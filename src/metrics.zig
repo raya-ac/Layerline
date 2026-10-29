@@ -1,6 +1,7 @@
 const std = @import("std");
 const http_response = @import("http_response.zig");
 const resource_budget = @import("resource_budget.zig");
+const config_store_mod = @import("config_store.zig");
 
 pub const StaticTransferMode = enum {
     sendfile,
@@ -8,6 +9,7 @@ pub const StaticTransferMode = enum {
 };
 
 pub const ServerMetrics = struct {
+    config_store: ?*config_store_mod.Store = null,
     active_connections: std.atomic.Value(usize),
     connections_total: std.atomic.Value(usize),
     connections_rejected_total: std.atomic.Value(usize),
@@ -471,5 +473,15 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
         "# TYPE layerline_http2_memory_limit_bytes gauge\n" ++
         "layerline_http2_memory_limit_bytes {d}\n", .{ resource_budget.http2_jobs.load(.acquire), resource_budget.http2.used.load(.acquire), resource_budget.http2.limit });
     defer allocator.free(http2_resources);
-    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources });
+    const snapshots = if (metrics.config_store) |store| store.stats() else config_store_mod.Stats{ .generation = 0, .snapshots = 0, .readers = 0, .owned_bytes = 0 };
+    const config_resources = try std.fmt.allocPrint(allocator, "# HELP layerline_config_generation Last published config generation.\n" ++
+        "# TYPE layerline_config_generation gauge\nlayerline_config_generation {d}\n" ++
+        "# HELP layerline_config_snapshots Live config generations, including retirement cleanup.\n" ++
+        "# TYPE layerline_config_snapshots gauge\nlayerline_config_snapshots {d}\n" ++
+        "# HELP layerline_config_readers Active config reader leases.\n" ++
+        "# TYPE layerline_config_readers gauge\nlayerline_config_readers {d}\n" ++
+        "# HELP layerline_config_owned_bytes Retained reload arenas, excluding process-owned boot config and pool allocations.\n" ++
+        "# TYPE layerline_config_owned_bytes gauge\nlayerline_config_owned_bytes {d}\n", .{ snapshots.generation, snapshots.snapshots, snapshots.readers, snapshots.owned_bytes });
+    defer allocator.free(config_resources);
+    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources, config_resources });
 }

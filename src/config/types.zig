@@ -63,7 +63,7 @@ pub const UpstreamKeepAlivePool = struct {
 
 pub const FastcgiIdleConnection = struct {
     stream: std.Io.net.Stream,
-    endpoint_name: []const u8,
+    endpoint_name: []u8,
     expires_at_ms: i64,
     requests_served: usize,
 };

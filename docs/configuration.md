@@ -241,6 +241,15 @@ Upstream target scopes are `global <index>`, `route <route-name> <index>`, `doma
 
 `SIGHUP` follows the same in-memory reload path as the admin `reload` command. If the candidate config changes listener-bound settings, Layerline logs `SIGHUP reload blocked` and keeps serving the current snapshot.
 
+Old connections retain their original routing and TLS config until they close;
+their joined HTTP/2 jobs share that lifetime. Retired reload arenas and idle HTTP
+pools are then reclaimed. The 32-generation ceiling limits simultaneously live or
+retiring generations, not the number of reloads over the process lifetime. If it
+is reached, let old connections drain before retrying. Health checks and renewal
+use current config, and disabling/changing admin access is checked immediately
+even on older connections. The `layerline_config_*` gauges report generation,
+snapshots, readers and owned reload-arena bytes (not full process RSS).
+
 ## Admin Web UI
 
 The browser admin UI is disabled by default. Enable it only on a trusted admin path:

@@ -1,6 +1,7 @@
 const std = @import("std");
 const php_version = @import("php_version.zig");
 const config_mod = @import("config.zig");
+const config_store = @import("config_store.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
@@ -47,7 +48,7 @@ pub const HealthTransition = enum {
 
 pub const HealthCheckContext = struct {
     io: std.Io,
-    cfg: *ServerConfig,
+    acquire_config: *const fn () config_store.Lease,
     callbacks: Callbacks,
 };
 
@@ -63,6 +64,65 @@ fn keepaliveConfigured(cfg: *const ServerConfig) bool {
 fn closeIdleConnection(conn: UpstreamIdleConnection, callbacks: Callbacks) void {
     callbacks.stream_close(conn.stream);
     callbacks.metrics.upstreamConnectionDiscarded();
+}
+
+pub fn deinitConfigPools(io: std.Io, cfg: *ServerConfig, metrics: *metrics_mod.ServerMetrics, close: *const fn (std.Io.net.Stream) void) void {
+    const Cleanup = struct {
+        fn target(context: std.Io, upstream: *UpstreamConfig, counters: *metrics_mod.ServerMetrics, close_stream: *const fn (std.Io.net.Stream) void) void {
+            upstream.keepalive_pool.mutex.lockUncancelable(context);
+            defer upstream.keepalive_pool.mutex.unlock(context);
+            while (upstream.keepalive_pool.idle.pop()) |conn| {
+                close_stream(conn.stream);
+                counters.upstreamConnectionDiscarded();
+            }
+            upstream.keepalive_pool.idle.deinit(std.heap.page_allocator);
+            upstream.keepalive_pool.idle = .empty;
+        }
+        fn pool(context: std.Io, targets: *UpstreamPoolConfig, counters: *metrics_mod.ServerMetrics, close_stream: *const fn (std.Io.net.Stream) void) void {
+            for (targets.targets.items) |*upstream| target(context, upstream, counters, close_stream);
+        }
+    };
+    if (cfg.h2_upstream) |*upstream| Cleanup.target(io, upstream, metrics, close);
+    if (cfg.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
+    for (cfg.routes.items) |*route| if (route.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
+    for (cfg.domains.items) |*domain| {
+        if (domain.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
+        for (domain.routes.items) |*route| if (route.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
+    }
+}
+
+test "retired global route domain and domain-route pools close all idle descriptors" {
+    const Fake = struct {
+        var closed: usize = 0;
+        fn close(_: std.Io.net.Stream) void {
+            closed += 1;
+        }
+    };
+    Fake.closed = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = config_mod.defaultServerConfig();
+    var metrics = metrics_mod.ServerMetrics.init();
+    defer deinitConfigPools(std.testing.io, &cfg, &metrics, Fake.close);
+    for ([_][2][]const u8{
+        .{ "h2_upstream", "http://127.0.0.1:8999" },
+        .{ "proxy", "http://127.0.0.1:9000" },
+        .{ "route", "app /app/* proxy" },
+        .{ "route_proxy.app", "http://127.0.0.1:9001" },
+        .{ "server", "site" },
+        .{ "server_name.site", "example.test" },
+        .{ "server_proxy.site", "http://127.0.0.1:9002" },
+        .{ "server_route.site", "app /app/* proxy" },
+        .{ "server_route_proxy.site.app", "http://127.0.0.1:9003" },
+    }) |entry| try config_mod.applyConfigLine(&cfg, allocator, entry[0], entry[1]);
+    const pools = [_]*UpstreamPoolConfig{ &cfg.upstream.?, &cfg.routes.items[0].upstream.?, &cfg.domains.items[0].upstream.?, &cfg.domains.items[0].routes.items[0].upstream.? };
+    try cfg.h2_upstream.?.keepalive_pool.idle.append(std.heap.page_allocator, .{ .stream = .{ .socket = .{ .handle = 122, .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
+    for (pools, 0..) |pool, index| try pool.targets.items[0].keepalive_pool.idle.append(std.heap.page_allocator, .{ .stream = .{ .socket = .{ .handle = @intCast(123 + index), .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
+    deinitConfigPools(std.testing.io, &cfg, &metrics, Fake.close);
+    try std.testing.expectEqual(5, Fake.closed);
+    try std.testing.expectEqual(0, cfg.h2_upstream.?.keepalive_pool.idle.capacity);
+    for (pools) |pool| try std.testing.expectEqual(0, pool.targets.items[0].keepalive_pool.idle.capacity);
 }
 
 fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, now_ms: i64, callbacks: Callbacks) !UpstreamConnectionLease {
@@ -503,25 +563,63 @@ fn runHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig
     }
 }
 
-fn runHealthCheckCycle(allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) void {
+const HealthSchedule = struct {
+    generation: u64 = 0,
+    cursor: usize = 0,
+    deadlines: std.ArrayList(i64) = .empty,
+
+    fn begin(self: *HealthSchedule, generation: u64) void {
+        if (self.generation != generation) {
+            self.deadlines.clearRetainingCapacity();
+            self.generation = generation;
+        }
+        self.cursor = 0;
+    }
+
+    fn due(self: *HealthSchedule, allocator: std.mem.Allocator, now_ms: i64, interval_ms: u32) !bool {
+        const index = self.cursor;
+        self.cursor += 1;
+        if (index == self.deadlines.items.len) try self.deadlines.append(allocator, 0);
+        if (now_ms < self.deadlines.items[index]) return false;
+        self.deadlines.items[index] = now_ms +| @as(i64, @intCast(@max(interval_ms, 1)));
+        return true;
+    }
+
+    fn visit(self: *HealthSchedule, allocator: std.mem.Allocator, pool: *UpstreamPoolConfig, policy: UpstreamRuntimePolicy, callbacks: Callbacks) !void {
+        if (!policy.health_check_enabled) return;
+        if (try self.due(allocator, callbacks.upstream_now_ms(), policy.health_check_interval_ms)) {
+            runHealthCheckForPool(allocator, pool, policy, callbacks);
+        }
+    }
+
+    fn delay(self: *const HealthSchedule, now_ms: i64) u32 {
+        var result: i64 = 250;
+        for (self.deadlines.items) |at| result = @min(result, @max(1, at -| now_ms));
+        return @intCast(result);
+    }
+};
+
+fn runHealthCheckCycle(schedule: *HealthSchedule, allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) !u32 {
+    schedule.begin(cfg.cache_generation);
     if (cfg.upstream) |*pool| {
-        runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, null), callbacks);
+        try schedule.visit(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, null), callbacks);
     }
     for (cfg.routes.items) |*route| {
         if (route.upstream) |*pool| {
-            runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, route), callbacks);
+            try schedule.visit(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, null, route), callbacks);
         }
     }
     for (cfg.domains.items) |*domain| {
         if (domain.upstream) |*pool| {
-            runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, null), callbacks);
+            try schedule.visit(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, null), callbacks);
         }
         for (domain.routes.items) |*route| {
             if (route.upstream) |*pool| {
-                runHealthCheckForPool(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, route), callbacks);
+                try schedule.visit(allocator, pool, config_mod.upstreamRuntimePolicyFor(cfg, domain, route), callbacks);
             }
         }
     }
+    return schedule.delay(callbacks.upstream_now_ms());
 }
 
 fn sleepHealthInterval(io: std.Io, interval_ms: u32, callbacks: Callbacks) void {
@@ -535,10 +633,31 @@ fn sleepHealthInterval(io: std.Io, interval_ms: u32, callbacks: Callbacks) void 
 
 pub fn healthCheckTask(ctx: HealthCheckContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
+    var schedule = HealthSchedule{};
+    defer schedule.deadlines.deinit(std.heap.page_allocator);
     while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
-        runHealthCheckCycle(std.heap.page_allocator, ctx.cfg, ctx.callbacks);
-        sleepHealthInterval(ctx.io, ctx.cfg.upstream_health_check_interval_ms, ctx.callbacks);
+        const delay: u32 = cycle: {
+            var lease = ctx.acquire_config();
+            defer lease.deinit();
+            break :cycle runHealthCheckCycle(&schedule, std.heap.page_allocator, lease.cfg, ctx.callbacks) catch 250;
+        };
+        sleepHealthInterval(ctx.io, delay, ctx.callbacks);
     }
+}
+
+test "health schedules honor each pool interval and reset after reload" {
+    var schedule = HealthSchedule{};
+    defer schedule.deadlines.deinit(std.testing.allocator);
+    schedule.begin(1);
+    try std.testing.expect(try schedule.due(std.testing.allocator, 100, 100));
+    try std.testing.expect(try schedule.due(std.testing.allocator, 100, 1000));
+    schedule.begin(1);
+    try std.testing.expect(try schedule.due(std.testing.allocator, 200, 100));
+    try std.testing.expect(!try schedule.due(std.testing.allocator, 200, 1000));
+    try std.testing.expectEqual(100, schedule.delay(200));
+    schedule.begin(2);
+    try std.testing.expect(try schedule.due(std.testing.allocator, 200, 100));
+    try std.testing.expect(try schedule.due(std.testing.allocator, 200, 1000));
 }
 
 pub fn forwardToPool(

@@ -84,8 +84,10 @@ This does not enable admin over the experimental HTTP/3 path.
 
 Web-triggered reloads allocate published config snapshots independently of the
 request arena. Snapshot metadata uses the store's allocator, while each owned
-arena is released by its own allocator after workers have stopped. The existing
-32-snapshot retention limit remains; this is not yet reader-lease reclamation.
+arena is released by its own allocator. Connection and background-reader leases
+keep published arenas alive only until their final reader exits. Admin requests
+recheck the current enablement, path and credentials even on a connection opened
+before a reload.
 
 The local Unix control socket accepts one newline-terminated command per
 connection, at most 1023 bytes before the newline. It does not dispatch partial
@@ -140,11 +142,22 @@ The default connection gate is 1,024 sockets because the current runtime uses a
 worker thread per connection. Explicit higher limits require a measured host
 budget; this is not a process-wide heap/RSS cap.
 
-Config snapshots have distinct cache generations. Until reader leases replace
-raw config pointers, a process retains at most 32 snapshots including startup;
-further reloads return `ReloadLimitRequiresRestart` without replacing the active
-config. Plan a managed restart after 31 successful reloads. This bounds snapshot
-count while preserving old connections; it is not automatic snapshot reclamation.
+Config snapshots have distinct cache generations. Retired reload arenas and
+their HTTP idle pools are reclaimed after their final connection/background
+reader exits, including joined HTTP/2 routing jobs. The shared FastCGI pool owns
+its endpoint keys independently of these arenas. At most 32 generations may be
+live or undergoing cleanup at once; `TooManyLiveConfigGenerations` rejects a
+reload without changing the active config until old readers drain. This is not
+a lifetime reload limit. Stale concurrent builders cannot overwrite a newer
+publication. Metrics expose the current generation, retained snapshot count,
+reader count and owned reload-arena capacity; the process-owned boot config and
+separately allocated pool storage are excluded from the arena-byte gauge.
+
+Health checks acquire the current config each cycle and follow each pool's own
+interval, including checks enabled by reload. Certificate renewal also reads
+current policy, releases its lease before sleeping and reloads TLS material after
+renewal. Unrelated config reloads do not postpone scheduled renewal. External
+certificate-tool execution still lacks an independently enforced child deadline.
 
 ## Shutdown ownership
 

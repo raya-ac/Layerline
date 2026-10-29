@@ -37,8 +37,7 @@ pub fn context() http1_responses.Context {
 
 pub fn readErrorDocument(allocator: std.mem.Allocator, code: u16) !?[]u8 {
     if (code < 400 or code > 599 or runtime_state.current_request_headers.len == 0) return null;
-    if (runtime_state.config_store.active.load(.acquire) == 0) return null;
-    const cfg = runtime_state.activeConfig();
+    const cfg = runtime_state.current_response_config orelse return null;
     const domain = routing_mod.findDomainForRequest(cfg, runtime_state.current_request_headers) orelse return null;
     return custom_errors.readDomainDocument(stream_runtime.activeIo(), allocator, cfg, domain, code) catch null;
 }

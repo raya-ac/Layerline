@@ -17,6 +17,7 @@ pub threadlocal var current_request_headers: []const u8 = "";
 pub threadlocal var current_request_id: []const u8 = "";
 pub threadlocal var current_compression_policy: CompressionPolicy = .disabled;
 pub threadlocal var current_access_log: ?*access_log_mod.Context = null;
+pub threadlocal var current_response_config: ?*const ServerConfig = null;
 
 pub var access_log_writer = access_log_mod.Writer{};
 pub var config_store = config_store_mod.Store{};
@@ -32,8 +33,12 @@ pub fn currentRequestId() []const u8 {
     return current_request_id;
 }
 
-pub fn activeConfig() *ServerConfig {
-    return config_store.current();
+pub fn acquireConfig() config_store_mod.Lease {
+    return config_store.acquire() orelse unreachable;
+}
+
+pub fn setResponseConfig(cfg: ?*const ServerConfig) void {
+    current_response_config = cfg;
 }
 
 pub fn resolveRequestId(io: std.Io, allocator: std.mem.Allocator, headers: []const u8) ![]const u8 {

@@ -137,6 +137,10 @@ fn upstreamNowMs() i64 {
     return std.Io.Timestamp.now(activeIo(), .awake).toMilliseconds();
 }
 
+fn retireConfig(cfg: *ServerConfig) void {
+    upstream_runtime.deinitConfigPools(activeIo(), cfg, &runtime_state.server_metrics, streamClose);
+}
+
 fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -176,8 +180,8 @@ fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const Se
 }
 
 fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerConfig) !void {
-    // A browser request arena is reset after the reply. Published snapshots
-    // must instead own process-lifetime storage, just like signal reloads.
+    // A browser request arena is reset after the reply. Each publication owns
+    // separate storage until its last connection/background reader exits.
     const allocator = std.heap.page_allocator;
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -189,7 +193,7 @@ fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerC
     const candidate_allocator = arena.allocator();
     const candidate = try candidate_allocator.create(ServerConfig);
     candidate.* = defaultServerConfig();
-    candidate.config_path = active.config_path;
+    candidate.config_path = try candidate_allocator.dupe(u8, active.config_path);
     try loadConfig(io, candidate_allocator, candidate, candidate.config_path);
     try loadConfiguredDomainConfigs(io, candidate_allocator, candidate);
     normalizeConfig(candidate);
@@ -197,7 +201,7 @@ fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerC
     try validateConfig(candidate);
     try validateReloadCompatibility(active, candidate);
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
-    try runtime_state.config_store.activateOwned(arena, candidate);
+    try runtime_state.config_store.activateOwned(arena, candidate, active.cache_generation);
 }
 
 fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
@@ -230,7 +234,9 @@ fn reloadSignalWatcherTask(io: std.Io) void {
     bindThreadIo(io);
     while (!runtime_state.shutdown_requested.load(.acquire)) {
         if (runtime_state.reload_requested.swap(false, .acq_rel)) {
-            reloadConfigInMemory(io, std.heap.page_allocator, runtime_state.activeConfig()) catch |err| {
+            var lease = runtime_state.acquireConfig();
+            defer lease.deinit();
+            reloadConfigInMemory(io, std.heap.page_allocator, lease.cfg) catch |err| {
                 std.debug.print("SIGHUP reload blocked: {}\n", .{err});
                 continue;
             };
@@ -282,7 +288,7 @@ fn adminHttpCallbacks() admin_http.Callbacks {
 
 fn adminCallbacks() admin_runtime.Callbacks {
     return .{
-        .active_config = runtime_state.activeConfig,
+        .acquire_config = runtime_state.acquireConfig,
         .active_io = activeIo,
         .bind_thread_io = bindThreadIo,
         .close_stream = streamClose,
@@ -689,10 +695,17 @@ fn routeAdminUi(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Alloca
     }
 }
 
-fn buildAdminResponse(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest) !admin_reply.Response {
+fn buildAdminResponse(io: std.Io, allocator: std.mem.Allocator, _: *ServerConfig, req: HttpRequest) !admin_reply.Response {
+    var lease = runtime_state.acquireConfig();
+    defer lease.deinit();
+    const cfg = lease.cfg;
     var reply: admin_reply.Reply = .{ .allocator = allocator };
     defer reply.deinit();
-    try admin_runtime.handleUi(io, &reply, allocator, cfg, req, std.mem.eql(u8, req.method, "HEAD"), adminCallbacks());
+    if (!cfg.admin_ui_enabled or !admin_support.adminPathMatches(cfg.admin_ui_path, req.path)) {
+        try reply.set(404, "Not Found", "text/plain; charset=utf-8", "Not found.\n", &.{});
+    } else {
+        try admin_runtime.handleUi(io, &reply, allocator, cfg, req, std.mem.eql(u8, req.method, "HEAD"), adminCallbacks());
+    }
     return reply.take();
 }
 
@@ -740,6 +753,9 @@ fn routeRequest(
     req: HttpRequest,
     process_env: *const std.process.Environ.Map,
 ) !void {
+    const previous = runtime_state.current_response_config;
+    runtime_state.setResponseConfig(cfg);
+    defer runtime_state.setResponseConfig(previous);
     try http1_router.route(io, stream, allocator, cfg, req, process_env, http1RouterCallbacks());
 }
 
@@ -747,7 +763,7 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
     return .{
         .access_log_set_error = runtime_state.accessLogSetError,
         .access_log_set_handler = runtime_state.accessLogSetHandler,
-        .active_config = runtime_state.activeConfig,
+        .acquire_config = runtime_state.acquireConfig,
         .bind_thread_io = bindThreadIo,
         .clear_access_context = runtime_state.clearAccessLogContext,
         .clear_request_context = runtime_state.clearHttp1RequestContext,
@@ -768,6 +784,7 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
         .serve_acme_challenge = serveAcmeChallenge,
         .set_access_context = runtime_state.setAccessLogContext,
         .set_request_context = runtime_state.setHttp1RequestContext,
+        .set_response_config = runtime_state.setResponseConfig,
         .set_response_headers = runtime_state.setResponseHeaders,
         .set_stream_read_timeout = setStreamReadTimeout,
         .set_stream_timeouts = setStreamTimeouts,
@@ -841,11 +858,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
         return err;
     };
-    try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg);
+    try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg, retireConfig);
+    runtime_state.server_metrics.config_store = &runtime_state.config_store;
     defer runtime_state.config_store.deinit();
     defer {
         runtime_state.buffered_response_cache.deinit();
         runtime_state.static_response_cache.deinit();
+        php_runtime.deinitKeepalivePool(phpCallbacks());
         deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
     }
 
@@ -860,7 +879,7 @@ pub fn main(init: std.process.Init) !void {
         .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .server_header = SERVER_HEADER,
         .callbacks = .{
-            .active_config = runtime_state.activeConfig,
+            .acquire_config = runtime_state.acquireConfig,
             .admin = adminCallbacks(),
             .bind_thread_io = bindThreadIo,
             .http1 = http1RuntimeCallbacks(),

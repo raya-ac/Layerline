@@ -4,6 +4,7 @@ const acme_renewal = @import("acme_renewal.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
+const config_store = @import("config_store.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http3_server = @import("http3_server.zig");
 const metrics_mod = @import("metrics.zig");
@@ -16,7 +17,7 @@ const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
 
 pub const Callbacks = struct {
-    active_config: *const fn () *ServerConfig,
+    acquire_config: *const fn () config_store.Lease,
     admin: admin_runtime.Callbacks,
     bind_thread_io: *const fn (std.Io) void,
     http1: http1_runtime.Callbacks,
@@ -104,7 +105,7 @@ fn reloadSignalTask(ctx: Context) void {
 
 fn http3Task(ctx: Context) void {
     ctx.callbacks.bind_thread_io(ctx.io);
-    http3_server.serveProbeTask(ctx.io, ctx.cfg, ctx.process_env, ctx.metrics, ctx.server_header, ctx.callbacks.active_config, ctx.shutdown_requested, ctx.callbacks.http3);
+    http3_server.serveProbeTask(ctx.io, ctx.cfg, ctx.process_env, ctx.metrics, ctx.server_header, ctx.callbacks.acquire_config, ctx.shutdown_requested, ctx.callbacks.http3);
 }
 
 const ShutdownWatcherContext = struct {
@@ -227,12 +228,12 @@ fn startRedirectListener(
 
 fn startBackgroundWorkers(ctx: Context, workers: *Workers) !void {
     try workers.start(reloadSignalTask, .{ctx});
-    if (config_mod.configCanRunHealthChecks(ctx.cfg)) {
-        workers.start(upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .cfg = ctx.cfg, .callbacks = ctx.callbacks.upstream }}) catch |err| {
+    {
+        workers.start(upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return err;
         };
-        std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
+        if (config_mod.configCanRunHealthChecks(ctx.cfg)) std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
     }
     if (ctx.cfg.http3_enabled) {
         workers.start(http3Task, .{ctx}) catch |err| {
@@ -247,13 +248,13 @@ fn startBackgroundWorkers(ctx: Context, workers: *Workers) !void {
             return err;
         };
     }
-    if (ctx.cfg.tls_auto and ctx.cfg.letsencrypt_renew) {
+    if (ctx.cfg.tls_auto) {
         workers.start(acme_renewal.renewalTask, .{acme_renewal.Context{
             .io = ctx.io,
-            .cfg = ctx.cfg,
-            .metrics = ctx.metrics,
+            .acquire_config = ctx.callbacks.acquire_config,
             .shutdown_requested = ctx.shutdown_requested,
             .bind_thread_io = ctx.callbacks.bind_thread_io,
+            .renew_certs = ctx.callbacks.admin.renew_certs,
         }}) catch |err| {
             std.debug.print("Failed to start Let's Encrypt renewal loop: {}\n", .{err});
             return err;
@@ -274,7 +275,8 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
             break;
         }
 
-        const active_cfg = ctx.callbacks.active_config();
+        var lease = ctx.callbacks.acquire_config();
+        const active_cfg = lease.cfg;
         if (!concurrency.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.metrics.connectionRejected();
             std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{active_cfg.max_concurrent_connections});
@@ -286,6 +288,7 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
                 "Maximum concurrent connections reached. Try again in a moment.",
             ) catch {};
             stream_runtime.streamClose(conn);
+            lease.deinit();
             continue;
         }
 
@@ -297,7 +300,7 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
             .{
                 ctx.io,
                 conn,
-                active_cfg,
+                lease,
                 ctx.allocator,
                 concurrency,
                 ctx.process_env,
@@ -305,8 +308,9 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
             },
         ) catch |err| {
             std.debug.print("Failed to start connection worker: {}\n", .{err});
-            concurrency.release();
             stream_runtime.streamClose(conn);
+            lease.deinit();
+            concurrency.release();
             continue;
         };
         worker.detach();
