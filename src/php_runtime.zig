@@ -1,4 +1,7 @@
 const std = @import("std");
+const php_version = @import("php_version.zig");
+const routing = @import("routing.zig");
+const static_files = @import("static_files.zig");
 const cgi_headers = @import("cgi_headers.zig");
 const config_mod = @import("config.zig");
 const fastcgi = @import("fastcgi.zig");
@@ -16,6 +19,15 @@ const HttpRequest = request_mod.HttpRequest;
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const RouteConfig = config_mod.RouteConfig;
 const ServerConfig = config_mod.ServerConfig;
+
+fn scriptAllowed(cfg: *const ServerConfig, req: HttpRequest, relative: []const u8) bool {
+    static_files.validateScriptPath(relative) catch return false;
+    if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(relative), "test.php")) return true;
+    const domain = routing.findDomainForRequest(cfg, req.headers);
+    const route = routing.findDomainRoute(domain, req.path) orelse routing.findNamedRoute(cfg, req.path);
+    const allowed = if (route) |value| value.php_info_page orelse routing.domainPhpInfoPage(cfg, domain) else routing.domainPhpInfoPage(cfg, domain);
+    return allowed;
+}
 
 pub const Callbacks = struct {
     active_io: *const fn () std.Io,
@@ -141,6 +153,15 @@ fn sendPhpOutput(stream: std.Io.net.Stream, allocator: std.mem.Allocator, output
     const headers = split.headers;
     const body = split.body;
 
+    if (php_version.exposedHeaders(headers)) |version| {
+        php_version.log(version);
+        const message = try php_version.updateMessage(allocator, version);
+        defer allocator.free(message);
+        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, close_connection, "Cache-Control: no-store\r\n");
+        if (!is_head) try callbacks.stream_write_all(stream, message);
+        return;
+    }
+
     const status = cgi_headers.parseStatus(headers);
     const ctype_out = cgi_headers.findHeaderValue(headers, "Content-Type") orelse "text/plain; charset=utf-8";
     const extra_headers = try cgi_headers.buildExtraHeaders(allocator, headers);
@@ -185,6 +206,11 @@ fn h2PhpOutputResponse(allocator: std.mem.Allocator, output: []const u8) !H2Buff
         };
     };
 
+    if (php_version.exposedHeaders(split.headers)) |version| {
+        php_version.log(version);
+        return .{ .status_code = 503, .content_type = "text/plain; charset=utf-8", .body = try php_version.updateMessage(allocator, version), .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
+    }
+
     const status = cgi_headers.parseStatus(split.headers);
     const content_type = if (cgi_headers.findHeaderValue(split.headers, "Content-Type")) |ctype|
         try allocator.dupe(u8, http_headers.trimValue(ctype))
@@ -198,6 +224,15 @@ fn h2PhpOutputResponse(allocator: std.mem.Allocator, output: []const u8) !H2Buff
         .body = try allocator.dupe(u8, split.body),
         .headers = headers,
     };
+}
+
+test "FastCGI version warning withholds an affected backend body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try h2PhpOutputResponse(arena.allocator(), "X-Powered-By: PHP/8.4.26\r\nContent-Type: text/plain\r\n\r\nbackend secret");
+    try std.testing.expectEqual(503, response.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "Site owner: update PHP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "backend secret") == null);
 }
 
 fn runFastcgiRequest(
@@ -312,6 +347,7 @@ pub fn buildHttp2FastcgiResponse(
     timeout_ms: u32,
     callbacks: Callbacks,
 ) !H2BufferedResponse {
+    if (!scriptAllowed(cfg, req, script_rel_path)) return callbacks.h2_error_response(allocator, 404, "Not Found", "The requested resource was not found on this server.");
     const endpoint = php_fastcgi orelse return callbacks.h2_error_response(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing currently requires FastCGI.");
     if (config_mod.disablesOptionalUrl(endpoint)) return callbacks.h2_error_response(allocator, 501, "Not Implemented", "Native HTTP/2 PHP routing currently requires FastCGI.");
 
@@ -323,12 +359,10 @@ pub fn buildHttp2FastcgiResponse(
     const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
     defer allocator.free(script_path);
 
-    const script_stat = std.Io.Dir.cwd().statFile(io, script_path, .{}) catch {
+    const script = static_files.openRootScript(io, php_root, rel_path) catch {
         return callbacks.h2_error_response(allocator, 404, "Not Found", "The requested resource was not found on this server.");
     };
-    if (script_stat.kind != .file) {
-        return callbacks.h2_error_response(allocator, 404, "Not Found", "The requested resource was not found on this server.");
-    }
+    defer script.close(io);
 
     const result = runFastcgiRequest(allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, timeout_ms, callbacks) catch |err| switch (err) {
         error.InvalidFastcgiEndpoint => return callbacks.h2_error_response(allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid."),
@@ -388,7 +422,7 @@ pub fn handleScript(
     callbacks: Callbacks,
 ) !void {
     const rel_path = script_rel_path;
-    if (rel_path.len == 0 or std.mem.indexOf(u8, rel_path, "..") != null) {
+    if (!scriptAllowed(cfg, req, rel_path)) {
         try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
         return;
     }
@@ -396,14 +430,11 @@ pub fn handleScript(
     const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
     defer allocator.free(script_path);
 
-    const script_stat = std.Io.Dir.cwd().statFile(io, script_path, .{}) catch {
+    const script = static_files.openRootScript(io, php_root, rel_path) catch {
         try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
         return;
     };
-    if (script_stat.kind != .file) {
-        try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
-        return;
-    }
+    defer script.close(io);
 
     if (php_fastcgi) |endpoint| {
         if (!config_mod.disablesOptionalUrl(endpoint)) {

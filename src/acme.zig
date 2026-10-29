@@ -1,4 +1,5 @@
 const std = @import("std");
+const static_files = @import("static_files.zig");
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
@@ -60,6 +61,16 @@ pub fn buildAcmeChallengeFilePath(allocator: std.mem.Allocator, webroot: []const
     const challenge_dir = try buildAcmeChallengeDir(allocator, webroot);
     defer allocator.free(challenge_dir);
     return std.fs.path.join(allocator, &.{ challenge_dir, token });
+}
+
+pub fn openChallenge(io: std.Io, allocator: std.mem.Allocator, webroot: []const u8, token: []const u8) !std.Io.File {
+    const trimmed = stripTrailingPathSeparators(webroot);
+    const relative = if (std.mem.endsWith(u8, trimmed, ACME_CHALLENGE_PATH_SUFFIX))
+        try allocator.dupe(u8, token)
+    else
+        try std.fs.path.join(allocator, &.{ ACME_CHALLENGE_DIR, token });
+    defer allocator.free(relative);
+    return static_files.openRootFile(io, webroot, relative);
 }
 
 pub fn appendLetsEncryptWebrootArgs(

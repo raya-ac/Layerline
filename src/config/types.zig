@@ -335,6 +335,7 @@ pub const DomainConfig = struct {
 
 // All server behavior is described in this single config object.
 pub const ServerConfig = struct {
+    cache_generation: u64 = 0,
     config_path: []const u8,
     host: []const u8,
     port: u16,

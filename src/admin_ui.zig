@@ -144,7 +144,7 @@ pub fn renderAdminSetupPage(allocator: std.mem.Allocator, cfg: *const ServerConf
     try appendAdminShellStart(&out, allocator, cfg, "First Launch Setup");
     try out.appendSlice(allocator,
         \\<h1>First launch setup</h1>
-        \\<p class="lede">Create the first local admin account. Layerline writes the password hash and session seed to the configured credentials file, then locks this setup screen.</p>
+        \\<p class="lede">Create the first admin account with the setup token from the server.</p>
         \\<div class="panel"><div class="panel-inner">
         \\
     );
@@ -152,6 +152,7 @@ pub fn renderAdminSetupPage(allocator: std.mem.Allocator, cfg: *const ServerConf
     try out.print(
         allocator,
         \\<form class="stack" method="post" action="{s}/setup">
+        \\  <label>Setup token<input type="password" name="setup_token" autocomplete="off" required minlength="64" maxlength="64"></label>
         \\  <label>Username<input name="username" autocomplete="username" required minlength="2" maxlength="64"></label>
         \\  <label>Password<input type="password" name="password" autocomplete="new-password" required minlength="8"></label>
         \\  <label>Confirm password<input type="password" name="password_confirm" autocomplete="new-password" required minlength="8"></label>

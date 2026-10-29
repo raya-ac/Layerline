@@ -1,4 +1,5 @@
 const std = @import("std");
+const php_version = @import("php_version.zig");
 
 const config_mod = @import("config.zig");
 const h2_native = @import("h2_native.zig");
@@ -115,6 +116,10 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     const body_tail = raw[header_end..];
     const status_line_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.BadGateway;
     const response_headers = header_bytes[status_line_end + 2 .. header_end - 4];
+    if (php_version.exposedHeaders(response_headers)) |version| {
+        php_version.log(version);
+        return .{ .status_code = 503, .content_type = "text/plain; charset=utf-8", .body = try php_version.updateMessage(allocator, version), .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
+    }
     const framing = try proxy_utils.parseUpstreamResponseFraming(header_bytes, response_headers);
     const status_code = framing.status_code orelse 502;
 

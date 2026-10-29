@@ -178,20 +178,30 @@ pub fn parseOptionalContentLength(headers: []const u8) !?usize {
     if (findHeaderValue(headers, "Content-Length")) |raw| {
         const value = trimValue(raw);
         if (value.len == 0) return error.BadGateway;
-        return std.fmt.parseInt(usize, value, 10) catch return error.BadGateway;
+        return http_headers.parseDecimalLength(value) catch return error.BadGateway;
     }
     return null;
 }
 
 pub fn parseUpstreamResponseFraming(header_bytes: []const u8, response_headers: []const u8) !UpstreamResponseFraming {
-    const connection = findHeaderValue(response_headers, "Connection") orelse "";
-    const transfer_encoding = findHeaderValue(response_headers, "Transfer-Encoding") orelse "";
+    http_headers.validateHeaderBlock(response_headers) catch return error.BadGateway;
+    http_headers.validateRequestFraming(response_headers) catch return error.BadGateway;
+    const http10 = std.mem.startsWith(u8, header_bytes, "HTTP/1.0 ");
+    if (!http10 and !std.mem.startsWith(u8, header_bytes, "HTTP/1.1 ")) return error.BadGateway;
     return .{
         .status_code = parseHttpStatusCode(header_bytes),
         .content_length = try parseOptionalContentLength(response_headers),
-        .transfer_chunked = hasConnectionToken(transfer_encoding, "chunked"),
-        .connection_close = hasConnectionToken(connection, "close"),
+        .transfer_chunked = http_headers.hasHeaderToken(response_headers, "Transfer-Encoding", "chunked"),
+        .connection_close = http_headers.hasHeaderToken(response_headers, "Connection", "close") or
+            (http10 and !http_headers.hasHeaderToken(response_headers, "Connection", "keep-alive")),
     };
+}
+
+test "upstream HTTP10 closes by default and ambiguous framing is rejected" {
+    try std.testing.expect((try parseUpstreamResponseFraming("HTTP/1.0 200 OK", "Content-Length: 1")).connection_close);
+    try std.testing.expect(!(try parseUpstreamResponseFraming("HTTP/1.0 200 OK", "Content-Length: 1\r\nConnection: keep-alive")).connection_close);
+    for ([_][]const u8{ "Content-Length: 1\r\nContent-Length: 2", "Content-Length: +1", "Content-Length: 1\r\nTransfer-Encoding: chunked", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked" }) |fields|
+        try std.testing.expectError(error.BadGateway, parseUpstreamResponseFraming("HTTP/1.1 200 OK", fields));
 }
 
 pub fn responseHasNoBody(method: []const u8, status_code: ?u16) bool {

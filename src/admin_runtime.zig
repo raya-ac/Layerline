@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
+const session_mod = @import("admin_sessions.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
 const config_loader = @import("config_loader.zig");
 const config_mod = @import("config.zig");
@@ -68,6 +69,13 @@ fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
     };
     defer admin_support.freeFormFields(allocator, &fields);
 
+    const saved_token = try admin_support.ensureAdminSetupToken(io, allocator, cfg);
+    defer allocator.free(saved_token);
+    const supplied = admin_support.formValue(fields.items, "setup_token") orelse "";
+    if (supplied.len != 64 or !std.crypto.timing_safe.eql([64]u8, saved_token[0..64].*, supplied[0..64].*)) {
+        try callbacks.send_setup_page(stream, allocator, cfg, "Enter the local setup token to create admin access.", 403, "Forbidden", close_connection, false);
+        return;
+    }
     const username = admin_support.formValue(fields.items, "username") orelse "";
     const password = admin_support.formValue(fields.items, "password") orelse "";
     const password_confirm = admin_support.formValue(fields.items, "password_confirm") orelse "";
@@ -82,12 +90,19 @@ fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
         try callbacks.send_setup_page(stream, allocator, cfg, message, 400, "Bad Request", close_connection, false);
         return;
     };
-    const cookie = try admin_support.makeAdminSessionCookie(allocator, cfg, credentials);
+    const token_path = try admin_support.adminSetupTokenPath(allocator, cfg);
+    defer allocator.free(token_path);
+    std.Io.Dir.cwd().deleteFile(io, token_path) catch {};
+    const cookie = try admin_support.makeAdminSessionCookie(io, allocator, cfg, credentials);
     defer allocator.free(cookie);
     try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
 }
 
-fn handleLoginPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleLoginPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+    if (!session_mod.sessions.admitLogin(std.Io.Timestamp.now(io, .awake).toSeconds())) {
+        try callbacks.send_login_page(stream, allocator, cfg, "Too many sign-in attempts. Try again shortly.", 429, "Too Many Requests", close_connection, false);
+        return;
+    }
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
         try callbacks.send_login_page(stream, allocator, cfg, "The login form could not be parsed.", 400, "Bad Request", close_connection, false);
         return;
@@ -101,7 +116,7 @@ fn handleLoginPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg:
         return;
     }
 
-    const cookie = try admin_support.makeAdminSessionCookie(allocator, cfg, credentials);
+    const cookie = try admin_support.makeAdminSessionCookie(io, allocator, cfg, credentials);
     defer allocator.free(cookie);
     try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
 }
@@ -487,8 +502,14 @@ pub fn handleUi(
     }
 
     const sub_path = admin_support.adminSubPath(cfg.admin_ui_path, req.path);
+    if (std.mem.eql(u8, method, "POST") and !admin_support.adminMutationOriginAllowed(req.headers, cfg.tls_enabled)) {
+        try callbacks.send_response(stream, 403, "Forbidden", "text/plain; charset=utf-8", "Admin requests must come from the same origin.\n", close_connection);
+        return;
+    }
     const maybe_credentials = try admin_support.loadAdminCredentials(io, allocator, cfg.admin_credentials_path);
     if (maybe_credentials == null) {
+        const setup_token = try admin_support.ensureAdminSetupToken(io, allocator, cfg);
+        defer allocator.free(setup_token);
         if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/setup")) {
             try handleSetupPost(io, stream, allocator, cfg, req, close_connection, callbacks);
             return;
@@ -503,22 +524,23 @@ pub fn handleUi(
 
     const credentials = maybe_credentials.?;
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/login")) {
-        try handleLoginPost(stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        try handleLoginPost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/logout")) {
-        const cookie = try admin_support.makeAdminClearCookie(allocator, cfg);
-        defer allocator.free(cookie);
-        try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
-        return;
-    }
-
-    if (!admin_support.adminSessionCookieValid(req.headers, credentials)) {
+    if (!admin_support.adminSessionCookieValid(io, req.headers, credentials)) {
         if (std.mem.eql(u8, method, "GET") or is_head) {
             try callbacks.send_login_page(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
             return;
         }
         try callbacks.send_login_page(stream, allocator, cfg, "Sign in before using the admin dashboard.", 401, "Unauthorized", close_connection, false);
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/logout")) {
+        admin_support.revokeAdminSession(req.headers, credentials);
+        const cookie = try admin_support.makeAdminClearCookie(allocator, cfg);
+        defer allocator.free(cookie);
+        try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
         return;
     }
 

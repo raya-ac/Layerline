@@ -8,6 +8,11 @@ const static_files = @import("static_files.zig");
 test {
     _ = @import("http3_server.zig");
     _ = @import("http2_flow.zig");
+    _ = @import("admin_support.zig");
+    _ = @import("config_store.zig");
+    _ = @import("request_guard.zig");
+    _ = @import("php_version.zig");
+    _ = @import("php_runtime.zig");
 }
 
 test "static conditional precedence and weak ETags" {

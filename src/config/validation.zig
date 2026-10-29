@@ -183,6 +183,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
         _ = std.Io.net.UnixAddress.init(socket_path) catch return error.InvalidConfigValue;
     }
     if (cfg.admin_ui_enabled) {
+        if (!cfg.tls_enabled and !std.mem.eql(u8, cfg.host, "127.0.0.1") and !std.mem.eql(u8, cfg.host, "::1") and !std.mem.eql(u8, cfg.host, "localhost")) return error.AdminRequiresTlsOrLoopback;
         try validateAdminUiPath(cfg.admin_ui_path);
         if (cfg.admin_credentials_path.len == 0) return error.InvalidConfigValue;
         if (std.mem.indexOfAny(u8, cfg.admin_credentials_path, "\r\n\x00") != null) return error.InvalidConfigValue;

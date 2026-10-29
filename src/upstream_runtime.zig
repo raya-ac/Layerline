@@ -1,4 +1,5 @@
 const std = @import("std");
+const php_version = @import("php_version.zig");
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
@@ -17,6 +18,7 @@ const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 const UpstreamResponseForwardResult = proxy_utils.UpstreamResponseForwardResult;
 
 pub const Callbacks = struct {
+    send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
     access_log_set_upstream: *const fn ([]const u8) void,
     active_io: *const fn () std.Io,
     bind_thread_io: *const fn (std.Io) void,
@@ -204,6 +206,14 @@ fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
     const headers_start = status_line_end + 2;
     const headers_end = header_end - 4;
     const response_headers = header_bytes[headers_start..headers_end];
+    if (php_version.exposedHeaders(response_headers)) |version| {
+        php_version.log(version);
+        const message = try php_version.updateMessage(std.heap.page_allocator, version);
+        defer std.heap.page_allocator.free(message);
+        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
+        if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
+        return .{ .reusable = false };
+    }
     const framing = try proxy_utils.parseUpstreamResponseFraming(header_bytes, response_headers);
 
     callbacks.stream_write_all(stream, header_bytes[0..status_line_end]) catch return error.CloseConnection;
@@ -256,6 +266,14 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.S
     const header_bytes = response_buffer[0..header_end];
     const body_tail = response_buffer[header_end..used];
     const status_code = proxy_utils.parseHttpStatusCode(header_bytes) orelse return error.BadGateway;
+    if (php_version.exposedHeaders(header_bytes)) |version| {
+        php_version.log(version);
+        const message = try php_version.updateMessage(std.heap.page_allocator, version);
+        defer std.heap.page_allocator.free(message);
+        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
+        try callbacks.stream_write_all(stream, message);
+        return;
+    }
     if (status_code != 101) return error.BadGateway;
 
     callbacks.stream_write_all(stream, header_bytes) catch return error.CloseConnection;

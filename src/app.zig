@@ -358,6 +358,7 @@ fn phpCallbacks() php_runtime.Callbacks {
 
 fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
     return .{
+        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
         .access_log_set_upstream = runtime_state.accessLogSetUpstream,
         .active_io = activeIo,
         .bind_thread_io = bindThreadIo,
@@ -384,6 +385,7 @@ fn sendMethodNotAllowedWithAllow(stream: std.Io.net.Stream, allocator: std.mem.A
 
 fn http1StaticCallbacks() http1_static.Callbacks {
     return .{
+        .allow_sendfile = currentTlsChannel() == null,
         .metrics = &runtime_state.server_metrics,
         .response_cache = &runtime_state.static_response_cache,
         .send_bad_request_for_method = sendBadRequestForMethod,

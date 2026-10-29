@@ -15,6 +15,14 @@ pub const ByteRange = struct {
 };
 
 pub fn validateStaticPath(path: []const u8) !void {
+    return validatePath(path, false);
+}
+
+pub fn validateScriptPath(path: []const u8) !void {
+    return validatePath(path, true);
+}
+
+fn validatePath(path: []const u8, allow_script: bool) !void {
     if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, '\\') != null)
         return error.InvalidStaticPath;
     for (path) |byte| {
@@ -27,6 +35,7 @@ pub fn validateStaticPath(path: []const u8) !void {
             return error.InvalidStaticPath;
         if (component[0] == '.' and !(index == 0 and std.mem.eql(u8, component, ".well-known")))
             return error.PrivateStaticPath;
+        if (allow_script) continue;
 
         // A static alias must never turn a PHP script into a source download.
         // Check every suffix so compressed copies and backups stay private too.
@@ -383,9 +392,56 @@ pub fn statRegularFile(io: std.Io, file_path: []const u8) !std.Io.File.Stat {
     return stat;
 }
 
+pub fn openRootFile(io: std.Io, root: []const u8, relative: []const u8) !std.Io.File {
+    try validateStaticPath(relative);
+    return openRootHandle(io, root, relative);
+}
+
+pub fn openRootScript(io: std.Io, root: []const u8, relative: []const u8) !std.Io.File {
+    try validateScriptPath(relative);
+    return openRootHandle(io, root, relative);
+}
+
+fn openRootHandle(io: std.Io, root: []const u8, relative: []const u8) !std.Io.File {
+    // The configured root may be a release symlink. Once opened, every child
+    // component is resolved from a held directory handle without following links.
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+    defer dir.close(io);
+    var parts = std.mem.splitScalar(u8, relative, '/');
+    var name = parts.next().?;
+    while (parts.next()) |next| {
+        const child = try dir.openDir(io, name, .{ .follow_symlinks = false });
+        dir.close(io);
+        dir = child;
+        name = next;
+    }
+    const file = try dir.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false });
+    errdefer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.NotFile;
+    return file;
+}
+
+pub fn readOpened(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, limit: usize) ![]u8 {
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > limit) return error.StreamTooLong;
+    const data = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(data);
+    if (try file.readPositionalAll(io, data, 0) != data.len) return error.UnexpectedEndOfFile;
+    return data;
+}
+
+pub fn isHiddenFileError(err: anyerror) bool {
+    return switch (err) {
+        error.NotDir, error.FileNotFound, error.NotFile, error.IsDir, error.AccessDenied, error.SymLinkLoop, error.PrivateStaticPath, error.InvalidStaticPath => true,
+        else => false,
+    };
+}
+
 pub const RangeBodyCallbacks = struct {
     metrics: *metrics_mod.ServerMetrics,
     write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
+    allow_sendfile: bool = false,
 };
 
 fn trySendfileRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, body_len: usize) !bool {
@@ -426,15 +482,12 @@ fn trySendfileRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, 
 pub fn streamRangeBody(
     io: std.Io,
     stream: std.Io.net.Stream,
-    file_path: []const u8,
+    file: std.Io.File,
     start: usize,
     body_len: usize,
     callbacks: RangeBodyCallbacks,
 ) !void {
-    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
-
-    if (try trySendfileRange(stream, file, start, body_len)) {
+    if (callbacks.allow_sendfile and try trySendfileRange(stream, file, start, body_len)) {
         callbacks.metrics.staticBodySent(body_len, .sendfile);
         return;
     }

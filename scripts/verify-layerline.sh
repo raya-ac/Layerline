@@ -37,7 +37,7 @@ cleanup() {
   fi
   rm -rf "$TMP_DIR"
 }
-trap cleanup EXIT
+trap 'VERIFY_STATUS=$?; if [[ $VERIFY_STATUS -ne 0 && -f $LOG ]]; then tail -n 80 "$LOG" >&2; fi; cleanup' EXIT
 
 log() {
   printf '==> %s\n' "$*"
@@ -119,6 +119,7 @@ route_proxy.verify_proxy = http://127.0.0.1:19000 http://127.0.0.1:19001
 route_upstream_policy.verify_proxy = least_connections
 route = verify_cache /verify-cache/* proxy
 route_proxy.verify_cache = http://127.0.0.1:19000
+route = verify_php /verify-php/* php
 CONF
 mkdir -p "$SITE_DIR" "$CUSTOM_ROOT" "$RELOAD_ROOT" "$SIGHUP_ROOT"
 mkdir -p "$CUSTOM_ROOT/.git" "$CUSTOM_ROOT/.well-known"
@@ -126,6 +127,12 @@ printf 'private fixture\n' >"$CUSTOM_ROOT/.env"
 printf 'private fixture\n' >"$CUSTOM_ROOT/.git/config"
 printf 'private fixture\n' >"$CUSTOM_ROOT/source.PHP.bak"
 printf 'public security contact\n' >"$CUSTOM_ROOT/.well-known/security.txt"
+mkdir -p "$TMP_DIR/private" "$CUSTOM_ROOT/nested"
+printf 'private symlink fixture\n' >"$TMP_DIR/private/secret.txt"
+ln -s "$TMP_DIR/private/secret.txt" "$CUSTOM_ROOT/leak.txt"
+ln -s "$TMP_DIR/private" "$CUSTOM_ROOT/escape"
+ln -s "$TMP_DIR/private/secret.txt" "$CUSTOM_ROOT/font.woff2.br"
+ln -s "$TMP_DIR/private/secret.txt" "$CUSTOM_ROOT/nested/leak.txt"
 cat >"$CUSTOM_ROOT/index.html" <<'HTML'
 custom domain root
 HTML
@@ -227,6 +234,7 @@ ok "HTTP/1 parser hardening"
 
 python3 "$ROOT_DIR/scripts/verify-protocol.py" "$HOST" "$PORT"
 python3 "$ROOT_DIR/scripts/verify-h2.py" "$HOST" "$PORT"
+python3 "$ROOT_DIR/scripts/verify-security.py" "$HOST" "$PORT" "$ACCESS_LOG" "$LOG"
 
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null
@@ -531,11 +539,16 @@ grep -Fq 'First launch setup' "$ADMIN_SETUP_BODY" || die "admin UI did not show 
 ok "admin UI first-launch setup"
 
 COOKIE_JAR="$TMP_DIR/admin.cookies"
+SETUP_TOKEN_FILE="$TMP_DIR/.layerline-admin.creds.setup-token"
+[[ -s $SETUP_TOKEN_FILE ]] || die "admin setup did not create a local bootstrap token"
+MISSING_SETUP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --data 'username=admin&password=layerline-test-pass&password_confirm=layerline-test-pass' "$ADMIN_URL/setup")
+[[ $MISSING_SETUP_CODE == 403 && ! -e $ADMIN_CREDS ]] || die "admin setup accepted a missing bootstrap token"
 curl -fsS -c "$COOKIE_JAR" -o /dev/null \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data 'username=admin&password=layerline-test-pass&password_confirm=layerline-test-pass' \
+  --data "username=admin&password=layerline-test-pass&password_confirm=layerline-test-pass&setup_token=$(cat "$SETUP_TOKEN_FILE")" \
   "$ADMIN_URL/setup"
 [[ -s $ADMIN_CREDS ]] || die "admin credentials file was not created"
+[[ ! -e $SETUP_TOKEN_FILE ]] || die "setup token was not removed after creating credentials"
 ok "admin UI setup created credentials"
 
 ADMIN_LOGIN_BODY="$TMP_DIR/admin-login.body"
@@ -627,6 +640,24 @@ if grep -Fq '/certs/verify/privkey.pem' "$TMP_DIR/admin-add-site.body"; then
 fi
 ok "admin UI creates site configs"
 
+for origin in 'https://evil.test' 'null'; do
+  CODE=$(curl -sS -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' -H "Origin: $origin" --data 'target=' "$ADMIN_URL/api/cache/purge")
+  [[ $CODE == 403 ]] || die "admin mutation accepted a foreign origin"
+done
+CODE=$(curl -sS -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' -H 'Sec-Fetch-Site: same-site' --data 'target=' "$ADMIN_URL/api/cache/purge")
+[[ $CODE == 403 ]] || die "admin mutation accepted a sibling-site request"
+curl -fsS -b "$COOKIE_JAR" -o /dev/null -H "Origin: http://$HOST:$PORT" --data 'target=' "$ADMIN_URL/api/cache/purge"
+curl -fsS -b "$COOKIE_JAR" -o /dev/null --data '' "$ADMIN_URL/logout"
+CODE=$(curl -sS -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' --data 'target=' "$ADMIN_URL/api/cache/purge")
+[[ $CODE == 401 ]] || die "logged-out session cookie still authorized a mutation"
+LEGACY_SESSION=$(sed -n 's/^session=//p' "$ADMIN_CREDS")
+CODE=$(curl -sS -H "Cookie: layerline_admin=$LEGACY_SESSION" -o /dev/null -w '%{http_code}' --data 'target=' "$ADMIN_URL/api/cache/purge")
+[[ $CODE == 401 ]] || die "credential seed was accepted as a session cookie"
+curl -fsS -c "$COOKIE_JAR" -o /dev/null --data 'username=admin&password=layerline-test-pass' "$ADMIN_URL/login"
+curl -fsS -b "$COOKIE_JAR" "$ADMIN_URL" -o "$ADMIN_DASH_BODY"
+grep -Fq 'Control surface' "$ADMIN_DASH_BODY" || die "new login did not create a working session"
+ok "admin bootstrap proof, origin checks, revoked sessions and fresh login"
+
 [[ -s $ACCESS_LOG ]] || die "access log was not written"
 grep -Fq '"method":"GET"' "$ACCESS_LOG" || die "access log missing method"
 grep -Fq '"path":"/"' "$ACCESS_LOG" || die "access log missing root path"
@@ -653,6 +684,7 @@ ok "admin socket cleanup"
 REDIRECT_WEBROOT="$TMP_DIR/acme-webroot"
 mkdir -p "$REDIRECT_WEBROOT/.well-known/acme-challenge"
 printf 'redirect-acme-token\n' >"$REDIRECT_WEBROOT/.well-known/acme-challenge/token-123"
+ln -s "$TMP_DIR/private/secret.txt" "$REDIRECT_WEBROOT/.well-known/acme-challenge/leak"
 
 cat >"$CONFIG" <<CONF
 host = $HOST
@@ -674,10 +706,15 @@ log "starting temporary TLS server with HTTP redirect listener on http://$HOST:$
 PID=$!
 
 wait_for_http "http://$HOST:$REDIRECT_PORT/.well-known/acme-challenge/token-123" || die "HTTP redirect listener did not serve ACME challenge"
+curl -fsSk --http1.1 --max-time 5 "https://$HOST:$REDIRECT_TLS_PORT/static/hello.txt" -o "$TMP_DIR/tls-static.body"
+grep -Fq 'static file support' "$TMP_DIR/tls-static.body" || die "TLS static body did not stay inside encrypted records"
+ok "HTTP/1 TLS static streaming"
 ACME_BODY="$TMP_DIR/acme.body"
 curl -fsS "http://$HOST:$REDIRECT_PORT/.well-known/acme-challenge/token-123" -o "$ACME_BODY"
 grep -Fq 'redirect-acme-token' "$ACME_BODY" || die "ACME challenge body was unexpected"
 ok "HTTP redirect listener serves ACME challenge"
+CODE=$(curl -sS -o /dev/null -w '%{http_code}' "http://$HOST:$REDIRECT_PORT/.well-known/acme-challenge/leak")
+[[ $CODE == 404 ]] || die "ACME handler served a symlink outside its root"
 
 REDIRECT_HEADERS="$TMP_DIR/redirect.headers"
 REDIRECT_BODY="$TMP_DIR/redirect.body"

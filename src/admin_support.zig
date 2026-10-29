@@ -1,4 +1,5 @@
 const std = @import("std");
+const session_mod = @import("admin_sessions.zig");
 
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
@@ -731,28 +732,78 @@ fn findCookieValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn adminSessionCookieValid(headers: []const u8, credentials: AdminCredentials) bool {
-    const value = findCookieValue(headers, ADMIN_COOKIE_NAME) orelse return false;
-    const expected = std.fmt.bytesToHex(credentials.session, .lower);
-    if (value.len != expected.len) return false;
-    var actual: [ADMIN_SESSION_BYTES * 2]u8 = undefined;
-    @memcpy(actual[0..], value);
-    return std.crypto.timing_safe.eql([ADMIN_SESSION_BYTES * 2]u8, expected, actual);
+fn sessionToken(headers: []const u8) ?[32]u8 {
+    const value = findCookieValue(headers, ADMIN_COOKIE_NAME) orelse return null;
+    if (value.len != 64) return null;
+    var token: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&token, value) catch return null;
+    return token;
 }
 
-pub fn makeAdminSessionCookie(allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials) ![]const u8 {
-    const session_hex = std.fmt.bytesToHex(credentials.session, .lower);
+pub fn adminSessionCookieValid(io: std.Io, headers: []const u8, credentials: AdminCredentials) bool {
+    const token = sessionToken(headers) orelse return false;
+    return session_mod.sessions.valid(token, credentials.session, std.Io.Timestamp.now(io, .awake).toSeconds());
+}
+
+pub fn revokeAdminSession(headers: []const u8, credentials: AdminCredentials) void {
+    session_mod.sessions.revoke(sessionToken(headers) orelse return, credentials.session);
+}
+
+pub fn makeAdminSessionCookie(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials) ![]const u8 {
+    var token: [32]u8 = undefined;
+    io.random(&token);
+    try session_mod.sessions.issue(token, credentials.session, std.Io.Timestamp.now(io, .awake).toSeconds());
+    const session_hex = std.fmt.bytesToHex(token, .lower);
     return std.fmt.allocPrint(
         allocator,
-        "{s}={s}; HttpOnly; SameSite=Strict; Path={s}",
-        .{ ADMIN_COOKIE_NAME, session_hex[0..], cfg.admin_ui_path },
+        "{s}={s}; Max-Age=28800; HttpOnly; SameSite=Strict; Path={s}{s}",
+        .{ ADMIN_COOKIE_NAME, session_hex[0..], cfg.admin_ui_path, if (cfg.tls_enabled) "; Secure" else "" },
     );
 }
 
 pub fn makeAdminClearCookie(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}=; Max-Age=0; HttpOnly; SameSite=Strict; Path={s}",
-        .{ ADMIN_COOKIE_NAME, cfg.admin_ui_path },
+        "{s}=; Max-Age=0; HttpOnly; SameSite=Strict; Path={s}{s}",
+        .{ ADMIN_COOKIE_NAME, cfg.admin_ui_path, if (cfg.tls_enabled) "; Secure" else "" },
     );
+}
+
+pub fn adminMutationOriginAllowed(headers: []const u8, tls: bool) bool {
+    if (findHeaderValue(headers, "Sec-Fetch-Site")) |site| {
+        if (!std.mem.eql(u8, site, "same-origin") and !std.mem.eql(u8, site, "none")) return false;
+    }
+    const origin = findHeaderValue(headers, "Origin") orelse return true;
+    const prefix = if (tls) "https://" else "http://";
+    if (!std.mem.startsWith(u8, origin, prefix)) return false;
+    const authority = origin[prefix.len..];
+    if (std.mem.indexOfAny(u8, authority, "/?#@") != null) return false;
+    return std.ascii.eqlIgnoreCase(authority, findHeaderValue(headers, "Host") orelse return false);
+}
+
+pub fn adminSetupTokenPath(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.{s}.setup-token", .{ std.fs.path.dirname(cfg.admin_credentials_path) orelse ".", std.fs.path.basename(cfg.admin_credentials_path) });
+}
+
+pub fn ensureAdminSetupToken(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]u8 {
+    const path = try adminSetupTokenPath(allocator, cfg);
+    defer allocator.free(path);
+    try ensureParentDir(io, path);
+    var bytes: [32]u8 = undefined;
+    io.random(&bytes);
+    const token = std.fmt.bytesToHex(bytes, .lower);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &token, .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) } }) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128));
+    errdefer allocator.free(saved);
+    if (saved.len != 64) return error.InvalidSetupToken;
+    return saved;
+}
+
+test "admin mutations reject sibling origins and cross-site requests" {
+    try std.testing.expect(adminMutationOriginAllowed("Host: local:8080\r\nOrigin: http://local:8080\r\nSec-Fetch-Site: same-origin", false));
+    try std.testing.expect(!adminMutationOriginAllowed("Host: admin.test\r\nOrigin: https://sibling.test", true));
+    try std.testing.expect(!adminMutationOriginAllowed("Host: admin.test\r\nOrigin: null", true));
+    try std.testing.expect(!adminMutationOriginAllowed("Host: admin.test\r\nSec-Fetch-Site: same-site", true));
 }

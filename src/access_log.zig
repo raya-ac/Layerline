@@ -1,5 +1,7 @@
 const std = @import("std");
 
+var file_mutex: std.Io.Mutex = .init;
+
 pub const Context = struct {
     enabled: bool,
     sink: []const u8,
@@ -19,6 +21,25 @@ pub const Context = struct {
 pub const Writer = struct {
     mutex: std.Io.Mutex = .init,
 
+    pub fn securityBlock(self: *Writer, io: std.Io, sink: []const u8, method: []const u8, protocol: []const u8, path: []const u8, rule: []const u8) void {
+        var out = std.ArrayList(u8).empty;
+        const allocator = std.heap.page_allocator;
+        defer out.deinit(allocator);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+        const fingerprint = std.fmt.bytesToHex(digest, .lower);
+        out.appendSlice(allocator, "{\"event\":\"security.block\",\"action\":\"deny\",\"status\":403") catch return;
+        appendJsonNumberField(&out, allocator, "ts_ms", std.Io.Timestamp.now(io, .real).toMilliseconds(), true) catch return;
+        appendJsonStringField(&out, allocator, "rule", rule, true) catch return;
+        appendJsonStringField(&out, allocator, "method", method, true) catch return;
+        appendJsonStringField(&out, allocator, "protocol", protocol, true) catch return;
+        appendJsonStringField(&out, allocator, "path_sha256", &fingerprint, true) catch return;
+        out.appendSlice(allocator, "}\n") catch return;
+        self.writeLine(io, sink, out.items) catch {
+            std.debug.print("{s}", .{out.items});
+        };
+    }
+
     pub fn emit(self: *Writer, io: std.Io, maybe_ctx: ?*Context, server_name: []const u8, status_code: u16, body_bytes: usize) void {
         const ctx = maybe_ctx orelse return;
         if (!ctx.enabled or ctx.logged) return;
@@ -36,8 +57,9 @@ pub const Writer = struct {
         appendJsonNumberField(&out, allocator, "ts_ms", now_real_ms, false) catch return;
         appendJsonStringField(&out, allocator, "server", server_name, true) catch return;
         appendJsonStringField(&out, allocator, "method", ctx.method, true) catch return;
-        appendJsonStringField(&out, allocator, "path", ctx.path, true) catch return;
-        appendJsonStringField(&out, allocator, "query", ctx.query, true) catch return;
+        const blocked = std.mem.eql(u8, ctx.handler, "security_block");
+        appendJsonStringField(&out, allocator, "path", if (blocked) "[blocked]" else ctx.path, true) catch return;
+        appendJsonStringField(&out, allocator, "query", if (blocked) "" else ctx.query, true) catch return;
         appendJsonStringField(&out, allocator, "host", ctx.host, true) catch return;
         appendJsonStringField(&out, allocator, "protocol", ctx.protocol, true) catch return;
         appendJsonStringField(&out, allocator, "request_id", ctx.request_id, true) catch return;
@@ -59,6 +81,7 @@ pub const Writer = struct {
     }
 
     fn writeLine(self: *Writer, io: std.Io, sink: []const u8, line: []const u8) !void {
+        _ = self;
         if (usesStderr(sink)) {
             std.debug.print("{s}", .{line});
             return;
@@ -69,8 +92,8 @@ pub const Writer = struct {
         }
 
         try ensureParentDir(io, sink);
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        file_mutex.lockUncancelable(io);
+        defer file_mutex.unlock(io);
 
         var file = std.Io.Dir.cwd().openFile(io, sink, .{ .mode = .write_only }) catch |err| switch (err) {
             error.FileNotFound => try std.Io.Dir.cwd().createFile(io, sink, .{ .truncate = false, .permissions = @enumFromInt(0o640) }),

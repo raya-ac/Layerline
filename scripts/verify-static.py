@@ -48,9 +48,11 @@ with tempfile.TemporaryDirectory(prefix="layerline-static-") as directory:
         assert status == 200 and headers["content-length"] == str(len(body))
         assert "content-range" not in headers
         print(f"ok: {protocol} validators, ranges, stale fallback, HEAD metadata, and bodyless 304")
-        for path, host in [("/nogzip/test.php", "localhost"), ("/.env", "custom404.test"), ("/.git/config", "custom404.test"), ("/source.PHP.bak", "custom404.test")]:
+        for path, host in [("/nogzip/test.php", "localhost"), ("/verify-php/test.php", "localhost"), ("/.env", "custom404.test"), ("/.git/config", "custom404.test"), ("/source.PHP.bak", "custom404.test"), ("/leak.txt", "custom404.test"), ("/escape/secret.txt", "custom404.test"), ("/nested/leak.txt", "custom404.test")]:
             status, _, _ = fetch(protocol, path=path, host=host)
             assert status == 404, (protocol, path, status)
         status, _, document = fetch(protocol, path="/.well-known/security.txt")
         assert status == 200 and document == b"public security contact\n"
+        status, _, font = fetch(protocol, ["Accept-Encoding: br"], path="/font.woff2")
+        assert status == 200 and font == b"woff2\n", "precompressed symlink escaped the root"
         print(f"ok: {protocol} blocks static PHP source and private files without blocking .well-known")

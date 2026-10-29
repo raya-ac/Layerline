@@ -1,4 +1,5 @@
 const std = @import("std");
+const guard = @import("request_guard.zig");
 
 const buffered_cache = @import("buffered_cache.zig");
 const config_mod = @import("config.zig");
@@ -49,9 +50,8 @@ fn configuredHeadersAllowMicrocache(allocator: std.mem.Allocator, cfg: *const Se
 }
 
 fn microcacheKey(allocator: std.mem.Allocator, cfg: *const ServerConfig, scope: []const u8, req: HttpRequest) ![]u8 {
-    // Config snapshots remain allocated until shutdown. Their addresses keep
-    // in-flight fills from an old config out of the new config's cache.
-    const scoped = try std.fmt.allocPrint(allocator, "{x}:{s}", .{ @intFromPtr(cfg), scope });
+    // Reload generations prevent old in-flight fills crossing into new routes.
+    const scoped = try std.fmt.allocPrint(allocator, "{x}:{s}", .{ cfg.cache_generation, scope });
     defer allocator.free(scoped);
     return buffered_cache.makeKey(allocator, scoped, req);
 }
@@ -118,6 +118,11 @@ pub fn buildResponseForRequest(
     process_env: *const std.process.Environ.Map,
     callbacks: Callbacks,
 ) !H2BufferedResponse {
+    if (try guard.inspect(allocator, req)) |rule| {
+        guard.log(io, cfg, req, rule);
+        callbacks.access_log_set_handler("security_block");
+        return .{ .status_code = 403, .content_type = "text/plain; charset=utf-8", .body = guard.reply, .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
+    }
     _ = process_env;
     const is_head = std.mem.eql(u8, req.method, "HEAD");
     const domain = routing_mod.findDomainForRequestMutable(cfg, req.headers);

@@ -21,6 +21,7 @@ const Entry = struct {
     etag: []u8,
     body: []u8,
     expires_at_ms: i64,
+    charge: usize,
 };
 
 pub const StoreResult = enum {
@@ -39,6 +40,7 @@ pub const Store = struct {
     allocator: ?std.mem.Allocator = null,
     entries: std.ArrayList(Entry) = .empty,
     body_bytes: usize = 0,
+    resident_bytes: usize = 0,
 
     pub fn fetch(self: *Store, allocator: std.mem.Allocator, key: []const u8, etag: []const u8, now_ms: i64) !?[]u8 {
         self.lock();
@@ -57,13 +59,16 @@ pub const Store = struct {
         if (!policy.enabled) return .{ .result = .disabled };
         if (policy.max_bytes == 0 or policy.max_entry_bytes == 0 or policy.ttl_ms == 0) return .{ .result = .disabled };
         if (body.len > policy.max_entry_bytes or body.len > policy.max_bytes) return .{ .result = .too_large };
+        const charge = std.math.add(usize, body.len, key.len) catch return .{ .result = .too_large };
+        const cost = std.math.add(usize, charge, etag.len + @sizeOf(Entry) * 2 + 256) catch return .{ .result = .too_large };
+        if (cost > policy.max_bytes) return .{ .result = .too_large };
 
         self.lock();
         defer self.mutex.unlock();
 
         const allocator = self.allocator orelse blk: {
-            self.allocator = std.heap.page_allocator;
-            break :blk std.heap.page_allocator;
+            self.allocator = std.heap.smp_allocator;
+            break :blk std.heap.smp_allocator;
         };
 
         self.pruneExpiredLocked(now_ms);
@@ -78,11 +83,11 @@ pub const Store = struct {
         }
 
         var evictions: usize = 0;
-        while (self.entries.items.len > 0 and self.body_bytes + body.len > policy.max_bytes) {
+        while (self.entries.items.len > 0 and (self.resident_bytes > policy.max_bytes - cost or self.entries.items.len >= 4096)) {
             self.removeAtLocked(0);
             evictions += 1;
         }
-        if (self.body_bytes + body.len > policy.max_bytes) return .{ .result = .too_large, .evictions = evictions };
+        if (self.resident_bytes > policy.max_bytes - cost) return .{ .result = .too_large, .evictions = evictions };
 
         const owned_key = try allocator.dupe(u8, key);
         errdefer allocator.free(owned_key);
@@ -96,10 +101,12 @@ pub const Store = struct {
             .etag = owned_etag,
             .body = owned_body,
             .expires_at_ms = now_ms + @as(i64, policy.ttl_ms),
+            .charge = cost,
         };
 
         try self.entries.append(allocator, entry);
         self.body_bytes += body.len;
+        self.resident_bytes += cost;
         return .{ .result = .stored, .evictions = evictions };
     }
 
@@ -111,6 +118,7 @@ pub const Store = struct {
         for (self.entries.items) |entry| self.freeEntry(allocator, entry);
         self.entries.deinit(allocator);
         self.body_bytes = 0;
+        self.resident_bytes = 0;
         self.allocator = null;
     }
 
@@ -123,6 +131,7 @@ pub const Store = struct {
         for (self.entries.items) |entry| self.freeEntry(allocator, entry);
         self.entries.clearRetainingCapacity();
         self.body_bytes = 0;
+        self.resident_bytes = 0;
         return removed;
     }
 
@@ -164,6 +173,7 @@ pub const Store = struct {
         const allocator = self.allocator orelse return;
         const entry = self.entries.orderedRemove(index);
         self.body_bytes -|= entry.body.len;
+        self.resident_bytes -= entry.charge;
         self.freeEntry(allocator, entry);
     }
 
@@ -214,7 +224,7 @@ test "static response cache stores, hits, and expires entries" {
     var store = Store{};
     defer store.deinit();
 
-    const policy = Policy{ .enabled = true, .max_bytes = 16, .max_entry_bytes = 16, .ttl_ms = 1000 };
+    const policy = Policy{ .enabled = true, .max_bytes = 4096, .max_entry_bytes = 16, .ttl_ms = 1000 };
     try std.testing.expectEqual(StoreResult.stored, (try store.store("primary", "\"etag\"", "body", 10, policy)).result);
 
     const hit = (try store.fetch(std.testing.allocator, "primary", "\"etag\"", 20)).?;
@@ -230,4 +240,19 @@ test "static response cache stores, hits, and expires entries" {
     defer std.testing.allocator.free(other_hit);
     try std.testing.expectEqualStrings("other", other_hit);
     try std.testing.expect(try store.fetch(std.testing.allocator, "other", "\"etag\"", 2000) == null);
+}
+
+test "empty static entries still consume a bounded memory budget" {
+    var store = Store{ .allocator = std.testing.allocator };
+    defer store.deinit();
+    const policy = Policy{ .enabled = true, .max_bytes = 1024, .max_entry_bytes = 1024, .ttl_ms = 1000 };
+    for (0..1000) |i| {
+        var key: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&key, "empty-{d}", .{i});
+        _ = try store.store(value, "tag", "", 1, policy);
+        try std.testing.expect(store.resident_bytes <= policy.max_bytes);
+        try std.testing.expect(store.entries.items.len < 4);
+    }
+    _ = store.clear();
+    try std.testing.expectEqual(0, store.resident_bytes);
 }

@@ -7,6 +7,7 @@ const static_files = @import("static_files.zig");
 const http_headers = @import("http_headers.zig");
 
 pub const Callbacks = struct {
+    allow_sendfile: bool = false,
     metrics: *metrics_mod.ServerMetrics,
     response_cache: *static_cache.Store,
     send_bad_request_for_method: *const fn (std.mem.Allocator, std.Io.net.Stream, []const u8, bool, bool) anyerror!void,
@@ -43,13 +44,15 @@ pub fn serveStatic(
     const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
     defer allocator.free(file_path);
 
-    var stat = static_files.statRegularFile(io, file_path) catch |err| {
-        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) {
+    var file = static_files.openRootFile(io, static_dir, rel_path) catch |err| {
+        if (static_files.isHiddenFileError(err)) {
             try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
             return;
         }
         return err;
     };
+    defer file.close(io);
+    var stat = try file.stat(io);
 
     const raw_range_header = if (is_head) null else http_headers.findHeaderValue(request_headers, "Range");
     var selected_path = file_path;
@@ -67,10 +70,14 @@ pub fn serveStatic(
         for (candidates) |candidate| {
             if (!static_files.acceptsContentCoding(request_headers, candidate.coding)) continue;
             const candidate_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ file_path, candidate.suffix });
-            if (static_files.statRegularFile(io, candidate_path)) |candidate_stat| {
+            const candidate_rel = try std.fmt.allocPrint(allocator, "{s}{s}", .{ rel_path, candidate.suffix });
+            defer allocator.free(candidate_rel);
+            if (static_files.openRootFile(io, static_dir, candidate_rel)) |candidate_file| {
+                file.close(io);
+                file = candidate_file;
                 selected_path = candidate_path;
                 encoded_path = candidate_path;
-                stat = candidate_stat;
+                stat = try file.stat(io);
                 content_encoding = candidate.coding;
                 break;
             } else |_| {
@@ -132,7 +139,7 @@ pub fn serveStatic(
 
         try callbacks.send_response_no_body_headers(stream, 206, "Partial Content", content_type, body_len, close_connection, headers);
         if (!is_head) {
-            try static_files.streamRangeBody(io, stream, selected_path, range.start, body_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all });
+            try static_files.streamRangeBody(io, stream, file, range.start, body_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all, .allow_sendfile = callbacks.allow_sendfile });
         }
         return;
     }
@@ -152,7 +159,7 @@ pub fn serveStatic(
         }
 
         callbacks.metrics.responseCacheMiss();
-        const data = std.Io.Dir.cwd().readFileAlloc(io, selected_path, allocator, .limited(response_cache_policy.max_entry_bytes)) catch |err| {
+        const data = static_files.readOpened(io, allocator, file, response_cache_policy.max_entry_bytes) catch |err| {
             if (err == error.StreamTooLong) {
                 try callbacks.send_cool_error(stream, allocator, 413, "Payload Too Large", "Static file is too large for configured cache limits.", close_connection, is_head, null);
                 return;
@@ -184,7 +191,7 @@ pub fn serveStatic(
     defer allocator.free(base_headers);
     try callbacks.send_response_no_body_headers(stream, 200, "OK", content_type, file_len, close_connection, base_headers);
     if (!is_head) {
-        try static_files.streamRangeBody(io, stream, selected_path, 0, file_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all });
+        try static_files.streamRangeBody(io, stream, file, 0, file_len, .{ .metrics = callbacks.metrics, .write_all = callbacks.write_all, .allow_sendfile = callbacks.allow_sendfile });
     }
 }
 
@@ -203,10 +210,15 @@ pub fn serveAcmeChallenge(
         return;
     }
 
-    const file_path = try acme.buildAcmeChallengeFilePath(allocator, webroot, token);
-    defer allocator.free(file_path);
-
-    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
+    const file = acme.openChallenge(io, allocator, webroot, token) catch |err| {
+        if (static_files.isHiddenFileError(err)) {
+            try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
+            return;
+        }
+        return err;
+    };
+    defer file.close(io);
+    const data = static_files.readOpened(io, allocator, file, 64 * 1024) catch |err| {
         if (err == error.StreamTooLong) {
             try callbacks.send_cool_error(stream, allocator, 413, "Payload Too Large", "ACME challenge file is too large.", close_connection, is_head, null);
             return;

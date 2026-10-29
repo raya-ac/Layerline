@@ -1,4 +1,5 @@
 const std = @import("std");
+const guard = @import("request_guard.zig");
 const admin_support = @import("admin_support.zig");
 const config_mod = @import("config.zig");
 const php_runtime = @import("php_runtime.zig");
@@ -96,6 +97,14 @@ pub fn route(
     defer base_header_context.deinit(allocator);
     callbacks.set_response_headers(base_header_context.items);
     defer callbacks.clear_response_headers();
+
+    if (try guard.inspect(allocator, req)) |rule| {
+        guard.log(io, cfg, req, rule);
+        callbacks.access_log_set_handler("security_block");
+        callbacks.set_response_headers(&.{.{ .name = "Cache-Control", .value = "no-store" }});
+        try callbacks.send_response_for_method(stream, 403, "Forbidden", "text/plain; charset=utf-8", guard.reply, should_close, is_head);
+        return;
+    }
 
     if (cfg.admin_ui_enabled and admin_support.adminPathMatches(cfg.admin_ui_path, req.path)) {
         callbacks.access_log_set_handler("admin_ui");

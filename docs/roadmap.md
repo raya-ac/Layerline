@@ -4,9 +4,17 @@ Layerline should become a production web server, not a demo binary. The target i
 
 ## September 2026 Audit Gate
 
+October follow-up: HTTP/2 send windows and bounded queues, split header blocks,
+admin bootstrap/session/origin controls, static handle containment, PHP alias
+diagnostic gating, cache metadata accounting, and a 32-snapshot reload ceiling
+are implemented. Native PHP2Shell input controls and exposed-version update
+notices are covered by [the security policy and tests](security.md). Remaining
+work includes config reader leases/reclamation, HTTP/2 trailers and wider frame
+conformance, process-wide resource budgets, and full HTTP/3 interoperability.
+
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 
-The next work is HTTP/2 send-window accounting and bounded scheduling, followed by frame/stream conformance, admin bootstrap/session security, root-relative file containment, and cache/snapshot memory bounds. HTTP/3 remains experimental: configured certificate integration, Huffman decoding, flow control, and external client acceptance are incomplete. Disk caching and broad feature expansion follow these gates, not precede them.
+The next work is wider HTTP/2 frame/stream conformance, process-wide resource budgets, and config reader leases/reclamation. HTTP/3 remains experimental: configured certificate integration, Huffman decoding, flow control, and external client acceptance are incomplete. Disk caching and broad feature expansion follow these gates, not precede them.
 
 This plan is based on the current local code plus the public feature surfaces documented by Caddy and NGINX:
 

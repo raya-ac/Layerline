@@ -32,17 +32,16 @@ pub fn readDomainDocument(
     const name = documentName(status_code) orelse return null;
     if (domain == null) return null;
 
-    const file_path = try std.fs.path.join(allocator, &.{ routing_mod.domainStaticDir(cfg, domain), name });
-    defer allocator.free(file_path);
-
-    const stat = static_files.statRegularFile(io, file_path) catch |err| {
-        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
+    const file = static_files.openRootFile(io, routing_mod.domainStaticDir(cfg, domain), name) catch |err| {
+        if (static_files.isHiddenFileError(err)) return null;
         return err;
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
     const max_document_bytes = @min(64 * 1024, config_mod.maxStaticFileBytesFor(cfg, domain, null));
     if (stat.size > max_document_bytes) return null;
 
-    return std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_document_bytes)) catch |err| {
+    return static_files.readOpened(io, allocator, file, max_document_bytes) catch |err| {
         if (err == error.StreamTooLong or err == error.NotDir or err == error.FileNotFound or err == error.NotFile) return null;
         return err;
     };

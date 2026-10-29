@@ -60,12 +60,14 @@ pub fn readStaticFile(
     };
 
     const file_path = try std.fs.path.join(allocator, &.{ static_dir, rel_path });
-    const stat = static_files.statRegularFile(io, file_path) catch |err| {
-        if (err == error.NotDir or err == error.FileNotFound or err == error.NotFile) {
+    const file = static_files.openRootFile(io, static_dir, rel_path) catch |err| {
+        if (static_files.isHiddenFileError(err)) {
             return coolErrorResponse(allocator, server_name, server_tagline, 404, "Not Found", "The requested resource was not found on this server.");
         }
         return err;
     };
+    defer file.close(io);
+    const stat = try file.stat(io);
     if (stat.size > max_file_bytes) {
         return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
     }
@@ -93,8 +95,6 @@ pub fn readStaticFile(
             return response;
         };
         const data = try allocator.alloc(u8, range.end - range.start + 1);
-        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{ .mode = .read_only, .allow_directory = false });
-        defer file.close(io);
         if (try file.readPositionalAll(io, data, range.start) != data.len) return error.UnexpectedEndOfFile;
         const cache_status = try static_cache.cacheStatusStatic(allocator, null);
         const base = try staticResponseHeaders(allocator, etag, last_modified, cache_status);
@@ -115,7 +115,7 @@ pub fn readStaticFile(
         }
 
         metrics.responseCacheMiss();
-        const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
+        const data = static_files.readOpened(io, allocator, file, max_file_bytes) catch |err| {
             if (err == error.StreamTooLong) {
                 return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
             }
@@ -135,7 +135,7 @@ pub fn readStaticFile(
         return .{ .status_code = 200, .content_type = content_type, .body = data, .headers = headers };
     }
 
-    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_file_bytes)) catch |err| {
+    const data = static_files.readOpened(io, allocator, file, max_file_bytes) catch |err| {
         if (err == error.StreamTooLong) {
             return coolErrorResponse(allocator, server_name, server_tagline, 413, "Payload Too Large", "Static file is too large for configured limits.");
         }
@@ -160,9 +160,12 @@ pub fn readAcmeChallenge(
         return coolErrorResponse(allocator, server_name, server_tagline, 400, "Bad Request", "Invalid ACME challenge path.");
     }
 
-    const file_path = try acme_mod.buildAcmeChallengeFilePath(allocator, webroot, token);
-    defer allocator.free(file_path);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(64 * 1024)) catch |err| {
+    const file = acme_mod.openChallenge(io, allocator, webroot, token) catch |err| {
+        if (static_files.isHiddenFileError(err)) return coolErrorResponse(allocator, server_name, server_tagline, 404, "Not Found", "The requested resource was not found on this server.");
+        return err;
+    };
+    defer file.close(io);
+    const data = static_files.readOpened(io, allocator, file, 64 * 1024) catch |err| {
         if (err == error.NotDir or err == error.FileNotFound) {
             return coolErrorResponse(allocator, server_name, server_tagline, 404, "Not Found", "The requested resource was not found on this server.");
         }
