@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real trickle clients: absolute HTTP/1, TLS and multiplexed HTTP/2 budgets."""
+"""Real slow clients: absolute HTTP/1, TLS and multiplexed HTTP/2 budgets."""
 import http.client
 import pathlib
 import signal
@@ -28,6 +28,8 @@ def context(protocol="http/1.1"):
 class Server:
     def __init__(self, folder, secure):
         self.secure = secure
+        (folder / "queued.bin").write_bytes(b"q" * (128 * 1024))
+        (folder / "blocked.bin").write_bytes(b"b" * (8 * 1024 * 1024))
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
@@ -36,8 +38,11 @@ class Server:
         config.write_text(f"""host = 127.0.0.1
 port = {self.port}
 tls = {str(secure).lower()}
+dir = {folder}
+serve_static_root = true
 read_header_timeout_ms = 500
 read_body_timeout_ms = 300
+write_timeout_ms = 350
 idle_timeout_ms = 1500
 graceful_shutdown_timeout_ms = 1000
 admin_ui = {str(secure).lower()}
@@ -59,11 +64,21 @@ admin_credentials_path = {folder / 'owner.creds'}
             self.close()
             raise
 
-    def raw(self):
-        return socket.create_connection(("127.0.0.1", self.port), timeout=2)
+    def raw(self, receive_buffer=None):
+        if receive_buffer is None:
+            return socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        conn = socket.socket()
+        try:
+            conn.settimeout(2)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+            conn.connect(("127.0.0.1", self.port))
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
-    def connect(self, protocol="http/1.1"):
-        conn = self.raw()
+    def connect(self, protocol="http/1.1", receive_buffer=None):
+        conn = self.raw(receive_buffer)
         return context(protocol).wrap_socket(conn, server_hostname="localhost") if self.secure else conn
 
     def health(self):
@@ -188,10 +203,21 @@ def fields(path=b"/health", method=b"GET"):
 
 
 class H2:
-    def __init__(self, server, wire=False):
-        self.conn = TLSWire(server) if wire else server.connect("h2")
-        self.conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0))
+    def __init__(self, server, wire=False, initial_window=None, receive_buffer=None):
+        self.conn = TLSWire(server) if wire else server.connect("h2", receive_buffer)
+        settings = b"" if initial_window is None else struct.pack("!HI", 4, initial_window)
+        self.conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, settings))
         self.barrier()
+
+    @classmethod
+    def upgrade(cls, server):
+        client = cls.__new__(cls)
+        client.conn = server.connect()
+        client.conn.sendall(b"GET /queued.bin HTTP/1.1\r\nHost: local\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAQAAAAA\r\n\r\n")
+        assert header(client.conn).startswith(b"HTTP/1.1 101"), "h2c upgrade failed"
+        client.conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, struct.pack("!HI", 4, 0)))
+        client.until(lambda f: f[0] == 1 and f[2] == 1)
+        return client
 
     def send(self, kind, flags, stream, payload=b""):
         self.conn.sendall(frame(kind, flags, stream, payload))
@@ -260,6 +286,107 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                 assert response.status == 200 and response.read() == b"ok\n"
             print(f"ok: {'TLS' if secure else 'plain'} HTTP/1 absolute header/Content-Length/chunked budgets and separate keep-alive idle time")
 
+            for progress in [False, True]:
+                h2 = H2(server, initial_window=0)
+                try:
+                    started = time.monotonic()
+                    h2.send(1, 5, 1, fields(b"/queued.bin"))
+                    h2.until(lambda f: f[0] == 1 and f[2] == 1)
+                    received = []
+                    if progress:
+                        for stream in [3, 5, 7, 9, 11]:
+                            time.sleep(0.08)
+                            h2.send(8, 0, 1, (1).to_bytes(4, "big"))
+                            h2.send(1, 5, stream, fields())
+                            h2.send(8, 0, stream, (3).to_bytes(4, "big"))
+                            received += h2.barrier()
+                        assert any(k == 0 and s == 11 and f & 1 and p == b"ok\n" for k, f, s, p in received)
+                    else:
+                        received = h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
+                    assert (3, 0, 1, (8).to_bytes(4, "big")) in received, "PING/window traffic renewed a queued response deadline"
+                    assert not any(k == 7 for k, _, _, _ in received)
+                    assert time.monotonic() - started < 0.9, "zero-window output survived its response budget"
+                    h2.send(8, 0, 1, (65535).to_bytes(4, "big"))
+                    assert not any(k == 0 and s == 1 for k, _, s, _ in h2.barrier()), "expired response resumed sending"
+                finally:
+                    h2.conn.close()
+
+            h2 = H2(server)
+            try:
+                started = time.monotonic()
+                h2.send(1, 5, 1, fields(b"/queued.bin"))
+                received = []
+                total = 0
+                while total < 65535:
+                    item = h2.receive()
+                    received.append(item)
+                    if item[0] == 0:
+                        total += len(item[3])
+                assert total == 65535
+                h2.send(8, 0, 1, (131072).to_bytes(4, "big"))  # Only connection credit is now stalled.
+                received += h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
+                assert time.monotonic() - started < 0.9
+                h2.send(8, 0, 0, (65535).to_bytes(4, "big"))
+                h2.send(1, 5, 3, fields())
+                received = h2.until(lambda f: f[0] == 0 and f[1] & 1 and f[2] == 3)
+                assert any(k == 0 and s == 3 and p == b"ok\n" for k, _, s, p in received)
+            finally:
+                h2.conn.close()
+            for cut in [4, 16]:
+                h2 = H2(server, initial_window=0)
+                try:
+                    h2.send(1, 5, 1, fields(b"/queued.bin"))
+                    h2.until(lambda f: f[0] == 1 and f[2] == 1)
+                    wire = frame(1, 5, 3, fields()) + frame(8, 0, 3, (3).to_bytes(4, "big"))
+                    h2.conn.sendall(wire[:cut])
+                    h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
+                    h2.conn.sendall(wire[cut:])
+                    received = h2.until(lambda f: f[0] == 0 and f[1] & 1 and f[2] == 3)
+                    assert any(k == 0 and p == b"ok\n" for k, _, _, p in received), "partial input lost when queued output expired"
+                finally:
+                    h2.conn.close()
+            print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 zero windows and window trickle expire output without disrupting healthy streams")
+
+            if not secure:
+                h2 = H2.upgrade(server)
+                try:
+                    started = time.monotonic()
+                    h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
+                    assert time.monotonic() - started < 0.9
+                    h2.send(1, 5, 3, fields())
+                    h2.send(8, 0, 3, (3).to_bytes(4, "big"))
+                    received = h2.until(lambda f: f[0] == 0 and f[1] & 1 and f[2] == 3)
+                    assert any(k == 0 and p == b"ok\n" for k, _, _, p in received)
+                finally:
+                    h2.conn.close()
+                print("ok: h2c upgrade stream uses the same absolute response budget")
+
+            h2 = H2(server, initial_window=1 << 30, receive_buffer=4096)
+            try:
+                previous = server.log.read_text().count('"phase":"wire"')
+                started = time.monotonic()
+                h2.send(8, 0, 0, (1 << 30).to_bytes(4, "big"))
+                h2.send(1, 5, 1, fields(b"/blocked.bin"))
+                h2.until(lambda f: f[0] == 1 and f[2] == 1)
+                while server.log.read_text().count('"phase":"wire"') == previous and time.monotonic() - started < 0.9:
+                    assert h2.conn.recv(1024), "writer closed before recording its timeout"
+                    time.sleep(0.08)
+                assert server.log.read_text().count('"phase":"wire"') == previous + 1, "small successful writes renewed the response wire budget"
+                assert time.monotonic() - started < 0.9
+                h2.conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                draining_until = time.monotonic() + 3
+                while True:
+                    try:
+                        if not h2.conn.recv(65536):
+                            break
+                    except (ConnectionResetError, ssl.SSLEOFError):
+                        break
+                    assert time.monotonic() < draining_until, "timed-out frame writer kept the connection alive"
+            finally:
+                h2.conn.close()
+            server.health()
+            print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 blocked socket writes close at the original response deadline")
+
             h2 = H2(server)
             try:
                 h2.upload()
@@ -317,6 +444,20 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
             print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 stream expiry preserves healthy streams and partial frames; aggregate header deadline enforced")
 
             if secure:
+                for cut in [2, 7]:
+                    h2 = H2(server, wire=True, initial_window=0)
+                    try:
+                        h2.send(1, 5, 1, fields(b"/queued.bin"))
+                        h2.until(lambda f: f[0] == 1 and f[2] == 1)
+                        packet = frame(1, 5, 3, fields()) + frame(8, 0, 3, (3).to_bytes(4, "big"))
+                        wire = h2.conn.encrypt(packet)
+                        h2.conn.conn.sendall(wire[:cut])
+                        h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
+                        h2.conn.conn.sendall(wire[cut:])
+                        received = h2.until(lambda f: f[0] == 0 and f[1] & 1 and f[2] == 3)
+                        assert any(k == 0 and p == b"ok\n" for k, _, _, p in received), "partial ciphertext lost when queued output expired"
+                    finally:
+                        h2.conn.close()
                 for cut in [2, 7]:
                     h2 = H2(server, wire=True)
                     try:

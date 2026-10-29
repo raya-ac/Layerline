@@ -1,12 +1,15 @@
 const std = @import("std");
 const h2 = @import("h2_native.zig");
 const support = @import("http2_support.zig");
+const Deadline = @import("read_deadline.zig").Deadline;
+const write_deadline = @import("write_deadline.zig");
 
 const Pending = struct {
     id: u32,
     window: i64,
     body: ?[]u8 = null,
     sent: usize = 0,
+    deadline: Deadline = .{},
 };
 
 // The runtime handles a connection synchronously on one worker, like its TLS
@@ -15,6 +18,8 @@ pub threadlocal var active: ?*State = null;
 
 pub const State = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    write_timeout_ms: u32 = 30000,
     streams: std.ArrayList(Pending) = .empty,
     connection_window: i64 = 65535,
     initial_window: i64 = 65535,
@@ -87,17 +92,51 @@ pub const State = struct {
         const i = self.find(id) orelse return error.BadRequest;
         if (self.streams.items[i].body != null) return error.BadRequest;
         if (body.len > max_queued_bytes - self.queued_bytes) return error.QueueLimit;
+        _ = try self.startResponse(id);
         self.streams.items[i].body = try self.allocator.dupe(u8, body);
         self.queued_bytes += body.len;
     }
 
+    pub fn startResponse(self: *State, id: u32) !Deadline {
+        const item = &self.streams.items[self.find(id) orelse return error.BadRequest];
+        if (item.deadline.at == null) item.deadline = .after(.now(self.io, .awake), self.write_timeout_ms);
+        return item.deadline;
+    }
+
+    pub fn nextDeadline(self: *const State) Deadline {
+        var deadline = Deadline{};
+        for (self.streams.items) |item| {
+            if (item.body != null) deadline = Deadline.earliest(deadline, item.deadline);
+        }
+        return deadline;
+    }
+
+    pub fn expire(self: *State, stream: std.Io.net.Stream, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+        var i: usize = 0;
+        while (i < self.streams.items.len) {
+            if (try self.expireAt(i, .now(self.io, .awake), stream, write)) continue;
+            i += 1;
+        }
+    }
+
+    fn expireAt(self: *State, i: usize, now: std.Io.Timestamp, stream: std.Io.net.Stream, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !bool {
+        const item = self.streams.items[i];
+        if (item.body == null or !item.deadline.expired(now)) return false;
+        self.cancel(item.id);
+        if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.write_timeout\",\"protocol\":\"h2\",\"phase\":\"response\",\"stream_id\":{d}}}\n", .{item.id});
+        try support.sendRst(stream, item.id, 8, write);
+        return true;
+    }
+
     pub fn flush(self: *State, stream: std.Io.net.Stream, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+        try self.expire(stream, write);
         // One frame per eligible stream per round keeps a stalled stream from
         // consuming the connection's remaining credit ahead of its neighbours.
         while (self.connection_window > 0) {
             var progressed = false;
             var i: usize = 0;
             while (i < self.streams.items.len and self.connection_window > 0) {
+                if (try self.expireAt(i, .now(self.io, .awake), stream, write)) continue;
                 const item = &self.streams.items[i];
                 const body = item.body orelse {
                     i += 1;
@@ -109,7 +148,11 @@ pub const State = struct {
                 }
                 const count = @min(body.len - item.sent, 16384, @as(usize, @intCast(@min(item.window, self.connection_window))));
                 const end = item.sent + count;
-                try support.sendFrame(stream, h2.FRAME_DATA, if (end == body.len) h2.FLAG_END_STREAM else 0, item.id, body[item.sent..end], write);
+                {
+                    const previous = write_deadline.push(.{ .io = self.io, .handle = stream.socket.handle, .deadline = item.deadline, .restore_timeout_ms = self.write_timeout_ms, .stream_id = item.id });
+                    defer write_deadline.restore(previous);
+                    try support.sendFrame(stream, h2.FRAME_DATA, if (end == body.len) h2.FLAG_END_STREAM else 0, item.id, body[item.sent..end], write);
+                }
                 item.sent = end;
                 item.window -= @intCast(count);
                 self.connection_window -= @intCast(count);
@@ -126,7 +169,7 @@ pub const State = struct {
 };
 
 test "settings preserve consumed credit and reject overflow" {
-    var state = State{ .allocator = std.testing.allocator };
+    var state = State{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer state.deinit();
     try state.open(1);
     state.streams.items[0].window -= 10;
@@ -137,4 +180,53 @@ test "settings preserve consumed credit and reject overflow" {
     try std.testing.expectError(error.BadRequest, state.update(0, 0));
     try std.testing.expectError(error.FlowControl, state.settings("\x00\x04\x80\x00\x00\x00"));
     try std.testing.expectError(error.FlowControl, state.update(0, 0x7fffffff));
+}
+
+threadlocal var test_output: [256]u8 = undefined;
+threadlocal var test_output_used: usize = 0;
+
+fn captureWrite(_: std.Io.net.Stream, bytes: []const u8) !void {
+    @memcpy(test_output[test_output_used..][0..bytes.len], bytes);
+    test_output_used += bytes.len;
+}
+
+test "response expiry releases owned bodies and slots without renewing on credit" {
+    var state = State{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer state.deinit();
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    try state.open(1);
+    try state.queue(1, "held");
+    try state.open(3);
+    try state.queue(3, "healthy");
+    state.streams.items[0].deadline = .after(.fromNanoseconds(0), 100);
+    state.streams.items[1].deadline = .after(.fromNanoseconds(0), 200);
+    const original = state.nextDeadline().at.?.nanoseconds;
+    try state.settings("\x00\x04\x00\x00\x00\x00");
+    try state.update(1, 1);
+    try std.testing.expectEqual(original, (try state.startResponse(1)).at.?.nanoseconds);
+    try std.testing.expectEqual(original, state.nextDeadline().at.?.nanoseconds);
+    test_output_used = 0;
+    try std.testing.expect(try state.expireAt(0, .fromNanoseconds(100 * std.time.ns_per_ms), stream, captureWrite));
+    try std.testing.expectEqualStrings("\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08", test_output[0..test_output_used]);
+    try std.testing.expectEqual(7, state.queued_bytes);
+    try std.testing.expect(state.find(1) == null);
+    try std.testing.expectEqualStrings("healthy", state.streams.items[state.find(3).?].body.?);
+    state.cancel(3);
+    try std.testing.expectEqual(0, state.queued_bytes);
+    try std.testing.expect(state.nextDeadline().at == null);
+    try state.open(5);
+    try std.testing.expect(state.streams.items[state.find(5).?].deadline.at == null);
+}
+
+test "zero connection credit does not prevent response expiry" {
+    var state = State{ .allocator = std.testing.allocator, .io = std.testing.io, .connection_window = 0 };
+    defer state.deinit();
+    try state.open(1);
+    try state.queue(1, "held");
+    state.streams.items[0].deadline = .after(.fromNanoseconds(0), 1);
+    test_output_used = 0;
+    try state.flush(.{ .socket = .{ .handle = 123, .address = undefined } }, captureWrite);
+    try std.testing.expectEqual(13, test_output_used);
+    try std.testing.expectEqual(0, state.streams.items.len);
+    try std.testing.expectEqual(0, state.queued_bytes);
 }

@@ -27,8 +27,14 @@ new-stream refusal, blocked reads/writes, and zero-window deadline expiry.
 Absolute client read deadlines now cover HTTP/1 header/body phases, TLS reads,
 HTTP/2 frame/header-block assembly, and independent pending uploads. Real trickle
 clients and partial TLS/frame resumption tests cover both plain and TLS paths.
-The next work is wider HTTP/2 frame/stream conformance, whole-response send
-deadlines, process-wide resource budgets, and config reader leases/reclamation.
+HTTP/2 response transfer deadlines now bound queued headers/DATA and both
+flow-control windows without renewal by PINGs or tiny credit updates. Expiry
+releases body memory/stream slots; partial wire-write failures close the
+connection instead of appending corrupt frame bytes. Wire tests cover plain/TLS,
+healthy-stream progress, partial input resumption, and blocked socket writes.
+The next work is wider HTTP/2 frame/stream conformance, HTTP/1 whole-response send
+deadlines, asynchronous backend routing, process-wide resource budgets, and
+config reader leases/reclamation.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

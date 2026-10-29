@@ -153,9 +153,35 @@ An expired framing/header budget closes the connection because its message
 boundary can no longer be obtained within policy. Optional trailers do not
 renew the upload deadline. Backend sockets never inherit a client read budget.
 
-This does not add whole-response send deadlines, a process-wide RSS cap, QUIC
-request deadlines, or verified Windows timeout enforcement. Existing write and
-upstream socket timeouts still apply; broader resource/transport gates remain.
+This does not add a process-wide RSS cap, QUIC request deadlines, or verified
+Windows timeout enforcement. Upstream socket timeouts still apply; broader
+resource/transport gates remain.
+
+## HTTP/2 Response Deadlines
+
+`write_timeout_ms` is also an absolute transfer budget for each HTTP/2 response,
+starting when the response is queued for sending. It covers output headers, DATA,
+and time spent waiting for stream or connection flow-control credit. PINGs,
+SETTINGS, and tiny WINDOW_UPDATE increments do not renew it. Increase this budget
+deliberately for responses that need longer transfers.
+
+An expired queued response releases its owned body and stream slot, receives
+RST_STREAM CANCEL, and records `server.write_timeout` with phase `response` and
+the stream ID. Other streams can continue. The frame reader includes these
+deadlines in its next wait while preserving partially received frames and TLS
+records. Backend sockets do not inherit a downstream response write budget.
+
+Every raw write within a response frame uses the remaining absolute budget,
+including TLS record writes. A failed or timed-out frame write closes the whole
+connection: another frame or GOAWAY cannot be appended after potentially partial
+frame/record bytes. Wire timeouts log phase `wire`. Neither event includes request
+paths, cookies, headers, or bodies.
+
+HTTP/1 writes and upstream operations still use socket-level timeouts rather than
+whole-response deadlines. The HTTP/2 connection worker currently routes backends
+synchronously, so an unrelated blocking backend operation can delay timer
+processing; output deadlines are checked again before sending. These controls
+are not an evented scheduler or a process-wide resource budget.
 
 ## Verification scope
 

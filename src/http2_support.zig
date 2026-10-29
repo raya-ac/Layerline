@@ -201,8 +201,25 @@ pub fn appendHeader(allocator: std.mem.Allocator, block: *std.ArrayList(u8), nam
 pub fn sendFrame(stream: std.Io.net.Stream, frame_type: u8, flags: u8, stream_id: u32, payload: []const u8, write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
     var header: [9]u8 = undefined;
     const rendered = try h2_native.writeFrameHeader(&header, payload.len, frame_type, flags, stream_id);
-    try write_all(stream, rendered);
-    if (payload.len > 0) try write_all(stream, payload);
+    // A failed write may have sent half a frame or TLS record. Nothing else,
+    // including GOAWAY, can safely be appended to this connection afterward.
+    write_all(stream, rendered) catch return error.CloseConnection;
+    if (payload.len > 0) write_all(stream, payload) catch return error.CloseConnection;
+}
+
+test "a failed frame write requires connection close, not a protocol error reply" {
+    const writer = struct {
+        fn fail(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.WriteTimeout;
+        }
+
+        fn failBody(_: std.Io.net.Stream, bytes: []const u8) !void {
+            if (bytes.len != 9) return error.WriteTimeout;
+        }
+    };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    try std.testing.expectError(error.CloseConnection, sendFrame(stream, h2_native.FRAME_DATA, 0, 1, "body", writer.fail));
+    try std.testing.expectError(error.CloseConnection, sendFrame(stream, h2_native.FRAME_DATA, 0, 1, "body", writer.failBody));
 }
 
 pub fn textResponse(status_code: u16, content_type: []const u8, body: []const u8) BufferedResponse {

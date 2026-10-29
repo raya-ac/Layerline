@@ -21,7 +21,7 @@ pub const Deadline = struct {
         const at = self.at orelse return null;
         if (now.nanoseconds >= at.nanoseconds) return error.RequestTimeout;
         const ns = at.nanoseconds - now.nanoseconds;
-        // Round up: a sub-millisecond remainder must not become SO_RCVTIMEO=0,
+        // Round up: a sub-millisecond remainder must not become a zero socket timeout,
         // which means an unlimited wait on the supported socket backends.
         return @intCast(@min(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(u32)));
     }

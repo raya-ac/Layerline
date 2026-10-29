@@ -216,6 +216,7 @@ pub fn runFrameLoop(
     initial_stream_id: u32,
 ) !void {
     runFrames(io, stream, allocator, cfg, reader, process_env, callbacks, flow, initial_stream_id) catch |err| {
+        if (err == error.CloseConnection) return err;
         const code: u32 = switch (err) {
             error.FlowControl => 3,
             error.FrameSize => ERROR_FRAME_SIZE,
@@ -262,6 +263,7 @@ fn runFrames(
 
     while (true) {
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
+        try flow.expire(stream, callbacks.write_all);
         if (callbacks.shutdown_requested.load(.acquire)) {
             if (!draining) {
                 try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
@@ -275,6 +277,7 @@ fn runFrames(
         reader.limit = if (first_frame) settings_deadline else .{};
         if (continuation_id != 0) reader.limit = Deadline.earliest(reader.limit, continuation_deadline);
         for (body_states.items) |state| reader.limit = Deadline.earliest(reader.limit, state.deadline);
+        reader.limit = Deadline.earliest(reader.limit, flow.nextDeadline());
         concurrency_mod.setCurrentIdle(io, body_states.items.len == 0 and flow.streams.items.len == 0);
         var frame = h2_support.readFrame(reader, allocator, 16384) catch |err| switch (err) {
             error.ConnectionClosed => {
@@ -291,8 +294,8 @@ fn runFrames(
                     try h2_support.sendGoaway(stream, flow.last_stream_id, if (reader.frame_started == null and continuation_id == 0 and !first_frame) 0 else 0xb, callbacks.write_all);
                     return;
                 }
-                // Only a body budget expired. Its reset is handled above on the
-                // next iteration; the reader retains any partial frame bytes.
+                // A stream body/response budget expired. Reset it on the next
+                // iteration; preserve any partial frame and TLS record bytes.
                 continue;
             },
             else => return err,
@@ -305,6 +308,7 @@ fn runFrames(
             return;
         }
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
+        try flow.expire(stream, callbacks.write_all);
         concurrency_mod.setCurrentIdle(io, false);
 
         if (first_frame) {

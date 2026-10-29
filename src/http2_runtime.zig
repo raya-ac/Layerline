@@ -1,5 +1,6 @@
 const std = @import("std");
 const read_deadline = @import("read_deadline.zig");
+const write_deadline = @import("write_deadline.zig");
 
 const access_log_mod = @import("access_log.zig");
 const config_mod = @import("config.zig");
@@ -131,13 +132,18 @@ pub fn sendResponse(
         flow.cancel(stream_id);
         return;
     };
-    var offset: usize = 0;
-    while (offset < header_block.items.len) {
-        const end = @min(offset + 16384, header_block.items.len);
-        const flags: u8 = (if (end == header_block.items.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
-            (if (offset == 0 and body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0));
-        try h2_support.sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, header_block.items[offset..end], ctx.stream_write_all);
-        offset = end;
+    {
+        const deadline = try flow.startResponse(stream_id);
+        const previous = write_deadline.push(.{ .io = flow.io, .handle = stream.socket.handle, .deadline = deadline, .restore_timeout_ms = flow.write_timeout_ms, .stream_id = stream_id });
+        defer write_deadline.restore(previous);
+        var offset: usize = 0;
+        while (offset < header_block.items.len) {
+            const end = @min(offset + 16384, header_block.items.len);
+            const flags: u8 = (if (end == header_block.items.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
+                (if (offset == 0 and body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0));
+            try h2_support.sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, header_block.items[offset..end], ctx.stream_write_all);
+            offset = end;
+        }
     }
     if (body_len == 0) flow.cancel(stream_id);
     try flow.flush(stream, ctx.stream_write_all);
@@ -206,7 +212,7 @@ pub fn handlePreface(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
-    var flow = flow_mod.State{ .allocator = std.heap.page_allocator };
+    var flow = flow_mod.State{ .allocator = std.heap.page_allocator, .io = io, .write_timeout_ms = cfg.write_timeout_ms };
     defer flow.deinit();
     const previous_flow = flow_mod.active;
     flow_mod.active = &flow;
@@ -238,7 +244,7 @@ pub fn handleUpgrade(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
-    var flow = flow_mod.State{ .allocator = std.heap.page_allocator };
+    var flow = flow_mod.State{ .allocator = std.heap.page_allocator, .io = io, .write_timeout_ms = cfg.write_timeout_ms };
     defer flow.deinit();
     const previous_flow = flow_mod.active;
     flow_mod.active = &flow;

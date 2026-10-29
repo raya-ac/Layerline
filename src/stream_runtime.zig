@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const config_mod = @import("config.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const read_deadline = @import("read_deadline.zig");
+const write_deadline = @import("write_deadline.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -74,12 +75,32 @@ pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
 
 pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
     const io = activeIo();
+    const budget = write_deadline.forStream(stream);
+    defer if (budget) |state| {
+        setStreamWriteTimeout(stream, state.restore_timeout_ms) catch {};
+    };
     var written: usize = 0;
     while (written < bytes.len) {
+        if (budget) |state| {
+            const remaining = state.remaining() catch |err| {
+                state.logTimeout();
+                return err;
+            };
+            if (remaining) |timeout_ms| try setStreamWriteTimeout(stream, timeout_ms);
+        }
         // netWrite expects a real scatter list here. Passing an empty one
         // looked tidy, then crashed in the vtable path.
         const empty: [1][]const u8 = .{""};
-        const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| return normalizeSocketIoError(err);
+        const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| {
+            const normalized = normalizeSocketIoError(err);
+            if (budget) |state| {
+                if (normalized == error.RequestTimeout) {
+                    state.logTimeout();
+                    return error.WriteTimeout;
+                }
+            }
+            return normalized;
+        };
         if (n == 0) return error.WriteZero;
         written += n;
     }
