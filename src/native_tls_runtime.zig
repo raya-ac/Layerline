@@ -32,11 +32,47 @@ pub const Channel = struct {
     server_sequence: u64 = 0,
     pending_plaintext: ?[]u8 = null,
     pending_offset: usize = 0,
+    record_header: [5]u8 = undefined,
+    record_header_used: usize = 0,
+    record: ?[]u8 = null,
+    record_used: usize = 0,
 
     pub fn deinit(self: *Channel) void {
         if (self.pending_plaintext) |pending| self.allocator.free(pending);
+        if (self.record) |record| self.allocator.free(record);
         self.pending_plaintext = null;
         self.pending_offset = 0;
+        self.record = null;
+        self.record_header_used = 0;
+        self.record_used = 0;
+    }
+
+    fn readRecord(self: *Channel) ![]u8 {
+        // Keep partial ciphertext across a stream deadline. Restarting at a new
+        // record header would desynchronize TLS on the surviving HTTP/2 streams.
+        while (self.record_header_used < self.record_header.len) {
+            const n = try self.raw_read(self.stream, self.record_header[self.record_header_used..]);
+            if (n == 0) return error.ConnectionClosed;
+            self.record_header_used += n;
+        }
+        if (self.record == null) {
+            const len = std.mem.readInt(u16, self.record_header[3..5], .big);
+            if (len > MAX_RECORD_BYTES - 5) return error.RequestTooLarge;
+            const record = try self.allocator.alloc(u8, 5 + @as(usize, len));
+            @memcpy(record[0..5], &self.record_header);
+            self.record = record;
+            self.record_used = 5;
+        }
+        const record = self.record.?;
+        while (self.record_used < record.len) {
+            const n = try self.raw_read(self.stream, record[self.record_used..]);
+            if (n == 0) return error.ConnectionClosed;
+            self.record_used += n;
+        }
+        self.record = null;
+        self.record_header_used = 0;
+        self.record_used = 0;
+        return record;
     }
 };
 
@@ -71,6 +107,7 @@ pub fn readClientHelloRecord(stream: std.Io.net.Stream, allocator: std.mem.Alloc
     const record_len = try tls_client_hello.recordLength(&header);
     if (record_len > 5 + 16 * 1024) return error.RequestTooLarge;
     const record = try allocator.alloc(u8, record_len);
+    errdefer allocator.free(record);
     @memcpy(record[0..header.len], &header);
     const copied_body: usize = if (prefill.len > header.len) @min(prefill.len - header.len, record_len - header.len) else 0;
     if (copied_body > 0) {
@@ -133,6 +170,7 @@ fn readRecordRaw(stream: std.Io.net.Stream, allocator: std.mem.Allocator, raw_re
     const payload_len = (@as(usize, header[3]) << 8) | header[4];
     if (payload_len > MAX_RECORD_BYTES - 5) return error.RequestTooLarge;
     const record = try allocator.alloc(u8, 5 + payload_len);
+    errdefer allocator.free(record);
     @memcpy(record[0..5], &header);
     used = 5;
     while (used < record.len) {
@@ -190,7 +228,7 @@ pub fn readApplicationData(channel: *Channel, out: []u8) !usize {
             channel.pending_offset = 0;
         }
 
-        const record = try readRecordRaw(channel.stream, channel.allocator, channel.raw_read);
+        const record = try channel.readRecord();
         defer channel.allocator.free(record);
 
         switch (record[0]) {
@@ -248,6 +286,44 @@ pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
             channel.raw_write_all,
         );
         offset += chunk_len;
+    }
+}
+
+threadlocal var partial_record_step: usize = 0;
+
+fn partialRecordRead(_: std.Io.net.Stream, out: []u8) !usize {
+    const step = partial_record_step;
+    partial_record_step += 1;
+    const piece: []const u8 = switch (step) {
+        0 => "\x17\x03",
+        1, 4 => return error.RequestTimeout,
+        2 => "\x03\x00\x04",
+        3 => "te",
+        5 => "st",
+        else => return 0,
+    };
+    @memcpy(out[0..piece.len], piece);
+    return piece.len;
+}
+
+fn noRecordWrite(_: std.Io.net.Stream, _: []const u8) !void {
+    return error.UnexpectedWrite;
+}
+
+test "partial TLS records resume after read timeout and clean up on abandonment" {
+    for ([_]bool{ false, true }) |abandon| {
+        partial_record_step = 0;
+        var channel = Channel{ .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = undefined, .server_application_keys = undefined, .raw_read = partialRecordRead, .raw_write_all = noRecordWrite };
+        defer channel.deinit();
+        try std.testing.expectError(error.RequestTimeout, channel.readRecord());
+        try std.testing.expectEqual(2, channel.record_header_used);
+        try std.testing.expectError(error.RequestTimeout, channel.readRecord());
+        try std.testing.expectEqual(7, channel.record_used);
+        if (!abandon) {
+            const record = try channel.readRecord();
+            defer std.testing.allocator.free(record);
+            try std.testing.expectEqualStrings("\x17\x03\x03\x00\x04test", record);
+        }
     }
 }
 

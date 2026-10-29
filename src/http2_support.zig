@@ -4,6 +4,8 @@ const h2_native = @import("h2_native.zig");
 const http_headers = @import("http_headers.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
+const read_deadline = @import("read_deadline.zig");
+const Deadline = read_deadline.Deadline;
 
 pub const PREFACE_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -22,6 +24,7 @@ pub const BufferedResponse = struct {
 
 pub const Frame = struct {
     header: h2_native.FrameHeader,
+    // Borrowed until the reader advances to the next frame.
     payload: []u8,
 };
 
@@ -30,6 +33,7 @@ pub const RequestState = struct {
     req: request_mod.HttpRequest,
     body: std.ArrayList(u8) = .empty,
     expected_content_length: ?usize = null,
+    deadline: Deadline = .{},
 
     pub fn deinit(self: *RequestState, allocator: std.mem.Allocator) void {
         allocator.free(self.req.method);
@@ -41,9 +45,59 @@ pub const RequestState = struct {
 };
 
 pub const PendingReader = struct {
+    io: std.Io,
     stream: std.Io.net.Stream,
     pending: []const u8,
     read: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
+    header: [9]u8 = undefined,
+    header_used: usize = 0,
+    payload: ?[]u8 = null,
+    buffer: ?[]u8 = null,
+    payload_used: usize = 0,
+    frame_started: ?std.Io.Timestamp = null,
+    idle_started: ?std.Io.Timestamp = null,
+    completed_started: std.Io.Timestamp = .zero,
+    header_timeout_ms: u32 = 10_000,
+    idle_timeout_ms: u32 = 60_000,
+    limit: Deadline = .{},
+
+    pub fn deinit(self: *PendingReader, allocator: std.mem.Allocator) void {
+        if (self.buffer) |buffer| allocator.free(buffer);
+        read_deadline.clear(self.stream);
+    }
+
+    pub fn phaseDeadline(self: *PendingReader) Deadline {
+        if (self.frame_started) |start| return .after(start, self.header_timeout_ms);
+        if (self.idle_started == null) self.idle_started = .now(self.io, .awake);
+        return .after(self.idle_started.?, self.idle_timeout_ms);
+    }
+
+    fn readFrameBytes(self: *PendingReader, out: []u8) !usize {
+        read_deadline.install(.{
+            .io = self.io,
+            .handle = self.stream.socket.handle,
+            .deadline = Deadline.earliest(self.phaseDeadline(), self.limit),
+            .restore_timeout_ms = self.idle_timeout_ms,
+            .progress_timeout_ms = self.header_timeout_ms,
+            .track_progress = true,
+            .progress_started = self.frame_started,
+            .replace_on_progress = true,
+            .limit = self.limit,
+        });
+        defer if (read_deadline.forStream(self.stream)) |budget| {
+            self.frame_started = budget.progress_started;
+        };
+        if (self.pending.len > 0) {
+            const n = @min(out.len, self.pending.len);
+            @memcpy(out[0..n], self.pending[0..n]);
+            self.pending = self.pending[n..];
+            read_deadline.noteProgress(self.stream);
+            return n;
+        }
+        const n = try self.read(self.stream, out);
+        if (n > 0) read_deadline.noteProgress(self.stream);
+        return n;
+    }
 
     pub fn readExact(self: *PendingReader, out: []u8) !void {
         var written: usize = 0;
@@ -254,13 +308,38 @@ pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.Deco
 }
 
 pub fn readFrame(reader: *PendingReader, allocator: std.mem.Allocator, max_payload_bytes: usize) !Frame {
-    var header_bytes: [9]u8 = undefined;
-    try reader.readExact(&header_bytes);
-    const header = try h2_native.parseFrameHeader(&header_bytes);
+    while (reader.header_used < reader.header.len) {
+        const n = try reader.readFrameBytes(reader.header[reader.header_used..]);
+        if (n == 0) return error.ConnectionClosed;
+        reader.header_used += n;
+    }
+    const header = try h2_native.parseFrameHeader(&reader.header);
     if (header.length > max_payload_bytes) return error.FrameSize;
-    const payload = try allocator.alloc(u8, header.length);
-    errdefer allocator.free(payload);
-    if (payload.len > 0) try reader.readExact(payload);
+    if (reader.payload == null) {
+        if (header.length == 0) {
+            reader.payload = &.{};
+        } else {
+            if (reader.buffer) |buffer| {
+                if (buffer.len < header.length) reader.buffer = try allocator.realloc(buffer, max_payload_bytes);
+            } else {
+                reader.buffer = try allocator.alloc(u8, max_payload_bytes);
+            }
+            reader.payload = reader.buffer.?[0..header.length];
+        }
+    }
+    const payload = reader.payload.?;
+    while (reader.payload_used < payload.len) {
+        const n = try reader.readFrameBytes(payload[reader.payload_used..]);
+        if (n == 0) return error.ConnectionClosed;
+        reader.payload_used += n;
+    }
+    reader.completed_started = reader.frame_started orelse .now(reader.io, .awake);
+    reader.header_used = 0;
+    reader.payload = null;
+    reader.payload_used = 0;
+    reader.frame_started = null;
+    reader.idle_started = .now(reader.io, .awake);
+    read_deadline.clear(reader.stream);
     return .{ .header = header, .payload = payload };
 }
 
@@ -336,6 +415,36 @@ pub fn readClientPreface(reader: *PendingReader) !void {
     var preface_buf: [PREFACE_MAGIC.len]u8 = undefined;
     try reader.readExact(&preface_buf);
     if (!std.mem.eql(u8, &preface_buf, PREFACE_MAGIC)) return error.BadRequest;
+}
+
+threadlocal var partial_frame_step: usize = 0;
+
+fn partialFrameRead(_: std.Io.net.Stream, out: []u8) !usize {
+    const step = partial_frame_step;
+    partial_frame_step += 1;
+    const piece: []const u8 = switch (step) {
+        0 => "\x00\x00\x08\x06",
+        1, 4 => return error.RequestTimeout,
+        2 => "\x00\x00\x00\x00\x00",
+        3 => "pin",
+        5 => "gpong",
+        else => return 0,
+    };
+    @memcpy(out[0..piece.len], piece);
+    return piece.len;
+}
+
+test "HTTP2 frame header and payload survive read budget interrupts" {
+    partial_frame_step = 0;
+    var reader = PendingReader{ .io = std.testing.io, .stream = .{ .socket = .{ .handle = 123, .address = undefined } }, .pending = "", .read = partialFrameRead };
+    defer reader.deinit(std.testing.allocator);
+    try std.testing.expectError(error.RequestTimeout, readFrame(&reader, std.testing.allocator, 16384));
+    try std.testing.expectEqual(4, reader.header_used);
+    try std.testing.expectError(error.RequestTimeout, readFrame(&reader, std.testing.allocator, 16384));
+    try std.testing.expectEqual(3, reader.payload_used);
+    const frame = try readFrame(&reader, std.testing.allocator, 16384);
+    try std.testing.expectEqual(h2_native.FRAME_PING, frame.header.frame_type);
+    try std.testing.expectEqualStrings("pingpong", frame.payload);
 }
 
 pub fn decodeChunkedBuffer(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const config_mod = @import("config.zig");
 const native_tls = @import("native_tls_runtime.zig");
+const read_deadline = @import("read_deadline.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -41,14 +42,27 @@ fn normalizeSocketIoError(err: anyerror) anyerror {
 
 pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     const io = activeIo();
+    if (read_deadline.forStream(stream)) |budget| {
+        if (try budget.remaining()) |remaining| {
+            try setStreamReadTimeout(stream, remaining);
+        }
+    }
+    defer if (read_deadline.forStream(stream)) |budget| {
+        setStreamReadTimeout(stream, budget.restore_timeout_ms) catch {};
+    };
     var data: [1][]u8 = .{out};
-    return io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
+    const n = io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| return normalizeSocketIoError(err);
+    if (n > 0) read_deadline.noteProgress(stream);
+    return n;
 }
 
 pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
+    if (read_deadline.forStream(stream)) |budget| _ = try budget.remaining();
     if (current_tls_channel) |channel| {
         if (stream.socket.handle == channel.stream.socket.handle) {
-            return native_tls.readApplicationData(channel, out);
+            const n = try native_tls.readApplicationData(channel, out);
+            if (n > 0) read_deadline.noteProgress(stream);
+            return n;
         }
     }
     return rawStreamRead(stream, out);

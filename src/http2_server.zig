@@ -6,6 +6,7 @@ const h2_native = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
 const flow_mod = @import("http2_flow.zig");
 const request_mod = @import("request.zig");
+const Deadline = @import("read_deadline.zig").Deadline;
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -97,6 +98,7 @@ fn handleHeadersFrame(
         .stream_id = frame.header.stream_id,
         .req = try h2_support.cloneRequest(state_allocator, req),
         .expected_content_length = expected_content_length,
+        .deadline = .after(.now(io, .awake), cfg.read_body_timeout_ms),
     };
     errdefer pending.deinit(state_allocator);
     try states.append(state_allocator, pending);
@@ -186,6 +188,22 @@ fn handleDataFrame(
     try completeBody(io, stream, scratch_allocator, state_allocator, cfg, process_env, states, state_index, callbacks);
 }
 
+fn expireBodies(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, states: *std.ArrayList(h2_support.RequestState), flow: *flow_mod.State, callbacks: Callbacks) !void {
+    const now = std.Io.Timestamp.now(io, .awake);
+    var i: usize = 0;
+    while (i < states.items.len) {
+        const state = states.items[i];
+        if (state.deadline.expired(now)) {
+            try h2_support.sendRst(stream, state.stream_id, 8, callbacks.write_all);
+            flow.cancel(state.stream_id);
+            h2_support.removeRequestState(states, allocator, i);
+            std.debug.print("{{\"event\":\"server.read_timeout\",\"protocol\":\"h2\",\"phase\":\"body\",\"stream_id\":{d}}}\n", .{state.stream_id});
+        } else {
+            i += 1;
+        }
+    }
+}
+
 pub fn runFrameLoop(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -239,8 +257,11 @@ fn runFrames(
     var continuation = std.ArrayList(u8).empty;
     defer continuation.deinit(allocator);
     var draining = false;
+    var continuation_deadline = Deadline{};
+    const settings_deadline = Deadline.after(.now(io, .awake), cfg.read_header_timeout_ms);
 
     while (true) {
+        try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
         if (callbacks.shutdown_requested.load(.acquire)) {
             if (!draining) {
                 try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
@@ -251,17 +272,39 @@ fn runFrames(
 
         _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
+        reader.limit = if (first_frame) settings_deadline else .{};
+        if (continuation_id != 0) reader.limit = Deadline.earliest(reader.limit, continuation_deadline);
+        for (body_states.items) |state| reader.limit = Deadline.earliest(reader.limit, state.deadline);
         concurrency_mod.setCurrentIdle(io, body_states.items.len == 0 and flow.streams.items.len == 0);
-        var frame = h2_support.readFrame(reader, req_alloc, 16384) catch |err| switch (err) {
+        var frame = h2_support.readFrame(reader, allocator, 16384) catch |err| switch (err) {
             error.ConnectionClosed => {
                 if (callbacks.shutdown_requested.load(.acquire) and !draining) {
                     try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
                 }
                 return;
             },
-            error.RequestTimeout => return,
+            error.RequestTimeout => {
+                const now = std.Io.Timestamp.now(io, .awake);
+                if (reader.phaseDeadline().expired(now) or (first_frame and settings_deadline.expired(now)) or
+                    (continuation_id != 0 and continuation_deadline.expired(now)))
+                {
+                    try h2_support.sendGoaway(stream, flow.last_stream_id, if (reader.frame_started == null and continuation_id == 0 and !first_frame) 0 else 0xb, callbacks.write_all);
+                    return;
+                }
+                // Only a body budget expired. Its reset is handled above on the
+                // next iteration; the reader retains any partial frame bytes.
+                continue;
+            },
             else => return err,
         };
+        const now = std.Io.Timestamp.now(io, .awake);
+        if (Deadline.after(reader.completed_started, cfg.read_header_timeout_ms).expired(now) or
+            (continuation_id != 0 and continuation_deadline.expired(now)))
+        {
+            try h2_support.sendGoaway(stream, flow.last_stream_id, 0xb, callbacks.write_all);
+            return;
+        }
+        try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
         concurrency_mod.setCurrentIdle(io, false);
 
         if (first_frame) {
@@ -303,6 +346,7 @@ fn runFrames(
                     try continuation.appendSlice(allocator, fragment);
                     continuation_id = frame.header.stream_id;
                     continuation_flags = frame.header.flags & h2_native.FLAG_END_STREAM;
+                    continuation_deadline = .after(reader.completed_started, cfg.read_header_timeout_ms);
                     continue;
                 }
                 if (fragment.len > cfg.max_request_bytes) return error.BadRequest;

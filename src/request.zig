@@ -23,6 +23,7 @@ pub const StreamFns = struct {
     read: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
     set_read_timeout: *const fn (std.Io.net.Stream, u32) anyerror!void,
+    begin_read_deadline: ?*const fn (std.Io.net.Stream, u32) void = null,
 };
 
 pub fn upstreamHashInput(req: HttpRequest) upstream.RequestHashInput {
@@ -254,6 +255,7 @@ pub fn parse(
     }
 
     try fns.set_read_timeout(stream, read_body_timeout_ms);
+    if (fns.begin_read_deadline) |begin| begin(stream, read_body_timeout_ms);
     const body_read = try request_body.readBody(stream, allocator, headers, body_tail, max_body_bytes, max_chunk_line_bytes, fns.read);
     const close_connection = http_headers.parseConnectionClose(version, headers) or body_read.discarded_pipeline_bytes;
 

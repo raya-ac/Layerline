@@ -129,6 +129,27 @@ while another thread might still access them. Outstanding requests can be lost
 at that deadline. This is a process boundary, not cancellation of external PHP
 or certificate-tool child processes; supervise and isolate those separately.
 
+## Read Deadlines
+
+On the verified macOS/Linux socket backends, read limits are absolute monotonic
+budgets, not timers renewed by every byte. HTTP/1 headers and TLS negotiation
+use `read_header_timeout_ms`; decoded request bodies, including chunk framing
+and trailers, use `read_body_timeout_ms`. Keep-alive idle waits have a separate
+`idle_timeout_ms` budget and transition to a fresh header budget on first input.
+
+HTTP/2 bounds preface/initial SETTINGS waits, frame assembly, and the whole
+HEADERS/CONTINUATION block. Each pending upload has its own absolute body
+deadline. Expired uploads receive CANCEL resets without resetting healthy
+streams. Partial frame bytes and partial TLS record headers/ciphertext survive
+those interrupts. The frame reader reuses one bounded buffer per connection.
+An expired framing/header budget closes the connection because its message
+boundary can no longer be obtained within policy. Optional trailers do not
+renew the upload deadline. Backend sockets never inherit a client read budget.
+
+This does not add whole-response send deadlines, a process-wide RSS cap, QUIC
+request deadlines, or verified Windows timeout enforcement. Existing write and
+upstream socket timeouts still apply; broader resource/transport gates remain.
+
 ## Verification scope
 
 `zig build test` includes the native guard, session lifecycle, cache accounting,
@@ -150,6 +171,12 @@ blocked request reads, zero-window responses, and blocked large-file writes.
 To exercise an already-built release on its target OS without installing Zig,
 run `LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline bash scripts/verify-layerline.sh`.
 The verifier reports this explicitly and skips only compilation, not runtime checks.
+
+`scripts/verify-deadlines.py` tests plain and TLS trickle headers, Content-Length
+and chunked bodies, separate keep-alive timing, HTTP/2 upload expiry alongside
+healthy streams, interrupted frame/TLS-record resumption, frame-byte trickles,
+and aggregate continuation limits. Unit tests cover deadline rounding/socket
+isolation and partial frame/record cleanup. Both scripts run in the main verifier.
 
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do

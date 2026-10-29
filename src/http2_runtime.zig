@@ -1,4 +1,5 @@
 const std = @import("std");
+const read_deadline = @import("read_deadline.zig");
 
 const access_log_mod = @import("access_log.zig");
 const config_mod = @import("config.zig");
@@ -199,7 +200,7 @@ pub fn completeRequest(
 pub fn handlePreface(
     io: std.Io,
     stream: std.Io.net.Stream,
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     cfg: *ServerConfig,
     prefill: []const u8,
     process_env: *const std.process.Environ.Map,
@@ -211,14 +212,17 @@ pub fn handlePreface(
     flow_mod.active = &flow;
     defer flow_mod.active = previous_flow;
     var reader = H2PendingReader{
+        .io = io,
         .stream = stream,
         .pending = prefill,
         .read = ctx.stream_read,
+        .header_timeout_ms = cfg.read_header_timeout_ms,
+        .idle_timeout_ms = cfg.idle_timeout_ms,
     };
-    h2_support.readClientPreface(&reader) catch {
-        try ctx.send_cool_error_with_connection(stream, allocator, 400, "Bad Request", "Invalid HTTP/2 connection preface.", true, false, null);
-        return;
-    };
+    defer reader.deinit(flow.allocator);
+    read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
+    try h2_support.readClientPreface(&reader);
+    read_deadline.clear(stream);
 
     try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
     std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
@@ -266,14 +270,20 @@ pub fn handleUpgrade(
     try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
 
     var reader = H2PendingReader{
+        .io = io,
         .stream = stream,
         .pending = req.h2c_upgrade_tail,
         .read = ctx.stream_read,
+        .header_timeout_ms = cfg.read_header_timeout_ms,
+        .idle_timeout_ms = cfg.idle_timeout_ms,
     };
+    defer reader.deinit(flow.allocator);
+    read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
     h2_support.readClientPreface(&reader) catch {
         try h2_support.sendFrame(stream, h2_native.FRAME_GOAWAY, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x01", ctx.stream_write_all);
         return;
     };
+    read_deadline.clear(stream);
 
     var h2_req = req;
     h2_req.version = "HTTP/2.0";

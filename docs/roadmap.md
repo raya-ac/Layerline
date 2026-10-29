@@ -24,8 +24,11 @@ Worker shutdown ownership now retains/joins background threads before cleanup;
 an independent deadline guard exits without freeing borrowed runtime state if a
 worker remains stuck. Wire/process tests cover active HTTP/1 and HTTP/2 drain,
 new-stream refusal, blocked reads/writes, and zero-window deadline expiry.
-The next work is wider HTTP/2 frame/stream conformance, process-wide resource
-budgets, absolute slow-client deadlines, and config reader leases/reclamation.
+Absolute client read deadlines now cover HTTP/1 header/body phases, TLS reads,
+HTTP/2 frame/header-block assembly, and independent pending uploads. Real trickle
+clients and partial TLS/frame resumption tests cover both plain and TLS paths.
+The next work is wider HTTP/2 frame/stream conformance, whole-response send
+deadlines, process-wide resource budgets, and config reader leases/reclamation.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

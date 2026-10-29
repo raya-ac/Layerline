@@ -8,6 +8,7 @@ const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const request_mod = @import("request.zig");
+const read_deadline = @import("read_deadline.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
@@ -93,6 +94,8 @@ fn handleHttpRedirectConnection(
     allocator: std.mem.Allocator,
     callbacks: Callbacks,
 ) !void {
+    read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
+    defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const req_alloc = arena.allocator();
@@ -190,6 +193,7 @@ fn handleHttpRedirectConnection(
             },
         }
     };
+    read_deadline.clear(stream);
     req.close_connection = true;
     callbacks.metrics.requestStarted();
     const request_id = try callbacks.resolve_request_id(io, req_alloc, req.headers);
@@ -299,6 +303,7 @@ pub fn handleConnection(
     process_env: *const std.process.Environ.Map,
     callbacks: Callbacks,
 ) !void {
+    defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var handled_requests: usize = 0;
@@ -320,6 +325,14 @@ pub fn handleConnection(
         callbacks.set_stream_read_timeout(stream, next_read_timeout) catch |err| {
             std.debug.print("Socket read timeout setup failed: {}\n", .{err});
         };
+        read_deadline.begin(io, stream, next_read_timeout);
+        if (handled_requests > 0) {
+            var budget = read_deadline.forStream(stream).?;
+            budget.progress_timeout_ms = cfg.read_header_timeout_ms;
+            budget.track_progress = true;
+            budget.replace_on_progress = true;
+            read_deadline.install(budget);
+        }
         var prefill_buf: [64]u8 = undefined;
         concurrency_mod.setCurrentIdle(io, true);
         const prefill_len = callbacks.stream_read(stream, &prefill_buf) catch |err| switch (err) {
@@ -375,6 +388,7 @@ pub fn handleConnection(
             .read = callbacks.stream_read,
             .write_all = callbacks.stream_write_all,
             .set_read_timeout = callbacks.set_stream_read_timeout,
+            .begin_read_deadline = read_deadline.restart,
         }) catch |err| {
             if (err != error.ConnectionClosed) callbacks.metrics.requestParseError();
             switch (err) {
@@ -488,6 +502,7 @@ pub fn handleConnection(
                 },
             }
         };
+        read_deadline.clear(stream);
         handled_requests += 1;
         callbacks.metrics.requestStarted();
 

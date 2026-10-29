@@ -15,6 +15,8 @@ test {
     _ = @import("php_runtime.zig");
     _ = @import("server_runtime.zig");
     _ = @import("concurrency.zig");
+    _ = @import("read_deadline.zig");
+    _ = @import("native_tls_runtime.zig");
 }
 
 test "HTTP2 trailers stay separate from routing and authentication fields" {
