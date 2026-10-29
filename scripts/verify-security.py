@@ -95,6 +95,10 @@ try:
             for version in ["8.2.35", "8.3.36", "8.4.27", "8.5.12"]:
                 status = subprocess.check_output(["curl", "-sS", "--max-time", "5", protocol, "-o", str(output), "-w", "%{http_code}", base + "/verify-proxy/version/" + version])
                 assert status == b"200" and output.read_bytes() == b"original backend page", (protocol, version, status, output.read_bytes())
+            for version in ["8.2.35-dev", "8.3.36-RC1", "8.4.27-beta1", "8.5.12-alpha2"]:
+                status = subprocess.check_output(["curl", "-sS", "--max-time", "5", protocol, "-o", str(output), "-w", "%{http_code}", base + "/verify-proxy/version/" + version])
+                response = output.read_text()
+                assert status == b"503" and "(pre-release)" in response and "original backend page" not in response
             status = subprocess.check_output(["curl", "-sS", "--max-time", "5", protocol, "--head", "-o", str(headers), "-w", "%{http_code}", base + "/verify-proxy/version/8.4.26"])
             assert status == b"503" and "cache-control: no-store" in headers.read_text().lower()
             print(f"ok: {protocol} affected exposed PHP versions show owner update notice; patched releases serve normally")

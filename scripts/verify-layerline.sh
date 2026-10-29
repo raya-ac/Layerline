@@ -760,4 +760,7 @@ python3 "$ROOT_DIR/scripts/verify-shutdown.py" "$SERVER_BINARY"
 log "verifying absolute read deadlines"
 python3 "$ROOT_DIR/scripts/verify-deadlines.py" "$SERVER_BINARY"
 
+log "verifying CGI and FastCGI version notices"
+python3 "$ROOT_DIR/scripts/verify-php-version.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

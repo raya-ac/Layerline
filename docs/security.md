@@ -43,6 +43,10 @@ Older branches require migration. A structured `security.php_version` denial
 is written to stderr/journald. The replacement response uses `Cache-Control:
 no-store`.
 
+Development, alpha, beta, and release-candidate builds at a minimum fixed
+version are not accepted as proof of a patched release. Notices and log events
+mark them as pre-releases; ordinary distribution package suffixes remain valid.
+
 This checks what the backend advertises; it does not probe third-party hosts,
 inspect hidden PHP installations, or prove an undisclosed runtime is patched.
 Some vendors backport fixes without changing the upstream version. Owners must
