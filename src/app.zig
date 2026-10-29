@@ -447,7 +447,7 @@ fn handleHttp1ConnectionFromTls(
     allocator: std.mem.Allocator,
     process_env: *const std.process.Environ.Map,
 ) !void {
-    try http1_runtime.handleConnection(io, stream, cfg, allocator, process_env, http1RuntimeCallbacks());
+    try http1_runtime.handleHttp1Connection(io, stream, cfg, allocator, process_env, "", http1RuntimeCallbacks());
 }
 
 fn tlsAcceptCallbacks() tls_accept.Callbacks {
@@ -777,7 +777,6 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
         .handle_http2_preface = handleHttp2Preface,
         .handle_http2_upgrade = handleHttp2Upgrade,
         .handle_tls_client_hello_probe = handleTlsClientHelloProbe,
-        .is_tls_connection = stream_runtime.isTlsConnection,
         .metrics = &runtime_state.server_metrics,
         .resolve_request_id = runtime_state.resolveRequestId,
         .route_request = routeRequest,

@@ -325,6 +325,12 @@ RSA TLS signing uses joined, separately sized worker stacks instead of the small
 connection stack. At most eight signers run at once, each with a 512 KiB stack;
 excess handshakes fail admission. This bounds the extra signing workspace without
 enlarging every connection stack. It is not a full TLS/process memory budget.
+Initial protocol detection is separate from the HTTP/1 request loop, so TLS
+does not retain a second full request-handler frame. Once HTTP starts, bytes
+that resemble a TLS record are malformed HTTP, not another handshake. CGI
+environment encoding also avoids general-purpose formatting on that stack.
+Linux and macOS Debug wire tests exercise CGI over RSA TLS with the default
+64 KiB connection stack.
 
 ## Backend Failures
 

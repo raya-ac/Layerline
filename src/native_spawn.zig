@@ -164,6 +164,26 @@ fn check(io: std.Io, deadline: Deadline, shutdown: ?*const std.atomic.Value(bool
     _ = try deadline.remaining(.now(io, .awake));
 }
 
+fn environmentBlock(allocator: std.mem.Allocator, environment: *const std.process.Environ.Map) !std.process.Environ.PosixBlock {
+    const count = environment.count() - @intFromBool(environment.contains("ZIG_PROGRESS"));
+    const entries = try allocator.allocSentinel(?[*:0]u8, count, null);
+    var used: usize = 0;
+    errdefer {
+        for (entries[0..used]) |entry| allocator.free(std.mem.span(entry.?));
+        allocator.free(entries);
+    }
+    for (environment.keys(), environment.values()) |key, value| {
+        if (std.mem.eql(u8, key, "ZIG_PROGRESS")) continue;
+        if (key.len == 0 or std.mem.indexOfAny(u8, key, "=\x00") != null or std.mem.indexOfScalar(u8, value, 0) != null)
+            return error.InvalidArgument;
+        // POSIX needs literal key=value strings. Avoid the general formatter:
+        // TLS callers may have very little connection-stack space left here.
+        entries[used] = (try std.mem.concatWithSentinel(allocator, u8, &.{ key, "=", value }, 0)).ptr;
+        used += 1;
+    }
+    return .{ .slice = entries };
+}
+
 pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, environment: ?*const std.process.Environ.Map, deadline: Deadline, shutdown: ?*const std.atomic.Value(bool)) !Spawned {
     try check(io, deadline, shutdown);
     if (argv.len == 0 or argv[0].len == 0) return error.InvalidArgument;
@@ -176,7 +196,7 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
         argument.* = (try temporary.dupeZ(u8, value)).ptr;
     }
     const empty = [_:null]?[*:0]const u8{};
-    const envp: [*:null]const ?[*:0]const u8 = if (environment) |env| @ptrCast((try env.createPosixBlock(temporary, .{ .zig_progress_fd = -1 })).slice.ptr) else &empty;
+    const envp: [*:null]const ?[*:0]const u8 = if (environment) |env| @ptrCast((try environmentBlock(temporary, env)).slice.ptr) else &empty;
     var paths = std.ArrayList([:0]const u8).empty;
     if (std.mem.indexOfScalar(u8, argv[0], '/') != null) {
         try paths.append(temporary, try temporary.dupeZ(u8, argv[0]));
@@ -184,7 +204,7 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
         const path = if (environment) |env| env.get("PATH") orelse "/usr/local/bin:/usr/bin:/bin" else "/usr/local/bin:/usr/bin:/bin";
         var entries = std.mem.splitScalar(u8, path, ':');
         while (entries.next()) |entry| {
-            const candidate = try std.fmt.allocPrintSentinel(temporary, "{s}/{s}", .{ if (entry.len == 0) "." else entry, argv[0] }, 0);
+            const candidate = try std.mem.concatWithSentinel(temporary, u8, &.{ if (entry.len == 0) "." else entry, "/", argv[0] }, 0);
             try paths.append(temporary, candidate);
         }
     }
@@ -256,4 +276,33 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
         },
         .exec_status = .{ .handle = pipes[3][0], .flags = .{ .nonblocking = false } },
     };
+}
+
+test "child environment encoding preserves values and excludes the inherited progress descriptor" {
+    var environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("LANG", "C.UTF-8");
+    try environment.put("EMPTY", "");
+    try environment.put("VALUE", "a=b\nwith spaces");
+    try environment.put("ZIG_PROGRESS", "42");
+    const Case = struct {
+        fn exercise(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !void {
+            const block = try environmentBlock(allocator, env);
+            defer block.deinit(allocator);
+            try std.testing.expectEqual(3, block.slice.len);
+            try std.testing.expectEqualStrings("LANG=C.UTF-8", std.mem.span(block.slice[0].?));
+            try std.testing.expectEqualStrings("EMPTY=", std.mem.span(block.slice[1].?));
+            try std.testing.expectEqualStrings("VALUE=a=b\nwith spaces", std.mem.span(block.slice[2].?));
+            try std.testing.expect(block.slice.ptr[block.slice.len] == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.exercise, .{&environment});
+}
+
+test "child environment encoding rejects embedded nulls without leaking earlier entries" {
+    var environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("VALID", "first");
+    try environment.put("KEY", "value\x00suffix");
+    try std.testing.expectError(error.InvalidArgument, environmentBlock(std.testing.allocator, &environment));
 }

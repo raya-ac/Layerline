@@ -95,7 +95,9 @@ with concurrent bounded pipes, absolute deadlines, failed-exec reaping, a shared
 a separate positive `external_command_timeout_ms` setting (300000 by default).
 Raw command output is not logged; Cloudflare authorization travels through stdin.
 RSA signing is isolated on bounded joined worker stacks, rather than overflowing
-the default small connection stack in Debug. These controls do not sandbox child
+the default small connection stack in Debug. Initial protocol selection no longer
+retains a duplicate HTTP request handler during TLS, and CGI environment encoding
+avoids general formatting on that stack. These controls do not sandbox child
 code or cover uninterruptible kernel operations. Darwin resolver cancellation
 still needs stronger deadline guarantees. The next work also includes wider HTTP/2 frame/stream
 conformance, listener readiness and full process resource budgets.

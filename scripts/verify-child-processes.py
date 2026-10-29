@@ -49,11 +49,27 @@ def stopped(folder, previous, label):
             assert subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout.strip() == "", ("unreaped leader", pid)
 
 
-def request(number, tls, kind, body=None, path="/index.php"):
+def open_connection(number, tls):
     context = ssl._create_unverified_context()
-    connection = http.client.HTTPSConnection("127.0.0.1", number, context=context, timeout=3) if tls else http.client.HTTPConnection("127.0.0.1", number, timeout=3)
+    # Debug RSA-4096 signing is much slower on x86 than the optimized binary.
+    # Keep that handshake allowance separate from CGI's measured wire budget.
+    connection = http.client.HTTPSConnection("127.0.0.1", number, context=context, timeout=15) if tls else http.client.HTTPConnection("127.0.0.1", number, timeout=3)
+    start = time.monotonic()
     try:
         connection.connect()
+        connection.sock.settimeout(3)
+    except BaseException:
+        connection.close()
+        raise
+    elapsed = time.monotonic() - start
+    if elapsed > 2:
+        print(f"TLS handshake: {elapsed:.3f}s", flush=True)
+    return connection
+
+
+def request(number, tls, kind, body=None, path="/index.php"):
+    connection = open_connection(number, tls)
+    try:
         start = time.monotonic()
         connection.request("POST" if body else "GET", path + "?" + kind, body=body)
         reply = connection.getresponse()
@@ -168,7 +184,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                     stopped(folder, previous, kind)
                     if kind in ["hang", "descendant"]:
                         assert any(value["kind"] == "sleeper" for pid, value in records(folder).items() if previous.get(pid) != value), "descendant cleanup was not exercised"
-                connection = http.client.HTTPSConnection("127.0.0.1", number, context=ssl._create_unverified_context(), timeout=3) if tls else http.client.HTTPConnection("127.0.0.1", number, timeout=3)
+                connection = open_connection(number, tls)
                 try:
                     connection.request("GET", "/missing/page")
                     response = connection.getresponse()
@@ -183,6 +199,21 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                 status, data, elapsed = request(number, tls, "slow", path="/extended/page")
                 assert status == 200 and data == b"ok" and elapsed >= .6, (status, elapsed)
                 stopped(folder, previous, "route timeout override")
+                for normal_first in ([False, True] if tls else [True]):
+                    connection = open_connection(number, tls)
+                    try:
+                        if normal_first:
+                            connection.request("GET", "/index.php?okay")
+                            response = connection.getresponse()
+                            assert response.status == 200 and response.read() == b"ok"
+                        connection.sock.sendall(b"\x16GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        response = http.client.HTTPResponse(connection.sock)
+                        response.begin()
+                        assert response.status == 400, ("repeated protocol detection", tls, normal_first, response.status)
+                        response.read()
+                        response.close()
+                    finally:
+                        connection.close()
                 stop_server(process)
                 assert process.returncode == 0, log_path.read_text()
                 process = None

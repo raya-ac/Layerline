@@ -34,7 +34,6 @@ pub const Callbacks = struct {
     handle_http2_preface: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, []const u8, *const std.process.Environ.Map) anyerror!void,
     handle_http2_upgrade: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, HttpRequest, *const std.process.Environ.Map) anyerror!void,
     handle_tls_client_hello_probe: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, []const u8, *const std.process.Environ.Map) anyerror!void,
-    is_tls_connection: *const fn () bool,
     metrics: *ServerMetrics,
     resolve_request_id: *const fn (std.Io, std.mem.Allocator, []const u8) anyerror![]const u8,
     route_request: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, HttpRequest, *const std.process.Environ.Map) anyerror!void,
@@ -318,6 +317,54 @@ pub fn handleConnection(
     callbacks: Callbacks,
 ) !void {
     defer read_deadline.clear(stream);
+    const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
+    defer write_deadline.restore(previous_write);
+    try callbacks.set_stream_timeouts(stream, cfg.read_header_timeout_ms, cfg.write_timeout_ms);
+    read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
+    var prefill_buf: [64]u8 = undefined;
+    concurrency_mod.setCurrentIdle(io, true);
+    const length = callbacks.stream_read(stream, &prefill_buf) catch |err| switch (err) {
+        error.RequestTimeout => {
+            try callbacks.send_cool_error_with_connection(stream, allocator, 408, "Request Timeout", "No request bytes arrived before the header timeout.", true, false, null);
+            return;
+        },
+        else => return err,
+    };
+    if (length == 0) return;
+    concurrency_mod.setCurrentIdle(io, false);
+    if (callbacks.shutdown_requested.load(.acquire)) return;
+    const prefill = prefill_buf[0..length];
+    if (cfg.tls_enabled and !tls_client_hello.looksLikeTlsClientHello(prefill)) {
+        try callbacks.send_cool_error_with_connection(stream, allocator, 400, "Bad Request", "This listener requires HTTPS.", true, false, null);
+        return;
+    }
+    if (h2_support.isLikelyPreface(prefill)) {
+        write_deadline.clear(stream);
+        return callbacks.handle_http2_preface(io, stream, allocator, cfg, prefill, process_env);
+    }
+    if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
+        write_deadline.clear(stream);
+        return callbacks.handle_tls_client_hello_probe(io, stream, allocator, cfg, prefill, process_env);
+    }
+    if (native_tls.isHttp3OverTcpProbe(prefill)) {
+        try callbacks.send_cool_error_with_connection(stream, allocator, 426, "Upgrade Required", "HTTP/3 is a QUIC transport and cannot be served directly over this TCP socket.", true, false, null);
+        return;
+    }
+    try handleHttp1Connection(io, stream, cfg, allocator, process_env, prefill, callbacks);
+}
+
+// Protocol selection stays outside the request loop. TLS enters this directly,
+// rather than keeping a second full HTTP handler on the connection stack.
+pub fn handleHttp1Connection(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    cfg: *ServerConfig,
+    allocator: std.mem.Allocator,
+    process_env: *const std.process.Environ.Map,
+    initial_prefill: []const u8,
+    callbacks: Callbacks,
+) !void {
+    defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var handled_requests: usize = 0;
@@ -341,7 +388,7 @@ pub fn handleConnection(
         callbacks.set_stream_read_timeout(stream, next_read_timeout) catch |err| {
             std.debug.print("Socket read timeout setup failed: {}\n", .{err});
         };
-        read_deadline.begin(io, stream, next_read_timeout);
+        if (handled_requests > 0 or initial_prefill.len == 0) read_deadline.begin(io, stream, next_read_timeout);
         if (handled_requests > 0) {
             var budget = read_deadline.forStream(stream).?;
             budget.progress_timeout_ms = cfg.read_header_timeout_ms;
@@ -351,7 +398,11 @@ pub fn handleConnection(
         }
         var prefill_buf: [64]u8 = undefined;
         concurrency_mod.setCurrentIdle(io, true);
-        const prefill_len = callbacks.stream_read(stream, &prefill_buf) catch |err| switch (err) {
+        const prefill_len = if (handled_requests == 0 and initial_prefill.len > 0) blk: {
+            std.debug.assert(initial_prefill.len <= prefill_buf.len);
+            @memcpy(prefill_buf[0..initial_prefill.len], initial_prefill);
+            break :blk initial_prefill.len;
+        } else callbacks.stream_read(stream, &prefill_buf) catch |err| switch (err) {
             error.RequestTimeout => {
                 if (handled_requests > 0) return;
                 try callbacks.send_cool_error_with_connection(
@@ -372,37 +423,6 @@ pub fn handleConnection(
         concurrency_mod.setCurrentIdle(io, false);
         if (callbacks.shutdown_requested.load(.acquire)) return;
         const prefill = prefill_buf[0..prefill_len];
-
-        if (cfg.tls_enabled and !callbacks.is_tls_connection() and !tls_client_hello.looksLikeTlsClientHello(prefill)) {
-            try callbacks.send_cool_error_with_connection(stream, req_alloc, 400, "Bad Request", "This listener requires HTTPS.", true, false, null);
-            return;
-        }
-
-        if (h2_support.isLikelyPreface(prefill)) {
-            write_deadline.clear(stream);
-            try callbacks.handle_http2_preface(io, stream, req_alloc, cfg, prefill, process_env);
-            return;
-        }
-
-        if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
-            write_deadline.clear(stream);
-            try callbacks.handle_tls_client_hello_probe(io, stream, allocator, cfg, prefill, process_env);
-            return;
-        }
-
-        if (native_tls.isHttp3OverTcpProbe(prefill)) {
-            try callbacks.send_cool_error_with_connection(
-                stream,
-                req_alloc,
-                426,
-                "Upgrade Required",
-                "HTTP/3 is a QUIC transport and cannot be served directly over this TCP socket.",
-                true,
-                false,
-                null,
-            );
-            return;
-        }
 
         callbacks.set_stream_read_timeout(stream, cfg.read_header_timeout_ms) catch |err| {
             std.debug.print("Socket header timeout setup failed: {}\n", .{err});
