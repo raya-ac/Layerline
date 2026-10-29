@@ -8,6 +8,7 @@ const config_store = @import("config_store.zig");
 const http1_runtime = @import("http1_runtime.zig");
 const http3_server = @import("http3_server.zig");
 const metrics_mod = @import("metrics.zig");
+const native_connect = @import("native_connect.zig");
 const static_cache = @import("static_cache.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const upstream_mod = @import("upstream.zig");
@@ -95,7 +96,7 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
 fn wakeAdminListener(ctx: Context) void {
     if (!ctx.cfg.admin_enabled) return;
     const address = std.Io.net.UnixAddress.init(ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path) catch return;
-    const conn = address.connect(ctx.io) catch return;
+    const conn = native_connect.connectUnix(&address, ctx.io) catch return;
     conn.close(ctx.io);
 }
 

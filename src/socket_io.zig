@@ -144,6 +144,11 @@ pub fn write(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8, options: 
     return writeWith(io, stream, bytes, options, Native);
 }
 
+pub fn waitWritable(io: std.Io, stream: std.Io.net.Stream) !void {
+    const wait: Wait = .{ .io = io, .handle = stream.socket.handle, .direction = .write, .deadline = .{} };
+    try wait.ready(Native);
+}
+
 test "nonblocking socket IO retries EAGAIN and interruption without renewing its deadline" {
     const Fake = struct {
         var attempts: usize = 0;

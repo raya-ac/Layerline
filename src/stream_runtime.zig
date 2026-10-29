@@ -8,6 +8,7 @@ const read_interrupt = @import("read_interrupt.zig");
 const backend_deadline = @import("backend_deadline.zig");
 const socket_timeout = @import("socket_timeout.zig");
 const socket_io = @import("socket_io.zig");
+const native_connect = @import("native_connect.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -206,11 +207,11 @@ pub fn connectTcpHost(allocator: std.mem.Allocator, host: []const u8, port: u16)
     _ = allocator;
     if (std.Io.net.IpAddress.parse(host, port)) |address| {
         var addr = address;
-        return backend_deadline.connect(activeIo(), std.Io.net.IpAddress.connect, .{ &addr, activeIo(), std.Io.net.IpAddress.ConnectOptions{ .mode = .stream } });
+        return backend_deadline.connect(activeIo(), native_connect.connectIp, .{ &addr, activeIo() });
     } else |_| {}
 
     const host_name = try std.Io.net.HostName.init(host);
-    return backend_deadline.connect(activeIo(), std.Io.net.HostName.connect, .{ host_name, activeIo(), port, std.Io.net.IpAddress.ConnectOptions{ .mode = .stream } });
+    return backend_deadline.connect(activeIo(), native_connect.connectHost, .{ host_name, activeIo(), port });
 }
 
 pub fn listenerWakeHost(host: []const u8) []const u8 {
@@ -224,7 +225,7 @@ pub fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgi
         .tcp => |tcp| try connectTcpHost(allocator, tcp.host, tcp.port),
         .unix => |path| blk: {
             const unix_addr = try std.Io.net.UnixAddress.init(path);
-            break :blk try backend_deadline.connect(activeIo(), std.Io.net.UnixAddress.connect, .{ &unix_addr, activeIo() });
+            break :blk try backend_deadline.connect(activeIo(), native_connect.connectUnix, .{ &unix_addr, activeIo() });
         },
     };
 }

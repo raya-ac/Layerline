@@ -82,9 +82,13 @@ POSIX socket IO now handles peer-reset timeout updates and normal `EAGAIN`
 without entering Zig's blocking-IO panic paths. Nonblocking reads/writes carry
 the original deadline into bounded poll waits and check IO cancellation between
 waits, preserving joined backend cleanup and partial TLS/frame resumption.
-The original Debug disconnect and deadline tests pass; the intermittent Darwin
-backend-connect `Unexpected` failure remains under investigation, with phase
-and errno-snapshot diagnostics rather than widened test limits.
+The original Debug disconnect and deadline tests pass. The traced Darwin
+backend-connect failure reported `ISCONN` after an interrupted handshake; the
+native nonblocking TCP/Unix connector now accepts that completed connection and
+checks asynchronous completion with `SO_ERROR`. Hostname lookup still uses the
+standard resolver and races candidate addresses, with cancelable result
+publication and owned cleanup for losing sockets. It does not add HTTP retries
+or reset the outer backend-attempt deadline.
 Darwin resolver cancellation and external CGI execution still need stronger
 deadline guarantees. The next work also includes wider HTTP/2 frame/stream
 conformance, listener readiness and full process resource budgets.

@@ -26,6 +26,7 @@ const http1_runtime = @import("http1_runtime.zig");
 const http1_static = @import("http1_static.zig");
 const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
+const native_connect = @import("native_connect.zig");
 const php_runtime = @import("php_runtime.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
@@ -816,7 +817,7 @@ fn runAdminCommand(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerC
     bindThreadIo(io);
     const socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
     const address = try std.Io.net.UnixAddress.init(socket_path);
-    const stream = try address.connect(io);
+    const stream = try native_connect.connectUnix(&address, io);
     defer streamClose(stream);
 
     const line = try std.fmt.allocPrint(allocator, "{s}\n", .{command});
