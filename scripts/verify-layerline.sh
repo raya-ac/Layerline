@@ -133,6 +133,7 @@ cat >"$CUSTOM_ROOT/404.html" <<'HTML'
 custom domain 404 page
 HTML
 printf 'woff2\n' >"$CUSTOM_ROOT/font.woff2"
+dd if=/dev/zero of="$CUSTOM_ROOT/large.bin" bs=1024 count=256 2>/dev/null
 cat >"$SITE_DIR/custom404.conf" <<CONF
 name = custom404
 server_name = custom404.test
@@ -225,6 +226,7 @@ grep -Fq '400 Bad Request' "$BAD_TARGET_RAW" || die "bad request target did not 
 ok "HTTP/1 parser hardening"
 
 python3 "$ROOT_DIR/scripts/verify-protocol.py" "$HOST" "$PORT"
+python3 "$ROOT_DIR/scripts/verify-h2.py" "$HOST" "$PORT"
 
 STATIC_HEADERS="$TMP_DIR/static.headers"
 curl -fsS -D "$STATIC_HEADERS" "http://$HOST:$PORT/static/hello.txt" >/dev/null

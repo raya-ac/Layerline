@@ -7,6 +7,7 @@ const static_files = @import("static_files.zig");
 
 test {
     _ = @import("http3_server.zig");
+    _ = @import("http2_flow.zig");
 }
 
 test "static conditional precedence and weak ETags" {

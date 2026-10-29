@@ -4,6 +4,7 @@ const access_log_mod = @import("access_log.zig");
 const config_mod = @import("config.zig");
 const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
+const flow_mod = @import("http2_flow.zig");
 const h2_support = @import("http2_support.zig");
 const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
@@ -73,7 +74,8 @@ pub fn sendResponse(
 
     // Preserve upstream JSON and protocol headers; only replace HTML error bodies.
     const custom_body = if (response.status_code >= 400 and response.status_code <= 599 and
-        std.mem.startsWith(u8, response.content_type, "text/html")) blk: {
+        std.mem.startsWith(u8, response.content_type, "text/html"))
+    blk: {
         if (ctx.read_error_document) |read| break :blk read(allocator, response.status_code) catch null;
         break :blk null;
     } else null;
@@ -121,18 +123,23 @@ pub fn sendResponse(
         try h2_support.appendHeader(allocator, &header_block, header.name, header.value);
     }
 
-    const header_flags = h2_native.FLAG_END_HEADERS | if (body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0);
-    try h2_support.sendFrame(stream, h2_native.FRAME_HEADERS, header_flags, stream_id, header_block.items, ctx.stream_write_all);
-
-    if (body_len > 0) {
-        var sent: usize = 0;
-        while (sent < body_len) {
-            const chunk_len = @min(@as(usize, 16 * 1024), body_len - sent);
-            const flags = if (sent + chunk_len == body_len) h2_native.FLAG_END_STREAM else @as(u8, 0);
-            try h2_support.sendFrame(stream, h2_native.FRAME_DATA, flags, stream_id, prepared.body[sent .. sent + chunk_len], ctx.stream_write_all);
-            sent += chunk_len;
-        }
+    const flow = flow_mod.active orelse return error.MissingHttp2Connection;
+    if (body_len > 0) flow.queue(stream_id, prepared.body) catch |err| {
+        if (err != error.QueueLimit) return err;
+        try h2_support.sendRst(stream, stream_id, 0xb, ctx.stream_write_all);
+        flow.cancel(stream_id);
+        return;
+    };
+    var offset: usize = 0;
+    while (offset < header_block.items.len) {
+        const end = @min(offset + 16384, header_block.items.len);
+        const flags: u8 = (if (end == header_block.items.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
+            (if (offset == 0 and body_len == 0) h2_native.FLAG_END_STREAM else @as(u8, 0));
+        try h2_support.sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, header_block.items[offset..end], ctx.stream_write_all);
+        offset = end;
     }
+    if (body_len == 0) flow.cancel(stream_id);
+    try flow.flush(stream, ctx.stream_write_all);
 
     ctx.record_response_sent(response.status_code, body_len);
 }
@@ -198,6 +205,11 @@ pub fn handlePreface(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
+    var flow = flow_mod.State{ .allocator = std.heap.page_allocator };
+    defer flow.deinit();
+    const previous_flow = flow_mod.active;
+    flow_mod.active = &flow;
+    defer flow_mod.active = previous_flow;
     var reader = H2PendingReader{
         .stream = stream,
         .pending = prefill,
@@ -210,7 +222,7 @@ pub fn handlePreface(
 
     try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", ctx.stream_write_all);
     std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
-    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, ctx.frame_callbacks);
+    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 0);
 }
 
 pub fn handleUpgrade(
@@ -222,6 +234,19 @@ pub fn handleUpgrade(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
+    var flow = flow_mod.State{ .allocator = std.heap.page_allocator };
+    defer flow.deinit();
+    const previous_flow = flow_mod.active;
+    flow_mod.active = &flow;
+    defer flow_mod.active = previous_flow;
+    if (http_headers.findHeaderValue(req.headers, "HTTP2-Settings")) |settings| {
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const payload = try allocator.alloc(u8, try decoder.calcSizeForSlice(settings));
+        defer allocator.free(payload);
+        try decoder.decode(payload, settings);
+        try flow.settings(payload);
+    }
+    try flow.open(1);
     try ctx.stream_write_all(
         stream,
         "HTTP/1.1 101 Switching Protocols\r\n" ++
@@ -259,5 +284,5 @@ pub fn handleUpgrade(
         else => try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 upgrade request."),
     };
     try ctx.send_response(stream, allocator, 1, response, std.mem.eql(u8, h2_req.method, "HEAD"));
-    try h2_server.runFrameLoop(io, stream, allocator, cfg, &reader, process_env, ctx.frame_callbacks);
+    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 1);
 }
