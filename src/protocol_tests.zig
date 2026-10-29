@@ -7,6 +7,7 @@ const static_files = @import("static_files.zig");
 
 test {
     _ = @import("backend_deadline.zig");
+    _ = @import("upstream_runtime.zig");
     _ = @import("http3_server.zig");
     _ = @import("http2_flow.zig");
     _ = @import("http2_dispatch.zig");

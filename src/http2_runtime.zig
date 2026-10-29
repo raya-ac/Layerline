@@ -197,6 +197,7 @@ pub fn prepareRequest(
     ctx.access_log_set_handler("h2");
     const response = ctx.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
         error.OutOfMemory, error.Canceled => return err,
+        error.BackendCapacity => try ctx.cool_error_response(allocator, 503, "Service Unavailable", "Local backend connection capacity is exhausted."),
         else => blk: {
             ctx.access_log_set_error(@errorName(err));
             break :blk try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request.");

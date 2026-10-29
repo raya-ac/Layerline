@@ -118,6 +118,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (ConnectionError, TimeoutError):
                 pass
             return
+        self.server.upload_started = time.monotonic()
         self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         try:
             for _ in range(100):
@@ -184,6 +185,8 @@ with tempfile.TemporaryDirectory(prefix="ll-backend-", dir="/tmp") as temporary:
     for fallback in [False, True]:
         backend = HTTP(("127.0.0.1", 0), Handler)
         backend.fallback, backend.pooled, backend.posts, backend.probe_times = fallback, set(), [], []
+        backend.upload_started = None
+        backend.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         backends.append(backend)
     fpm = FPM(("127.0.0.1", 0), FastCGI)
     unix = UnixFPM(str(folder / "fpm.sock"), FastCGI)
@@ -242,13 +245,19 @@ route_upstream_health_check_interval_ms.probe = 30000
                 (folder / "body").unlink(missing_ok=True)
                 command = ["curl", "-skS", "--max-time", "1.4", protocol, "-o", str(folder / "body"), "-w", "%{http_code} %{http_version}"]
                 if data:
-                    command += ["--data-binary", "@" + str(data)]
+                    command += ["--verbose", "--data-binary", "@" + str(data)]
+                if path.startswith("upload/"):
+                    backends[0].upload_started = None
+                    command += ["--max-time", "5", "-H", "Expect: 100-continue"]
                 if path.startswith("retry"):
                     command += ["-H", "Cookie: ll_upstream=0"]
                 command += [f"{scheme}://127.0.0.1:{port}/{path}"]
                 started = time.monotonic()
                 reply = subprocess.run(command, capture_output=True, text=True)
                 elapsed = time.monotonic() - started
+                if path.startswith("upload/"):
+                    assert backends[0].upload_started is not None, ("upload never reached backend", reply.stderr)
+                    elapsed = time.monotonic() - backends[0].upload_started
                 assert elapsed < 1.2, ("backend progress renewed deadline", path, elapsed, reply.stderr)
                 status, version = reply.stdout.split()
                 assert version == ("1.1" if protocol == "--http1.1" else "2"), reply.stdout
@@ -328,6 +337,7 @@ route_upstream_health_check_interval_ms.probe = 30000
                     assert len(events) >= 10, ("backend deadlines were not logged", events)
                     assert all(set(event) == {"event", "phase"} for event in events), events
                     assert all(event["phase"] in ["connect", "read", "write"] for event in events), events
+                    assert any(event["phase"] == "write" for event in events), "blocked backend write was not exercised"
             except BaseException:
                 print(log_path.read_text(), file=sys.stderr)
                 if access.exists():

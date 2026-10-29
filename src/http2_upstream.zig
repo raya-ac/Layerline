@@ -178,7 +178,7 @@ pub fn fetchPoolResponse(
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
         var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
-            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            if (err == error.Canceled or err == error.OutOfMemory or err == error.BackendCapacity) return err;
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
             if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
@@ -260,7 +260,7 @@ test "canceling a client or exhausting local memory never ejects an upstream" {
         .active_io = Fake.io,
     };
     const req: request_mod.HttpRequest = .{ .method = "GET", .path = "/", .query = "", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true };
-    for ([_]anyerror{ error.Canceled, error.OutOfMemory }) |failure| {
+    for ([_]anyerror{ error.Canceled, error.OutOfMemory, error.BackendCapacity }) |failure| {
         Fake.failure = failure;
         Fake.connects = 0;
         try std.testing.expectError(failure, fetchPoolResponse(allocator, &pool, .round_robin, config_mod.upstreamRuntimePolicyFromConfig(&cfg), req, &cfg, callbacks));

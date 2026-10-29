@@ -239,7 +239,7 @@ test "FastCGI version warning withholds an affected backend body" {
 
 fn fastcgiIoError(err: anyerror) anyerror {
     return switch (err) {
-        error.Canceled, error.OutOfMemory, error.RequestTimeout, error.StreamTooLong => err,
+        error.Canceled, error.OutOfMemory, error.RequestTimeout, error.StreamTooLong, error.BackendCapacity => err,
         else => error.FastcgiProtocolFailed,
     };
 }
@@ -270,7 +270,7 @@ fn runFastcgiRequest(
     const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
     defer backend_deadline.restore(previous_backend);
     const lease = fastcgiAcquireConnection(allocator, php_fastcgi, endpoint, cfg, timeout_ms, callbacks.now_ms(), callbacks) catch |err| switch (err) {
-        error.RequestTimeout, error.Canceled, error.OutOfMemory => return err,
+        error.RequestTimeout, error.Canceled, error.OutOfMemory, error.BackendCapacity => return err,
         else => return error.FastcgiConnectFailed,
     };
     const conn = lease.stream;
@@ -326,6 +326,10 @@ fn handleFastcgi(
     callbacks: Callbacks,
 ) !void {
     const result = runFastcgiRequest(allocator, cfg, req, php_root, php_fastcgi, script_path, script_name, path_info, timeout_ms, callbacks) catch |err| switch (err) {
+        error.BackendCapacity => {
+            try callbacks.send_cool_error(stream, allocator, 503, "Service Unavailable", "Local backend connection capacity is exhausted.", close_connection, is_head, null);
+            return;
+        },
         error.RequestTimeout => {
             try callbacks.send_cool_error(stream, allocator, 504, "Gateway Timeout", "PHP FastCGI request exceeded its backend deadline.", close_connection, is_head, null);
             return;
@@ -393,6 +397,7 @@ pub fn buildHttp2FastcgiResponse(
     defer script.close(io);
 
     const result = runFastcgiRequest(allocator, cfg, req, php_root, endpoint, script_path, script_name, path_info, timeout_ms, callbacks) catch |err| switch (err) {
+        error.BackendCapacity => return callbacks.h2_error_response(allocator, 503, "Service Unavailable", "Local backend connection capacity is exhausted."),
         error.RequestTimeout => return callbacks.h2_error_response(allocator, 504, "Gateway Timeout", "PHP FastCGI request exceeded its backend deadline."),
         error.InvalidFastcgiEndpoint => return callbacks.h2_error_response(allocator, 500, "Server Error", "PHP FastCGI endpoint is invalid."),
         error.FastcgiConnectFailed => return callbacks.h2_error_response(allocator, 502, "Bad Gateway", "PHP FastCGI worker could not be reached."),

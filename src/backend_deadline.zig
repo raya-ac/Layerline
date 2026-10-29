@@ -48,10 +48,16 @@ pub fn logTimeout(phase: []const u8) void {
 // ConnectOptions.timeout is not implemented by Zig's threaded IO yet. Race the
 // whole dial (including lookup) and join it before any borrowed inputs go away.
 pub fn connect(io: std.Io, comptime dial: anytype, args: std.meta.ArgsTuple(@TypeOf(dial))) !std.Io.net.Stream {
-    const state = active orelse return @call(.auto, dial, args);
-    _ = try state.remaining();
-    const at = state.deadline.at orelse return @call(.auto, dial, args);
-    return connectUntil(io, at, dial, args) catch |err| switch (err) {
+    const at = if (active) |state| blk: {
+        _ = try state.remaining();
+        break :blk state.deadline.at;
+    } else null;
+    const result = if (at) |end| connectUntil(io, end, dial, args) else @call(.auto, dial, args);
+    return result catch |err| switch (err) {
+        error.BackendCapacity, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+            if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.backend_capacity\",\"phase\":\"connect\"}}\n", .{});
+            return error.BackendCapacity;
+        },
         error.RequestTimeout, error.Timeout, error.TimedOut, error.ConnectionTimedOut => {
             logTimeout("connect");
             return error.RequestTimeout;
@@ -73,8 +79,8 @@ fn connectUntil(io: std.Io, at: std.Io.Timestamp, comptime dial: anytype, args: 
             return @call(.auto, dial, arguments);
         }
     };
-    try select.concurrent(.connected, Dial.run, .{args});
-    try select.concurrent(.timer, std.Io.Clock.Timestamp.wait, .{ std.Io.Clock.Timestamp{ .raw = at, .clock = .awake }, io });
+    select.concurrent(.connected, Dial.run, .{args}) catch return error.BackendCapacity;
+    select.concurrent(.timer, std.Io.Clock.Timestamp.wait, .{ std.Io.Clock.Timestamp{ .raw = at, .clock = .awake }, io }) catch return error.BackendCapacity;
     switch (try select.await()) {
         .timer => |result| {
             try result;
@@ -169,4 +175,50 @@ test "owner cancellation joins both dial and timer without becoming a timeout" {
     try Fake.entered.wait(std.testing.io);
     try std.testing.expectError(error.Canceled, task.cancel(std.testing.io));
     try std.testing.expect(Fake.stopped.load(.acquire));
+}
+
+test "failed dial or timer admission returns local capacity and closes late sockets" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        var closed: std.atomic.Value(usize) = .init(0);
+        fn dial() anyerror!std.Io.net.Stream {
+            return .{ .socket = .{ .handle = 123, .address = undefined } };
+        }
+        fn close(_: ?*anyopaque, handles: []const std.Io.net.Socket.Handle) void {
+            std.debug.assert(handles.len == 1 and handles[0] == 123);
+            _ = closed.fetchAdd(1, .acq_rel);
+        }
+        fn start(userdata: ?*anyopaque, group: *std.Io.Group, context: []const u8, alignment: std.mem.Alignment, entry: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+            calls += 1;
+            if (calls == fail_at) return error.ConcurrencyUnavailable;
+            return std.testing.io.vtable.groupConcurrent(userdata, group, context, alignment, entry);
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.groupConcurrent = Fake.start;
+    vtable.netClose = Fake.close;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    for (1..3) |fail_at| {
+        Fake.calls = 0;
+        Fake.fail_at = fail_at;
+        Fake.closed.store(0, .release);
+        const previous = push(io, 1000);
+        defer restore(previous);
+        try std.testing.expectError(error.BackendCapacity, connect(io, Fake.dial, .{}));
+        try std.testing.expectEqual(fail_at, Fake.calls);
+        try std.testing.expectEqual(fail_at - 1, Fake.closed.load(.acquire));
+    }
+}
+
+test "disabled deadlines still classify local descriptor exhaustion" {
+    const Fake = struct {
+        fn dial() !std.Io.net.Stream {
+            return error.ProcessFdQuotaExceeded;
+        }
+    };
+    const previous = push(std.testing.io, 0);
+    defer restore(previous);
+    try std.testing.expectError(error.BackendCapacity, connect(std.testing.io, Fake.dial, .{}));
 }

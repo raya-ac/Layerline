@@ -261,6 +261,12 @@ cancellable resolver. Darwin's libc resolver can delay cancellation while inside
 process execution is still outside these socket budgets. This is not a full
 end-to-end application execution deadline on every platform/path.
 
+Local dial task/descriptor exhaustion returns 503 without retries or passive
+backend ejection. Active probes skip results caused by local capacity/allocation
+failure or cancellation instead of marking the target unhealthy. A private
+`server.backend_capacity` event records the connect phase. Fault-injection tests
+cover first/second task launch failure, late socket cleanup, and health counters.
+
 Each permitted retry receives a fresh attempt budget, within the configured
 attempt limit. Automatic retries are restricted to known idempotent methods
 (GET, HEAD, OPTIONS, TRACE, PUT, DELETE), following
@@ -271,6 +277,10 @@ line. Their total elapsed budget includes downstream forwarding time; timeout
 closure after output starts does not count as passive backend failure, since
 slow clients can consume that time too. Other backend failures and pre-response
 timeouts retain passive failure accounting.
+
+Buffered proxy requests remove `Expect` before forwarding: Layerline has already
+handled `100-continue` and received the client's body. This avoids soliciting a
+second interim response from the backend after the upload is complete.
 
 Buffered HTTP/2 and FastCGI timeouts return 504 before response output. FastCGI
 transport/protocol failures return 502 and discard the connection, rather than

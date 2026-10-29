@@ -493,7 +493,11 @@ fn runHealthCheckForPool(allocator: std.mem.Allocator, pool: *UpstreamPoolConfig
     for (pool.targets.items) |*upstream| {
         if (callbacks.shutdown_requested.load(.acquire)) return;
 
-        const healthy = checkHealth(allocator, upstream, policy.health_check_path, policy.health_check_timeout_ms, callbacks) catch false;
+        const healthy = checkHealth(allocator, upstream, policy.health_check_path, policy.health_check_timeout_ms, callbacks) catch |err| switch (err) {
+            error.Canceled => return,
+            error.OutOfMemory, error.BackendCapacity => continue,
+            else => false,
+        };
         const transition = recordActiveHealthResult(upstream, healthy, callbacks.upstream_now_ms(), cooldown_ms, policy.slow_start_ms);
         recordActiveHealthMetrics(transition, healthy, callbacks);
     }
@@ -587,6 +591,10 @@ pub fn forwardToPool(
         defer if (sticky_cookie) |header| allocator.free(header);
 
         forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, sticky_cookie, callbacks) catch |err| switch (err) {
+            error.BackendCapacity => {
+                try callbacks.send_cool_error(stream, allocator, 503, "Service Unavailable", "Local backend connection capacity is exhausted.", true, is_head, null);
+                return;
+            },
             error.DownstreamClosed => {
                 return error.CloseConnection;
             },
@@ -633,4 +641,97 @@ pub fn forwardToPool(
     };
 
     try callbacks.send_cool_error(stream, allocator, 502, "Bad Gateway", "All configured upstream attempts failed.", true, is_head, null);
+}
+
+test "local dial pressure and cancellation never retry or eject healthy upstreams" {
+    const Fake = struct {
+        var failure: anyerror = error.BackendCapacity;
+        var connects: usize = 0;
+        var status: u16 = 0;
+        var shutdown: std.atomic.Value(bool) = .init(false);
+        fn io() std.Io {
+            return std.testing.io;
+        }
+        fn bind(_: std.Io) void {}
+        fn connect(_: std.mem.Allocator, _: []const u8, _: u16) !std.Io.net.Stream {
+            connects += 1;
+            return failure;
+        }
+        fn label(_: []const u8) void {}
+        fn requestId() []const u8 {
+            return "";
+        }
+        fn errorPage(_: std.Io.net.Stream, _: std.mem.Allocator, code: u16, _: []const u8, _: []const u8, _: bool, _: bool, _: ?[]const u8) !void {
+            status = code;
+        }
+        fn headers(_: std.Io.net.Stream, _: u16, _: []const u8, _: []const u8, _: usize, _: bool, _: ?[]const u8) !void {
+            return error.UnexpectedHeaders;
+        }
+        fn tunnel(_: std.Io.net.Stream, _: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedTunnel;
+        }
+        fn timeout(_: std.Io.net.Stream, _: u32, _: u32) !void {}
+        fn close(_: std.Io.net.Stream) void {}
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+        fn responseHeaders(_: std.Io.net.Stream) !void {
+            return error.UnexpectedHeaders;
+        }
+        fn now() i64 {
+            return 1000;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = config_mod.defaultServerConfig();
+    cfg.upstream_max_failures = 1;
+    cfg.upstream_health_check_enabled = true;
+    var pool = try config_mod.parseUpstreamPool(allocator, "http://127.0.0.1:9000,http://127.0.0.1:9001");
+    var metrics = metrics_mod.ServerMetrics.init();
+    const callbacks: Callbacks = .{
+        .send_response_no_body_headers = Fake.headers,
+        .access_log_set_upstream = Fake.label,
+        .active_io = Fake.io,
+        .bind_thread_io = Fake.bind,
+        .connect_tcp_host = Fake.connect,
+        .current_request_id = Fake.requestId,
+        .metrics = &metrics,
+        .proxy_raw_bidirectional = Fake.tunnel,
+        .send_cool_error = Fake.errorPage,
+        .set_stream_timeouts = Fake.timeout,
+        .shutdown_requested = &Fake.shutdown,
+        .stream_close = Fake.close,
+        .stream_read = Fake.read,
+        .stream_write_all = Fake.write,
+        .upstream_now_ms = Fake.now,
+        .write_response_headers = Fake.responseHeaders,
+    };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    const req: HttpRequest = .{ .method = "GET", .path = "/", .query = "", .headers = "Host: local", .body = "", .version = "HTTP/1.1", .close_connection = true };
+    const policy = config_mod.upstreamRuntimePolicyFromConfig(&cfg);
+    for ([_]anyerror{ error.BackendCapacity, error.OutOfMemory, error.Canceled }) |err| {
+        Fake.failure = err;
+        Fake.connects = 0;
+        Fake.status = 0;
+        if (err == error.BackendCapacity) {
+            try forwardToPool(stream, allocator, &pool, .round_robin, policy, req, &cfg, callbacks);
+            try std.testing.expectEqual(503, Fake.status);
+        } else {
+            try std.testing.expectError(err, forwardToPool(stream, allocator, &pool, .round_robin, policy, req, &cfg, callbacks));
+        }
+        try std.testing.expectEqual(1, Fake.connects);
+        runHealthCheckForPool(allocator, &pool, policy, callbacks);
+        for (pool.targets.items) |target| {
+            try std.testing.expectEqual(0, target.active_requests.load(.acquire));
+            try std.testing.expectEqual(0, target.passive_failures.load(.acquire));
+            try std.testing.expectEqual(0, target.ejected_until_ms.load(.acquire));
+        }
+    }
+    try std.testing.expectEqual(0, metrics.upstream_failures_total.load(.acquire));
+    try std.testing.expectEqual(0, metrics.upstream_health_check_failures_total.load(.acquire));
 }

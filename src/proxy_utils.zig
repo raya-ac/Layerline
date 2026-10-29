@@ -37,6 +37,8 @@ pub fn buildProxyPath(allocator: std.mem.Allocator, base_path: []const u8, reque
 }
 
 pub fn isSkippedProxyHeader(name: []const u8) bool {
+    // Request bodies are already buffered and 100-continue was handled locally.
+    if (std.ascii.eqlIgnoreCase(name, "Expect")) return true;
     return std.ascii.eqlIgnoreCase(name, "Connection") or
         std.ascii.eqlIgnoreCase(name, "Content-Length") or
         std.ascii.eqlIgnoreCase(name, "Keep-Alive") or
@@ -48,6 +50,12 @@ pub fn isSkippedProxyHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "Upgrade") or
         std.ascii.eqlIgnoreCase(name, "Host") or
         std.ascii.eqlIgnoreCase(name, "X-Request-Id");
+}
+
+test "buffered proxy requests do not forward an already handled expectation" {
+    try std.testing.expect(isSkippedProxyHeader("Expect"));
+    try std.testing.expect(isSkippedProxyHeader("expect"));
+    try std.testing.expect(!isSkippedProxyHeader("X-Expect"));
 }
 
 pub fn isHttpUpgradeHeaders(headers: []const u8) bool {
