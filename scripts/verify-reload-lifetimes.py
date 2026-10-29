@@ -116,7 +116,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.paths[self.path] += 1
         if self.path.endswith("/hold"):
             self.server.entered.set()
-            if not self.server.release.wait(timeout=10):
+            if not self.server.release.wait(timeout=120):
+                self.server.hold_expired.set()
+                self.close_connection = True
                 return
         self.send_response(200)
         self.send_header("Content-Length", "7")
@@ -178,7 +180,7 @@ with tempfile.TemporaryDirectory(prefix="ll-reload-", dir="/tmp") as temporary:
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "1", "-subj", "/CN=reload.test", "-keyout", str(folder / "key.pem"), "-out", str(folder / "cert.pem")], check=True, capture_output=True)
     backend = HTTP(("127.0.0.1", 0), Handler)
     backend.lock, backend.open_connections, backend.paths = threading.Lock(), 0, collections.Counter()
-    backend.entered, backend.release = threading.Event(), threading.Event()
+    backend.entered, backend.release, backend.hold_expired = threading.Event(), threading.Event(), threading.Event()
     fpm = FPM(("127.0.0.1", 0), FastCGI)
     fpm.lock, fpm.connections, fpm.requests, fpm.open_connections = threading.Lock(), 0, 0, 0
     threads = []
@@ -194,6 +196,7 @@ with tempfile.TemporaryDirectory(prefix="ll-reload-", dir="/tmp") as temporary:
             config, admin = folder / "server.conf", folder / "admin.sock"
             log_path = folder / ("tls.log" if secure else "plain.log")
             held, h2, process = None, None, None
+            started = time.monotonic()
 
             def write_config(name, health=False, ui=True):
                 config.write_text(f"""host = 127.0.0.1
@@ -211,8 +214,9 @@ php_fastcgi = 127.0.0.1:{fpm.server_address[1]}
 admin_socket = {admin}
 admin_ui = {str(ui).lower()}
 admin_credentials_path = {folder}/owner.creds
-idle_timeout_ms = 60000
-write_timeout_ms = 60000
+idle_timeout_ms = 120000
+write_timeout_ms = 120000
+upstream_timeout_ms = 120000
 upstream_keepalive_idle_timeout_ms = 60000
 fastcgi_keepalive_idle_timeout_ms = 60000
 fastcgi_keepalive_max_requests = 1000
@@ -291,6 +295,7 @@ upstream_health_check_interval_ms = 30000
                     assert not h2.responses[1]["body"], "zero-window stream sent body"
                     backend.entered.clear()
                     backend.release.clear()
+                    backend.hold_expired.clear()
                     h2.request(3, "/app/hold")
                     assert backend.entered.wait(timeout=4), "H2 child never reached backend"
                     with fpm.lock:
@@ -312,8 +317,10 @@ upstream_health_check_interval_ms = 30000
                     assert held.sock is held_socket, "HTTP/1 reader silently reconnected"
                     assert request("/missing") == (404, b"missing-a")
                     assert h2.finish(1)["body"] == b"missing-b"
+                    assert not backend.hold_expired.is_set(), ("mock backend hold expired during reload loop", time.monotonic() - started)
                     backend.release.set()
-                    assert h2.finish(3)["body"] == b"backend"
+                    reply = h2.finish(3)
+                    assert reply["status"] == 200 and reply["body"] == b"backend", (reply["status"], reply["body"][:180], time.monotonic() - started)
                     h2.request(5, "/")
                     assert h2.finish(5)["body"] == b"b"
                     wait_until(lambda: fpm.requests - first_requests == 96, "FPM request accounting incomplete")
@@ -351,7 +358,7 @@ upstream_health_check_interval_ms = 30000
                     assert process.wait(timeout=4) == 0, log_path.read_text()
                     assert "panic" not in log_path.read_text().lower(), log_path.read_text()
                     wait_until(lambda: backend.open_connections == 0 and fpm.open_connections == 0, "shutdown retained backend pool sockets")
-                print(f"ok: {'TLS/ALPN' if secure else 'plain/h2c'} reload leases, 96 replacements, pool cleanup, health refresh and admin revocation", flush=True)
+                print(f"ok: {'TLS/ALPN' if secure else 'plain/h2c'} reload leases, 96 replacements, pool cleanup, health refresh and admin revocation ({time.monotonic() - started:.1f}s)", flush=True)
             except BaseException:
                 print(log_path.read_text()[-6000:], file=sys.stderr)
                 raise
