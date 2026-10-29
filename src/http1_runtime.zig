@@ -32,6 +32,7 @@ pub const Callbacks = struct {
     handle_http2_preface: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, []const u8, *const std.process.Environ.Map) anyerror!void,
     handle_http2_upgrade: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, HttpRequest, *const std.process.Environ.Map) anyerror!void,
     handle_tls_client_hello_probe: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, []const u8, *const std.process.Environ.Map) anyerror!void,
+    is_tls_connection: *const fn () bool,
     metrics: *ServerMetrics,
     resolve_request_id: *const fn (std.Io, std.mem.Allocator, []const u8) anyerror![]const u8,
     route_request: *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, HttpRequest, *const std.process.Environ.Map) anyerror!void,
@@ -356,6 +357,11 @@ pub fn handleConnection(
         concurrency_mod.setCurrentIdle(io, false);
         if (callbacks.shutdown_requested.load(.acquire)) return;
         const prefill = prefill_buf[0..prefill_len];
+
+        if (cfg.tls_enabled and !callbacks.is_tls_connection() and !tls_client_hello.looksLikeTlsClientHello(prefill)) {
+            try callbacks.send_cool_error_with_connection(stream, req_alloc, 400, "Bad Request", "This listener requires HTTPS.", true, false, null);
+            return;
+        }
 
         if (h2_support.isLikelyPreface(prefill)) {
             try callbacks.handle_http2_preface(io, stream, req_alloc, cfg, prefill, process_env);

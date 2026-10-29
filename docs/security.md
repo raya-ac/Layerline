@@ -52,7 +52,10 @@ cannot certify a backport. Upgrade and restart all relevant PHP workers.
 ## Admin access
 
 The web UI remains disabled by default. Enabling it on a non-loopback listener
-requires native TLS. First-account setup requires a random 256-bit local token,
+requires native TLS. A primary listener with `tls = true` rejects plaintext
+HTTP/1 and h2c before routing, including admin bootstrap. Forwarding headers do
+not establish an encrypted transport. The separate HTTP redirect/ACME listener
+remains HTTP-only. First-account setup requires a random 256-bit local token,
 stored beside the configured credentials as `.<credentials-basename>.setup-token`
 with mode 0600. Visiting the setup screen creates that file; read it locally or
 over SSH and enter it into the setup form. It is removed after credentials are

@@ -735,6 +735,7 @@ fn http1RuntimeCallbacks() http1_runtime.Callbacks {
         .handle_http2_preface = handleHttp2Preface,
         .handle_http2_upgrade = handleHttp2Upgrade,
         .handle_tls_client_hello_probe = handleTlsClientHelloProbe,
+        .is_tls_connection = stream_runtime.isTlsConnection,
         .metrics = &runtime_state.server_metrics,
         .resolve_request_id = runtime_state.resolveRequestId,
         .route_request = routeRequest,

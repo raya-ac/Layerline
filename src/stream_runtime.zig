@@ -33,6 +33,10 @@ pub fn currentTlsChannel() ?*TlsChannel {
     return current_tls_channel;
 }
 
+pub fn isTlsConnection() bool {
+    return current_tls_channel != null;
+}
+
 fn normalizeSocketIoError(err: anyerror) anyerror {
     return switch (err) {
         error.WouldBlock, error.TimedOut, error.ConnectionTimedOut, error.Unexpected => error.RequestTimeout,

@@ -40,6 +40,8 @@ read_header_timeout_ms = 500
 read_body_timeout_ms = 300
 idle_timeout_ms = 1500
 graceful_shutdown_timeout_ms = 1000
+admin_ui = {str(secure).lower()}
+admin_credentials_path = {folder / 'owner.creds'}
 """)
         self.output = self.log.open("wb")
         self.process = subprocess.Popen([str(BINARY), "--config", str(config)], cwd=ROOT, stdout=self.output, stderr=subprocess.STDOUT)
@@ -97,6 +99,19 @@ def header(conn):
     while not data.endswith(b"\r\n\r\n"):
         data += exact(conn, 1)
     return data
+
+
+def plaintext_rejected(conn):
+    received = b""
+    try:
+        while b"\r\n" not in received:
+            part = conn.recv(4096)
+            if not part:
+                break
+            received += part
+    except ConnectionResetError:
+        pass  # Rejecting before reading the request can reset TCP on close.
+    assert not received or received.startswith(b"HTTP/1.1 400 "), ("TLS-only listener routed plaintext", received[:150])
 
 
 def trickle(conn, pieces):
@@ -208,6 +223,21 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
     for secure in [False, True]:
         server = Server(pathlib.Path(tmp), secure)
         try:
+            if secure:
+                for path, extra in [(b"/health", b""), (b"/_layerline/admin", b""), (b"/_layerline/admin", b"X-Forwarded-Proto: https\r\n")]:
+                    with server.raw() as conn:
+                        conn.sendall(b"GET " + path + b" HTTP/1.1\r\nHost: local\r\n" + extra + b"\r\n")
+                        plaintext_rejected(conn)
+                assert not (pathlib.Path(tmp) / ".owner.creds.setup-token").exists(), "plaintext request reached admin setup"
+                with server.raw() as conn:
+                    conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0))
+                    plaintext_rejected(conn)
+                with server.connect() as conn:
+                    conn.sendall(b"GET /_layerline/admin HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+                    response = http.client.HTTPResponse(conn)
+                    response.begin()
+                    assert response.status == 200 and b"setup_token" in response.read()
+                print("ok: TLS-only listener rejects plaintext and spoofed forwarding before admin bootstrap")
             with server.connect() as conn:
                 trickle(conn, [b"GET /health HTTP/1.1\r\nHost: local\r\nX-Slow: "] + [b"x"] * 9 + [b"\r\nConnection: close\r\n\r\n"])
             for chunked in [False, True]:
