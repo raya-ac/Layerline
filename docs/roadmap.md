@@ -78,8 +78,13 @@ Successful backend reads and writes recheck the original absolute budget
 after the syscall too: delayed kernel timer wakeups cannot accept a late backend
 reply as success. Bytes already written remain accounted before a late write is
 aborted. Downstream partial TLS/frame input is not discarded by this check.
-Darwin socket timeout/error handling still has a failing Debug disconnect test;
-a green ReleaseFast run does not close that gate.
+POSIX socket IO now handles peer-reset timeout updates and normal `EAGAIN`
+without entering Zig's blocking-IO panic paths. Nonblocking reads/writes carry
+the original deadline into bounded poll waits and check IO cancellation between
+waits, preserving joined backend cleanup and partial TLS/frame resumption.
+The original Debug disconnect and deadline tests pass; the intermittent Darwin
+backend-connect `Unexpected` failure remains under investigation, with phase
+and errno-snapshot diagnostics rather than widened test limits.
 Darwin resolver cancellation and external CGI execution still need stronger
 deadline guarantees. The next work also includes wider HTTP/2 frame/stream
 conformance, listener readiness and full process resource budgets.

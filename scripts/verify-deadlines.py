@@ -89,6 +89,7 @@ admin_credentials_path = {folder / 'owner.creds'}
             assert response.status == 200 and response.read() == b"ok\n"
 
     def close(self):
+        failed = sys.exc_info()[0] is not None or self.process.poll() not in [None, 0]
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGTERM)
             try:
@@ -97,6 +98,9 @@ admin_credentials_path = {folder / 'owner.creds'}
                 self.process.kill()
                 self.process.wait(timeout=2)
         self.output.close()
+        if failed:
+            print(("deadline fixture process exit", self.process.returncode), file=sys.stderr)
+            print(self.log.read_text(), file=sys.stderr)
 
 
 def exact(conn, count):

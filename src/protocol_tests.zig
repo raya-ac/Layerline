@@ -28,6 +28,7 @@ test {
     _ = @import("raw_proxy.zig");
     _ = @import("native_tls_runtime.zig");
     _ = @import("stream_runtime.zig");
+    _ = @import("socket_io.zig");
 }
 
 test "HTTP2 trailers stay separate from routing and authentication fields" {

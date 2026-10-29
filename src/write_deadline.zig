@@ -1,5 +1,6 @@
 const std = @import("std");
 const Deadline = @import("read_deadline.zig").Deadline;
+const socket_timeout = @import("socket_timeout.zig");
 const Protocol = enum { h1, h2 };
 
 pub const State = struct {
@@ -83,9 +84,7 @@ pub fn clear(stream: std.Io.net.Stream) void {
 }
 
 pub fn setSocketTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
-    if (@import("builtin").os.tag == .windows) return;
-    var timeout = std.posix.timeval{ .sec = @intCast(timeout_ms / 1000), .usec = @intCast((timeout_ms % 1000) * 1000) };
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+    try socket_timeout.set(stream, .write, timeout_ms);
 }
 
 test "HTTP1 arms lazily, keeps one deadline, and resets after interim responses" {

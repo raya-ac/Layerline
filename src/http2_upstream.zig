@@ -76,6 +76,10 @@ fn appendForwardedRequestHeaders(
 
 fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
     if (upstream.https) return error.UnsupportedUpstreamScheme;
+    var phase: enum { connect, configure, request, response_head, response_body } = .connect;
+    errdefer |err| if (!@import("builtin").is_test and err == error.Unexpected) {
+        std.debug.print("{{\"event\":\"server.upstream_failure_detail\",\"protocol\":\"h2\",\"phase\":\"{s}\",\"error\":\"{s}\"}}\n", .{ @tagName(phase), @errorName(err) });
+    };
     const previous_backend = backend_deadline.push(callbacks.active_io(), runtime_policy.timeout_ms);
     defer backend_deadline.restore(previous_backend);
 
@@ -88,10 +92,12 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
 
     const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
     defer callbacks.stream_close(upstream_conn);
+    phase = .configure;
     try backend_deadline.attach(upstream_conn);
     try callbacks.set_stream_timeouts(upstream_conn, runtime_policy.timeout_ms, runtime_policy.timeout_ms);
 
     const proxy_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, req.path, req.query);
+    phase = .request;
     var request = std.ArrayList(u8).empty;
     defer request.deinit(allocator);
     try request.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, proxy_path });
@@ -104,6 +110,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     defer allocator.destroy(reader);
     var informational = std.ArrayList(h2_support.Informational).empty;
     defer informational.deinit(allocator);
+    phase = .response_head;
     const head = final: while (true) {
         const head = try reader.nextHead();
         if (php_version.exposedHeaders(head.fields)) |version| {
@@ -123,6 +130,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
         }
     };
     try reader.beginBody(req.method, head.framing, cfg.max_static_file_bytes);
+    phase = .response_body;
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     while (try reader.nextData()) |data| try body.appendSlice(allocator, data);

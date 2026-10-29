@@ -85,7 +85,13 @@ fn connectUntil(io: std.Io, at: std.Io.Timestamp, comptime dial: anytype, args: 
     };
     const Dial = struct {
         fn run(arguments: @TypeOf(args)) anyerror!std.Io.net.Stream {
-            return @call(.auto, dial, arguments);
+            return @call(.auto, dial, arguments) catch |err| {
+                if (!@import("builtin").is_test and @import("builtin").os.tag == .macos and err == error.Unexpected) {
+                    const cause = std.posix.errno(@as(c_int, -1));
+                    std.debug.print("{{\"event\":\"server.connect_error\",\"error\":\"Unexpected\",\"errno_snapshot\":\"{s}\"}}\n", .{@tagName(cause)});
+                }
+                return err;
+            };
         }
     };
     select.concurrent(.connected, Dial.run, .{args}) catch return error.BackendCapacity;

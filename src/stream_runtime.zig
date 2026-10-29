@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 const config_mod = @import("config.zig");
 const native_tls = @import("native_tls_runtime.zig");
@@ -7,6 +6,8 @@ const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const read_interrupt = @import("read_interrupt.zig");
 const backend_deadline = @import("backend_deadline.zig");
+const socket_timeout = @import("socket_timeout.zig");
+const socket_io = @import("socket_io.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -42,7 +43,7 @@ pub fn isTlsConnection() bool {
 
 fn normalizeSocketIoError(err: anyerror) anyerror {
     return switch (err) {
-        error.WouldBlock, error.TimedOut, error.ConnectionTimedOut, error.Unexpected => error.RequestTimeout,
+        error.WouldBlock, error.TimedOut, error.ConnectionTimedOut => error.RequestTimeout,
         else => err,
     };
 }
@@ -53,14 +54,17 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
         if (scope.stream.socket.handle == stream.socket.handle) try scope.wait();
     }
     var timeout: ?u32 = null;
+    var limit = read_deadline.Deadline{};
     var restore_timeout: ?u32 = null;
     if (read_deadline.forStream(stream)) |budget| {
+        limit = budget.deadline;
         if (try budget.remaining()) |remaining| {
             timeout = if (budget.restore_timeout_ms == 0) remaining else @min(remaining, budget.restore_timeout_ms);
         }
         restore_timeout = budget.restore_timeout_ms;
     }
     if (backend_deadline.forStream(stream)) |budget| {
+        limit = .earliest(limit, budget.deadline);
         const remaining = budget.remaining() catch |err| {
             backend_deadline.logTimeout("read");
             return err;
@@ -72,8 +76,7 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     defer if (restore_timeout) |ms| {
         setStreamReadTimeout(stream, ms) catch {};
     };
-    var data: [1][]u8 = .{out};
-    const n = io.vtable.netRead(io.userdata, stream.socket.handle, &data) catch |err| {
+    const n = socket_io.read(io, stream, out, .{ .timeout_ms = timeout, .deadline = limit }) catch |err| {
         const normalized = normalizeSocketIoError(err);
         if (normalized == error.RequestTimeout) {
             if (backend_deadline.forStream(stream)) |state| {
@@ -109,6 +112,10 @@ pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
 }
 
 pub fn rawStreamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, accepted: *usize) !void {
+    try rawStreamWriteAllUsing(stream, bytes, accepted, socket_io.write);
+}
+
+fn rawStreamWriteAllUsing(stream: std.Io.net.Stream, bytes: []const u8, accepted: *usize, write: *const fn (std.Io, std.Io.net.Stream, []const u8, socket_io.Options) anyerror!usize) !void {
     const io = activeIo();
     const budget = write_deadline.startWrite(stream);
     const backend = backend_deadline.forStream(stream);
@@ -120,8 +127,11 @@ pub fn rawStreamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, ac
     };
     var written: usize = 0;
     while (written < bytes.len) {
+        var options = socket_io.Options{};
         if (budget) |state| {
             try state.prepare(stream);
+            options.timeout_ms = try state.remaining();
+            options.deadline = state.deadline;
         }
         if (backend) |state| {
             const remaining = state.remaining() catch |err| {
@@ -129,11 +139,10 @@ pub fn rawStreamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, ac
                 return err;
             };
             if (remaining) |ms| try setStreamWriteTimeout(stream, ms);
+            if (remaining) |ms| options.timeout_ms = @min(options.timeout_ms orelse ms, ms);
+            options.deadline = .earliest(options.deadline, state.deadline);
         }
-        // netWrite expects a real scatter list here. Passing an empty one
-        // looked tidy, then crashed in the vtable path.
-        const empty: [1][]const u8 = .{""};
-        const n = io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[written..], &empty, 0) catch |err| {
+        const n = write(io, stream, bytes[written..], options) catch |err| {
             const normalized = normalizeSocketIoError(err);
             if (normalized == error.RequestTimeout and backend != null) backend_deadline.logTimeout("write");
             if (budget) |state| {
@@ -176,17 +185,8 @@ pub fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args:
     try streamWriteAll(stream, rendered);
 }
 
-fn timeoutMsToTimeval(timeout_ms: u32) std.posix.timeval {
-    return .{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-}
-
 pub fn setStreamReadTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
-    if (builtin.os.tag == .windows) return;
-    var tv = timeoutMsToTimeval(timeout_ms);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try socket_timeout.set(stream, .read, timeout_ms);
 }
 
 pub fn setStreamWriteTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
@@ -234,7 +234,7 @@ test "counted socket writes retain accepted bytes on errors and zero writes" {
         var calls: usize = 0;
         var failure: bool = false;
         var zero: bool = false;
-        fn write(_: ?*anyopaque, _: std.Io.net.Socket.Handle, header: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
+        fn write(_: std.Io, _: std.Io.net.Stream, header: []const u8, _: socket_io.Options) !usize {
             calls += 1;
             if (calls == 2) {
                 if (failure) return error.ConnectionResetByPeer;
@@ -243,11 +243,9 @@ test "counted socket writes retain accepted bytes on errors and zero writes" {
             return @min(3, header.len);
         }
     };
-    var vtable = std.testing.io.vtable.*;
-    vtable.netWrite = Fake.write;
     const previous_io = current_io;
     defer current_io = previous_io;
-    bindThreadIo(.{ .userdata = std.testing.io.userdata, .vtable = &vtable });
+    bindThreadIo(std.testing.io);
     const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
     for ([_]u8{ 0, 1, 2 }) |mode| {
         Fake.calls = 0;
@@ -255,11 +253,18 @@ test "counted socket writes retain accepted bytes on errors and zero writes" {
         Fake.zero = mode == 2;
         var bytes: usize = 5;
         if (mode == 0) {
-            try rawStreamWriteAllCounted(stream, "1234567", &bytes);
+            try rawStreamWriteAllUsing(stream, "1234567", &bytes, Fake.write);
             try std.testing.expectEqual(12, bytes);
         } else {
-            try std.testing.expectError(if (mode == 1) error.ConnectionResetByPeer else error.WriteZero, rawStreamWriteAllCounted(stream, "1234567", &bytes));
+            try std.testing.expectError(if (mode == 1) error.ConnectionResetByPeer else error.WriteZero, rawStreamWriteAllUsing(stream, "1234567", &bytes, Fake.write));
             try std.testing.expectEqual(8, bytes);
         }
     }
+}
+
+test "unexpected socket failures are not disguised as timeouts" {
+    try std.testing.expectEqual(error.RequestTimeout, normalizeSocketIoError(error.WouldBlock));
+    try std.testing.expectEqual(error.RequestTimeout, normalizeSocketIoError(error.TimedOut));
+    try std.testing.expectEqual(error.Unexpected, normalizeSocketIoError(error.Unexpected));
+    try std.testing.expectEqual(error.SocketClosed, normalizeSocketIoError(error.SocketClosed));
 }
