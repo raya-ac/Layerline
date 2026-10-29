@@ -50,5 +50,5 @@ zig build test
 the verifier starts temporary local servers. [benchmarking](docs/benchmarking.md) is separate.
 
 <p align="center">
-  <img src="public/laina.png" alt="laina, layerline's mascot" width="160">
+  <img src="public/laina-v2.png" alt="laina, layerline's mascot" width="160">
 </p>

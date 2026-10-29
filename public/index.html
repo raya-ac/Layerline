@@ -3,195 +3,175 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Layerline - Origin Surface Web Server</title>
-  <meta name="description" content="Layerline is a Zig web server for direct edge serving: virtual hosts, PHP, reverse proxying, TLS, metrics, admin controls, HTTP/2, and in-tree HTTP/3 work.">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f4f7f6">
+  <title>Layerline - a web server, written in zig.</title>
+  <meta name="description" content="Static files, PHP, reverse proxies and native TLS. Layerline is a web server written in Zig, with per-site configs and an optional admin UI. HTTP/3 is experimental.">
+  <meta property="og:title" content="Layerline">
+  <meta property="og:description" content="a web server, written in zig. static files, php and apps. served directly.">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="https://layerline.dev/static/laina-v2.png">
+  <meta property="og:image:alt" content="Laina, Layerline's black-haired and teal-accented anime mascot, waving hello.">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <link rel="stylesheet" href="/static/site.css">
+  <link rel="preload" as="image" href="/static/laina-v2.png">
+  <link rel="stylesheet" href="/static/site.css?v=laina-refresh">
+  <script src="/static/site.js?v=laina-refresh" defer></script>
 </head>
 <body>
+  <a class="skip-link" href="#main">skip to content</a>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Layerline home">
-      <img src="/favicon.svg" alt="">
-      <span><strong>Layerline</strong><small>Origin surface web server</small></span>
-    </a>
-    <nav aria-label="Primary">
-      <a href="#features">Features</a>
-      <a href="#config">Config</a>
-      <a href="#admin">Admin</a>
-      <a href="#compare">Compare</a>
-      <a href="#setup">Setup</a>
-      <a href="https://github.com/raya-ac/Layerline">GitHub</a>
-    </nav>
+    <div class="wrap topbar-inner">
+      <a class="brand" href="/" aria-label="Layerline home">
+        <img src="/favicon.svg" width="32" height="32" alt="">
+        <span>Layerline</span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#config">config</a>
+        <a href="#compare">compare</a>
+        <a class="nav-source" href="https://github.com/raya-ac/Layerline">github <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a>
+      </nav>
+    </div>
   </header>
 
-  <main>
-    <section class="hero">
-      <div class="hero-inner">
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap hero-inner">
         <div class="hero-copy">
-          <p class="eyebrow">HTTP/1.1 native // HTTP/2 router // HTTP/3 in tree</p>
-          <h1>Layerline</h1>
-          <p class="lede">A Zig web server built to own the edge directly: serve static sites, run PHP, proxy apps, terminate TLS, expose admin controls, and keep the config close to the machine.</p>
-          <div class="actions">
-            <a class="button primary" href="https://github.com/raya-ac/Layerline">View GitHub</a>
-            <a class="button" href="#setup">Install</a>
-            <a class="button" href="/health">Live health</a>
+          <p class="eyebrow entrance">your sites. your server.</p>
+          <h1 class="entrance" id="hero-title">Layerline</h1>
+          <p class="hero-tagline entrance">a web server, written in zig.</p>
+          <p class="hero-description entrance">Static files, PHP and apps. Served directly.</p>
+          <div class="actions entrance">
+            <a class="button primary" href="#setup">get started <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="18" height="18"></a>
+            <a class="text-link" href="https://github.com/raya-ac/Layerline">read the source <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a>
           </div>
         </div>
-
-        <div class="hero-art" aria-label="Layerline protocol surface">
-          <div class="protocol-rail"><span>ORIGIN SURFACE</span><span>edge listener</span></div>
-          <div class="route-line"></div>
-          <div class="packet packet-one"></div>
-          <div class="packet packet-two"></div>
-          <img class="mascot" src="/static/laina.png?v=site" alt="Laina, Layerline's route operator mascot">
-          <div class="protocol-stack" aria-hidden="true">
-            <span>HTTP/1.1</span>
-            <span>HTTP/2</span>
-            <span>HTTP/3</span>
-          </div>
-          <p class="art-caption"><strong>Laina</strong><span>Layerline's route operator: mascot, config guide, and protocol signal.</span></p>
-        </div>
+        <figure class="hero-art">
+          <img class="mascot" src="/static/laina-v2.png" width="1024" height="1536" fetchpriority="high" alt="Laina waves hello: black and teal twin tails, coral clips, a teal scarf and an off-white utility jacket.">
+          <figcaption><span class="caption-rule"></span>laina <span>/ keeping an eye on the routes</span></figcaption>
+        </figure>
       </div>
     </section>
 
-    <section class="proofline" aria-label="Runtime proof">
-      <div><strong>Virtual hosts</strong><span>Per-domain files, SNI certs, wildcard names, route-local overrides</span></div>
-      <div><strong>PHP and FastCGI</strong><span>php-cgi fallback, php-fpm pooling, front-controller mode</span></div>
-      <div><strong>Reverse proxy</strong><span>Retries, policies, keep-alive reuse, ejection, circuit recovery</span></div>
-      <div><strong>Admin controls</strong><span>Disabled by default, first-launch setup, settings, config previews</span></div>
-    </section>
-
-    <section class="section" id="features">
-      <div class="section-head">
-        <p class="eyebrow">Server surface</p>
-        <h2>Enough pieces to host real sites without hiding behind another server.</h2>
-      </div>
-      <div class="feature-grid">
-        <article><h3>Static hot path</h3><p>Darwin sendfile, bounded buffered fallback, byte ranges, ETags, precompressed sidecars, and configurable cache policy.</p></article>
-        <article><h3>App routing</h3><p>Named routes can serve static trees, PHP apps, or reverse-proxied services with route-local roots, timeouts, and upstream policy.</p></article>
-        <article><h3>TLS ownership</h3><p>Native TLS 1.3, ALPN, SNI certificate selection, certbot webroot automation, and a port-80 redirect/ACME listener.</p></article>
-        <article><h3>Operational visibility</h3><p>Prometheus-style metrics, structured JSON access logs, admin status, route dumps, cert views, and config validation.</p></article>
-        <article><h3>Modern protocols</h3><p>HTTP/1.1 and native HTTP/2 route today. The native QUIC/TLS HTTP/3 path is in-tree and currently serving the default response.</p></article>
-        <article><h3>Direct deploys</h3><p>Systemd, launchd, Docker, per-domain config files, and deployment docs are part of the repository, not a later wrapper.</p></article>
+    <section class="protocols" aria-label="Protocol support">
+      <div class="wrap protocol-grid">
+        <div><span class="protocol-name">HTTP/1.1</span><span class="status"><i></i>native</span></div>
+        <div><span class="protocol-name">HTTP/2</span><span class="status"><i></i>native</span></div>
+        <div><span class="protocol-name">HTTP/3</span><a class="status experimental" href="https://github.com/raya-ac/Layerline/blob/main/docs/roadmap.md"><i></i>experimental</a></div>
       </div>
     </section>
 
-    <section class="section config-split" id="config">
-      <div class="section-head">
-        <p class="eyebrow">Config model</p>
-        <h2>Main runtime settings plus nginx-style per-domain files.</h2>
-      </div>
-      <div class="code-pair">
-        <div>
-          <h3>Main server config</h3>
-          <p>Listener, process limits, protocol toggles, defaults, admin state, logging, and global runtime behavior stay in one main file.</p>
-          <pre><code>host = 0.0.0.0
-port = 443
-static_dir = public
-serve_static_root = true
+    <section class="section config-section" id="config" aria-labelledby="config-title">
+      <div class="wrap config-layout">
+        <div class="config-copy reveal">
+          <p class="eyebrow">01 / configuration</p>
+          <h2 id="config-title">one file per site.</h2>
+          <p>Keep the listener settings in one place. Give each domain its own config. Static site, PHP app or proxy: same server.</p>
+          <div class="main-config">
+            <h3>server.conf</h3>
+            <pre><code id="main-config">host = 127.0.0.1
+port = 8080
 domain_config_dir = domains-enabled
-tls = true
-http_redirect = true
 admin_ui = false</code></pre>
+          </div>
+          <a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/configuration.md">configuration reference <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a>
         </div>
-        <div>
-          <h3>Per-domain config</h3>
-          <p>Each site gets a focused file with server names, root, proxy/PHP behavior, certificates, redirects, headers, and named routes.</p>
-          <pre><code># domains-enabled/layerline.conf
-server_name = layerline.dev www.layerline.dev
-root = /srv/layerline/public
+        <div class="config-editor reveal">
+          <div class="editor-header"><span>domains-enabled/example.conf</span><button class="icon-button copy-button" type="button" data-copy-panel="site-examples" aria-label="Copy site config" title="Copy site config" hidden><img src="/static/icons/copy.svg" width="18" height="18" alt=""></button></div>
+          <div class="tabs" role="tablist" aria-label="Site config examples" hidden>
+            <button type="button" role="tab" id="tab-static" aria-controls="config-static" aria-selected="true" tabindex="0">static</button>
+            <button type="button" role="tab" id="tab-proxy" aria-controls="config-proxy" aria-selected="false" tabindex="-1">proxy</button>
+            <button type="button" role="tab" id="tab-php" aria-controls="config-php" aria-selected="false" tabindex="-1">php</button>
+          </div>
+          <div id="site-examples">
+            <div class="code-panel" id="config-static" role="tabpanel" aria-labelledby="tab-static" tabindex="0">
+              <h3 class="example-label">static site</h3>
+              <pre><code>server_name = example.com www.example.com
+root = /srv/www/example
 index = index.html
+serve_static_root = true</code></pre>
+              <p class="editor-note">Files, ranges, ETags and precompressed sidecars.</p>
+            </div>
+            <div class="code-panel" id="config-proxy" role="tabpanel" aria-labelledby="tab-proxy" tabindex="0">
+              <h3 class="example-label">reverse proxy</h3>
+              <pre><code>server_name = api.example.com
+serve_static_root = false
+proxy = http://127.0.0.1:3000, http://127.0.0.1:3001
+upstream_policy = least_connections
+proxy_timeout_ms = 15000</code></pre>
+              <p class="editor-note">An HTTP upstream pool with health and retry controls.</p>
+            </div>
+            <div class="code-panel" id="config-php" role="tabpanel" aria-labelledby="tab-php" tabindex="0">
+              <h3 class="example-label">php / fastcgi</h3>
+              <pre><code>server_name = app.example.com
+root = /srv/www/app/public
 serve_static_root = true
-route = docs /docs/* static
-route_dir.docs = /srv/layerline/docs
-proxy = http://127.0.0.1:3000</code></pre>
+php_root = /srv/www/app/public
+php_fastcgi = unix:/run/php/php-fpm.sock
+php_index = index.php
+php_front_controller = true</code></pre>
+              <p class="editor-note">Use your PHP-FPM socket path. PHP runs separately.</p>
+            </div>
+          </div>
+          <div class="editor-footer"><span>plain text. no generated config required.</span><span aria-hidden="true">.conf</span></div>
         </div>
       </div>
     </section>
 
-    <section class="section admin-section" id="admin">
-      <div class="section-head">
-        <p class="eyebrow">Admin UI</p>
-        <h2>Control panel built into the same server, off until you turn it on.</h2>
-      </div>
-      <div class="admin-layout">
-        <div class="admin-copy">
-          <p>Layerline's admin UI creates access on first launch, then gives operators a browser surface for site management, main settings, redacted config previews, route tables, certificate state, metrics, and validation.</p>
-          <ul>
-            <li>Add new sites by writing enabled domain config files.</li>
-            <li>Save main server settings with a backup beside the config.</li>
-            <li>Inspect redacted config previews without leaking tokens or private key paths.</li>
-            <li>Validate activation config and TLS material before managed restart.</li>
-          </ul>
+    <section class="section features" id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <div class="section-heading reveal"><p class="eyebrow">02 / in the server</p><h2 id="features-title">the useful bits,<br>already in the tree.</h2></div>
+        <div class="feature-list">
+          <article class="feature reveal"><span class="feature-number">01</span><div><h3>files and caching</h3><p>Byte ranges, ETags, gzip, precompressed files and scoped cache policies.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">02</span><div><h3>apps and upstreams</h3><p>HTTP proxy pools, health checks, bounded attempts and direct FastCGI for PHP-FPM.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">03</span><div><h3>native TLS</h3><p>TLS 1.3, ALPN and per-domain SNI certificates. Certificate automation integrates with certbot.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">04</span><div><h3>configs that stay yours</h3><p>Per-domain files, route overrides, config validation and compatible in-memory reloads.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">05</span><div><h3>logs and visibility</h3><p>Structured access logs, metrics, route inspection and upstream diagnostics.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">06</span><div><h3>an optional control panel</h3><p>Site management, staged config edits and runtime controls. Off by default; first setup needs a local token.</p><a href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md#admin-access">admin setup and security <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="14" height="14"></a></div></article>
         </div>
-        <pre><code>admin_ui = true
-admin_ui_path = /_layerline/admin
-admin_credentials_path = /etc/layerline/admin.credentials
-domain_config_dir = domains-enabled</code></pre>
       </div>
     </section>
 
-    <section class="section compare" id="compare">
-      <div class="section-head">
-        <p class="eyebrow">Against the old guard</p>
-        <h2>The goal is Caddy/nginx scale, with more direct control from Zig.</h2>
+    <section class="section compare" id="compare" aria-labelledby="compare-title">
+      <div class="wrap">
+        <div class="section-heading reveal"><p class="eyebrow">03 / where it fits</p><h2 id="compare-title">same job.<br>different starting point.</h2><p>Caddy and nginx have years of production use behind them. Layerline is younger. Here's the comparison without pretending otherwise.</p></div>
+        <div class="table-wrap reveal" role="region" aria-label="Web server comparison" tabindex="0">
+          <table>
+            <caption class="sr-only">Selected capabilities, not performance benchmarks or a claim of feature parity.</caption>
+            <thead><tr><th scope="col">capability</th><th scope="col">Layerline</th><th scope="col">Caddy</th><th scope="col">nginx</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">written in</th><td>Zig</td><td>Go</td><td>C</td></tr>
+              <tr><th scope="row">HTTP/1.1 + HTTP/2</th><td>native implementations</td><td>included</td><td>HTTP/2 module</td></tr>
+              <tr><th scope="row">HTTP/3</th><td><span class="comparison-caution">experimental</span></td><td>included</td><td>optional, experimental module</td></tr>
+              <tr><th scope="row">HTTPS</th><td>native TLS 1.3; certbot integration</td><td>automatic HTTPS</td><td>configured TLS certificates</td></tr>
+              <tr><th scope="row">PHP-FPM</th><td>direct FastCGI</td><td>php_fastcgi directive</td><td>FastCGI module</td></tr>
+              <tr><th scope="row">management</th><td>optional web UI + local socket</td><td>admin API</td><td>config files + CLI</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="source-note">Selected open-source capabilities. Builds and configuration matter. Sources: <a href="https://caddyserver.com/features">Caddy</a>, <a href="https://caddyserver.com/docs/caddyfile/directives/php_fastcgi">Caddy PHP</a>, <a href="https://nginx.org/en/docs/">nginx docs</a>, <a href="https://nginx.org/en/docs/http/ngx_http_v3_module.html">nginx HTTP/3</a>.</p>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr><th>Capability</th><th>Layerline</th><th>Caddy</th><th>nginx</th></tr>
-          </thead>
-          <tbody>
-            <tr><td>Config style</td><td>Main runtime config plus per-domain site files</td><td>Caddyfile and JSON admin API</td><td>Main config plus sites-enabled patterns</td></tr>
-            <tr><td>Static files</td><td>Sendfile, ranges, ETags, precompressed sidecars</td><td>Mature static serving</td><td>Mature static serving</td></tr>
-            <tr><td>TLS</td><td>Native TLS 1.3, SNI certs, certbot automation</td><td>Automatic certificates as a core feature</td><td>Manual or external ACME tooling</td></tr>
-            <tr><td>PHP</td><td>CGI fallback and direct FastCGI/php-fpm</td><td>Reverse proxy to PHP/FastCGI setups</td><td>Mature FastCGI integration</td></tr>
-            <tr><td>Proxy pools</td><td>Retries, policies, keep-alive, ejection, circuit recovery</td><td>Strong reverse proxy defaults</td><td>Mature upstream module</td></tr>
-            <tr><td>Admin surface</td><td>Disabled by default browser UI plus local socket</td><td>Admin API, no default full control panel</td><td>No built-in browser UI</td></tr>
-            <tr><td>HTTP/3</td><td>Native QUIC/TLS path in progress</td><td>Production-ready HTTP/3 support</td><td>Available in modern builds/configs</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <p class="note">Layerline already serves layerline.dev and fronts memorylayer.run as the active edge. It can serve normal HTTP/1.1 and HTTP/2 routes, own TLS, proxy apps, host PHP, and expose admin diagnostics. Full HTTP/3 route dispatch, in-memory hot reload, and long soak conformance remain roadmap work.</p>
     </section>
 
-    <section class="section setup" id="setup">
-      <div class="section-head">
-        <p class="eyebrow">Setup</p>
-        <h2>Build, verify, run, then point a domain at it.</h2>
-      </div>
-      <div class="setup-grid">
-        <pre><code>git clone https://github.com/raya-ac/Layerline.git
+    <section class="status-section" aria-labelledby="status-title">
+      <div class="wrap status-layout reveal"><div><p class="eyebrow">a note before you deploy</p><h2 id="status-title">still being built.</h2></div><div><p>I'm building this to run sites without Caddy or nginx in front. It's not a drop-in replacement yet. HTTP/3 interoperability, longer soak tests and more runtime hardening are still on the list.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/roadmap.md">the actual roadmap <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md">security notes <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div></div>
+    </section>
+
+    <section class="section setup" id="setup" aria-labelledby="setup-title">
+      <div class="wrap setup-layout">
+        <div class="reveal"><p class="eyebrow">04 / give it a run</p><h2 id="setup-title">build it.<br>point it at a site.</h2><p>You'll need Zig 0.16. This starts a local server on port 8080, with the admin UI off.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/deployment.md">deployment guide <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div>
+        <div class="setup-commands reveal">
+          <div class="command-heading"><h3>from source</h3><button class="icon-button copy-button" type="button" data-copy="quickstart" aria-label="Copy quick start commands" title="Copy quick start commands" hidden><img src="/static/icons/copy.svg" width="18" height="18" alt=""></button></div>
+          <pre><code id="quickstart">git clone https://github.com/raya-ac/Layerline.git
 cd Layerline
-zig build -Doptimize=ReleaseFast
-./scripts/verify-layerline.sh</code></pre>
-        <pre><code>./zig-out/bin/layerline \
-  --config server.conf \
-  --admin-ui true \
-  --admin-ui-path /_layerline/admin</code></pre>
-        <pre><code>curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/metrics
-zig build run -- --dump-routes
-zig build run -- --validate-config</code></pre>
-      </div>
-      <div class="actions final-actions">
-        <a class="button primary" href="https://github.com/raya-ac/Layerline">GitHub repository</a>
-        <a class="button" href="https://github.com/raya-ac/Layerline/blob/main/README.md">Read the README</a>
-        <a class="button" href="https://github.com/raya-ac/Layerline/blob/main/docs/deployment.md">Deployment docs</a>
-      </div>
-    </section>
-
-    <section class="section roadmap" id="roadmap">
-      <div class="section-head">
-        <p class="eyebrow">Roadmap honesty</p>
-        <h2>Production quality is a checklist, not a slogan.</h2>
-      </div>
-      <div class="roadmap-grid">
-        <div><strong>Ready now</strong><span>Static, PHP/FastCGI, proxy pools, domain files, TLS material loading, HTTP/2 routing, admin setup, metrics, logs.</span></div>
-        <div><strong>In progress</strong><span>Full HTTP/3 route dispatch, in-memory hot reload, broader h2/h3 conformance, route-local stale/cache behavior, cert reload.</span></div>
-        <div><strong>Next gate</strong><span>General Caddy-class replacement after reload, live TLS material, route controls, soak tests, and rollback paths pass together.</span></div>
+zig build run -- --config examples/local.conf</code></pre>
+          <p class="local-address"><span class="status"><i></i>then open</span> <a href="http://127.0.0.1:8080/">127.0.0.1:8080 <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></p>
+        </div>
       </div>
     </section>
   </main>
+
+  <footer><div class="wrap footer-inner"><a class="brand" href="#main"><img src="/favicon.svg" width="28" height="28" alt=""><span>Layerline</span></a><p>built by ari. watched over by laina.</p><a href="https://github.com/raya-ac/Layerline">source on github <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div></footer>
+  <p class="sr-only" id="copy-status" role="status" aria-live="polite"></p>
 </body>
 </html>
