@@ -7,6 +7,7 @@ const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
+const upstream_idle = @import("upstream_idle.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const backend_deadline = @import("backend_deadline.zig");
@@ -132,7 +133,7 @@ fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cf
         defer upstream.keepalive_pool.mutex.unlock(io);
 
         while (upstream.keepalive_pool.idle.pop()) |conn| {
-            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests) {
+            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests or !upstream_idle.reusable(conn.stream)) {
                 closeIdleConnection(conn, callbacks);
                 continue;
             }

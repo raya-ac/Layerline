@@ -785,6 +785,9 @@ python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
 log "verifying absolute backend attempt deadlines and retry safety"
 python3 "$ROOT_DIR/scripts/verify-backend-deadlines.py" "$SERVER_BINARY"
 
+log "verifying idle upstream socket safety"
+python3 "$ROOT_DIR/scripts/verify-upstream-idle.py" "$SERVER_BINARY"
+
 log "verifying config reader lifetimes and repeated reloads"
 python3 "$ROOT_DIR/scripts/verify-reload-lifetimes.py" "$SERVER_BINARY"
 
