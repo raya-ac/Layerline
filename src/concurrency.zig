@@ -94,3 +94,20 @@ pub fn waitForDrain(io: std.Io, state: *State, timeout_ms: u32) void {
         remaining -= step_ms;
     }
 }
+
+test "connection gate stops at its limit and released capacity is reusable" {
+    var metrics = metrics_mod.ServerMetrics.init();
+    var state = State.init(&metrics);
+    try std.testing.expect(!state.tryAcquire(0));
+    try std.testing.expect(state.tryAcquire(2));
+    try std.testing.expect(state.tryAcquire(2));
+    try std.testing.expect(!state.tryAcquire(2));
+    try std.testing.expectEqual(2, state.active());
+    state.release();
+    try std.testing.expect(state.tryAcquire(2));
+    state.release();
+    state.release();
+    try std.testing.expectEqual(0, state.active());
+    try std.testing.expectEqual(0, metrics.active_connections.load(.monotonic));
+    try std.testing.expectEqual(3, metrics.connections_total.load(.monotonic));
+}

@@ -33,7 +33,7 @@ const validateFastcgiEndpoint = parsing.validateFastcgiEndpoint;
 
 pub fn normalizeConfig(cfg: *ServerConfig) void {
     if (cfg.max_concurrent_connections == 0) {
-        cfg.max_concurrent_connections = 1024;
+        cfg.max_concurrent_connections = types.DEFAULT_MAX_CONCURRENT_CONNECTIONS;
     }
     if (cfg.max_requests_per_connection == 0) {
         cfg.max_requests_per_connection = DEFAULT_MAX_REQUESTS_PER_CONNECTION;

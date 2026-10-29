@@ -98,6 +98,9 @@ DATA discarded on closed or rejected streams still restores connection credit.
 Cache budgets charge keys, headers and
 entry metadata as well as bodies, and each cache has a 4096-entry ceiling.
 These are live-data budgets, not exact process RSS limits.
+The default connection gate is 1,024 sockets because the current runtime uses a
+worker thread per connection. Explicit higher limits require a measured host
+budget; this is not a process-wide heap/RSS cap.
 
 Config snapshots have distinct cache generations. Until reader leases replace
 raw config pointers, a process retains at most 32 snapshots including startup;

@@ -259,7 +259,7 @@ tls = false
 max_request_bytes = 16384
 max_body_bytes = 1048576
 max_static_file_bytes = 10485760
-max_concurrent_connections = 1000000
+max_concurrent_connections = 1024
 ```
 
 ## HTTP/2 and HTTP/3
@@ -601,11 +601,11 @@ Behavior:
 
 ### High-traffic operation
 
-For sustained inbound load, run behind your edge proxy/load balancer and tune:
+Start with a measured per-host connection budget and tune under realistic load:
 
 ```bash
 zig build run -- \
-  --max-concurrent-connections 1000000 \
+  --max-concurrent-connections 1024 \
   --max-requests-per-connection 256 \
   --worker-stack-size 65536 \
   --max-php-output-bytes 2097152 \
@@ -621,10 +621,13 @@ zig build run -- \
 
 When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
 This process still uses one worker thread per accepted socket, so extreme live-connection fan-in should use a dedicated L4/edge balancing tier while native evented IO is built out.
+The default is 1,024 concurrent connections, not a claim of one-million-connection
+capacity. Explicit overrides remain supported; budget thread stacks, request and
+response buffers, upstream sockets, and file descriptors before increasing it.
 `SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for connection and background workers to drain. HTTP/2 refuses new streams while completing existing work. A stuck worker triggers a logged exit with status 1 at the deadline, without freeing runtime state that worker still borrows; see [shutdown ownership](docs/security.md#shutdown-ownership).
 Common host limits to revisit before aggressive load tests:
 
-- Linux/macOS: increase open file limit (`ulimit -n 2000000`).
+- Linux/macOS: set the open-file limit for the measured connection budget, including upstream and admin sockets.
 - Tune socket backlog and SYN/FIN handling in kernel sysctls according to your OS.
 - Keep `max_requests_per_connection` low so idle keep-alive connections rotate quickly.
 

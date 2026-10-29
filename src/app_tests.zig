@@ -76,6 +76,17 @@ const upstreamRuntimePolicyFromConfig = config_mod.upstreamRuntimePolicyFromConf
 const upstreamRuntimePolicyFor = config_mod.upstreamRuntimePolicyFor;
 const HttpRequest = request_mod.HttpRequest;
 
+test "connection defaults are bounded and explicit limits survive normalization" {
+    var cfg = defaultServerConfig();
+    try std.testing.expectEqual(1024, cfg.max_concurrent_connections);
+    cfg.max_concurrent_connections = 0;
+    normalizeConfig(&cfg);
+    try std.testing.expectEqual(1024, cfg.max_concurrent_connections);
+    cfg.max_concurrent_connections = 64;
+    normalizeConfig(&cfg);
+    try std.testing.expectEqual(64, cfg.max_concurrent_connections);
+}
+
 test "parses FastCGI tcp and unix endpoints" {
     const tcp = try parseFastcgiEndpoint("tcp://127.0.0.1:9000");
     try std.testing.expectEqualStrings("127.0.0.1", tcp.tcp.host);
