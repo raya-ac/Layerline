@@ -15,6 +15,7 @@ pub const Context = struct {
     handler: []const u8 = "routing",
     upstream: ?[]const u8 = null,
     error_name: ?[]const u8 = null,
+    response_complete: ?bool = null,
     logged: bool = false,
 };
 
@@ -67,6 +68,9 @@ pub const Writer = struct {
         appendJsonNumberField(&out, allocator, "bytes", body_bytes, true) catch return;
         appendJsonNumberField(&out, allocator, "duration_ms", duration_ms, true) catch return;
         appendJsonStringField(&out, allocator, "handler", ctx.handler, true) catch return;
+        if (ctx.response_complete) |complete| {
+            out.appendSlice(allocator, if (complete) ",\"response_complete\":true" else ",\"response_complete\":false") catch return;
+        }
         if (ctx.upstream) |upstream| {
             appendJsonStringField(&out, allocator, "upstream", upstream, true) catch return;
         }

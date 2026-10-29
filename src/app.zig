@@ -341,6 +341,8 @@ fn phpCallbacks() php_runtime.Callbacks {
 fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
     return .{
         .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
+        .send_response_headers = sendResponseWithConnectionAndHeaders,
+        .access_log_set_error = runtime_state.accessLogSetError,
         .access_log_set_upstream = runtime_state.accessLogSetUpstream,
         .active_io = activeIo,
         .bind_thread_io = bindThreadIo,
@@ -348,12 +350,14 @@ fn upstreamRuntimeCallbacks() upstream_runtime.Callbacks {
         .current_request_id = runtime_state.currentRequestId,
         .metrics = &runtime_state.server_metrics,
         .proxy_raw_bidirectional = proxyRawBidirectional,
+        .record_proxy_response = http1_response_bridge.recordProxyResponse,
         .send_cool_error = sendCoolErrorWithConnection,
         .set_stream_timeouts = setStreamTimeouts,
         .shutdown_requested = &runtime_state.shutdown_requested,
         .stream_close = streamClose,
         .stream_read = streamRead,
         .stream_write_all = streamWriteAll,
+        .stream_write_all_counted = stream_runtime.streamWriteAllCounted,
         .upstream_now_ms = upstreamNowMs,
         .write_response_headers = streamWriteConfiguredResponseHeaders,
     };

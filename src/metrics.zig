@@ -294,7 +294,7 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
             "layerline_responses_total{{class=\"4xx\"}} {d}\n" ++
             "layerline_responses_total{{class=\"5xx\"}} {d}\n" ++
             "layerline_responses_total{{class=\"all\"}} {d}\n" ++
-            "# HELP layerline_response_body_bytes_total HTTP/1 response body bytes written by normal response helpers.\n" ++
+            "# HELP layerline_response_body_bytes_total HTTP response body bytes accepted by response writers, excluding framing and tunnel traffic.\n" ++
             "# TYPE layerline_response_body_bytes_total counter\n" ++
             "layerline_response_body_bytes_total {d}\n" ++
             "# HELP layerline_static_body_bytes_total Static file body bytes streamed from disk.\n" ++

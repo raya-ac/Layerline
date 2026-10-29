@@ -54,6 +54,16 @@ HTTP/1 responses now have a first-write-to-finish budget too, including Darwin
 sendfile and forwarded proxy body waits. Partial upstream responses never retry
 or append another HTTP status line. Interim replies, keep-alive requests, and
 upgraded tunnels retain separate lifetimes; plain/TLS wire tests cover them.
+Direct HTTP/1 proxy replies now record one final access entry and response metric,
+including partial responses. Their `response_complete` flag distinguishes a
+finished message from an aborted transfer; `bytes` excludes headers, chunk framing
+and trailers. Plain writes count socket-accepted payload bytes, while TLS counts
+payload in fully written records, not incomplete ciphertext or delivery ACKs.
+Upgrade handshakes are recorded before tunnel traffic begins. Early hints and
+backend retries do not create duplicate final-response entries, and disabling
+access logging does not disable response metrics. Wire tests cover plain/TLS,
+HEAD, empty replies, truncation, invalid trailers, timeouts and PHP update notices;
+this completion field is not yet emitted by every response handler/protocol.
 HTTP/2 backend routing now uses bounded concurrent tasks (eight per connection,
 64 process-wide), while frame parsing, HPACK, TLS output, and flow control stay on
 the connection thread. A blocked backend no longer stalls PINGs or independent

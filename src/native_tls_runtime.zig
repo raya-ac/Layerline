@@ -273,6 +273,11 @@ pub fn readApplicationData(channel: *Channel, out: []u8) !usize {
 }
 
 pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
+    var accepted: usize = 0;
+    try writeApplicationDataCounted(channel, bytes, &accepted);
+}
+
+pub fn writeApplicationDataCounted(channel: *Channel, bytes: []const u8, accepted: *usize) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const chunk_len = @min(bytes.len - offset, MAX_INNER_PLAINTEXT_BYTES - 1);
@@ -286,6 +291,35 @@ pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
             channel.raw_write_all,
         );
         offset += chunk_len;
+        // Incomplete ciphertext is not a body byte the peer can decrypt.
+        accepted.* +|= chunk_len;
+    }
+}
+
+test "counted TLS writes include only complete application records" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var limit: usize = 0;
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            calls += 1;
+            if (calls > limit) return error.ConnectionResetByPeer;
+        }
+    };
+    const keys = tls13_native.deriveTlsRecordKeys([_]u8{0x66} ** 32);
+    const payload = [_]u8{'x'} ** 20000;
+    for (0..3) |limit| {
+        Fake.calls = 0;
+        Fake.limit = limit;
+        var channel: Channel = .{ .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = partialRecordRead, .raw_write_all = Fake.write };
+        defer channel.deinit();
+        var bytes: usize = 7;
+        if (limit == 2) {
+            try writeApplicationDataCounted(&channel, &payload, &bytes);
+            try std.testing.expectEqual(20007, bytes);
+        } else {
+            try std.testing.expectError(error.ConnectionResetByPeer, writeApplicationDataCounted(&channel, &payload, &bytes));
+            try std.testing.expectEqual(7 + limit * (MAX_INNER_PLAINTEXT_BYTES - 1), bytes);
+        }
     }
 }
 

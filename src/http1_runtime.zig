@@ -547,6 +547,7 @@ pub fn handleConnection(
             };
             callbacks.set_access_context(&access_ctx, request_id);
             defer callbacks.clear_access_context();
+            defer if (!access_ctx.logged) callbacks.emit_access_log(0, 0);
 
             if (req.h2c_upgrade_tail.len > 0 or request_mod.isH2cUpgradeHeaders(req.headers)) {
                 write_deadline.clear(stream);
@@ -570,8 +571,6 @@ pub fn handleConnection(
                     return err;
                 },
             };
-
-            if (!access_ctx.logged) callbacks.emit_access_log(0, 0);
         }
 
         if (req.close_connection or callbacks.shutdown_requested.load(.acquire)) break;

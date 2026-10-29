@@ -99,6 +99,11 @@ pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
 }
 
 pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var written: usize = 0;
+    try rawStreamWriteAllCounted(stream, bytes, &written);
+}
+
+pub fn rawStreamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, accepted: *usize) !void {
     const io = activeIo();
     const budget = write_deadline.startWrite(stream);
     const backend = backend_deadline.forStream(stream);
@@ -136,16 +141,22 @@ pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
         };
         if (n == 0) return error.WriteZero;
         written += n;
+        accepted.* +|= n;
     }
 }
 
 pub fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var written: usize = 0;
+    try streamWriteAllCounted(stream, bytes, &written);
+}
+
+pub fn streamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, accepted: *usize) !void {
     if (current_tls_channel) |channel| {
         if (stream.socket.handle == channel.stream.socket.handle) {
-            return native_tls.writeApplicationData(channel, bytes);
+            return native_tls.writeApplicationDataCounted(channel, bytes, accepted);
         }
     }
-    return rawStreamWriteAll(stream, bytes);
+    return rawStreamWriteAllCounted(stream, bytes, accepted);
 }
 
 pub fn streamWriteFmt(stream: std.Io.net.Stream, comptime fmt: []const u8, args: anytype) !void {
@@ -205,4 +216,39 @@ pub fn connectFastcgiEndpoint(allocator: std.mem.Allocator, endpoint: PhpFastcgi
             break :blk try backend_deadline.connect(activeIo(), std.Io.net.UnixAddress.connect, .{ &unix_addr, activeIo() });
         },
     };
+}
+
+test "counted socket writes retain accepted bytes on errors and zero writes" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var failure: bool = false;
+        var zero: bool = false;
+        fn write(_: ?*anyopaque, _: std.Io.net.Socket.Handle, header: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
+            calls += 1;
+            if (calls == 2) {
+                if (failure) return error.ConnectionResetByPeer;
+                if (zero) return 0;
+            }
+            return @min(3, header.len);
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.netWrite = Fake.write;
+    const previous_io = current_io;
+    defer current_io = previous_io;
+    bindThreadIo(.{ .userdata = std.testing.io.userdata, .vtable = &vtable });
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    for ([_]u8{ 0, 1, 2 }) |mode| {
+        Fake.calls = 0;
+        Fake.failure = mode == 1;
+        Fake.zero = mode == 2;
+        var bytes: usize = 5;
+        if (mode == 0) {
+            try rawStreamWriteAllCounted(stream, "1234567", &bytes);
+            try std.testing.expectEqual(12, bytes);
+        } else {
+            try std.testing.expectError(if (mode == 1) error.ConnectionResetByPeer else error.WriteZero, rawStreamWriteAllCounted(stream, "1234567", &bytes));
+            try std.testing.expectEqual(8, bytes);
+        }
+    }
 }

@@ -24,6 +24,8 @@ const UpstreamResponseForwardResult = proxy_utils.UpstreamResponseForwardResult;
 
 pub const Callbacks = struct {
     send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
+    send_response_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, []const u8, bool, ?[]const u8) anyerror!void,
+    access_log_set_error: *const fn ([]const u8) void,
     access_log_set_upstream: *const fn ([]const u8) void,
     active_io: *const fn () std.Io,
     bind_thread_io: *const fn (std.Io) void,
@@ -31,12 +33,14 @@ pub const Callbacks = struct {
     current_request_id: *const fn () []const u8,
     metrics: *metrics_mod.ServerMetrics,
     proxy_raw_bidirectional: *const fn (std.Io.net.Stream, std.Io.net.Stream, []const u8) anyerror!void,
+    record_proxy_response: *const fn (u16, usize, bool) void,
     send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8, bool, bool, ?[]const u8) anyerror!void,
     set_stream_timeouts: *const fn (std.Io.net.Stream, u32, u32) anyerror!void,
     shutdown_requested: *std.atomic.Value(bool),
     stream_close: *const fn (std.Io.net.Stream) void,
     stream_read: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     stream_write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
+    stream_write_all_counted: *const fn (std.Io.net.Stream, []const u8, *usize) anyerror!void,
     upstream_now_ms: *const fn () i64,
     write_response_headers: *const fn (std.Io.net.Stream) anyerror!void,
 };
@@ -213,17 +217,35 @@ fn forwardInterim(stream: std.Io.net.Stream, head: upstream_reader.Head, callbac
     write_deadline.restart(stream);
 }
 
+fn sendVersionNotice(stream: std.Io.net.Stream, req: HttpRequest, version: php_version.Version, callbacks: Callbacks) !void {
+    php_version.log(version);
+    const message = try php_version.updateMessage(std.heap.page_allocator, version);
+    defer std.heap.page_allocator.free(message);
+    if (std.mem.eql(u8, req.method, "HEAD")) {
+        try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
+    } else {
+        try callbacks.send_response_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message, true, "Cache-Control: no-store\r\n");
+    }
+}
+
+const ResponseProgress = struct {
+    status: u16,
+    bytes: usize = 0,
+    complete: bool = false,
+    callbacks: Callbacks,
+
+    fn finish(self: *const ResponseProgress) void {
+        self.callbacks.record_proxy_response(self.status, self.bytes, self.complete);
+    }
+};
+
 fn forwardResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, timeout_ms: u32, callbacks: Callbacks) !UpstreamResponseForwardResult {
     const reader = try upstream_reader.Reader.create(allocator, upstream_conn, callbacks.stream_read);
     defer allocator.destroy(reader);
     const head = final: while (true) {
         const head = try reader.nextHead();
         if (php_version.exposedHeaders(head.fields)) |version| {
-            php_version.log(version);
-            const message = try php_version.updateMessage(std.heap.page_allocator, version);
-            defer std.heap.page_allocator.free(message);
-            try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
-            if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
+            try sendVersionNotice(stream, req, version, callbacks);
             return .{ .reusable = false };
         }
         const status = head.framing.status_code.?;
@@ -233,6 +255,9 @@ fn forwardResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upst
     };
     const framing = head.framing;
     try reader.beginBody(req.method, framing, null);
+    var progress: ResponseProgress = .{ .status = framing.status_code.?, .callbacks = callbacks };
+    defer progress.finish();
+    errdefer |err| callbacks.access_log_set_error(@errorName(err));
     callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
     callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     try forwardFields(stream, head.fields, head.fields, callbacks);
@@ -268,7 +293,7 @@ fn forwardResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upst
             var buffer: [32]u8 = undefined;
             callbacks.stream_write_all(stream, try std.fmt.bufPrint(&buffer, "{x}\r\n", .{data.len})) catch return error.DownstreamClosed;
         }
-        callbacks.stream_write_all(stream, data) catch return error.DownstreamClosed;
+        callbacks.stream_write_all_counted(stream, data, &progress.bytes) catch return error.DownstreamClosed;
         if (chunked) callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     }
     if (chunked) {
@@ -276,6 +301,7 @@ fn forwardResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upst
         try forwardFields(stream, reader.trailers(), head.fields, callbacks);
         callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     }
+    progress.complete = true;
     return .{ .reusable = reader.reusable(framing) };
 }
 
@@ -285,11 +311,7 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocato
     const head = final: while (true) {
         const head = try reader.nextHead();
         if (php_version.exposedHeaders(head.fields)) |version| {
-            php_version.log(version);
-            const message = try php_version.updateMessage(std.heap.page_allocator, version);
-            defer std.heap.page_allocator.free(message);
-            try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
-            if (!std.mem.eql(u8, req.method, "HEAD")) try callbacks.stream_write_all(stream, message);
+            try sendVersionNotice(stream, req, version, callbacks);
             return;
         }
         const status = head.framing.status_code.?;
@@ -300,12 +322,20 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, allocator: std.mem.Allocato
     if (!proxy_utils.isHttpUpgradeHeaders(head.fields)) return error.BadGateway;
     const protocol = http_headers.findHeaderValue(head.fields, "Upgrade").?;
     if (!http_headers.hasConnectionToken(http_headers.findHeaderValue(req.headers, "Upgrade").?, protocol)) return error.BadGateway;
-    callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
-    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
-    try forwardFields(stream, head.fields, head.fields, callbacks);
-    callbacks.stream_write_all(stream, "Connection: Upgrade\r\nUpgrade: ") catch return error.DownstreamClosed;
-    callbacks.stream_write_all(stream, protocol) catch return error.DownstreamClosed;
-    callbacks.stream_write_all(stream, "\r\n\r\n") catch return error.DownstreamClosed;
+    {
+        // Record the completed handshake before entering the tunnel. Its raw
+        // traffic and lifetime are not part of an HTTP response body.
+        var progress: ResponseProgress = .{ .status = 101, .callbacks = callbacks };
+        defer progress.finish();
+        errdefer |err| callbacks.access_log_set_error(@errorName(err));
+        callbacks.stream_write_all(stream, head.status_line) catch return error.DownstreamClosed;
+        callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
+        try forwardFields(stream, head.fields, head.fields, callbacks);
+        callbacks.stream_write_all(stream, "Connection: Upgrade\r\nUpgrade: ") catch return error.DownstreamClosed;
+        callbacks.stream_write_all(stream, protocol) catch return error.DownstreamClosed;
+        callbacks.stream_write_all(stream, "\r\n\r\n") catch return error.DownstreamClosed;
+        progress.complete = true;
+    }
     write_deadline.clear(stream);
     backend_deadline.clear(upstream_conn);
     callbacks.proxy_raw_bidirectional(upstream_conn, stream, reader.pending) catch return error.DownstreamClosed;
@@ -763,6 +793,10 @@ test "local dial pressure and cancellation never retry or eject healthy upstream
         fn headers(_: std.Io.net.Stream, _: u16, _: []const u8, _: []const u8, _: usize, _: bool, _: ?[]const u8) !void {
             return error.UnexpectedHeaders;
         }
+        fn bodyHeaders(_: std.Io.net.Stream, _: u16, _: []const u8, _: []const u8, _: []const u8, _: bool, _: ?[]const u8) !void {
+            return error.UnexpectedHeaders;
+        }
+        fn record(_: u16, _: usize, _: bool) void {}
         fn tunnel(_: std.Io.net.Stream, _: std.Io.net.Stream, _: []const u8) !void {
             return error.UnexpectedTunnel;
         }
@@ -772,6 +806,9 @@ test "local dial pressure and cancellation never retry or eject healthy upstream
             return error.UnexpectedRead;
         }
         fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+        fn writeCounted(_: std.Io.net.Stream, _: []const u8, _: *usize) !void {
             return error.UnexpectedWrite;
         }
         fn responseHeaders(_: std.Io.net.Stream) !void {
@@ -791,6 +828,8 @@ test "local dial pressure and cancellation never retry or eject healthy upstream
     var metrics = metrics_mod.ServerMetrics.init();
     const callbacks: Callbacks = .{
         .send_response_no_body_headers = Fake.headers,
+        .send_response_headers = Fake.bodyHeaders,
+        .access_log_set_error = Fake.label,
         .access_log_set_upstream = Fake.label,
         .active_io = Fake.io,
         .bind_thread_io = Fake.bind,
@@ -798,12 +837,14 @@ test "local dial pressure and cancellation never retry or eject healthy upstream
         .current_request_id = Fake.requestId,
         .metrics = &metrics,
         .proxy_raw_bidirectional = Fake.tunnel,
+        .record_proxy_response = Fake.record,
         .send_cool_error = Fake.errorPage,
         .set_stream_timeouts = Fake.timeout,
         .shutdown_requested = &Fake.shutdown,
         .stream_close = Fake.close,
         .stream_read = Fake.read,
         .stream_write_all = Fake.write,
+        .stream_write_all_counted = Fake.writeCounted,
         .upstream_now_ms = Fake.now,
         .write_response_headers = Fake.responseHeaders,
     };

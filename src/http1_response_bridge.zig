@@ -143,6 +143,11 @@ pub fn recordResponseSent(status_code: u16, body_bytes: usize) void {
     emitAccessLog(status_code, body_bytes);
 }
 
+pub fn recordProxyResponse(status_code: u16, body_bytes: usize, complete: bool) void {
+    if (runtime_state.current_access_log) |ctx| ctx.response_complete = complete;
+    recordResponseSent(status_code, body_bytes);
+}
+
 pub fn emitAccessLog(status_code: u16, body_bytes: usize) void {
     runtime_state.emitAccessLog(stream_runtime.activeIo(), server_identity.name, status_code, body_bytes);
 }
