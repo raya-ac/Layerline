@@ -74,6 +74,13 @@ and same-site/cross-site browser fetch metadata. Non-browser clients without an
 Origin still need valid authentication. A global budget of ten login attempts
 per ten seconds bounds password-hash work.
 
+The local Unix control socket accepts one newline-terminated command per
+connection, at most 1023 bytes before the newline. It does not dispatch partial
+reads or incomplete EOF input, and an absolute one-second read deadline bounds
+fragmented commands. Extra lines are not executed. The CLI sends each command
+with its newline in the same write buffer; command framing does not depend on
+socket read boundaries.
+
 ## Files and memory
 
 Static assets, precompressed sidecars, custom error documents, and ACME tokens

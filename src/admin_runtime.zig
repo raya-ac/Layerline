@@ -1,4 +1,5 @@
 const std = @import("std");
+const read_deadline = @import("read_deadline.zig");
 const builtin = @import("builtin");
 const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
@@ -886,13 +887,60 @@ fn handleCommand(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *
     try sendText(stream, "ERROR unknown command\n", callbacks);
 }
 
+fn readSocketCommand(stream: std.Io.net.Stream, buffer: []u8, read: *const fn (std.Io.net.Stream, []u8) anyerror!usize) ![]const u8 {
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const n = try read(stream, buffer[used..]);
+        if (n == 0) return error.IncompleteAdminCommand;
+        if (std.mem.indexOfScalar(u8, buffer[used..][0..n], '\n')) |end| return buffer[0 .. used + end];
+        used += n;
+    }
+    return error.AdminCommandTooLong;
+}
+
 fn handleConnection(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, callbacks: Callbacks) !void {
     callbacks.set_stream_timeouts(stream, 1_000, 1_000) catch {};
+    read_deadline.begin(callbacks.active_io(), stream, 1_000);
+    defer read_deadline.clear(stream);
     var buffer: [1024]u8 = undefined;
-    const n = try callbacks.read_stream(stream, &buffer);
-    if (n == 0) return;
+    const command = readSocketCommand(stream, &buffer, callbacks.read_stream) catch |err| {
+        const message = switch (err) {
+            error.IncompleteAdminCommand => "ERROR admin command requires a newline\n",
+            error.AdminCommandTooLong => "ERROR admin command exceeds 1023 bytes\n",
+            error.RequestTimeout => "ERROR admin command timed out\n",
+            else => return err,
+        };
+        try sendText(stream, message, callbacks);
+        return;
+    };
+    read_deadline.clear(stream);
     _ = cfg;
-    try handleCommand(stream, allocator, callbacks.active_config(), buffer[0..n], callbacks);
+    try handleCommand(stream, allocator, callbacks.active_config(), command, callbacks);
+}
+
+test "admin command framing waits for a newline across arbitrary reads" {
+    const fixture = struct {
+        var input: []const u8 = "";
+        var chunk: usize = 1;
+        fn read(_: std.Io.net.Stream, out: []u8) !usize {
+            const count = @min(input.len, out.len, chunk);
+            @memcpy(out[0..count], input[0..count]);
+            input = input[count..];
+            return count;
+        }
+    };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    var buffer: [1024]u8 = undefined;
+    for (1..16) |chunk| {
+        fixture.input = "status\nignored\n";
+        fixture.chunk = chunk;
+        try std.testing.expectEqualStrings("status", try readSocketCommand(stream, &buffer, fixture.read));
+    }
+    fixture.input = "status";
+    try std.testing.expectError(error.IncompleteAdminCommand, readSocketCommand(stream, &buffer, fixture.read));
+    const oversized = [_]u8{'x'} ** 1025;
+    fixture.input = &oversized;
+    try std.testing.expectError(error.AdminCommandTooLong, readSocketCommand(stream, &buffer, fixture.read));
 }
 
 pub fn unlinkUnixSocket(path: []const u8, callbacks: Callbacks) void {

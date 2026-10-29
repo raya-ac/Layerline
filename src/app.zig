@@ -771,15 +771,15 @@ fn doctor(io: std.Io, cfg: *const ServerConfig) usize {
 }
 
 fn runAdminCommand(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, command: []const u8) !void {
-    _ = allocator;
     bindThreadIo(io);
     const socket_path = cfg.admin_socket_path orelse DEFAULT_ADMIN_SOCKET_PATH;
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(io);
     defer streamClose(stream);
 
-    try rawStreamWriteAll(stream, command);
-    try rawStreamWriteAll(stream, "\n");
+    const line = try std.fmt.allocPrint(allocator, "{s}\n", .{command});
+    defer allocator.free(line);
+    try rawStreamWriteAll(stream, line);
 
     var buf: [4096]u8 = undefined;
     while (true) {

@@ -211,6 +211,8 @@ if grep -Fq 'verify-secret-token' "$CLI_CONFIG_OUT"; then
 fi
 ok "CLI admin redacted config"
 
+python3 "$ROOT_DIR/scripts/verify-admin-socket.py" "$SOCKET"
+
 ROOT_BODY="$TMP_DIR/root.body"
 curl -fsS "http://$HOST:$PORT/" -o "$ROOT_BODY"
 grep -Fq 'Layerline' "$ROOT_BODY" || die "root page did not contain Layerline"

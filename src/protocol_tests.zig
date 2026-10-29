@@ -9,6 +9,7 @@ test {
     _ = @import("http3_server.zig");
     _ = @import("http2_flow.zig");
     _ = @import("admin_support.zig");
+    _ = @import("admin_runtime.zig");
     _ = @import("config_store.zig");
     _ = @import("request_guard.zig");
     _ = @import("php_version.zig");
