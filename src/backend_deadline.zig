@@ -45,6 +45,15 @@ pub fn logTimeout(phase: []const u8) void {
     std.debug.print("{{\"event\":\"server.backend_timeout\",\"phase\":\"{s}\"}}\n", .{phase});
 }
 
+pub fn checkReadCompletion(stream: std.Io.net.Stream) !void {
+    if (forStream(stream)) |state| {
+        _ = state.remaining() catch |err| {
+            logTimeout("read");
+            return err;
+        };
+    }
+}
+
 // ConnectOptions.timeout is not implemented by Zig's threaded IO yet. Race the
 // whole dial (including lookup) and join it before any borrowed inputs go away.
 pub fn connect(io: std.Io, comptime dial: anytype, args: std.meta.ArgsTuple(@TypeOf(dial))) !std.Io.net.Stream {
@@ -113,6 +122,20 @@ test "backend budgets keep their original deadline and match only their socket" 
     try std.testing.expect(forStream(stream) != null);
     clear(stream);
     try std.testing.expect(forStream(stream) == null);
+}
+
+test "late successful reads still fail the original backend budget" {
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    const other = std.Io.net.Stream{ .socket = .{ .handle = 124, .address = undefined } };
+    const previous = active;
+    defer active = previous;
+    active = .{ .io = std.testing.io, .deadline = .after(.zero, 1), .timeout_ms = 1, .handle = stream.socket.handle };
+    try checkReadCompletion(other);
+    try std.testing.expectError(error.RequestTimeout, checkReadCompletion(stream));
+    active.?.deadline = .{};
+    try checkReadCompletion(stream);
+    active = null;
+    try checkReadCompletion(stream);
 }
 
 test "dial timeout cancels and joins work before returning" {

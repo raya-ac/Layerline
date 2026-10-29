@@ -82,6 +82,11 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
         }
         return normalized;
     };
+    // Socket timers are a wakeup mechanism, not proof that a successful read
+    // finished on time. Late backend bytes must not turn a timeout into a 200.
+    // Do not drop downstream bytes here: HTTP/2 retains partial TLS/frame input
+    // across its soft stream deadlines.
+    try backend_deadline.checkReadCompletion(stream);
     if (n > 0) read_deadline.noteProgress(stream);
     return n;
 }
@@ -142,6 +147,12 @@ pub fn rawStreamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, ac
         if (n == 0) return error.WriteZero;
         written += n;
         accepted.* +|= n;
+        if (backend) |state| {
+            _ = state.remaining() catch |err| {
+                backend_deadline.logTimeout("write");
+                return err;
+            };
+        }
     }
 }
 

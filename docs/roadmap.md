@@ -74,6 +74,12 @@ Proxy/FastCGI attempts and health probes now use absolute backend budgets across
 dialing, writes, and reads. Automatic proxy retries exclude non-idempotent
 methods; each permitted attempt has a fresh budget. Plain/TLS wire tests cover
 trickling backends, FastCGI TCP/Unix records, stale sockets, and tunnel lifetimes.
+Successful backend reads and writes recheck the original absolute budget
+after the syscall too: delayed kernel timer wakeups cannot accept a late backend
+reply as success. Bytes already written remain accounted before a late write is
+aborted. Downstream partial TLS/frame input is not discarded by this check.
+Darwin socket timeout/error handling still has a failing Debug disconnect test;
+a green ReleaseFast run does not close that gate.
 Darwin resolver cancellation and external CGI execution still need stronger
 deadline guarantees. The next work also includes wider HTTP/2 frame/stream
 conformance, listener readiness and full process resource budgets.
