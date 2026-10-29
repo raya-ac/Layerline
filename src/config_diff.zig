@@ -244,6 +244,7 @@ pub fn render(allocator: std.mem.Allocator, active: *const ServerConfig, candida
     changes += try appendBoolChange(&out, allocator, "global.compression", active.compression_enabled, candidate.compression_enabled);
     changes += try appendBoolChange(&out, allocator, "global.response_cache", active.response_cache_enabled, candidate.response_cache_enabled);
     changes += try appendBoolChange(&out, allocator, "global.tls", active.tls_enabled, candidate.tls_enabled);
+    changes += try appendIntChange(&out, allocator, u32, "global.external_command_timeout_ms", active.external_command_timeout_ms, candidate.external_command_timeout_ms);
     changes += try appendOptionalStringChange(&out, allocator, "global.tls_cert", active.tls_cert, candidate.tls_cert);
     changes += try appendBoolChange(&out, allocator, "global.http_redirect", active.http_redirect_enabled, candidate.http_redirect_enabled);
     changes += try appendBoolChange(&out, allocator, "global.http3", active.http3_enabled, candidate.http3_enabled);

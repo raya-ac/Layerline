@@ -210,7 +210,7 @@ fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *
     if (active.letsencrypt_domains == null or active.letsencrypt_domains.?.len == 0) return error.AcmeRenewalDisabled;
     if (active.letsencrypt_webroot.len == 0) return error.AcmeRenewalDisabled;
 
-    try acme_mod.runLetsEncryptRenewal(io, allocator, active, &runtime_state.server_metrics);
+    try acme_mod.runLetsEncryptRenewal(io, allocator, active, &runtime_state.server_metrics, &runtime_state.shutdown_requested, runtime_state.process_env);
     try reloadConfigInMemory(io, allocator, active);
 }
 
@@ -838,6 +838,8 @@ fn usage() void {
 
 // Bootstraps config/CLI, optional cert automation, then starts the accept loop.
 pub fn main(init: std.process.Init) !void {
+    runtime_state.process_env = init.environ_map;
+    defer runtime_state.process_env = null;
     bindThreadIo(init.io);
     installProcessSignalHandlers();
     runtime_state.shutdown_requested.store(false, .release);
@@ -848,15 +850,15 @@ pub fn main(init: std.process.Init) !void {
     if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
 
     if (cfg.tls_auto) {
-        ensureLetsEncryptSetup(init.io, std.heap.page_allocator, &cfg) catch |err| {
+        ensureLetsEncryptSetup(init.io, std.heap.page_allocator, &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
             std.debug.print("Let's Encrypt automation failed: {}\n", .{err});
-            return;
+            return err;
         };
     }
 
-    ensureCloudflareDeployment(init.io, std.heap.page_allocator, &cfg) catch |err| {
+    ensureCloudflareDeployment(init.io, std.heap.page_allocator, &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
         std.debug.print("Cloudflare deployment failed: {}\n", .{err});
-        return;
+        return err;
     };
 
     loadAllConfiguredTlsMaterials(init.io, std.heap.page_allocator, &cfg) catch |err| {

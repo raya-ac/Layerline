@@ -89,8 +89,15 @@ checks asynchronous completion with `SO_ERROR`. Hostname lookup still uses the
 standard resolver and races candidate addresses, with cancelable result
 publication and owned cleanup for losing sockets. It does not add HTTP retries
 or reset the outer backend-attempt deadline.
-Darwin resolver cancellation and external CGI execution still need stronger
-deadline guarantees. The next work also includes wider HTTP/2 frame/stream
+CGI and external certificate/DNS commands now use an owned native process runner
+with concurrent bounded pipes, absolute deadlines, failed-exec reaping, a shared
+64-child admission limit, and shutdown group cleanup. Certificate commands have
+a separate positive `external_command_timeout_ms` setting (300000 by default).
+Raw command output is not logged; Cloudflare authorization travels through stdin.
+RSA signing is isolated on bounded joined worker stacks, rather than overflowing
+the default small connection stack in Debug. These controls do not sandbox child
+code or cover uninterruptible kernel operations. Darwin resolver cancellation
+still needs stronger deadline guarantees. The next work also includes wider HTTP/2 frame/stream
 conformance, listener readiness and full process resource budgets.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client

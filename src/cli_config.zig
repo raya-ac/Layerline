@@ -150,6 +150,10 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
                 return false;
             };
             cfg.letsencrypt_renew_interval_ms = std.fmt.parseInt(u32, value, 10) catch cfg.letsencrypt_renew_interval_ms;
+        } else if (std.mem.eql(u8, arg, "--external-command-timeout-ms")) {
+            const value = args.next() orelse return error.InvalidConfigValue;
+            cfg.external_command_timeout_ms = std.fmt.parseInt(u32, value, 10) catch return error.InvalidConfigValue;
+            if (cfg.external_command_timeout_ms == 0) return error.InvalidConfigValue;
         } else if (std.mem.eql(u8, arg, "--http-redirect") or std.mem.eql(u8, arg, "--http-to-https")) {
             const value = args.next() orelse {
                 callbacks.usage();

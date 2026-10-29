@@ -174,6 +174,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.index_file.len == 0) return error.InvalidConfigValue;
     if (cfg.php_root.len == 0) return error.InvalidConfigValue;
     if (cfg.php_binary.len == 0) return error.InvalidConfigValue;
+    if (cfg.external_command_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.php_fastcgi) |endpoint| try validateFastcgiEndpoint(endpoint);
     if (!isSafeRelativeScriptPath(cfg.php_index)) return error.InvalidConfigValue;
     if (cfg.http3_enabled and cfg.http3_port == 0) return error.InvalidConfigValue;

@@ -448,6 +448,7 @@ pub fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Alloc
     try appendAdminNumberInput(out, allocator, "Max request bytes", "max_request_bytes", cfg.max_request_bytes);
     try appendAdminNumberInput(out, allocator, "Header timeout ms", "read_header_timeout_ms", cfg.read_header_timeout_ms);
     try appendAdminNumberInput(out, allocator, "Idle timeout ms", "idle_timeout_ms", cfg.idle_timeout_ms);
+    try appendAdminNumberInput(out, allocator, "External command timeout ms", "external_command_timeout_ms", cfg.external_command_timeout_ms);
     try appendAdminNumberInput(out, allocator, "Worker stack bytes", "worker_stack_size", cfg.worker_stack_size);
 
     try out.appendSlice(allocator,

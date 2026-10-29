@@ -355,6 +355,9 @@ fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
     const max_request_bytes = admin_support.adminTrimmedField(fields.items, "max_request_bytes");
     const read_header_timeout_ms = admin_support.adminTrimmedField(fields.items, "read_header_timeout_ms");
     const idle_timeout_ms = admin_support.adminTrimmedField(fields.items, "idle_timeout_ms");
+    const posted_command_timeout = admin_support.adminTrimmedField(fields.items, "external_command_timeout_ms");
+    var command_timeout_buffer: [10]u8 = undefined;
+    const external_command_timeout_ms = if (posted_command_timeout.len > 0) posted_command_timeout else try std.fmt.bufPrint(&command_timeout_buffer, "{d}", .{cfg.external_command_timeout_ms});
     const worker_stack_size = admin_support.adminTrimmedField(fields.items, "worker_stack_size");
 
     const settings = [_]AdminConfigSetting{
@@ -398,6 +401,7 @@ fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
         .{ .key = "max_request_bytes", .value = max_request_bytes },
         .{ .key = "read_header_timeout_ms", .value = read_header_timeout_ms },
         .{ .key = "idle_timeout_ms", .value = idle_timeout_ms },
+        .{ .key = "external_command_timeout_ms", .value = external_command_timeout_ms },
         .{ .key = "worker_stack_size", .value = worker_stack_size },
     };
 

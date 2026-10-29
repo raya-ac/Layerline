@@ -645,6 +645,9 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         cfg.write_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "upstream_timeout_ms")) {
         cfg.upstream_timeout_ms = try parseConfigU32(v);
+    } else if (std.mem.eql(u8, k, "external_command_timeout_ms")) {
+        cfg.external_command_timeout_ms = try parseConfigU32(v);
+        if (cfg.external_command_timeout_ms == 0) return error.InvalidConfigValue;
     } else if (std.mem.eql(u8, k, "upstream_retries")) {
         cfg.upstream_retries = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "upstream_max_failures") or std.mem.eql(u8, k, "upstream_max_fails") or std.mem.eql(u8, k, "proxy_max_fails")) {

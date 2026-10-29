@@ -3,6 +3,7 @@ const static_files = @import("static_files.zig");
 const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
+const child_process = @import("child_process.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
@@ -134,24 +135,39 @@ pub fn applyLetsEncryptDefaultCertPaths(allocator: std.mem.Allocator, cfg: *Serv
     }
 }
 
-pub fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) ![]const u8 {
+pub const CommandOptions = struct {
+    timeout_ms: u32 = config_mod.DEFAULT_EXTERNAL_COMMAND_TIMEOUT_MS,
+    shutdown: ?*const std.atomic.Value(bool) = null,
+    input: []const u8 = "",
+    environ_map: ?*const std.process.Environ.Map = null,
+};
+
+pub fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, options: CommandOptions) ![]const u8 {
     var full_args = std.ArrayList([]const u8).empty;
     defer full_args.deinit(allocator);
     try full_args.append(allocator, command);
     for (args) |arg| try full_args.append(allocator, arg);
 
-    const result = try std.process.run(
-        allocator,
+    const result = child_process.run(
         io,
+        allocator,
         .{
             .argv = full_args.items,
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(256 * 1024),
+            .stdout_limit = 1024 * 1024,
+            .stderr_limit = 256 * 1024,
+            .timeout_ms = options.timeout_ms,
+            .shutdown = options.shutdown,
+            .input = options.input,
+            .environ_map = options.environ_map,
         },
-    );
+    ) catch |err| {
+        // Command arguments and output may contain API credentials.
+        std.debug.print("{{\"event\":\"server.command_failure\",\"error\":\"{s}\"}}\n", .{@errorName(err)});
+        return err;
+    };
     const out = result.stdout;
-    const err_out = result.stderr;
-    defer allocator.free(err_out);
+    errdefer allocator.free(out);
+    defer allocator.free(result.stderr);
     switch (result.term) {
         .exited => |code| {
             if (code != 0) return error.UnexpectedExit;
@@ -159,19 +175,18 @@ pub fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, command: []co
         else => return error.UnexpectedExit,
     }
 
-    if (out.len > 0 and std.mem.indexOf(u8, command, "curl") == null) {
-        std.debug.print("[cmd] {s}\n", .{out});
-    }
-    if (err_out.len > 0) {
-        std.debug.print("[cmd err] {s}\n", .{err_out});
-    }
-
     return out;
 }
 
-pub fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !void {
-    const out = try runCommandCapture(io, allocator, command, args);
+pub fn runCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8, options: CommandOptions) !void {
+    const out = try runCommandCapture(io, allocator, command, args, options);
     allocator.free(out);
+}
+
+test "failed external commands release both captured output buffers" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.UnexpectedExit, runCommandCapture(std.testing.io, std.testing.allocator, "/bin/sh", &.{ "-c", "printf output; printf diagnostic >&2; exit 7" }, .{ .timeout_ms = 2000 }));
 }
 
 pub fn isCloudflareSuccess(payload: []const u8) bool {
@@ -205,24 +220,24 @@ pub fn callCloudflareApi(
     method: []const u8,
     endpoint: []const u8,
     payload: ?[]const u8,
+    options: CommandOptions,
 ) ![]const u8 {
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ api_base, endpoint });
     defer allocator.free(url);
 
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\nContent-Type: application/json\n", .{token});
     defer allocator.free(auth_header);
 
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
     try args.appendSlice(allocator, &.{
         "curl",
+        "--disable",
         "-fsS",
         "-X",
         method,
         "-H",
-        auth_header,
-        "-H",
-        "Content-Type: application/json",
+        "@-",
     });
     if (payload) |body| {
         try args.append(allocator, "-d");
@@ -230,20 +245,24 @@ pub fn callCloudflareApi(
     }
     try args.append(allocator, url);
 
-    return try runCommandCapture(io, allocator, args.items[0], args.items[1..]);
+    var command_options = options;
+    command_options.input = auth_header;
+    return try runCommandCapture(io, allocator, args.items[0], args.items[1..], command_options);
 }
 
-pub fn detectPublicIp(io: std.Io, allocator: std.mem.Allocator, record_type: []const u8) ![]const u8 {
+pub fn detectPublicIp(io: std.Io, allocator: std.mem.Allocator, record_type: []const u8, options: CommandOptions) ![]const u8 {
     const target_service = if (std.mem.eql(u8, record_type, "AAAA"))
         "https://api64.ipify.org?format=text"
     else
         "https://api64.ipify.org";
-    const out = trimValue(try runCommandCapture(io, allocator, "curl", &.{ "-fsS", target_service }));
+    const captured = try runCommandCapture(io, allocator, "curl", &.{ "--disable", "-fsS", target_service }, options);
+    defer allocator.free(captured);
+    const out = trimValue(captured);
     if (out.len == 0) return error.UnexpectedResponse;
     return try allocator.dupe(u8, out);
 }
 
-pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {
     if (!cfg.cloudflare_auto_deploy) return;
 
     if (cfg.cloudflare_token == null) {
@@ -253,6 +272,7 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
 
     const token = cfg.cloudflare_token.?;
     const api_base = cfg.cloudflare_api_base;
+    const options: CommandOptions = .{ .timeout_ms = @min(cfg.external_command_timeout_ms, 30_000), .shutdown = shutdown, .environ_map = environment };
 
     var zone_id = cfg.cloudflare_zone_id;
     var zone_id_owned: ?[]const u8 = null;
@@ -263,12 +283,11 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
         const zone_lookup_ep = try std.fmt.allocPrint(allocator, "/zones?name={s}", .{zone_name});
         defer allocator.free(zone_lookup_ep);
 
-        const zone_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", zone_lookup_ep, null);
+        const zone_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", zone_lookup_ep, null, options);
         defer allocator.free(zone_payload);
 
         if (!isCloudflareSuccess(zone_payload)) {
-            const reason = extractCloudflareError(zone_payload) orelse "unknown reason";
-            std.debug.print("Cloudflare zone lookup failed: {s}\n", .{reason});
+            std.debug.print("Cloudflare zone lookup failed.\n", .{});
             return error.CloudflareZoneLookupFailed;
         }
 
@@ -305,7 +324,7 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
             );
             return error.CloudflareRecordContentMissing;
         }
-        const detected = try detectPublicIp(io, allocator, record_type);
+        const detected = try detectPublicIp(io, allocator, record_type, options);
         auto_content = detected;
         break :blk detected;
     };
@@ -322,12 +341,11 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
     );
     defer allocator.free(list_endpoint);
 
-    const list_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", list_endpoint, null);
+    const list_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", list_endpoint, null, options);
     defer allocator.free(list_payload);
 
     if (!isCloudflareSuccess(list_payload)) {
-        const reason = extractCloudflareError(list_payload) orelse "unknown reason";
-        std.debug.print("Cloudflare DNS lookup failed: {s}\n", .{reason});
+        std.debug.print("Cloudflare DNS lookup failed.\n", .{});
         return error.CloudflareDnsLookupFailed;
     }
 
@@ -380,12 +398,11 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
         try std.fmt.allocPrint(allocator, "/zones/{s}/dns_records", .{zone_id.?});
     defer allocator.free(endpoint);
 
-    const deploy_payload = try callCloudflareApi(io, allocator, token, api_base, method, endpoint, record_payload);
+    const deploy_payload = try callCloudflareApi(io, allocator, token, api_base, method, endpoint, record_payload, options);
     defer allocator.free(deploy_payload);
 
     if (!isCloudflareSuccess(deploy_payload)) {
-        const reason = extractCloudflareError(deploy_payload) orelse "unknown reason";
-        std.debug.print("Cloudflare DNS {s} failed for {s}: {s}\n", .{ method, record_name, reason });
+        std.debug.print("Cloudflare DNS update failed.\n", .{});
         return error.CloudflareRecordUpdateFailed;
     }
 
@@ -393,7 +410,7 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
     std.debug.print("Cloudflare DNS {s}: {s} {s} -> {s}\n", .{ action, record_name, record_type, final_content });
 }
 
-pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
+pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {
     if (!cfg.tls_auto) return;
     if (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0) {
         std.debug.print("Skipping Let's Encrypt setup because letsencrypt_domains is empty.\n", .{});
@@ -424,10 +441,10 @@ pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Se
     try buildLetsEncryptCertonlyArgs(allocator, cfg, domains.items, &cert_args);
 
     std.debug.print("Running Let's Encrypt setup for {d} domain(s) via {s}\n", .{ domains.items.len, cfg.letsencrypt_certbot });
-    try runCommand(io, allocator, cfg.letsencrypt_certbot, cert_args.items);
+    try runCommand(io, allocator, cfg.letsencrypt_certbot, cert_args.items, .{ .timeout_ms = cfg.external_command_timeout_ms, .shutdown = shutdown, .environ_map = environment });
 }
 
-pub fn runLetsEncryptRenewal(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, metrics: *ServerMetrics) !void {
+pub fn runLetsEncryptRenewal(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, metrics: *ServerMetrics, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {
     if (!cfg.tls_auto or !cfg.letsencrypt_renew) return;
     if (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0) return;
     if (cfg.letsencrypt_webroot.len == 0) return;
@@ -438,7 +455,7 @@ pub fn runLetsEncryptRenewal(io: std.Io, allocator: std.mem.Allocator, cfg: *con
 
     std.debug.print("Running Let's Encrypt renewal via {s}\n", .{cfg.letsencrypt_certbot});
     metrics.acmeRenewalStarted();
-    runCommand(io, allocator, cfg.letsencrypt_certbot, renew_args.items) catch |err| {
+    runCommand(io, allocator, cfg.letsencrypt_certbot, renew_args.items, .{ .timeout_ms = cfg.external_command_timeout_ms, .shutdown = shutdown, .environ_map = environment }) catch |err| {
         metrics.acmeRenewalFailed();
         return err;
     };

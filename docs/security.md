@@ -269,15 +269,64 @@ downstream writes can still occupy the connection thread until their deadline.
 attempt: dialing, request writes, and response reads share one monotonic budget.
 FastCGI uses the same mechanism, including TCP and Unix sockets, PARAMS/STDIN
 writes, record headers, and output reads. Health probes use their own configured
-budget. Bytes arriving periodically do not renew these clocks. A timeout of zero
-disables the absolute backend budget as well as the existing socket idle limit.
+budget. Bytes arriving periodically do not renew these clocks. Validated backend
+timeout policies must be positive; zero is rejected by configuration validation.
 
 Dialing races an owned IO task against the deadline and cancels/joins it before
 returning; even a successful late connection is closed. Linux uses Zig's
 cancellable resolver. Darwin's libc resolver can delay cancellation while inside
-`getaddrinfo`, so a hard DNS deadline there is not yet guaranteed. External CGI
-process execution is still outside these socket budgets. This is not a full
-end-to-end application execution deadline on every platform/path.
+`getaddrinfo`, so a hard DNS deadline there is not yet guaranteed. This is not a
+full end-to-end application execution deadline on every platform/path.
+
+## Child Processes
+
+On Linux and macOS, CGI uses the selected `upstream_timeout_ms` budget for child
+launch, request input, stdout/stderr capture, and process exit. The pipes are
+pumped together, so a worker writing output before reading stdin cannot deadlock
+the request. Periodic output does not renew the deadline. Positive global,
+domain, and route timeout policies are honored.
+CGI output is bounded by `max_php_output_bytes`; stderr has a separate 64 KiB cap.
+Timeouts return 504, output/exec failures return 502, and local process/descriptor
+or allocation exhaustion returns 503 before response output.
+
+CGI, certificate, and DNS helper commands share a 64-child process-wide admission
+limit, held through cleanup. Layerline owns each PID immediately after fork,
+including failed execs, rather than relying on the standard spawn error path.
+Only prebuilt arguments/environment and async-signal-safe syscalls run in the
+fork child. A close-on-exec status pipe reports launch failure to the parent.
+Launch serialization prevents another command from inheriting a partially
+configured Darwin pipe. Normal completion and failure close all parent endpoints
+and reap the direct child. Remaining members of the child's process group receive
+SIGKILL; a SIGTERM-ignoring child cannot turn cleanup into an indefinite wait.
+The leader stays unreaped until group signaling is complete, avoiding PID reuse
+races. The shutdown registry uses the same ownership lock when signaling/reaping.
+
+Certificate commands use the positive `external_command_timeout_ms` setting,
+defaulting to 300000 ms. DNS/public-IP helpers use the lesser of that value and
+30000 ms. Setup failure exits nonzero. Setup and renewal observe shutdown;
+CGI gets its normal drain window, with remaining child work canceled 100 ms
+before the configured forced-exit deadline to allow joined cleanup. The final
+shutdown guard also signals registered children before exiting. Raw helper output
+is not logged. CGI diagnostics report byte counts, not their contents, and the
+Cloudflare child receives its authorization header through stdin instead of argv.
+Keep credentials in a private config rather than the owner's command line too.
+
+These are process-lifetime controls, not a sandbox or a hard kernel scheduling
+guarantee. Trusted scripts can change groups/credentials or delegate work to
+another service; that work is outside this process-group ownership. Uninterruptible
+kernel operations can delay reaping. CGI still runs with the server's identity
+and configured environment. Use an isolated PHP-FPM service for untrusted code.
+Native HTTP/2 PHP currently requires FastCGI, and Windows child lifetime handling
+has not been accepted.
+
+## RSA Signing
+
+RSA TLS signing uses joined, separately sized worker stacks instead of the small
+connection stack. At most eight signers run at once, each with a 512 KiB stack;
+excess handshakes fail admission. This bounds the extra signing workspace without
+enlarging every connection stack. It is not a full TLS/process memory budget.
+
+## Backend Failures
 
 Local dial task/descriptor exhaustion returns 503 without retries or passive
 backend ejection. Active probes skip results caused by local capacity/allocation
@@ -305,7 +354,7 @@ transport/protocol failures return 502 and discard the connection, rather than
 turning a stale worker socket into an internal 500. Reused connections start a
 fresh budget. A successful HTTP/1 Upgrade handshake disarms the attempt deadline
 before tunnel traffic begins; normal tunnel idle/shutdown rules still apply.
-`server.backend_timeout` events identify only `connect`, `read`, or `write`, not
+`server.backend_timeout` events identify `connect`, `read`, `write`, or `cgi`, not
 request paths, query strings, headers, bodies, or credentials.
 
 ## Verification scope
@@ -313,7 +362,8 @@ request paths, query strings, headers, bodies, or credentials.
 `zig build test` includes the native guard, session lifecycle, cache accounting,
 reload cap, and exposed-version checks. Allocation-failure injection covers
 HPACK table insertion and pending request cloning, including cleanup after every
-failed allocation. `scripts/verify-layerline.sh` exercises
+failed allocation, plus native child capture/launch allocations and output cleanup.
+`scripts/verify-layerline.sh` exercises
 wire-level HTTP/1 and HTTP/2, normal and abusive multipart fixtures, denial log
 privacy, backend version notices, admin bootstrap/logout/origin behavior,
 symlink escapes, encrypted static responses, and config reload. The raw HTTP/2

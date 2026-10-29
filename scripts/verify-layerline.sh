@@ -104,6 +104,7 @@ admin_ui_path = /_layerline/admin
 admin_credentials_path = $ADMIN_CREDS
 access_log = $ACCESS_LOG
 cf_token = verify-secret-token
+external_command_timeout_ms = 9876
 http3 = true
 http3_port = $H3_PORT
 compression = true
@@ -636,6 +637,7 @@ curl -fsS -b "$COOKIE_JAR" -o "$TMP_DIR/admin-settings.body" \
 grep -Fq 'Saved settings to ' "$TMP_DIR/admin-settings.body" || die "admin settings response did not confirm save"
 grep -Fq 'compression = true' "$CONFIG" || die "admin settings did not update main config"
 grep -Fq 'admin_ui = true' "$CONFIG" || die "admin settings did not preserve admin UI"
+grep -Fq 'external_command_timeout_ms = 9876' "$CONFIG" || die "older admin form dropped the existing command deadline"
 [[ -s "$CONFIG.bak" ]] || die "admin settings did not create a config backup"
 ok "admin UI saves main settings"
 
@@ -772,6 +774,9 @@ python3 "$ROOT_DIR/scripts/verify-deadlines.py" "$SERVER_BINARY"
 
 log "verifying CGI and FastCGI version notices"
 python3 "$ROOT_DIR/scripts/verify-php-version.py" "$SERVER_BINARY"
+
+log "verifying child-process deadlines and cleanup"
+python3 "$ROOT_DIR/scripts/verify-child-processes.py" "$SERVER_BINARY"
 
 log "verifying HTTP/1 response transfer budgets"
 python3 "$ROOT_DIR/scripts/verify-http1-transfer.py" "$SERVER_BINARY"

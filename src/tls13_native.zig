@@ -257,7 +257,48 @@ pub fn signCertificateVerifyRsaPssSha256(
 ) ![]u8 {
     const input = try certificateVerifySignatureInput(allocator, transcript_hash_value);
     defer allocator.free(input);
-    return rsaPssSha256Sign(io, allocator, key, input);
+    // The constant-time RSA implementation has a sizeable stack workspace in
+    // Debug builds. Keep that workspace off the small connection stacks, with
+    // bounded admission rather than growing every TLS connection's stack.
+    try reserveRsaSigner();
+    defer _ = rsa_signers.fetchSub(1, .acq_rel);
+    const Task = struct {
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        key: RsaPrivateKey,
+        input: []const u8,
+        result: anyerror![]u8 = error.RsaSigningIncomplete,
+
+        fn run(task: *@This()) void {
+            task.result = rsaPssSha256Sign(task.io, task.allocator, task.key, task.input);
+        }
+    };
+    var task: Task = .{ .io = io, .allocator = allocator, .key = key, .input = input };
+    const worker = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Task.run, .{&task});
+    // The task borrows key/input and the connection allocator. Never detach it.
+    worker.join();
+    return task.result;
+}
+
+const max_rsa_signers = 8;
+var rsa_signers = std.atomic.Value(usize).init(0);
+
+fn reserveRsaSigner() !void {
+    const previous = rsa_signers.fetchAdd(1, .acq_rel);
+    if (previous >= max_rsa_signers) {
+        _ = rsa_signers.fetchSub(1, .acq_rel);
+        return error.RsaSigningCapacity;
+    }
+}
+
+test "RSA signer admission remains bounded and failed reservations release their slot" {
+    try std.testing.expectEqual(0, rsa_signers.load(.acquire));
+    for (0..max_rsa_signers) |_| try reserveRsaSigner();
+    defer rsa_signers.store(0, .release);
+    try std.testing.expectError(error.RsaSigningCapacity, reserveRsaSigner());
+    try std.testing.expectEqual(max_rsa_signers, rsa_signers.load(.acquire));
+    _ = rsa_signers.fetchSub(1, .acq_rel);
+    try reserveRsaSigner();
 }
 
 pub fn buildSelfSignedEd25519Certificate(

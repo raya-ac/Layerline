@@ -14,6 +14,7 @@ pub const DEFAULT_READ_BODY_TIMEOUT_MS = 30_000;
 pub const DEFAULT_IDLE_TIMEOUT_MS = 60_000;
 pub const DEFAULT_WRITE_TIMEOUT_MS = 30_000;
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
+pub const DEFAULT_EXTERNAL_COMMAND_TIMEOUT_MS = 300_000;
 pub const DEFAULT_UPSTREAM_RETRIES = 1;
 pub const DEFAULT_UPSTREAM_MAX_FAILURES = 2;
 pub const DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS = 10_000;
@@ -401,6 +402,7 @@ pub const ServerConfig = struct {
     idle_timeout_ms: u32,
     write_timeout_ms: u32,
     upstream_timeout_ms: u32,
+    external_command_timeout_ms: u32,
     upstream_retries: usize,
     upstream_max_failures: usize,
     upstream_fail_timeout_ms: u32,
@@ -512,6 +514,7 @@ pub fn defaultServerConfig() ServerConfig {
         .idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS,
         .write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS,
         .upstream_timeout_ms = DEFAULT_UPSTREAM_TIMEOUT_MS,
+        .external_command_timeout_ms = DEFAULT_EXTERNAL_COMMAND_TIMEOUT_MS,
         .upstream_retries = DEFAULT_UPSTREAM_RETRIES,
         .upstream_max_failures = DEFAULT_UPSTREAM_MAX_FAILURES,
         .upstream_fail_timeout_ms = DEFAULT_UPSTREAM_FAIL_TIMEOUT_MS,

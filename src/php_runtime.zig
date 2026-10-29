@@ -12,6 +12,7 @@ const http_response = @import("http_response.zig");
 const metrics_mod = @import("metrics.zig");
 const request_mod = @import("request.zig");
 const backend_deadline = @import("backend_deadline.zig");
+const child_process = @import("child_process.zig");
 
 const FastcgiIdleConnection = config_mod.FastcgiIdleConnection;
 const FastcgiKeepAlivePool = config_mod.FastcgiKeepAlivePool;
@@ -600,62 +601,40 @@ pub fn handleScript(
 
     // PHP-CGI wants the script in the CGI environment. Plain `php` gets a
     // script argument as a fallback for local development setups.
-    var child = std.process.spawn(io, .{
+    const result = child_process.run(io, allocator, .{
         .argv = argv.items,
         .environ_map = &child_env,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit,
+        .input = req.body,
+        .timeout_ms = timeout_ms,
+        .stdout_limit = cfg.max_php_output_bytes,
+        .stderr_limit = callbacks.stderr_limit,
     }) catch |err| {
-        std.debug.print("PHP spawn failed for {s}: {}\n", .{ php_binary, err });
+        if (err == error.Canceled) return err;
+        const capacity = err == error.ChildCapacity or err == error.SystemResources or err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded or err == error.OutOfMemory;
+        if (err == error.RequestTimeout) backend_deadline.logTimeout("cgi");
+        std.debug.print("{{\"event\":\"server.cgi_failure\",\"error\":\"{s}\"}}\n", .{@errorName(err)});
+        const message = switch (err) {
+            error.RequestTimeout => "PHP CGI request exceeded its backend deadline.",
+            error.StdoutTooLong => "PHP response exceeded max_php_output_bytes.",
+            error.StderrTooLong => "PHP diagnostics exceeded the configured output limit.",
+            else => if (capacity) "Local child-process capacity is exhausted." else "PHP worker could not complete the request. Check php_bin and the worker configuration.",
+        };
         try callbacks.send_cool_error(
             stream,
             allocator,
-            502,
-            "Bad Gateway",
-            "PHP worker could not be started. Check php_bin and make sure php-cgi is installed or configured with an absolute path.",
+            if (err == error.RequestTimeout) 504 else if (capacity) 503 else 502,
+            if (err == error.RequestTimeout) "Gateway Timeout" else if (capacity) "Service Unavailable" else "Bad Gateway",
+            message,
             close_connection,
             is_head,
             null,
         );
         return;
     };
-    defer child.kill(io);
-
-    if (child.stdin) |in_pipe| {
-        var in_writer = in_pipe.writer(io, &.{});
-        if (req.body.len > 0) {
-            try in_writer.interface.writeAll(req.body);
-        }
-        in_pipe.close(io);
-    }
-
-    const max_output = cfg.max_php_output_bytes;
-    const output = if (child.stdout) |out_pipe| blk: {
-        var out_reader = out_pipe.reader(io, &.{});
-        const captured_output = out_reader.interface.allocRemaining(allocator, .limited(max_output)) catch |err| switch (err) {
-            error.StreamTooLong => {
-                try callbacks.send_cool_error(
-                    stream,
-                    allocator,
-                    502,
-                    "Bad Gateway",
-                    "PHP response exceeded max_php_output_bytes.",
-                    close_connection,
-                    is_head,
-                    null,
-                );
-                return;
-            },
-            else => |e| return e,
-        };
-        break :blk captured_output;
-    } else return error.InternalServerError;
-    defer allocator.free(output);
-    if (child.stdout) |out_pipe| out_pipe.close(io);
-
-    const term = try child.wait(io);
-    switch (term) {
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.stderr.len > 0) std.debug.print("{{\"event\":\"server.cgi_stderr\",\"bytes\":{d}}}\n", .{result.stderr.len});
+    switch (result.term) {
         .exited => |code| {
             if (code != 0) {
                 try callbacks.send_cool_error(
@@ -686,5 +665,5 @@ pub fn handleScript(
         },
     }
 
-    try sendPhpOutput(stream, allocator, output, close_connection, is_head, callbacks);
+    try sendPhpOutput(stream, allocator, result.stdout, close_connection, is_head, callbacks);
 }

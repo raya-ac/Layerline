@@ -5,6 +5,16 @@ const h2_support = @import("http2_support.zig");
 const cache = @import("buffered_cache.zig");
 const static_files = @import("static_files.zig");
 
+test "external command deadlines have a positive default and reject invalid config" {
+    const config = @import("config.zig");
+    var cfg = config.defaultServerConfig();
+    try std.testing.expectEqual(@as(u32, 300_000), cfg.external_command_timeout_ms);
+    try config.applyConfigLine(&cfg, std.testing.allocator, "external_command_timeout_ms", "75");
+    try std.testing.expectEqual(@as(u32, 75), cfg.external_command_timeout_ms);
+    try std.testing.expectError(error.InvalidConfigValue, config.applyConfigLine(&cfg, std.testing.allocator, "external_command_timeout_ms", "0"));
+    try std.testing.expectError(error.InvalidConfigValue, config.validateConfig(&cfg));
+}
+
 test {
     _ = @import("backend_deadline.zig");
     _ = @import("upstream_runtime.zig");
@@ -30,6 +40,7 @@ test {
     _ = @import("stream_runtime.zig");
     _ = @import("socket_io.zig");
     _ = @import("native_connect.zig");
+    _ = @import("child_process.zig");
 }
 
 test "HTTP2 trailers stay separate from routing and authentication fields" {

@@ -9,6 +9,7 @@ const http1_runtime = @import("http1_runtime.zig");
 const http3_server = @import("http3_server.zig");
 const metrics_mod = @import("metrics.zig");
 const native_connect = @import("native_connect.zig");
+const native_spawn = @import("native_spawn.zig");
 const static_cache = @import("static_cache.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const upstream_mod = @import("upstream.zig");
@@ -67,6 +68,7 @@ const ShutdownDeadlineContext = struct {
 };
 
 fn forceShutdown(ctx: Context, connections: *concurrency_mod.State) noreturn {
+    _ = native_spawn.tryStopAll(ctx.io);
     std.debug.print("{{\"event\":\"server.shutdown_timeout\",\"active_connections\":{d},\"timeout_ms\":{d}}}\n", .{ connections.active(), ctx.cfg.graceful_shutdown_timeout_ms });
     if (ctx.cfg.admin_enabled) {
         admin_runtime.unlinkUnixSocket(ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path, ctx.callbacks.admin);
@@ -84,8 +86,13 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     const start = std.Io.Timestamp.now(ctx.io, .awake);
+    var children_stopped = false;
     while (!state.complete.load(.acquire)) {
         const elapsed = start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
+        const child_cutoff = ctx.cfg.graceful_shutdown_timeout_ms -| @as(u32, 100);
+        if (!children_stopped and elapsed >= child_cutoff) {
+            children_stopped = native_spawn.tryStopAll(ctx.io);
+        }
         if (elapsed >= ctx.cfg.graceful_shutdown_timeout_ms) {
             forceShutdown(ctx, state.connections);
         }

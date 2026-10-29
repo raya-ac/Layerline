@@ -107,12 +107,13 @@ pub fn renderCerts(allocator: std.mem.Allocator, cfg: *const ServerConfig, runti
 
     try out.print(
         allocator,
-        "global tls={s} tls_auto={s} renew={s} renew_interval_ms={d} cert={s} key={s}\n",
+        "global tls={s} tls_auto={s} renew={s} renew_interval_ms={d} command_timeout_ms={d} cert={s} key={s}\n",
         .{
             boolText(cfg.tls_enabled),
             boolText(cfg.tls_auto),
             boolText(cfg.letsencrypt_renew),
             cfg.letsencrypt_renew_interval_ms,
+            cfg.external_command_timeout_ms,
             optionalPath(cfg.tls_cert),
             if (cfg.tls_key != null) "<configured>" else "<none>",
         },
