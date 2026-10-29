@@ -7,6 +7,8 @@ const h2_support = @import("http2_support.zig");
 const flow_mod = @import("http2_flow.zig");
 const request_mod = @import("request.zig");
 const Deadline = @import("read_deadline.zig").Deadline;
+const dispatch = @import("http2_dispatch.zig");
+const read_interrupt = @import("read_interrupt.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -19,13 +21,12 @@ pub const ERROR_REFUSED_STREAM: u32 = 0x7;
 
 pub const SendResponseFn = *const fn (std.Io.net.Stream, std.mem.Allocator, u32, h2_support.BufferedResponse, bool) anyerror!void;
 pub const ErrorResponseFn = *const fn (std.mem.Allocator, u16, []const u8, []const u8) anyerror!h2_support.BufferedResponse;
-pub const CompleteRequestFn = *const fn (std.Io, std.Io.net.Stream, std.mem.Allocator, *ServerConfig, *const std.process.Environ.Map, u32, request_mod.HttpRequest) anyerror!void;
 pub const WriteAllFn = *const fn (std.Io.net.Stream, []const u8) anyerror!void;
 
 pub const Callbacks = struct {
     send_response: SendResponseFn,
     error_response: ErrorResponseFn,
-    complete_request: CompleteRequestFn,
+    dispatch: dispatch.Callbacks,
     write_all: WriteAllFn,
     shutdown_requested: *std.atomic.Value(bool),
 };
@@ -46,6 +47,13 @@ fn headerFragment(frame: h2_support.Frame) ![]u8 {
     return frame.payload[offset .. frame.payload.len - padding];
 }
 
+fn submitRequest(jobs: *dispatch.Dispatcher, stream: std.Io.net.Stream, flow: *flow_mod.State, id: u32, req: request_mod.HttpRequest, callbacks: Callbacks) !void {
+    jobs.submit(id, req) catch |err| {
+        try h2_support.sendRst(stream, id, if (err == error.DispatchLimit) ERROR_REFUSED_STREAM else 2, callbacks.write_all);
+        flow.cancel(id);
+    };
+}
+
 fn handleHeadersFrame(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -53,9 +61,11 @@ fn handleHeadersFrame(
     state_allocator: std.mem.Allocator,
     decoded: *const h2_native.DecodedHeaders,
     cfg: *ServerConfig,
-    process_env: *const std.process.Environ.Map,
+    _: *const std.process.Environ.Map,
     states: *std.ArrayList(h2_support.RequestState),
     frame: h2_support.Frame,
+    flow: *flow_mod.State,
+    jobs: *dispatch.Dispatcher,
     callbacks: Callbacks,
 ) !void {
     const req = h2_support.parseRequest(allocator, decoded) catch {
@@ -78,7 +88,7 @@ fn handleHeadersFrame(
                 return;
             }
         }
-        try callbacks.complete_request(io, stream, allocator, cfg, process_env, frame.header.stream_id, req);
+        try submitRequest(jobs, stream, flow, frame.header.stream_id, req, callbacks);
         return;
     }
 
@@ -105,14 +115,16 @@ fn handleHeadersFrame(
 }
 
 fn completeBody(
-    io: std.Io,
+    _: std.Io,
     stream: std.Io.net.Stream,
     scratch_allocator: std.mem.Allocator,
     state_allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
-    process_env: *const std.process.Environ.Map,
+    _: *ServerConfig,
+    _: *const std.process.Environ.Map,
     states: *std.ArrayList(h2_support.RequestState),
     state_index: usize,
+    flow: *flow_mod.State,
+    jobs: *dispatch.Dispatcher,
     callbacks: Callbacks,
 ) !void {
     const state = &states.items[state_index];
@@ -125,7 +137,7 @@ fn completeBody(
         }
     }
     state.req.body = state.body.items;
-    try callbacks.complete_request(io, stream, scratch_allocator, cfg, process_env, state.stream_id, state.req);
+    try submitRequest(jobs, stream, flow, state.stream_id, state.req, callbacks);
 }
 
 fn handleDataFrame(
@@ -138,6 +150,7 @@ fn handleDataFrame(
     states: *std.ArrayList(h2_support.RequestState),
     frame: h2_support.Frame,
     flow: *flow_mod.State,
+    jobs: *dispatch.Dispatcher,
     callbacks: Callbacks,
 ) !void {
     if (frame.header.stream_id == 0) return error.BadRequest;
@@ -185,7 +198,7 @@ fn handleDataFrame(
     try h2_support.sendWindowUpdate(stream, frame.header.stream_id, frame.payload.len, callbacks.write_all);
 
     if ((frame.header.flags & h2_native.FLAG_END_STREAM) == 0) return;
-    try completeBody(io, stream, scratch_allocator, state_allocator, cfg, process_env, states, state_index, callbacks);
+    try completeBody(io, stream, scratch_allocator, state_allocator, cfg, process_env, states, state_index, flow, jobs, callbacks);
 }
 
 fn expireBodies(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, states: *std.ArrayList(h2_support.RequestState), flow: *flow_mod.State, callbacks: Callbacks) !void {
@@ -214,8 +227,9 @@ pub fn runFrameLoop(
     callbacks: Callbacks,
     flow: *flow_mod.State,
     initial_stream_id: u32,
+    initial_request: ?request_mod.HttpRequest,
 ) !void {
-    runFrames(io, stream, allocator, cfg, reader, process_env, callbacks, flow, initial_stream_id) catch |err| {
+    runFrames(io, stream, allocator, cfg, reader, process_env, callbacks, flow, initial_stream_id, initial_request) catch |err| {
         if (err == error.CloseConnection) return err;
         const code: u32 = switch (err) {
             error.FlowControl => 3,
@@ -240,7 +254,15 @@ fn runFrames(
     callbacks: Callbacks,
     flow: *flow_mod.State,
     initial_stream_id: u32,
+    initial_request: ?request_mod.HttpRequest,
 ) !void {
+    var jobs = try dispatch.Dispatcher.init(io, allocator, cfg, process_env, callbacks.dispatch);
+    defer jobs.deinit();
+    var interrupt: read_interrupt.Scope = .{ .stream = stream, .wake = &jobs.wake };
+    const previous_interrupt = read_interrupt.active;
+    read_interrupt.active = &interrupt;
+    defer read_interrupt.active = previous_interrupt;
+    if (initial_request) |req| try submitRequest(&jobs, stream, flow, initial_stream_id, req, callbacks);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var hpack_decoder = h2_native.HpackDecoder.init(allocator);
@@ -262,6 +284,7 @@ fn runFrames(
     const settings_deadline = Deadline.after(.now(io, .awake), cfg.read_header_timeout_ms);
 
     while (true) {
+        try jobs.pump(stream, flow, callbacks.write_all);
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
         try flow.expire(stream, callbacks.write_all);
         if (callbacks.shutdown_requested.load(.acquire)) {
@@ -269,7 +292,7 @@ fn runFrames(
                 try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
                 draining = true;
             }
-            if (body_states.items.len == 0 and flow.streams.items.len == 0) return;
+            if (body_states.items.len == 0 and flow.streams.items.len == 0 and jobs.count() == 0) return;
         }
 
         _ = arena.reset(.retain_capacity);
@@ -278,8 +301,11 @@ fn runFrames(
         if (continuation_id != 0) reader.limit = Deadline.earliest(reader.limit, continuation_deadline);
         for (body_states.items) |state| reader.limit = Deadline.earliest(reader.limit, state.deadline);
         reader.limit = Deadline.earliest(reader.limit, flow.nextDeadline());
-        concurrency_mod.setCurrentIdle(io, body_states.items.len == 0 and flow.streams.items.len == 0);
+        interrupt.busy = body_states.items.len != 0 or flow.streams.items.len != 0 or jobs.count() != 0;
+        reader.setBusy(interrupt.busy);
+        concurrency_mod.setCurrentIdle(io, !interrupt.busy);
         var frame = h2_support.readFrame(reader, allocator, 16384) catch |err| switch (err) {
+            error.DispatchReady => continue,
             error.ConnectionClosed => {
                 if (callbacks.shutdown_requested.load(.acquire) and !draining) {
                     try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
@@ -375,7 +401,7 @@ fn runFrames(
                     } else {
                         // Optional trailer metadata is validated and discarded,
                         // never merged into routing/authentication headers.
-                        try completeBody(io, stream, req_alloc, allocator, cfg, process_env, &body_states, i, callbacks);
+                        try completeBody(io, stream, req_alloc, allocator, cfg, process_env, &body_states, i, flow, &jobs, callbacks);
                     }
                     break :headers;
                 }
@@ -401,12 +427,12 @@ fn runFrames(
                     const response = try callbacks.error_response(req_alloc, 431, "Request Header Fields Too Large", "Decoded HTTP/2 headers exceed the configured limit.");
                     try callbacks.send_response(stream, req_alloc, frame.header.stream_id, response, false);
                 } else {
-                    try handleHeadersFrame(io, stream, req_alloc, allocator, &decoded, cfg, process_env, &body_states, frame, callbacks);
+                    try handleHeadersFrame(io, stream, req_alloc, allocator, &decoded, cfg, process_env, &body_states, frame, flow, &jobs, callbacks);
                 }
             },
             h2_native.FRAME_DATA => {
                 if (frame.header.stream_id == 0 or frame.header.stream_id % 2 == 0 or frame.header.stream_id > last_stream_id) return error.BadRequest;
-                try handleDataFrame(io, stream, req_alloc, allocator, cfg, process_env, &body_states, frame, flow, callbacks);
+                try handleDataFrame(io, stream, req_alloc, allocator, cfg, process_env, &body_states, frame, flow, &jobs, callbacks);
             },
             h2_native.FRAME_GOAWAY => {
                 if (frame.header.stream_id != 0) return error.BadRequest;
@@ -428,6 +454,7 @@ fn runFrames(
                 if (frame.payload.len != 4) return error.FrameSize;
                 if (frame.header.stream_id == 0 or frame.header.stream_id > last_stream_id) return error.BadRequest;
                 flow.cancel(frame.header.stream_id);
+                jobs.cancel(frame.header.stream_id);
                 if (h2_support.findRequestState(&body_states, frame.header.stream_id)) |i| h2_support.removeRequestState(&body_states, allocator, i);
             },
             0x2 => {

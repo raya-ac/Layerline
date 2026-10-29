@@ -36,8 +36,14 @@ HTTP/1 responses now have a first-write-to-finish budget too, including Darwin
 sendfile and forwarded proxy body waits. Partial upstream responses never retry
 or append another HTTP status line. Interim replies, keep-alive requests, and
 upgraded tunnels retain separate lifetimes; plain/TLS wire tests cover them.
-The next work is wider HTTP/2 frame/stream conformance, asynchronous backend
-routing, process-wide resource budgets, and config reader leases/reclamation.
+HTTP/2 backend routing now uses bounded concurrent tasks (eight per connection,
+64 process-wide), while frame parsing, HPACK, TLS output, and flow control stay on
+the connection thread. A blocked backend no longer stalls PINGs or independent
+stream deadlines. Shared HTTP/2 allocator requests have a 256 MiB cap; this does
+not cover TLS, caches, stacks, kernel memory, or other protocols. Plain/TLS wire
+tests cover admission, idle rearming, resets, and joined disconnect cleanup.
+The next work is wider HTTP/2 frame/stream conformance, end-to-end backend
+deadlines, full process resource budgets, and config reader leases/reclamation.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

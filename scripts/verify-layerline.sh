@@ -771,4 +771,7 @@ python3 "$ROOT_DIR/scripts/verify-http1-transfer.py" "$SERVER_BINARY"
 log "verifying native TLS HTTP/2 admin controls"
 python3 "$ROOT_DIR/scripts/verify-admin-http2.py" "$SERVER_BINARY"
 
+log "verifying HTTP/2 backend isolation and resource cleanup"
+python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

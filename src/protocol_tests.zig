@@ -8,6 +8,9 @@ const static_files = @import("static_files.zig");
 test {
     _ = @import("http3_server.zig");
     _ = @import("http2_flow.zig");
+    _ = @import("http2_dispatch.zig");
+    _ = @import("http2_upstream.zig");
+    _ = @import("resource_budget.zig");
     _ = @import("admin_support.zig");
     _ = @import("admin_runtime.zig");
     _ = @import("admin_reply.zig");

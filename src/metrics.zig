@@ -1,5 +1,6 @@
 const std = @import("std");
 const http_response = @import("http_response.zig");
+const resource_budget = @import("resource_budget.zig");
 
 pub const StaticTransferMode = enum {
     sendfile,
@@ -460,5 +461,15 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
     );
     defer allocator.free(fastcgi_metrics);
 
-    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics });
+    const http2_resources = try std.fmt.allocPrint(allocator, "# HELP layerline_http2_routing_jobs Admitted HTTP/2 routing jobs, including completed replies awaiting delivery.\n" ++
+        "# TYPE layerline_http2_routing_jobs gauge\n" ++
+        "layerline_http2_routing_jobs {d}\n" ++
+        "# HELP layerline_http2_memory_bytes Tracked HTTP/2 allocator bytes, excluding caches, TLS, stacks and kernel buffers.\n" ++
+        "# TYPE layerline_http2_memory_bytes gauge\n" ++
+        "layerline_http2_memory_bytes {d}\n" ++
+        "# HELP layerline_http2_memory_limit_bytes Shared HTTP/2 allocator budget.\n" ++
+        "# TYPE layerline_http2_memory_limit_bytes gauge\n" ++
+        "layerline_http2_memory_limit_bytes {d}\n", .{ resource_budget.http2_jobs.load(.acquire), resource_budget.http2.used.load(.acquire), resource_budget.http2.limit });
+    defer allocator.free(http2_resources);
+    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources });
 }

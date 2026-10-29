@@ -122,6 +122,17 @@ reset only that stream. Decoded header bytes have the configured header budget,
 including HPACK's 32-byte field accounting overhead. HPACK table-size updates
 must precede fields, and literal lengths are checked before offset arithmetic.
 DATA discarded on closed or rejected streams still restores connection credit.
+
+HTTP/2 connection state, HPACK, request buffers, routing arenas, and queued output
+share a 256 MiB allocator budget across connections. Routing admits at most eight
+jobs per connection and 64 process-wide, including completed jobs awaiting
+delivery; owned requests also have a 64 MiB per-connection ceiling. Exhausted
+admission refuses the stream instead of starting more backend work. The gauges
+`layerline_http2_routing_jobs`, `layerline_http2_memory_bytes`, and
+`layerline_http2_memory_limit_bytes` expose this accounting. It excludes TLS
+storage, caches, thread stacks, kernel buffers, and other protocols, so it is not
+a full process memory or thread cap.
+
 Cache budgets charge keys, headers and
 entry metadata as well as bodies, and each cache has a 4096-entry ceiling.
 These are live-data budgets, not exact process RSS limits.
@@ -220,10 +231,20 @@ frame/record bytes. Wire timeouts log phase `wire`; HTTP/1 also identifies
 request paths, cookies, headers, or bodies.
 
 Pre-response upstream operations and external PHP execution still have separate
-limits, not an end-to-end application deadline. The HTTP/2 connection worker currently routes backends
-synchronously, so an unrelated blocking backend operation can delay timer
-processing; output deadlines are checked again before sending. These controls
-are not an evented scheduler or a process-wide resource budget.
+limits, not an end-to-end application deadline. HTTP/2 backend routing runs in
+bounded concurrent tasks; the connection thread alone owns frame parsing, HPACK,
+TLS output, and response flow control. Completion wakes the reader without
+requiring another client frame. A blocked backend therefore does not prevent
+PING handling or expiry of another stream's upload/queued response. Idle expiry
+pauses while work remains and starts afresh when the connection becomes idle;
+partial-frame, upload, and response deadlines do not pause.
+
+Reset streams suppress late replies but cannot undo backend side effects already
+performed. Connection teardown cancels and joins routing tasks before releasing
+their arenas, wake descriptors, or borrowed config/TLS state. Local cancellation
+and allocation failure release upstream attempt leases without retrying or
+ejecting a healthy target. This is not a fully evented socket scheduler:
+downstream writes can still occupy the connection thread until their deadline.
 
 ## Verification scope
 
@@ -252,6 +273,12 @@ and chunked bodies, separate keep-alive timing, HTTP/2 upload expiry alongside
 healthy streams, interrupted frame/TLS-record resumption, frame-byte trickles,
 and aggregate continuation limits. Unit tests cover deadline rounding/socket
 isolation and partial frame/record cleanup. Both scripts run in the main verifier.
+
+`scripts/verify-h2-dispatch.py` holds a real backend request while testing PINGs,
+healthy streams, upload/response expiry, idle rearming, and per-request log/header
+isolation on plain and native TLS HTTP/2. It also covers h2c Upgrade dispatch,
+eight-job admission, reset suppression, and disconnect cancellation with zero
+remaining jobs/tracked HTTP/2 bytes. It runs in the main verifier too.
 
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do

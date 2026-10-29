@@ -235,9 +235,12 @@ class H2:
                 return frames
         raise AssertionError("expected frame not received")
 
-    def barrier(self):
+    def barrier(self, complete=None):
         self.send(6, 0, 0, b"deadline")
-        return self.until(lambda f: f == (6, 1, 0, b"deadline"))
+        frames = self.until(lambda f: f == (6, 1, 0, b"deadline"))
+        if complete is not None and not any(complete(item) for item in frames):
+            frames += self.until(complete)
+        return frames
 
     def upload(self):
         self.send(1, 4, 1, fields(b"/api/echo", b"POST"))
@@ -299,7 +302,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                             h2.send(8, 0, 1, (1).to_bytes(4, "big"))
                             h2.send(1, 5, stream, fields())
                             h2.send(8, 0, stream, (3).to_bytes(4, "big"))
-                            received += h2.barrier()
+                            received += h2.barrier(lambda f: f[0] == 0 and f[1] & 1 and f[2] == stream)
                         assert any(k == 0 and s == 11 and f & 1 and p == b"ok\n" for k, f, s, p in received)
                     else:
                         received = h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
@@ -395,7 +398,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                     time.sleep(0.08)
                     h2.send(0, 0, 1, b"x")
                     h2.send(1, 5, stream, fields())
-                    received += h2.barrier()
+                    received += h2.barrier(lambda f: f[0] == 0 and f[1] & 1 and f[2] == stream)
                 assert (3, 0, 1, (8).to_bytes(4, "big")) in received, "upload progress renewed the stream deadline"
                 assert any(k == 0 and s == 11 and f & 1 and p == b"ok\n" for k, f, s, p in received)
                 assert not any(k == 7 for k, _, _, _ in received)

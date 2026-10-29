@@ -8,6 +8,8 @@ const h2_native = @import("h2_native.zig");
 const h2_server = @import("http2_server.zig");
 const flow_mod = @import("http2_flow.zig");
 const h2_support = @import("http2_support.zig");
+const dispatch = @import("http2_dispatch.zig");
+const resource_budget = @import("resource_budget.zig");
 const http_headers = @import("http_headers.zig");
 const http_response = @import("http_response.zig");
 const http2_content = @import("http2_content.zig");
@@ -42,6 +44,9 @@ pub const CompleteContext = struct {
     clear_request_context: *const fn () void,
     set_access_context: *const fn (*access_log_mod.Context, []const u8) void,
     clear_access_context: *const fn () void,
+    get_response_headers: *const fn () []const ResponseHeaderRule,
+    get_compression_policy: *const fn () CompressionPolicy,
+    set_response_headers: *const fn ([]const ResponseHeaderRule) void,
     access_log_set_handler: *const fn ([]const u8) void,
     access_log_set_error: *const fn ([]const u8) void,
     emit_access_log: *const fn (u16, usize) void,
@@ -162,16 +167,14 @@ pub fn coolErrorResponse(
     return http2_content.coolErrorResponse(allocator, server_name, server_tagline, status_code, status_text, detail);
 }
 
-pub fn completeRequest(
+pub fn prepareRequest(
     io: std.Io,
-    stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     cfg: *ServerConfig,
     process_env: *const std.process.Environ.Map,
-    stream_id: u32,
     req: HttpRequest,
     ctx: CompleteContext,
-) !void {
+) !dispatch.Result {
     const request_id = try ctx.resolve_request_id(io, allocator, req.headers);
     ctx.set_request_context(req.headers, request_id, config_mod.compressionPolicyFromConfig(cfg));
     defer ctx.clear_request_context();
@@ -193,13 +196,23 @@ pub fn completeRequest(
     ctx.metrics.requestStarted();
     ctx.access_log_set_handler("h2");
     const response = ctx.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
-        error.OutOfMemory => return err,
+        error.OutOfMemory, error.Canceled => return err,
         else => blk: {
             ctx.access_log_set_error(@errorName(err));
             break :blk try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request.");
         },
     };
-    try ctx.send_response(stream, allocator, stream_id, response, std.mem.eql(u8, req.method, "HEAD"));
+    return .{ .response = response, .request_id = request_id, .access = access_ctx, .response_headers = ctx.get_response_headers(), .compression_policy = ctx.get_compression_policy() };
+}
+
+pub fn deliverRequest(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, req: HttpRequest, result: *dispatch.Result, ctx: CompleteContext) !void {
+    ctx.set_request_context(req.headers, result.request_id, result.compression_policy);
+    defer ctx.clear_request_context();
+    ctx.set_response_headers(result.response_headers);
+    var access_ctx = result.access;
+    ctx.set_access_context(&access_ctx, result.request_id);
+    defer ctx.clear_access_context();
+    try ctx.send_response(stream, allocator, stream_id, result.response, std.mem.eql(u8, req.method, "HEAD"));
     if (!access_ctx.logged) ctx.emit_access_log(0, 0);
 }
 
@@ -212,7 +225,7 @@ pub fn handlePreface(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
-    var flow = flow_mod.State{ .allocator = std.heap.page_allocator, .io = io, .write_timeout_ms = cfg.write_timeout_ms };
+    var flow = flow_mod.State{ .allocator = resource_budget.http2.allocator(), .io = io, .write_timeout_ms = cfg.write_timeout_ms };
     defer flow.deinit();
     const previous_flow = flow_mod.active;
     flow_mod.active = &flow;
@@ -232,7 +245,7 @@ pub fn handlePreface(
 
     try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
     std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
-    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 0);
+    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 0, null);
 }
 
 pub fn handleUpgrade(
@@ -244,7 +257,7 @@ pub fn handleUpgrade(
     process_env: *const std.process.Environ.Map,
     ctx: ConnectionContext,
 ) !void {
-    var flow = flow_mod.State{ .allocator = std.heap.page_allocator, .io = io, .write_timeout_ms = cfg.write_timeout_ms };
+    var flow = flow_mod.State{ .allocator = resource_budget.http2.allocator(), .io = io, .write_timeout_ms = cfg.write_timeout_ms };
     defer flow.deinit();
     const previous_flow = flow_mod.active;
     flow_mod.active = &flow;
@@ -299,10 +312,5 @@ pub fn handleUpgrade(
     h2_req.version = "HTTP/2.0";
     h2_req.close_connection = true;
     std.debug.print("HTTP/2 h2c upgrade {s} {s}\n", .{ h2_req.method, h2_req.path });
-    const response = ctx.build_response_for_request(io, allocator, cfg, h2_req, process_env) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 upgrade request."),
-    };
-    try ctx.send_response(stream, allocator, 1, response, std.mem.eql(u8, h2_req.method, "HEAD"));
-    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 1);
+    try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 1, h2_req);
 }

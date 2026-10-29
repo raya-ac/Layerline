@@ -5,6 +5,7 @@ const config_mod = @import("config.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
+const read_interrupt = @import("read_interrupt.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -47,6 +48,9 @@ fn normalizeSocketIoError(err: anyerror) anyerror {
 
 pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     const io = activeIo();
+    if (read_interrupt.active) |scope| {
+        if (scope.stream.socket.handle == stream.socket.handle) try scope.wait();
+    }
     if (read_deadline.forStream(stream)) |budget| {
         if (try budget.remaining()) |remaining| {
             try setStreamReadTimeout(stream, if (budget.restore_timeout_ms == 0) remaining else @min(remaining, budget.restore_timeout_ms));

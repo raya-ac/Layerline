@@ -67,6 +67,14 @@ pub fn setResponseHeaders(headers: []const ResponseHeaderRule) void {
     current_response_headers = headers;
 }
 
+pub fn responseHeaders() []const ResponseHeaderRule {
+    return current_response_headers;
+}
+
+pub fn compressionPolicy() CompressionPolicy {
+    return current_compression_policy;
+}
+
 pub fn setCompressionPolicy(policy: CompressionPolicy) void {
     current_compression_policy = policy;
 }

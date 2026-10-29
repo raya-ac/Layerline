@@ -44,14 +44,18 @@ class Client:
     def send(self, kind, flags, stream, payload=b""):
         self.conn.sendall(frame(kind, flags, stream, payload))
 
-    def barrier(self):
+    def barrier(self, complete=lambda _: True):
         self.send(6, 0, 0, b"barrier!")
         frames = []
+        acknowledged = False
         for _ in range(1000):
             item = self.receive()
             if item == (6, 1, 0, b"barrier!"):
+                acknowledged = True
+            else:
+                frames.append(item)
+            if acknowledged and complete(frames):
                 return frames
-            frames.append(item)
         raise AssertionError("PING not acknowledged")
 
     def receive(self):
@@ -72,7 +76,7 @@ class Client:
 
 with Client() as client:
     client.send(1, 5, 1, headers(b"/large.bin"))
-    frames = client.barrier()
+    frames = client.barrier(lambda items: any(k == 1 and s == 1 for k, _, s, _ in items))
     settings = [p for k, f, _, p in frames if k == 4 and not f & 1]
     assert len(settings) == 1
     advertised = dict(struct.unpack("!HI", settings[0][i:i + 6]) for i in range(0, len(settings[0]), 6))
@@ -81,7 +85,7 @@ with Client() as client:
     assert not any(k == 0 for k, _, _, _ in frames), "zero window must stop DATA"
     client.send(1, 5, 3, headers(b"/health"))
     client.window(3, 3)
-    frames = client.barrier()
+    frames = client.barrier(lambda items: any(k == 0 and s == 3 and f & 1 for k, f, s, _ in items))
     assert b"".join(p for k, _, s, p in frames if k == 0 and s == 3) == b"ok\n"
     assert any(k == 0 and s == 3 and f & 1 for k, f, s, _ in frames)
     assert not any(k == 0 and s == 1 for k, _, s, _ in frames), "blocked stream affected unrelated response"
@@ -98,12 +102,12 @@ with Client() as client:
 
 with Client() as client:
     client.send(1, 5, 1, headers(b"/large.bin"))
-    client.barrier()
+    client.barrier(lambda items: any(k == 1 and s == 1 for k, _, s, _ in items))
     client.send(3, 0, 1, bytes(4))
     client.window(1, 100000)
     client.send(1, 5, 3, headers(b"/health"))
     client.window(3, 3)
-    frames = client.barrier()
+    frames = client.barrier(lambda items: any(k == 0 and s == 3 and f & 1 for k, f, s, _ in items))
     assert not any(k == 0 and s == 1 for k, _, s, _ in frames), "reset response was still sent"
     assert any(k == 0 and s == 3 and f & 1 for k, f, s, _ in frames)
 
@@ -113,7 +117,7 @@ with Client() as client:
     client.send(1, 1 | 8 | 32, 1, b"\x02" + bytes(5) + block[:13] + b"xx")
     client.send(9, 4, 1, block[13:])
     client.window(1, 3)
-    frames = client.barrier()
+    frames = client.barrier(lambda items: any(k == 0 and s == 1 and f & 1 for k, f, s, _ in items))
     assert any(k == 1 and p.startswith(b"\x88") for k, _, _, p in frames)
     assert any(k == 0 and f & 1 and p == b"ok\n" for k, f, _, p in frames)
 
@@ -122,7 +126,7 @@ for split in [False, True]:
         # Hold every response at a zero stream window to reach the stream cap.
         for stream in range(1, 257, 2):
             client.send(1, 5, stream, headers(b"/health"))
-        client.barrier()
+            client.barrier(lambda items: any(k == 1 and s == stream for k, _, s, _ in items))
         # An insertion on a refused stream must still update the shared decoder.
         insertion = b"\x40" + literal(b"x-refused-state", b"retained")[1:]
         block = headers(b"/health") + insertion
@@ -136,7 +140,7 @@ for split in [False, True]:
         client.send(3, 0, 1, bytes(4))
         client.send(1, 5, 259, headers(b"/health") + b"\xbe")  # dynamic index 62
         client.window(259, 3)
-        frames = client.barrier()
+        frames = client.barrier(lambda items: any(k == 0 and s == 259 and f & 1 for k, f, s, _ in items))
         assert any(k == 0 and s == 259 and f & 1 and p == b"ok\n" for k, f, s, p in frames), "refusal desynchronized HPACK"
 
 for split in [False, True]:
@@ -144,7 +148,7 @@ for split in [False, True]:
         client.send(1, 4, 1, headers(b"/api/echo", b"POST") + literal(b"content-length", b"5"))
         client.send(0, 0, 1, b"hello")
         client.send(1, 5, 3, headers(b"/health"))
-        frames = client.barrier()
+        frames = client.barrier(lambda items: any(k == 0 and s == 3 and f & 1 for k, f, s, _ in items))
         assert not any(k in (0, 1) and s == 1 for k, _, s, _ in frames), "request dispatched before trailers"
         trailer = literal(b"content-digest", b"sha-256=:fixture:")
         if split:
@@ -152,7 +156,7 @@ for split in [False, True]:
             client.send(9, 4, 1, trailer[7:])
         else:
             client.send(1, 5, 1, trailer)
-        frames = client.barrier()
+        frames = client.barrier(lambda items: any(k == 0 and s == 1 and f & 1 for k, f, s, _ in items))
         assert b"".join(p for k, _, s, p in frames if k == 0 and s == 1) == b"hello"
         assert any(k == 0 and s == 1 and f & 1 for k, f, s, _ in frames)
 
@@ -162,7 +166,7 @@ for name, value, flags in [(b":path", b"/health", 5), (b"content-length", b"0", 
         client.send(0, 0, 1, b"hello")
         client.send(1, flags, 1, literal(name, value))
         client.send(1, 5, 3, headers(b"/health"))
-        frames = client.barrier()
+        frames = client.barrier(lambda items: any(k == 0 and s == 3 and f & 1 for k, f, s, _ in items))
         assert (3, 0, 1, (1).to_bytes(4, "big")) in frames, "invalid trailers were not stream errors"
         assert not any(k in (0, 1) and s == 1 for k, _, s, _ in frames), "invalid request was routed"
         assert any(k == 0 and s == 3 and f & 1 for k, f, s, _ in frames), "invalid trailers killed an unrelated stream"
@@ -178,17 +182,17 @@ with Client(window=65535) as client:
     # Repeating a small dynamic index must not bypass the decoded byte budget.
     insertion = b"\x40" + literal(b"x-large", b"v" * 120)[1:]
     client.send(1, 5, 1, headers(b"/health") + insertion)
-    client.barrier()
+    client.barrier(lambda items: any(k == 0 and s == 1 and f & 1 for k, f, s, _ in items))
     block = headers(b"/health") + b"\xbe" * 110
     client.send(1, 5, 3, block)
     client.send(1, 5, 5, headers(b"/health") + b"\xbe")
-    frames = client.barrier()
+    frames = client.barrier(lambda items: any(k == 0 and s == 5 and f & 1 for k, f, s, _ in items))
     assert any(k == 1 and s == 3 and not p.startswith(b"\x88") for k, _, s, p in frames), "compressed oversized header list was accepted"
     assert any(k == 0 and s == 5 and f & 1 for k, f, s, _ in frames), "header budget rejection broke HPACK"
 
 with Client(window=65535) as client:
     client.send(1, 5, 1, headers(b"/health"))
-    client.barrier()
+    client.barrier(lambda items: any(k == 0 and s == 1 and f & 1 for k, f, s, _ in items))
     client.send(0, 0, 1, b"discarded")
     frames = client.barrier()
     assert (8, 0, 0, (9).to_bytes(4, "big")) in frames, "discarded DATA lost connection credit"

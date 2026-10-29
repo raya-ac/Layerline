@@ -57,6 +57,7 @@ pub const PendingReader = struct {
     payload_used: usize = 0,
     frame_started: ?std.Io.Timestamp = null,
     idle_started: ?std.Io.Timestamp = null,
+    busy: bool = false,
     completed_started: std.Io.Timestamp = .zero,
     header_timeout_ms: u32 = 10_000,
     idle_timeout_ms: u32 = 60_000,
@@ -69,8 +70,14 @@ pub const PendingReader = struct {
 
     pub fn phaseDeadline(self: *PendingReader) Deadline {
         if (self.frame_started) |start| return .after(start, self.header_timeout_ms);
+        if (self.busy) return .{};
         if (self.idle_started == null) self.idle_started = .now(self.io, .awake);
         return .after(self.idle_started.?, self.idle_timeout_ms);
+    }
+
+    pub fn setBusy(self: *PendingReader, busy: bool) void {
+        if (self.busy and !busy) self.idle_started = .now(self.io, .awake);
+        self.busy = busy;
     }
 
     fn readFrameBytes(self: *PendingReader, out: []u8) !usize {
@@ -116,6 +123,30 @@ pub const PendingReader = struct {
         }
     }
 };
+
+test "active HTTP2 work pauses idle expiry but never a partial frame deadline" {
+    var reader: PendingReader = .{
+        .io = std.testing.io,
+        .stream = .{ .socket = .{ .handle = 123, .address = undefined } },
+        .pending = "",
+        .read = undefined,
+        .idle_started = .zero,
+        .idle_timeout_ms = 600,
+        .header_timeout_ms = 100,
+    };
+    try std.testing.expectEqual(Deadline.after(.zero, 600).at, reader.phaseDeadline().at);
+    reader.setBusy(true);
+    try std.testing.expect(reader.phaseDeadline().at == null);
+    reader.frame_started = .zero;
+    try std.testing.expectEqual(Deadline.after(.zero, 100).at, reader.phaseDeadline().at);
+    reader.setBusy(false);
+    try std.testing.expectEqual(Deadline.after(.zero, 100).at, reader.phaseDeadline().at);
+    reader.frame_started = null;
+    const idle = Deadline.after(reader.idle_started.?, 600);
+    try std.testing.expectEqual(idle.at, reader.phaseDeadline().at);
+    reader.setBusy(false);
+    try std.testing.expectEqual(idle.at, reader.phaseDeadline().at);
+}
 
 pub fn cloneRequest(allocator: std.mem.Allocator, req: request_mod.HttpRequest) !request_mod.HttpRequest {
     const method = try allocator.dupe(u8, req.method);

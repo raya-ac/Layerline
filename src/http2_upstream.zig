@@ -167,12 +167,13 @@ pub fn fetchPoolResponse(
             callbacks.metrics.upstreamEjectedSkip();
             continue;
         };
+        defer upstream_mod.upstreamEndAttempt(upstream, lease);
 
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
         var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
-            upstream_mod.upstreamEndAttempt(upstream, lease);
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
             if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
@@ -187,7 +188,6 @@ pub fn fetchPoolResponse(
             headers[response.headers.len] = .{ .name = "set-cookie", .value = cookie_value };
             response.headers = headers;
         }
-        upstream_mod.upstreamEndAttempt(upstream, lease);
         upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return response;
     }
@@ -202,4 +202,65 @@ pub fn fetchPoolResponse(
         else => {},
     };
     return callbacks.error_response(allocator, 502, "Bad Gateway", "All configured upstream attempts failed.");
+}
+
+test "canceling a client or exhausting local memory never ejects an upstream" {
+    const Fake = struct {
+        threadlocal var failure: anyerror = error.Canceled;
+        threadlocal var connects: usize = 0;
+        fn connect(_: std.mem.Allocator, _: []const u8, _: u16) !std.Io.net.Stream {
+            connects += 1;
+            return failure;
+        }
+        fn label(_: []const u8) void {}
+        fn requestId() []const u8 {
+            return "";
+        }
+        fn errorResponse(_: std.mem.Allocator, _: u16, _: []const u8, _: []const u8) !H2BufferedResponse {
+            return error.UnexpectedErrorPage;
+        }
+        fn timeout(_: std.Io.net.Stream, _: u32, _: u32) !void {}
+        fn close(_: std.Io.net.Stream) void {}
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+        fn now() i64 {
+            return 1000;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = config_mod.defaultServerConfig();
+    cfg.upstream_max_failures = 1;
+    var pool = try config_mod.parseUpstreamPool(allocator, "http://127.0.0.1:9000,http://127.0.0.1:9001");
+    var metrics = ServerMetrics.init();
+    const callbacks: Callbacks = .{
+        .access_log_set_upstream = Fake.label,
+        .connect_tcp_host = Fake.connect,
+        .current_request_id = Fake.requestId,
+        .error_response = Fake.errorResponse,
+        .metrics = &metrics,
+        .set_stream_timeouts = Fake.timeout,
+        .stream_close = Fake.close,
+        .stream_read = Fake.read,
+        .stream_write_all = Fake.write,
+        .upstream_now_ms = Fake.now,
+    };
+    const req: request_mod.HttpRequest = .{ .method = "GET", .path = "/", .query = "", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true };
+    for ([_]anyerror{ error.Canceled, error.OutOfMemory }) |failure| {
+        Fake.failure = failure;
+        Fake.connects = 0;
+        try std.testing.expectError(failure, fetchPoolResponse(allocator, &pool, .round_robin, config_mod.upstreamRuntimePolicyFromConfig(&cfg), req, &cfg, callbacks));
+        try std.testing.expectEqual(1, Fake.connects);
+        for (pool.targets.items) |target| {
+            try std.testing.expectEqual(0, target.active_requests.load(.acquire));
+            try std.testing.expectEqual(0, target.passive_failures.load(.acquire));
+            try std.testing.expectEqual(0, target.ejected_until_ms.load(.acquire));
+        }
+    }
+    try std.testing.expectEqual(0, metrics.upstream_failures_total.load(.acquire));
 }

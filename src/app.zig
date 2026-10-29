@@ -13,6 +13,7 @@ const config_mod = @import("config.zig");
 const custom_errors = @import("custom_errors.zig");
 const h2_server = @import("http2_server.zig");
 const h2_support = @import("http2_support.zig");
+const h2_dispatch = @import("http2_dispatch.zig");
 const http2_content = @import("http2_content.zig");
 const http2_router = @import("http2_router.zig");
 const http2_runtime = @import("http2_runtime.zig");
@@ -521,6 +522,9 @@ fn http2CompleteContext() http2_runtime.CompleteContext {
         .clear_request_context = runtime_state.clearHttp2RequestContext,
         .set_access_context = runtime_state.setAccessLogContext,
         .clear_access_context = runtime_state.clearAccessLogContext,
+        .get_response_headers = runtime_state.responseHeaders,
+        .get_compression_policy = runtime_state.compressionPolicy,
+        .set_response_headers = runtime_state.setResponseHeaders,
         .access_log_set_handler = runtime_state.accessLogSetHandler,
         .access_log_set_error = runtime_state.accessLogSetError,
         .emit_access_log = emitAccessLog,
@@ -530,23 +534,27 @@ fn http2CompleteContext() http2_runtime.CompleteContext {
     };
 }
 
-fn sendCompletedHttp2Request(
+fn prepareHttp2Request(
     io: std.Io,
-    stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     cfg: *ServerConfig,
-    process_env: *const std.process.Environ.Map,
-    stream_id: u32,
     req: HttpRequest,
-) !void {
-    try http2_runtime.completeRequest(io, stream, allocator, cfg, process_env, stream_id, req, http2CompleteContext());
+    process_env: *const std.process.Environ.Map,
+) !h2_dispatch.Result {
+    bindThreadIo(io);
+    stream_runtime.clearTlsChannel();
+    return http2_runtime.prepareRequest(io, allocator, cfg, process_env, req, http2CompleteContext());
+}
+
+fn deliverHttp2Request(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, req: HttpRequest, result: *h2_dispatch.Result) !void {
+    try http2_runtime.deliverRequest(stream, allocator, stream_id, req, result, http2CompleteContext());
 }
 
 fn http2Callbacks() h2_server.Callbacks {
     return .{
         .send_response = sendHttp2Response,
         .error_response = h2CoolErrorResponse,
-        .complete_request = sendCompletedHttp2Request,
+        .dispatch = .{ .prepare = prepareHttp2Request, .deliver = deliverHttp2Request },
         .write_all = streamWriteAll,
         .shutdown_requested = &runtime_state.shutdown_requested,
     };
