@@ -1074,7 +1074,7 @@ test "HTTP/3 routed responses accept parsed DATA bodies" {
     try std.testing.expect(std.mem.indexOf(u8, data, "hello") != null);
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig, callbacks: Callbacks) void {
+pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, active_config: *const fn () *ServerConfig, shutdown_requested: *std.atomic.Value(bool), callbacks: Callbacks) void {
     var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
         std.debug.print("HTTP/3 bind address error: {}\n", .{err});
         return;
@@ -1096,11 +1096,14 @@ pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const 
 
     var recv_buf: [4096]u8 = undefined;
 
-    while (true) {
-        const msg = socket.receive(io, &recv_buf) catch |err| {
+    while (!shutdown_requested.load(.acquire)) {
+        const msg = socket.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| {
+            if (err == error.Timeout or shutdown_requested.load(.acquire)) continue;
             std.debug.print("HTTP/3 UDP receive error: {}\n", .{err});
             continue;
         };
+
+        if (shutdown_requested.load(.acquire)) break;
 
         if (msg.data.len == 0) continue;
 

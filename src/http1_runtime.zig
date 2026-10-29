@@ -119,6 +119,7 @@ fn handleHttpRedirectConnection(
         else => |e| return e,
     };
     if (prefill_len == 0) return;
+    concurrency_mod.setCurrentIdle(io, false);
     const prefill = prefill_buf[0..prefill_len];
 
     if (h2_support.isLikelyPreface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or native_tls.isHttp3OverTcpProbe(prefill)) {
@@ -225,9 +226,12 @@ fn serveHttpRedirectConnectionTask(
     callbacks: Callbacks,
 ) void {
     callbacks.bind_thread_io(io);
+    var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
+    state.register(io, &registration);
     defer {
-        state.release();
+        state.unregister(io, &registration);
         callbacks.stream_close(stream);
+        state.release();
     }
 
     handleHttpRedirectConnection(io, stream, cfg, allocator, callbacks) catch |err| {
@@ -305,6 +309,7 @@ pub fn handleConnection(
     // Keep one connection worker alive across keep-alive requests.
     // Each request still gets a hard cap before the socket is closed.
     while (true) {
+        if (callbacks.shutdown_requested.load(.acquire)) return;
         if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
             return;
         }
@@ -316,6 +321,7 @@ pub fn handleConnection(
             std.debug.print("Socket read timeout setup failed: {}\n", .{err});
         };
         var prefill_buf: [64]u8 = undefined;
+        concurrency_mod.setCurrentIdle(io, true);
         const prefill_len = callbacks.stream_read(stream, &prefill_buf) catch |err| switch (err) {
             error.RequestTimeout => {
                 if (handled_requests > 0) return;
@@ -334,6 +340,8 @@ pub fn handleConnection(
             else => |e| return e,
         };
         if (prefill_len == 0) return;
+        concurrency_mod.setCurrentIdle(io, false);
+        if (callbacks.shutdown_requested.load(.acquire)) return;
         const prefill = prefill_buf[0..prefill_len];
 
         if (h2_support.isLikelyPreface(prefill)) {
@@ -505,7 +513,9 @@ pub fn handleConnection(
                 return;
             }
 
-            if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
+            if (callbacks.shutdown_requested.load(.acquire) or
+                (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection))
+            {
                 req.close_connection = true;
             }
 
@@ -522,7 +532,7 @@ pub fn handleConnection(
             if (!access_ctx.logged) callbacks.emit_access_log(0, 0);
         }
 
-        if (req.close_connection) break;
+        if (req.close_connection or callbacks.shutdown_requested.load(.acquire)) break;
     }
 }
 
@@ -536,11 +546,14 @@ pub fn serveConnectionTask(
     callbacks: Callbacks,
 ) void {
     callbacks.bind_thread_io(io);
+    var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
+    state.register(io, &registration);
 
     // One worker thread owns one stream; always release the slot and close stream.
     defer {
-        state.release();
+        state.unregister(io, &registration);
         callbacks.stream_close(stream);
+        state.release();
     }
 
     handleConnection(io, stream, cfg, allocator, process_env, callbacks) catch |err| {

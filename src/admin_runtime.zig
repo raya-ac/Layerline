@@ -925,6 +925,10 @@ pub fn serveSocketTask(ctx: SocketContext) void {
             ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
             continue;
         };
+        if (ctx.callbacks.shutdown_requested.load(.acquire)) {
+            ctx.callbacks.close_stream(conn);
+            break;
+        }
         handleConnection(conn, std.heap.page_allocator, ctx.cfg, ctx.callbacks) catch |err| {
             std.debug.print("Admin command failed: {}\n", .{err});
         };

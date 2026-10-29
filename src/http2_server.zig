@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const concurrency_mod = @import("concurrency.zig");
 const h2_native = @import("h2_native.zig");
 const h2_support = @import("http2_support.zig");
 const flow_mod = @import("http2_flow.zig");
@@ -237,20 +238,31 @@ fn runFrames(
     var continuation_flags: u8 = 0;
     var continuation = std.ArrayList(u8).empty;
     defer continuation.deinit(allocator);
+    var draining = false;
 
     while (true) {
         if (callbacks.shutdown_requested.load(.acquire)) {
-            try h2_support.sendGoaway(stream, last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
-            return;
+            if (!draining) {
+                try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+                draining = true;
+            }
+            if (body_states.items.len == 0 and flow.streams.items.len == 0) return;
         }
 
         _ = arena.reset(.retain_capacity);
         const req_alloc = arena.allocator();
+        concurrency_mod.setCurrentIdle(io, body_states.items.len == 0 and flow.streams.items.len == 0);
         var frame = h2_support.readFrame(reader, req_alloc, 16384) catch |err| switch (err) {
-            error.ConnectionClosed => return,
+            error.ConnectionClosed => {
+                if (callbacks.shutdown_requested.load(.acquire) and !draining) {
+                    try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+                }
+                return;
+            },
             error.RequestTimeout => return,
             else => return err,
         };
+        concurrency_mod.setCurrentIdle(io, false);
 
         if (first_frame) {
             first_frame = false;
@@ -325,7 +337,9 @@ fn runFrames(
                     break :headers;
                 }
                 last_stream_id = frame.header.stream_id;
-                if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection) {
+                if (draining or callbacks.shutdown_requested.load(.acquire) or
+                    (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection))
+                {
                     try h2_support.sendRst(stream, frame.header.stream_id, ERROR_REFUSED_STREAM, callbacks.write_all);
                     break :headers;
                 }
@@ -382,7 +396,7 @@ fn runFrames(
         try flow.flush(stream, callbacks.write_all);
 
         if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection and body_states.items.len == 0 and flow.streams.items.len == 0) {
-            try h2_support.sendGoaway(stream, last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+            try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
             return;
         }
     }

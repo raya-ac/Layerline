@@ -221,30 +221,18 @@ fn renderActivationConfigDiff(io: std.Io, allocator: std.mem.Allocator, active: 
     return config_diff.render(allocator, active, candidate);
 }
 
-const ReloadSignalWatcherContext = struct {
-    io: std.Io,
-};
-
-fn reloadSignalWatcherTask(ctx: ReloadSignalWatcherContext) void {
-    bindThreadIo(ctx.io);
+fn reloadSignalWatcherTask(io: std.Io) void {
+    bindThreadIo(io);
     while (!runtime_state.shutdown_requested.load(.acquire)) {
         if (runtime_state.reload_requested.swap(false, .acq_rel)) {
-            reloadConfigInMemory(ctx.io, std.heap.page_allocator, runtime_state.activeConfig()) catch |err| {
+            reloadConfigInMemory(io, std.heap.page_allocator, runtime_state.activeConfig()) catch |err| {
                 std.debug.print("SIGHUP reload blocked: {}\n", .{err});
                 continue;
             };
             std.debug.print("SIGHUP config reload completed for new connections.\n", .{});
         }
-        ctx.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
     }
-}
-
-fn startReloadSignalWatcher(io: std.Io) void {
-    const worker = std.Thread.spawn(.{}, reloadSignalWatcherTask, .{ReloadSignalWatcherContext{ .io = io }}) catch |err| {
-        std.debug.print("Failed to start SIGHUP reload watcher: {}\n", .{err});
-        return;
-    };
-    worker.detach();
 }
 
 fn adminRuntimeView() admin_pages.RuntimeView {
@@ -832,7 +820,6 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg);
-    startReloadSignalWatcher(init.io);
     defer runtime_state.config_store.deinit();
     defer {
         runtime_state.buffered_response_cache.deinit();
@@ -856,6 +843,7 @@ pub fn main(init: std.process.Init) !void {
             .bind_thread_io = bindThreadIo,
             .http1 = http1RuntimeCallbacks(),
             .http3 = http3Callbacks(),
+            .reload_signal = reloadSignalWatcherTask,
             .send_cool_error = sendCoolError,
             .upstream = upstreamRuntimeCallbacks(),
         },

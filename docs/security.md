@@ -105,6 +105,27 @@ further reloads return `ReloadLimitRequiresRestart` without replacing the active
 config. Plan a managed restart after 31 successful reloads. This bounds snapshot
 count while preserving old connections; it is not automatic snapshot reclamation.
 
+## Shutdown ownership
+
+The server retains and joins background threads before freeing runtime state,
+including the reload watcher, health checker, admin socket, QUIC listener, and
+optional redirect and renewal workers. QUIC's receive loop checks for shutdown
+between bounded receive waits. A locked connection registry interrupts idle
+HTTP/1 and HTTP/2 reads without shutting down active uploads or response writes.
+Workers unlink before closing sockets, so shutdown cannot target a reused file
+descriptor. Connection workers close their stream and finish
+metrics updates before publishing their final concurrency release.
+
+The graceful shutdown timeout covers the whole worker drain. HTTP/2 sends GOAWAY,
+refuses new streams, and lets existing uploads and flow-controlled responses
+finish within that period. If a connection or background operation is still
+stuck at the deadline, a separate guard logs `server.shutdown_timeout`, removes
+the admin socket, and exits with status 1 without unwinding runtime destructors.
+The OS then reclaims process memory together instead of freeing config/caches
+while another thread might still access them. Outstanding requests can be lost
+at that deadline. This is a process boundary, not cancellation of external PHP
+or certificate-tool child processes; supervise and isolate those separately.
+
 ## Verification scope
 
 `zig build test` includes the native guard, session lifecycle, cache accounting,
@@ -117,6 +138,15 @@ symlink escapes, encrypted static responses, and config reload. The raw HTTP/2
 tests include padded/split trailers, refused-stream HPACK synchronization,
 compressed header budget bypass attempts, discarded DATA credit, and GOAWAY
 error codes. Request trailer forwarding and response trailers are not implemented.
+
+`scripts/verify-shutdown.py` starts isolated loopback instances with admin, QUIC,
+health, and reload workers. It checks idle shutdown, in-flight HTTP/1 uploads,
+HTTP/2 upload/response drain with new-stream refusal, and deadline expiry for
+blocked request reads, zero-window responses, and blocked large-file writes.
+
+To exercise an already-built release on its target OS without installing Zig,
+run `LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline bash scripts/verify-layerline.sh`.
+The verifier reports this explicitly and skips only compilation, not runtime checks.
 
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do

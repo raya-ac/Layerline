@@ -113,6 +113,11 @@ Run the self-starting local verification harness:
 ./scripts/verify-layerline.sh
 ```
 
+For an already-built artifact on its target OS, set
+`LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline` when running the verifier.
+This skips compilation and runs the same isolated runtime checks, including
+active and deadline shutdown tests.
+
 ## Config file
 
 Use `--config` to load a base config, then override values with CLI flags.
@@ -616,7 +621,7 @@ zig build run -- \
 
 When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
 This process still uses one worker thread per accepted socket, so extreme live-connection fan-in should use a dedicated L4/edge balancing tier while native evented IO is built out.
-`SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for active handlers to drain.
+`SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for connection and background workers to drain. HTTP/2 refuses new streams while completing existing work. A stuck worker triggers a logged exit with status 1 at the deadline, without freeing runtime state that worker still borrows; see [shutdown ownership](docs/security.md#shutdown-ownership).
 Common host limits to revisit before aggressive load tests:
 
 - Linux/macOS: increase open file limit (`ulimit -n 2000000`).

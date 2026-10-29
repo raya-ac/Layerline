@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ZIG=${ZIG:-}
+SERVER_BINARY=${LAYERLINE_VERIFY_BINARY:-$ROOT_DIR/zig-out/bin/layerline}
 PORT=${LAYERLINE_VERIFY_PORT:-18145}
 HOST=${LAYERLINE_VERIFY_HOST:-127.0.0.1}
 REDIRECT_PORT=${LAYERLINE_VERIFY_REDIRECT_PORT:-$((PORT + 1))}
@@ -82,8 +83,14 @@ curl_supports_http3() {
   curl --version 2>/dev/null | grep -Eq '(^Features:| )HTTP3( |$)'
 }
 
-log "building Layerline release binary"
-"$ZIG" build -Doptimize=ReleaseFast
+if [[ -n ${LAYERLINE_VERIFY_BINARY:-} ]]; then
+  [[ $SERVER_BINARY = /* ]] || die "LAYERLINE_VERIFY_BINARY must be an absolute path"
+  log "using provided binary: $SERVER_BINARY"
+else
+  log "building Layerline release binary"
+  "$ZIG" build -Doptimize=ReleaseFast
+fi
+[[ -x $SERVER_BINARY ]] || die "Layerline binary is not executable: $SERVER_BINARY"
 
 cat >"$CONFIG" <<CONF
 host = $HOST
@@ -159,7 +166,7 @@ sighup domain root
 HTML
 
 DOCTOR_OUT="$TMP_DIR/doctor.out"
-"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --doctor >"$DOCTOR_OUT" 2>&1 || {
+"$SERVER_BINARY" --config "$CONFIG" --doctor >"$DOCTOR_OUT" 2>&1 || {
   cat "$DOCTOR_OUT" >&2
   die "layerline doctor failed"
 }
@@ -167,7 +174,7 @@ grep -Fq 'Layerline doctor OK' "$DOCTOR_OUT" || die "layerline doctor did not re
 ok "CLI doctor"
 
 CERTS_OUT="$TMP_DIR/certs.out"
-"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --certs >"$CERTS_OUT" 2>&1 || {
+"$SERVER_BINARY" --config "$CONFIG" --certs >"$CERTS_OUT" 2>&1 || {
   cat "$CERTS_OUT" >&2
   die "layerline certs failed"
 }
@@ -178,14 +185,14 @@ ok "CLI certs"
 log "starting temporary server on http://$HOST:$PORT"
 (
   cd "$ROOT_DIR"
-  ./zig-out/bin/layerline --config "$CONFIG"
+  exec "$SERVER_BINARY" --config "$CONFIG"
 ) >"$LOG" 2>&1 &
 PID=$!
 
 wait_for_http "http://$HOST:$PORT/health" || die "server did not become healthy"
 
 CLI_ADMIN_OUT="$TMP_DIR/cli-admin-status.out"
-"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --admin-command status >"$CLI_ADMIN_OUT" 2>&1 || {
+"$SERVER_BINARY" --config "$CONFIG" --admin-command status >"$CLI_ADMIN_OUT" 2>&1 || {
   cat "$CLI_ADMIN_OUT" >&2
   die "CLI admin command failed"
 }
@@ -193,7 +200,7 @@ grep -Fq '"server":"Layerline"' "$CLI_ADMIN_OUT" || die "CLI admin command did n
 ok "CLI admin command"
 
 CLI_CONFIG_OUT="$TMP_DIR/cli-admin-config.out"
-"$ROOT_DIR/zig-out/bin/layerline" --config "$CONFIG" --admin-command config >"$CLI_CONFIG_OUT" 2>&1 || {
+"$SERVER_BINARY" --config "$CONFIG" --admin-command config >"$CLI_CONFIG_OUT" 2>&1 || {
   cat "$CLI_CONFIG_OUT" >&2
   die "CLI admin config command failed"
 }
@@ -701,7 +708,7 @@ CONF
 log "starting temporary TLS server with HTTP redirect listener on http://$HOST:$REDIRECT_PORT"
 (
   cd "$ROOT_DIR"
-  ./zig-out/bin/layerline --config "$CONFIG"
+  exec "$SERVER_BINARY" --config "$CONFIG"
 ) >"$LOG" 2>&1 &
 PID=$!
 
@@ -746,5 +753,8 @@ ok "redirect listener access log"
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true
 PID=
+
+log "verifying active process shutdown"
+python3 "$ROOT_DIR/scripts/verify-shutdown.py" "$SERVER_BINARY"
 
 log "Layerline verification passed"

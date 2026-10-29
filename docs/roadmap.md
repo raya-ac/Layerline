@@ -20,11 +20,13 @@ Raw wire tests cover these paths; this is not a claim of full HTTP/2 conformance
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 
-The next work is worker shutdown ownership, wider HTTP/2 frame/stream conformance,
-process-wide resource budgets, and config reader leases/reclamation. Detached
-background workers and connections that outlive the graceful-drain deadline must
-not retain pointers to freed runtime/config state. A passing idle shutdown smoke
-test does not cover this lifecycle risk. HTTP/3 remains experimental: configured
+Worker shutdown ownership now retains/joins background threads before cleanup;
+an independent deadline guard exits without freeing borrowed runtime state if a
+worker remains stuck. Wire/process tests cover active HTTP/1 and HTTP/2 drain,
+new-stream refusal, blocked reads/writes, and zero-window deadline expiry.
+The next work is wider HTTP/2 frame/stream conformance, process-wide resource
+budgets, absolute slow-client deadlines, and config reader leases/reclamation.
+HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these
 gates, not precede them.
