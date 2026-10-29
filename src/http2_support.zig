@@ -160,6 +160,30 @@ pub fn validateRequestFields(fields: anytype) !void {
     }
 }
 
+pub fn validateTrailerFields(fields: anytype) !void {
+    try validateRequestFields(fields);
+    for (fields) |header| {
+        if (header.name[0] == ':') return error.BadRequest;
+        // Trailers must never change framing, routing, authentication, or the
+        // interpretation of content already received. Keep them out of headers.
+        for ([_][]const u8{ "host", "content-length", "content-type", "content-encoding", "content-range", "authorization", "proxy-authorization", "cookie", "expect", "range", "te", "trailer" }) |name| {
+            if (std.mem.eql(u8, header.name, name)) return error.BadRequest;
+        }
+        if (std.mem.startsWith(u8, header.name, "if-")) return error.BadRequest;
+    }
+}
+
+pub fn headerListFits(fields: anytype, limit: usize) bool {
+    var remaining = limit;
+    for (fields) |header| {
+        for ([_]usize{ header.name.len, header.value.len, 32 }) |size| {
+            if (size > remaining) return false;
+            remaining -= size;
+        }
+    }
+    return true;
+}
+
 pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.DecodedHeaders) !request_mod.HttpRequest {
     try validateRequestFields(decoded.headers.items);
     const method = decoded.get(":method") orelse return error.BadRequest;
@@ -214,7 +238,7 @@ pub fn readFrame(reader: *PendingReader, allocator: std.mem.Allocator, max_paylo
     var header_bytes: [9]u8 = undefined;
     try reader.readExact(&header_bytes);
     const header = try h2_native.parseFrameHeader(&header_bytes);
-    if (header.length > max_payload_bytes) return error.RequestTooLarge;
+    if (header.length > max_payload_bytes) return error.FrameSize;
     const payload = try allocator.alloc(u8, header.length);
     errdefer allocator.free(payload);
     if (payload.len > 0) try reader.readExact(payload);
@@ -225,6 +249,15 @@ pub fn sendRst(stream: std.Io.net.Stream, stream_id: u32, code: u32, write_all: 
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, code, .big);
     try sendFrame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload, write_all);
+}
+
+pub fn sendSettings(stream: std.Io.net.Stream, max_streams: u32, header_bytes: usize, write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+    var payload: [12]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 3, .big);
+    std.mem.writeInt(u32, payload[2..6], max_streams, .big);
+    std.mem.writeInt(u16, payload[6..8], 6, .big);
+    std.mem.writeInt(u32, payload[8..12], @intCast(@min(header_bytes, std.math.maxInt(u32))), .big);
+    try sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, &payload, write_all);
 }
 
 pub fn makeGoawayPayload(last_stream_id: u32, code: u32) [8]u8 {

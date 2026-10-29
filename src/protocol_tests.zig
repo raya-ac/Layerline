@@ -15,6 +15,17 @@ test {
     _ = @import("php_runtime.zig");
 }
 
+test "HTTP2 trailers stay separate from routing and authentication fields" {
+    const Header = @import("h2_native.zig").Header;
+    try h2_support.validateTrailerFields(&[_]Header{.{ .name = "content-digest", .value = "sha-256=:test:" }});
+    for ([_][]const u8{ ":path", "content-length", "host", "authorization", "cookie", "content-type", "if-match", "connection", "te", "trailer" }) |name| {
+        try std.testing.expectError(error.BadRequest, h2_support.validateTrailerFields(&[_]Header{.{ .name = name, .value = "changed" }}));
+    }
+    const fields = [_]Header{.{ .name = "x-test", .value = "value" }};
+    try std.testing.expect(h2_support.headerListFits(&fields, 43));
+    try std.testing.expect(!h2_support.headerListFits(&fields, 42));
+}
+
 test "static conditional precedence and weak ETags" {
     const mtime = std.Io.Timestamp.fromNanoseconds(@as(i96, 784111777) * std.time.ns_per_s);
     try std.testing.expect(!static_files.isNotModified("If-None-Match: \"old\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT", "\"new\"", mtime));

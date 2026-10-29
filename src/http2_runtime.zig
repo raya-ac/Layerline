@@ -220,7 +220,7 @@ pub fn handlePreface(
         return;
     };
 
-    try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", ctx.stream_write_all);
+    try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
     std.debug.print("HTTP/2 native h2c connection accepted\n", .{});
     try h2_server.runFrameLoop(io, stream, flow.allocator, cfg, &reader, process_env, ctx.frame_callbacks, &flow, 0);
 }
@@ -263,7 +263,7 @@ pub fn handleUpgrade(
     try ctx.stream_write_all(stream, "\r\n");
     ctx.record_response_sent(101, 0);
 
-    try h2_support.sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, "", ctx.stream_write_all);
+    try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
 
     var reader = H2PendingReader{
         .stream = stream,

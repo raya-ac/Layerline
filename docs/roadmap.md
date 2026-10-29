@@ -9,8 +9,14 @@ admin bootstrap/session/origin controls, static handle containment, PHP alias
 diagnostic gating, cache metadata accounting, and a 32-snapshot reload ceiling
 are implemented. Native PHP2Shell input controls and exposed-version update
 notices are covered by [the security policy and tests](security.md). Remaining
-work includes config reader leases/reclamation, HTTP/2 trailers and wider frame
-conformance, process-wide resource budgets, and full HTTP/3 interoperability.
+work includes config reader leases/reclamation, wider HTTP/2 conformance and
+trailer forwarding, process-wide resource budgets, and full HTTP/3 interoperability.
+
+The HTTP/2 follow-up accepts validated terminal request trailers without merging
+them into request headers, keeps HPACK synchronized on refused streams, bounds
+decoded header bytes, advertises actual stream/header limits, restores connection
+credit for discarded DATA, and reports frame-size errors with the correct code.
+Raw wire tests cover these paths; this is not a claim of full HTTP/2 conformance.
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 

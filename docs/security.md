@@ -85,7 +85,15 @@ sendfile is restricted to plaintext streams.
 
 HTTP/2 bounds active streams, queued response bodies, accumulated request bodies,
 frame size, and header assembly. Its send windows stop DATA when either the
-stream or connection has no credit. Cache budgets now charge keys, headers and
+stream or connection has no credit. Stream and decoded-header limits are
+advertised in SETTINGS. Header blocks are decoded even on refused/closed streams
+to preserve HPACK state, after stripping padding and priority prefixes. Valid
+request trailers may finish buffered uploads; optional trailer metadata is
+validated and discarded, never merged into routing or authentication headers.
+Pseudo-headers, framing/routing/authentication fields, and non-terminal trailers
+reset only that stream. Decoded header bytes have the configured header budget,
+including HPACK's 32-byte field accounting overhead. DATA discarded on closed or
+rejected streams still restores connection credit. Cache budgets charge keys, headers and
 entry metadata as well as bodies, and each cache has a 4096-entry ceiling.
 These are live-data budgets, not exact process RSS limits.
 
@@ -101,7 +109,10 @@ count while preserving old connections; it is not automatic snapshot reclamation
 reload cap, and exposed-version checks. `scripts/verify-layerline.sh` exercises
 wire-level HTTP/1 and HTTP/2, normal and abusive multipart fixtures, denial log
 privacy, backend version notices, admin bootstrap/logout/origin behavior,
-symlink escapes, encrypted static responses, and config reload.
+symlink escapes, encrypted static responses, and config reload. The raw HTTP/2
+tests include padded/split trailers, refused-stream HPACK synchronization,
+compressed header budget bypass attempts, discarded DATA credit, and GOAWAY
+error codes. Request trailer forwarding and response trailers are not implemented.
 
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do
