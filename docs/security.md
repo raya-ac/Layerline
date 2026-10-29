@@ -74,6 +74,19 @@ and same-site/cross-site browser fetch metadata. Non-browser clients without an
 Origin still need valid authentication. A global budget of ten login attempts
 per ten seconds bounds password-hash work.
 
+HTTP/1 and native HTTP/2 share the same setup, authentication, and mutation
+handlers. Admin replies always use `no-store`, `nosniff`, `DENY` framing, and
+`no-referrer`; tenant response headers, custom error documents, compression,
+and response caches do not apply. HEAD keeps the representation length without
+sending its body. HTTP/2 Cookie fields are joined with `; ` before application
+dispatch, as required by [RFC 9113 section 8.2.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.3).
+This does not enable admin over the experimental HTTP/3 path.
+
+Web-triggered reloads allocate published config snapshots independently of the
+request arena. Snapshot metadata uses the store's allocator, while each owned
+arena is released by its own allocator after workers have stopped. The existing
+32-snapshot retention limit remains; this is not yet reader-lease reclamation.
+
 The local Unix control socket accepts one newline-terminated command per
 connection, at most 1023 bytes before the newline. It does not dispatch partial
 reads or incomplete EOF input, and an absolute one-second read deadline bounds

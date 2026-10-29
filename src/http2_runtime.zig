@@ -75,7 +75,7 @@ pub fn sendResponse(
     defer header_block.deinit(allocator);
 
     // Preserve upstream JSON and protocol headers; only replace HTML error bodies.
-    const custom_body = if (response.status_code >= 400 and response.status_code <= 599 and
+    const custom_body = if (response.apply_custom_errors and response.status_code >= 400 and response.status_code <= 599 and
         std.mem.startsWith(u8, response.content_type, "text/html"))
     blk: {
         if (ctx.read_error_document) |read| break :blk read(allocator, response.status_code) catch null;

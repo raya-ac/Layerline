@@ -10,6 +10,7 @@ test {
     _ = @import("http2_flow.zig");
     _ = @import("admin_support.zig");
     _ = @import("admin_runtime.zig");
+    _ = @import("admin_reply.zig");
     _ = @import("config_store.zig");
     _ = @import("request_guard.zig");
     _ = @import("php_version.zig");
@@ -31,6 +32,30 @@ test "HTTP2 trailers stay separate from routing and authentication fields" {
     const fields = [_]Header{.{ .name = "x-test", .value = "value" }};
     try std.testing.expect(h2_support.headerListFits(&fields, 43));
     try std.testing.expect(!h2_support.headerListFits(&fields, 42));
+}
+
+fn splitCookieAllocationCheck(allocator: std.mem.Allocator) !void {
+    const fields = [_]h2.Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "local" },
+        .{ .name = ":path", .value = "/admin" },
+        .{ .name = "cookie", .value = "other=first" },
+        .{ .name = "authorization", .value = "first" },
+        .{ .name = "cookie", .value = "session=second; third=value" },
+        .{ .name = "authorization", .value = "second" },
+    };
+    const decoded: h2.DecodedHeaders = .{ .headers = .{ .items = @constCast(&fields), .capacity = fields.len } };
+    const req = try h2_support.parseRequest(allocator, &decoded);
+    defer allocator.free(req.method);
+    defer allocator.free(req.path);
+    defer allocator.free(req.query);
+    defer allocator.free(req.headers);
+    try std.testing.expectEqualStrings("Host: local\r\nauthorization: first\r\nauthorization: second\r\ncookie: other=first; session=second; third=value\r\n", req.headers);
+}
+
+test "HTTP2 joins only Cookie fields and cleans up failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, splitCookieAllocationCheck, .{});
 }
 
 test "static conditional precedence and weak ETags" {

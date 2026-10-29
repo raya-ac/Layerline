@@ -20,6 +20,7 @@ pub const BufferedResponse = struct {
     content_type: []const u8,
     body: []const u8,
     headers: []const h2_native.Header = &.{},
+    apply_custom_errors: bool = true,
 };
 
 pub const Frame = struct {
@@ -303,8 +304,19 @@ pub fn parseRequest(allocator: std.mem.Allocator, decoded: *const h2_native.Deco
     for (decoded.headers.items) |header| {
         if (header.name.len > 0 and header.name[0] == ':') continue;
         if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
+        if (std.mem.eql(u8, header.name, "cookie")) continue;
         try headers.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
     }
+    // RFC 9113 section 8.2.3: applications receive one Cookie field, joined
+    // with semicolons. Other repeated fields retain their original boundaries.
+    var saw_cookie = false;
+    for (decoded.headers.items) |header| {
+        if (!std.mem.eql(u8, header.name, "cookie")) continue;
+        try headers.appendSlice(allocator, if (saw_cookie) "; " else "cookie: ");
+        try headers.appendSlice(allocator, header.value);
+        saw_cookie = true;
+    }
+    if (saw_cookie) try headers.appendSlice(allocator, "\r\n");
 
     const owned_method = try allocator.dupe(u8, method);
     errdefer allocator.free(owned_method);

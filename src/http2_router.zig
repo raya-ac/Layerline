@@ -1,5 +1,6 @@
 const std = @import("std");
 const guard = @import("request_guard.zig");
+const admin_support = @import("admin_support.zig");
 
 const buffered_cache = @import("buffered_cache.zig");
 const config_mod = @import("config.zig");
@@ -26,6 +27,7 @@ const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
 
 pub const Callbacks = struct {
     access_log_set_handler: *const fn ([]const u8) void,
+    admin_response: *const fn (std.Io, std.mem.Allocator, *ServerConfig, HttpRequest) anyerror!H2BufferedResponse,
     custom_not_found_response: *const fn (std.Io, std.mem.Allocator, *const ServerConfig, ?*const DomainConfig) anyerror!?H2BufferedResponse,
     error_response: *const fn (std.mem.Allocator, u16, []const u8, []const u8) anyerror!H2BufferedResponse,
     fetch_upstream_pool_response: *const fn (std.mem.Allocator, *UpstreamPoolConfig, UpstreamPoolPolicy, UpstreamRuntimePolicy, HttpRequest, *const ServerConfig) anyerror!H2BufferedResponse,
@@ -122,6 +124,15 @@ pub fn buildResponseForRequest(
         guard.log(io, cfg, req, rule);
         callbacks.access_log_set_handler("security_block");
         return .{ .status_code = 403, .content_type = "text/plain; charset=utf-8", .body = guard.reply, .headers = &.{.{ .name = "cache-control", .value = "no-store" }} };
+    }
+    // HTTP/3 shares this router, but its control-plane exposure is not accepted.
+    if (cfg.admin_ui_enabled and std.mem.eql(u8, req.version, "HTTP/2.0") and
+        admin_support.adminPathMatches(cfg.admin_ui_path, req.path))
+    {
+        callbacks.set_response_headers(&.{});
+        callbacks.set_compression_policy(.disabled);
+        callbacks.access_log_set_handler("admin_ui");
+        return callbacks.admin_response(io, allocator, cfg, req);
     }
     _ = process_env;
     const is_head = std.mem.eql(u8, req.method, "HEAD");

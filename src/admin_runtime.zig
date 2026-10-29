@@ -2,6 +2,7 @@ const std = @import("std");
 const read_deadline = @import("read_deadline.zig");
 const builtin = @import("builtin");
 const admin_pages = @import("admin_pages.zig");
+const admin_reply = @import("admin_reply.zig");
 const admin_support = @import("admin_support.zig");
 const session_mod = @import("admin_sessions.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
@@ -12,6 +13,7 @@ const request_mod = @import("request.zig");
 
 const AdminConfigSetting = admin_support.AdminConfigSetting;
 const AdminCredentials = admin_support.AdminCredentials;
+const Reply = admin_reply.Reply;
 const HttpRequest = request_mod.HttpRequest;
 const ServerConfig = config_mod.ServerConfig;
 const isDomainConfigFileName = config_loader.isDomainConfigFileName;
@@ -32,7 +34,7 @@ pub const Callbacks = struct {
     runtime_view: *const fn () admin_pages.RuntimeView,
     send_dashboard_page: *const fn (
         std.Io,
-        std.Io.net.Stream,
+        *Reply,
         std.mem.Allocator,
         *const ServerConfig,
         AdminCredentials,
@@ -40,15 +42,12 @@ pub const Callbacks = struct {
         ?[]const u8,
         u16,
         []const u8,
-        bool,
-        bool,
     ) anyerror!void,
-    send_login_page: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8, bool, bool) anyerror!void,
-    send_method_not_allowed: *const fn (std.Io.net.Stream, std.mem.Allocator, []const u8, bool, bool) anyerror!void,
-    send_redirect: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, bool, bool) anyerror!void,
-    send_response: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, []const u8, bool) anyerror!void,
-    send_response_no_body: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
-    send_setup_page: *const fn (std.Io.net.Stream, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8, bool, bool) anyerror!void,
+    send_login_page: *const fn (*Reply, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8) anyerror!void,
+    send_method_not_allowed: *const fn (*Reply, std.mem.Allocator, []const u8) anyerror!void,
+    send_redirect: *const fn (*Reply, std.mem.Allocator, *const ServerConfig, ?[]const u8) anyerror!void,
+    send_response: *const fn (*Reply, u16, []const u8, []const u8, []const u8) anyerror!void,
+    send_setup_page: *const fn (*Reply, std.mem.Allocator, *const ServerConfig, ?[]const u8, u16, []const u8) anyerror!void,
     set_stream_timeouts: *const fn (std.Io.net.Stream, u32, u32) anyerror!void,
     shutdown_requested: *std.atomic.Value(bool),
     validate_activation: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
@@ -63,9 +62,9 @@ pub const SocketContext = struct {
     callbacks: Callbacks,
 };
 
-fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleSetupPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, req: HttpRequest, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_setup_page(stream, allocator, cfg, "The setup form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_setup_page(reply, allocator, cfg, "The setup form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -74,7 +73,7 @@ fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
     defer allocator.free(saved_token);
     const supplied = admin_support.formValue(fields.items, "setup_token") orelse "";
     if (supplied.len != 64 or !std.crypto.timing_safe.eql([64]u8, saved_token[0..64].*, supplied[0..64].*)) {
-        try callbacks.send_setup_page(stream, allocator, cfg, "Enter the local setup token to create admin access.", 403, "Forbidden", close_connection, false);
+        try callbacks.send_setup_page(reply, allocator, cfg, "Enter the local setup token to create admin access.", 403, "Forbidden");
         return;
     }
     const username = admin_support.formValue(fields.items, "username") orelse "";
@@ -88,7 +87,7 @@ fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
             error.PathAlreadyExists => "Admin access is already configured. Sign in instead.",
             else => "Layerline could not create the admin credentials file.",
         };
-        try callbacks.send_setup_page(stream, allocator, cfg, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_setup_page(reply, allocator, cfg, message, 400, "Bad Request");
         return;
     };
     const token_path = try admin_support.adminSetupTokenPath(allocator, cfg);
@@ -96,16 +95,16 @@ fn handleSetupPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
     std.Io.Dir.cwd().deleteFile(io, token_path) catch {};
     const cookie = try admin_support.makeAdminSessionCookie(io, allocator, cfg, credentials);
     defer allocator.free(cookie);
-    try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
+    try callbacks.send_redirect(reply, allocator, cfg, cookie);
 }
 
-fn handleLoginPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleLoginPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, callbacks: Callbacks) !void {
     if (!session_mod.sessions.admitLogin(std.Io.Timestamp.now(io, .awake).toSeconds())) {
-        try callbacks.send_login_page(stream, allocator, cfg, "Too many sign-in attempts. Try again shortly.", 429, "Too Many Requests", close_connection, false);
+        try callbacks.send_login_page(reply, allocator, cfg, "Too many sign-in attempts. Try again shortly.", 429, "Too Many Requests");
         return;
     }
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_login_page(stream, allocator, cfg, "The login form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_login_page(reply, allocator, cfg, "The login form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -113,50 +112,50 @@ fn handleLoginPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.All
     const username = admin_support.formValue(fields.items, "username") orelse "";
     const password = admin_support.formValue(fields.items, "password") orelse "";
     if (!std.mem.eql(u8, username, credentials.username) or !(try admin_support.verifyAdminPassword(credentials, password))) {
-        try callbacks.send_login_page(stream, allocator, cfg, "The username or password was not accepted.", 401, "Unauthorized", close_connection, false);
+        try callbacks.send_login_page(reply, allocator, cfg, "The username or password was not accepted.", 401, "Unauthorized");
         return;
     }
 
     const cookie = try admin_support.makeAdminSessionCookie(io, allocator, cfg, credentials);
     defer allocator.free(cookie);
-    try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
+    try callbacks.send_redirect(reply, allocator, cfg, cookie);
 }
 
-fn handleValidatePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+fn handleValidatePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
     callbacks.validate_activation(io, allocator, cfg) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "Activation config is invalid: {}", .{err});
         defer allocator.free(message);
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
-    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, "Activation config is valid. A managed restart can apply staged writes.", null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Activation config is valid. A managed restart can apply staged writes.", null, 200, "OK");
 }
 
-fn handleRestartPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+fn handleRestartPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
     callbacks.validate_activation(io, allocator, cfg) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "Restart blocked because activation config is invalid: {}", .{err});
         defer allocator.free(message);
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
 
     callbacks.request_restart();
-    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted");
 }
 
-fn handleReloadPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+fn handleReloadPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
     callbacks.reload_config(io, allocator, cfg) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "Reload blocked: {}", .{err});
         defer allocator.free(message);
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
 
     const active_cfg = callbacks.active_config();
-    try callbacks.send_dashboard_page(io, stream, allocator, active_cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, active_cfg, credentials, "Config reloaded in memory for new connections.", null, 200, "OK");
 }
 
-fn handleCertRenewPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, close_connection: bool, callbacks: Callbacks) !void {
+fn handleCertRenewPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
     callbacks.renew_certs(io, allocator, cfg) catch |err| {
         const message = switch (err) {
             error.AcmeRenewalDisabled => "Certificate renewal is not enabled. Configure tls_auto, letsencrypt_domains, letsencrypt_webroot, and letsencrypt_renew first.",
@@ -164,16 +163,16 @@ fn handleCertRenewPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem
         };
         const allocated = err != error.AcmeRenewalDisabled;
         defer if (allocated) allocator.free(message);
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
 
-    try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, callbacks.active_config(), credentials, "Certificate renewal completed and TLS material was reloaded for new connections.", null, 200, "OK");
 }
 
-fn handleCachePurgePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleCachePurgePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The cache purge form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The cache purge form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -187,7 +186,7 @@ fn handleCachePurgePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.me
         try std.fmt.allocPrint(allocator, "Purged {d} cache entries matching {s}.", .{ removed, target });
     defer allocator.free(message);
 
-    try callbacks.send_dashboard_page(io, stream, allocator, callbacks.active_config(), credentials, message, null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, callbacks.active_config(), credentials, message, null, 200, "OK");
 }
 
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
@@ -216,9 +215,9 @@ fn cachePurgeTargetFromRequest(allocator: std.mem.Allocator, req: HttpRequest) !
     return try allocator.dupe(u8, raw_target);
 }
 
-fn handleCachePurgeApiPost(stream: std.Io.net.Stream, allocator: std.mem.Allocator, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleCachePurgeApiPost(reply: *Reply, allocator: std.mem.Allocator, req: HttpRequest, callbacks: Callbacks) !void {
     const target = cachePurgeTargetFromRequest(allocator, req) catch {
-        try callbacks.send_response(stream, 400, "Bad Request", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid_form\"}\n", close_connection);
+        try callbacks.send_response(reply, 400, "Bad Request", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid_form\"}\n");
         return;
     };
     defer if (target.len > 0) allocator.free(target);
@@ -230,12 +229,12 @@ fn handleCachePurgeApiPost(stream: std.Io.net.Stream, allocator: std.mem.Allocat
     try appendJsonString(&body, allocator, if (target.len == 0) "all" else target);
     try body.appendSlice(allocator, "}\n");
 
-    try callbacks.send_response(stream, 200, "OK", "application/json; charset=utf-8", body.items, close_connection);
+    try callbacks.send_response(reply, 200, "OK", "application/json; charset=utf-8", body.items);
 }
 
-fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleAddSitePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The site form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The site form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -282,7 +281,7 @@ fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.A
             error.InvalidConfigValue => "The site values are invalid. Use a simple name, server names, safe paths, and complete route fields when adding a route.",
             else => "Layerline could not build that site config.",
         };
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
     defer allocator.free(site_config);
@@ -293,19 +292,19 @@ fn handleAddSitePost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.A
             error.PathAlreadyExists => "A site config with that internal name already exists.",
             else => "Layerline could not write the site config file.",
         };
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
     defer allocator.free(path);
 
     const message = try std.fmt.allocPrint(allocator, "Created {s}. Restart Layerline for the new site to become active.", .{path});
     defer allocator.free(message);
-    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, message, null, 201, "Created", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, message, null, 201, "Created");
 }
 
-fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, close_connection: bool, callbacks: Callbacks) !void {
+fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, req: HttpRequest, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The settings form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The settings form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -402,7 +401,7 @@ fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
             error.InvalidUpstream => "The proxy field must be one or more http:// or https:// upstream URLs.",
             else => "Layerline could not validate those settings.",
         };
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
 
@@ -411,14 +410,14 @@ fn handleSettingsPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.
             error.InvalidConfigValue => "The generated main config was too large or contained unsafe values.",
             else => "Layerline could not write the main config file.",
         };
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
     defer allocator.free(path);
 
     const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}. A backup was written when the file already existed. Restart Layerline for these changes to become active.", .{path});
     defer allocator.free(message);
-    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, message, null, 200, "OK");
 }
 
 fn parseAdminUsize(value: []const u8) !usize {
@@ -448,9 +447,9 @@ fn upstreamControlMessage(allocator: std.mem.Allocator, action: admin_upstreams.
     return std.fmt.allocPrint(allocator, "{s} domain {s} route {s} upstream target {d}.", .{ verb, address.domain, address.route, address.index });
 }
 
-fn handleUpstreamControlPost(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, credentials: AdminCredentials, req: HttpRequest, action: admin_upstreams.ControlAction, close_connection: bool, callbacks: Callbacks) !void {
+fn handleUpstreamControlPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *ServerConfig, credentials: AdminCredentials, req: HttpRequest, action: admin_upstreams.ControlAction, callbacks: Callbacks) !void {
     var fields = admin_support.parseUrlEncodedForm(allocator, req.body) catch {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream control form could not be parsed.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The upstream control form could not be parsed.", 400, "Bad Request");
         return;
     };
     defer admin_support.freeFormFields(allocator, &fields);
@@ -460,51 +459,49 @@ fn handleUpstreamControlPost(io: std.Io, stream: std.Io.net.Stream, allocator: s
         .domain = admin_support.adminTrimmedField(fields.items, "domain"),
         .route = admin_support.adminTrimmedField(fields.items, "route"),
         .index = parseAdminUsize(admin_support.adminTrimmedField(fields.items, "index")) catch {
-            try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream target index is invalid.", 400, "Bad Request", close_connection, false);
+            try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The upstream target index is invalid.", 400, "Bad Request");
             return;
         },
     };
     const duration_ms = parseAdminU32OrDefault(admin_support.adminTrimmedField(fields.items, "duration_ms"), admin_upstreams.DEFAULT_MANUAL_EJECT_MS) catch {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, "The upstream ejection duration is invalid.", 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, "The upstream ejection duration is invalid.", 400, "Bad Request");
         return;
     };
 
     admin_upstreams.applyControl(io, cfg, action, address, duration_ms) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "Upstream control failed: {}", .{err});
         defer allocator.free(message);
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, message, 400, "Bad Request", close_connection, false);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
 
     const message = try upstreamControlMessage(allocator, action, address);
     defer allocator.free(message);
-    try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, message, null, 200, "OK", close_connection, false);
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, message, null, 200, "OK");
 }
 
 pub fn handleUi(
     io: std.Io,
-    stream: std.Io.net.Stream,
+    reply: *Reply,
     allocator: std.mem.Allocator,
     cfg: *ServerConfig,
     req: HttpRequest,
-    close_connection: bool,
     is_head: bool,
     callbacks: Callbacks,
 ) !void {
     const method = req.method;
     if (std.mem.eql(u8, method, "OPTIONS")) {
-        const allow_header = "Allow: GET,HEAD,POST,OPTIONS\r\nCache-Control: no-store\r\n";
-        try callbacks.send_response_no_body(stream, 204, "No Content", "text/plain; charset=utf-8", 0, close_connection, allow_header);
+        try reply.set(204, "No Content", "text/plain; charset=utf-8", "", &.{.{ .name = "allow", .value = "GET,HEAD,POST,OPTIONS" }});
         return;
     }
     if (!(std.mem.eql(u8, method, "GET") or is_head or std.mem.eql(u8, method, "POST"))) {
-        try callbacks.send_method_not_allowed(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
+        try callbacks.send_method_not_allowed(reply, allocator, "GET,HEAD,POST,OPTIONS");
         return;
     }
 
     const sub_path = admin_support.adminSubPath(cfg.admin_ui_path, req.path);
     if (std.mem.eql(u8, method, "POST") and !admin_support.adminMutationOriginAllowed(req.headers, cfg.tls_enabled)) {
-        try callbacks.send_response(stream, 403, "Forbidden", "text/plain; charset=utf-8", "Admin requests must come from the same origin.\n", close_connection);
+        try callbacks.send_response(reply, 403, "Forbidden", "text/plain; charset=utf-8", "Admin requests must come from the same origin.\n");
         return;
     }
     const maybe_credentials = try admin_support.loadAdminCredentials(io, allocator, cfg.admin_credentials_path);
@@ -512,28 +509,28 @@ pub fn handleUi(
         const setup_token = try admin_support.ensureAdminSetupToken(io, allocator, cfg);
         defer allocator.free(setup_token);
         if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/setup")) {
-            try handleSetupPost(io, stream, allocator, cfg, req, close_connection, callbacks);
+            try handleSetupPost(io, reply, allocator, cfg, req, callbacks);
             return;
         }
         if (std.mem.eql(u8, method, "GET") or is_head) {
-            try callbacks.send_setup_page(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
+            try callbacks.send_setup_page(reply, allocator, cfg, null, 200, "OK");
             return;
         }
-        try callbacks.send_method_not_allowed(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
+        try callbacks.send_method_not_allowed(reply, allocator, "GET,HEAD,POST,OPTIONS");
         return;
     }
 
     const credentials = maybe_credentials.?;
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/login")) {
-        try handleLoginPost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        try handleLoginPost(io, reply, allocator, cfg, credentials, req, callbacks);
         return;
     }
     if (!admin_support.adminSessionCookieValid(io, req.headers, credentials)) {
         if (std.mem.eql(u8, method, "GET") or is_head) {
-            try callbacks.send_login_page(stream, allocator, cfg, null, 200, "OK", close_connection, is_head);
+            try callbacks.send_login_page(reply, allocator, cfg, null, 200, "OK");
             return;
         }
-        try callbacks.send_login_page(stream, allocator, cfg, "Sign in before using the admin dashboard.", 401, "Unauthorized", close_connection, false);
+        try callbacks.send_login_page(reply, allocator, cfg, "Sign in before using the admin dashboard.", 401, "Unauthorized");
         return;
     }
 
@@ -541,57 +538,57 @@ pub fn handleUi(
         admin_support.revokeAdminSession(req.headers, credentials);
         const cookie = try admin_support.makeAdminClearCookie(allocator, cfg);
         defer allocator.free(cookie);
-        try callbacks.send_redirect(stream, allocator, cfg, cookie, close_connection, false);
+        try callbacks.send_redirect(reply, allocator, cfg, cookie);
         return;
     }
 
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/validate")) {
-        try handleValidatePost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        try handleValidatePost(io, reply, allocator, cfg, credentials, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/restart")) {
-        try handleRestartPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        try handleRestartPost(io, reply, allocator, cfg, credentials, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/reload")) {
-        try handleReloadPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        try handleReloadPost(io, reply, allocator, cfg, credentials, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/certs/renew")) {
-        try handleCertRenewPost(io, stream, allocator, cfg, credentials, close_connection, callbacks);
+        try handleCertRenewPost(io, reply, allocator, cfg, credentials, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/cache/purge")) {
-        try handleCachePurgePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        try handleCachePurgePost(io, reply, allocator, cfg, credentials, req, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/api/cache/purge")) {
-        try handleCachePurgeApiPost(stream, allocator, req, close_connection, callbacks);
+        try handleCachePurgeApiPost(reply, allocator, req, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/eject")) {
-        try handleUpstreamControlPost(io, stream, allocator, cfg, credentials, req, .eject, close_connection, callbacks);
+        try handleUpstreamControlPost(io, reply, allocator, cfg, credentials, req, .eject, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/upstreams/recover")) {
-        try handleUpstreamControlPost(io, stream, allocator, cfg, credentials, req, .recover, close_connection, callbacks);
+        try handleUpstreamControlPost(io, reply, allocator, cfg, credentials, req, .recover, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/sites/add")) {
-        try handleAddSitePost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        try handleAddSitePost(io, reply, allocator, cfg, credentials, req, callbacks);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, sub_path, "/settings/save")) {
-        try handleSettingsPost(io, stream, allocator, cfg, credentials, req, close_connection, callbacks);
+        try handleSettingsPost(io, reply, allocator, cfg, credentials, req, callbacks);
         return;
     }
 
     if (std.mem.eql(u8, method, "GET") or is_head) {
-        try callbacks.send_dashboard_page(io, stream, allocator, cfg, credentials, null, null, 200, "OK", close_connection, is_head);
+        try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, null, 200, "OK");
         return;
     }
 
-    try callbacks.send_method_not_allowed(stream, allocator, "GET,HEAD,POST,OPTIONS", close_connection, is_head);
+    try callbacks.send_method_not_allowed(reply, allocator, "GET,HEAD,POST,OPTIONS");
 }
 
 fn sendText(stream: std.Io.net.Stream, bytes: []const u8, callbacks: Callbacks) !void {

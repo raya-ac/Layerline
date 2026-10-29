@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const admin_reply = @import("admin_reply.zig");
+const Reply = admin_reply.Reply;
 const admin_pages = @import("admin_pages.zig");
 const admin_support = @import("admin_support.zig");
 const admin_ui = @import("admin_ui.zig");
@@ -11,50 +13,36 @@ const ServerConfig = config_mod.ServerConfig;
 pub const Callbacks = struct {
     render_activation_diff: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror![]const u8,
     runtime_view: *const fn () admin_pages.RuntimeView,
-    send_response_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, []const u8, bool, ?[]const u8) anyerror!void,
-    send_response_no_body_headers: *const fn (std.Io.net.Stream, u16, []const u8, []const u8, usize, bool, ?[]const u8) anyerror!void,
     validate_activation: *const fn (std.Io, std.mem.Allocator, *const ServerConfig) anyerror!void,
 };
 
-pub fn sendRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool, callbacks: Callbacks) !void {
-    const extra_headers = if (cookie) |cookie_value|
-        try std.fmt.allocPrint(allocator, "Location: {s}\r\nSet-Cookie: {s}\r\nCache-Control: no-store\r\n", .{ cfg.admin_ui_path, cookie_value })
-    else
-        try std.fmt.allocPrint(allocator, "Location: {s}\r\nCache-Control: no-store\r\n", .{cfg.admin_ui_path});
-    defer allocator.free(extra_headers);
-
-    const body = "Redirecting to Layerline Admin.\n";
-    if (is_head) {
-        try callbacks.send_response_no_body_headers(stream, 303, "See Other", "text/plain; charset=utf-8", body.len, close_connection, extra_headers);
-    } else {
-        try callbacks.send_response_headers(stream, 303, "See Other", "text/plain; charset=utf-8", body, close_connection, extra_headers);
-    }
+pub fn sendRedirect(reply: *Reply, _: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8) !void {
+    var headers: [2]admin_reply.Header = undefined;
+    headers[0] = .{ .name = "location", .value = cfg.admin_ui_path };
+    if (cookie) |value| headers[1] = .{ .name = "set-cookie", .value = value };
+    const count: usize = if (cookie != null) 2 else 1;
+    try reply.set(303, "See Other", "text/plain; charset=utf-8", "Redirecting to Layerline Admin.\n", headers[0..count]);
 }
 
-fn sendPage(stream: std.Io.net.Stream, status_code: u16, status_text: []const u8, body: []const u8, close_connection: bool, is_head: bool, callbacks: Callbacks) !void {
-    const headers = "Cache-Control: no-store\r\n";
-    if (is_head) {
-        try callbacks.send_response_no_body_headers(stream, status_code, status_text, "text/html; charset=utf-8", body.len, close_connection, headers);
-    } else {
-        try callbacks.send_response_headers(stream, status_code, status_text, "text/html; charset=utf-8", body, close_connection, headers);
-    }
+fn sendPage(reply: *Reply, status_code: u16, status_text: []const u8, body: []const u8) !void {
+    try reply.set(status_code, status_text, "text/html; charset=utf-8", body, &.{});
 }
 
-pub fn sendSetupPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool, callbacks: Callbacks) !void {
+pub fn sendSetupPage(reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8) !void {
     const body = try admin_ui.renderAdminSetupPage(allocator, cfg, maybe_error);
     defer allocator.free(body);
-    try sendPage(stream, status_code, status_text, body, close_connection, is_head, callbacks);
+    try sendPage(reply, status_code, status_text, body);
 }
 
-pub fn sendLoginPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool, callbacks: Callbacks) !void {
+pub fn sendLoginPage(reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8) !void {
     const body = try admin_ui.renderAdminLoginPage(allocator, cfg, maybe_error);
     defer allocator.free(body);
-    try sendPage(stream, status_code, status_text, body, close_connection, is_head, callbacks);
+    try sendPage(reply, status_code, status_text, body);
 }
 
 pub fn sendDashboardPage(
     io: std.Io,
-    stream: std.Io.net.Stream,
+    reply: *Reply,
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     credentials: AdminCredentials,
@@ -62,11 +50,9 @@ pub fn sendDashboardPage(
     maybe_error: ?[]const u8,
     status_code: u16,
     status_text: []const u8,
-    close_connection: bool,
-    is_head: bool,
     callbacks: Callbacks,
 ) !void {
     const body = try admin_pages.renderDashboardPage(io, allocator, cfg, credentials, maybe_notice, maybe_error, callbacks.runtime_view(), callbacks.validate_activation, callbacks.render_activation_diff);
     defer allocator.free(body);
-    try sendPage(stream, status_code, status_text, body, close_connection, is_head, callbacks);
+    try sendPage(reply, status_code, status_text, body);
 }

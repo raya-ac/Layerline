@@ -768,4 +768,7 @@ python3 "$ROOT_DIR/scripts/verify-php-version.py" "$SERVER_BINARY"
 log "verifying HTTP/1 response transfer budgets"
 python3 "$ROOT_DIR/scripts/verify-http1-transfer.py" "$SERVER_BINARY"
 
+log "verifying native TLS HTTP/2 admin controls"
+python3 "$ROOT_DIR/scripts/verify-admin-http2.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

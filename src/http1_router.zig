@@ -107,6 +107,8 @@ pub fn route(
     }
 
     if (cfg.admin_ui_enabled and admin_support.adminPathMatches(cfg.admin_ui_path, req.path)) {
+        callbacks.set_response_headers(&.{});
+        callbacks.set_request_context(req.headers, .disabled);
         callbacks.access_log_set_handler("admin_ui");
         try callbacks.handle_admin_ui(io, stream, allocator, cfg, req, should_close, is_head);
         return;

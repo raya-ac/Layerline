@@ -39,12 +39,12 @@ pub const Store = struct {
         return @ptrFromInt(raw);
     }
 
-    pub fn activateOwned(self: *Store, allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, cfg: *ServerConfig) !void {
+    pub fn activateOwned(self: *Store, arena: *std.heap.ArenaAllocator, cfg: *ServerConfig) !void {
         self.lock();
         defer self.mutex.unlock();
 
         if (self.snapshots.items.len >= max_snapshots) return error.ReloadLimitRequiresRestart;
-        if (self.allocator == null) self.allocator = allocator;
+        const allocator = self.allocator orelse return error.ConfigNotInstalled;
         const snapshot = try allocator.create(Snapshot);
         errdefer allocator.destroy(snapshot);
         snapshot.* = .{ .cfg = cfg, .arena = arena };
@@ -61,8 +61,9 @@ pub const Store = struct {
         const allocator = self.allocator orelse return;
         for (self.snapshots.items) |snapshot| {
             if (snapshot.arena) |arena| {
+                const owner = arena.child_allocator;
                 arena.deinit();
-                allocator.destroy(arena);
+                owner.destroy(arena);
             }
             allocator.destroy(snapshot);
         }
@@ -87,7 +88,7 @@ test "reload snapshots have a hard cap and distinct cache generations" {
         arena.* = std.heap.ArenaAllocator.init(allocator);
         const cfg = try arena.allocator().create(ServerConfig);
         cfg.* = config_mod.defaultServerConfig();
-        try store.activateOwned(allocator, arena, cfg);
+        try store.activateOwned(arena, cfg);
         try std.testing.expectEqual(i + 1, cfg.cache_generation);
     }
     const previous = store.current();
@@ -98,7 +99,25 @@ test "reload snapshots have a hard cap and distinct cache generations" {
         allocator.destroy(rejected);
     }
     var cfg = config_mod.defaultServerConfig();
-    try std.testing.expectError(error.ReloadLimitRequiresRestart, store.activateOwned(allocator, rejected, &cfg));
+    try std.testing.expectError(error.ReloadLimitRequiresRestart, store.activateOwned(rejected, &cfg));
     try std.testing.expect(previous == store.current());
     try std.testing.expectEqual(0, cfg.cache_generation);
+}
+
+test "snapshot metadata and candidate arenas keep their respective allocators" {
+    var store = Store{};
+    defer store.deinit();
+    var initial = config_mod.defaultServerConfig();
+    try store.installInitial(std.testing.allocator, &initial);
+    const owner = std.heap.page_allocator;
+    const arena = try owner.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(owner);
+    errdefer {
+        arena.deinit();
+        owner.destroy(arena);
+    }
+    const candidate = try arena.allocator().create(ServerConfig);
+    candidate.* = config_mod.defaultServerConfig();
+    try store.activateOwned(arena, candidate);
+    try std.testing.expect(store.current() == candidate);
 }

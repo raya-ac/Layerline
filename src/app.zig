@@ -1,5 +1,6 @@
 const std = @import("std");
 const admin_http = @import("admin_http.zig");
+const admin_reply = @import("admin_reply.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_support = @import("admin_support.zig");
@@ -173,7 +174,10 @@ fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const Se
     if (!optionalStringEql(active.admin_socket_path, candidate.admin_socket_path)) return error.ReloadRequiresRestart;
 }
 
-fn reloadConfigInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
+fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerConfig) !void {
+    // A browser request arena is reset after the reply. Published snapshots
+    // must instead own process-lifetime storage, just like signal reloads.
+    const allocator = std.heap.page_allocator;
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
@@ -192,7 +196,7 @@ fn reloadConfigInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const
     try validateConfig(candidate);
     try validateReloadCompatibility(active, candidate);
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
-    try runtime_state.config_store.activateOwned(allocator, arena, candidate);
+    try runtime_state.config_store.activateOwned(arena, candidate);
 }
 
 fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
@@ -239,21 +243,9 @@ fn adminRuntimeView() admin_pages.RuntimeView {
     return .{ .server_name = SERVER_NAME, .metrics = &runtime_state.server_metrics };
 }
 
-fn sendAdminRedirect(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, cookie: ?[]const u8, close_connection: bool, is_head: bool) !void {
-    try admin_http.sendRedirect(stream, allocator, cfg, cookie, close_connection, is_head, adminHttpCallbacks());
-}
-
-fn sendAdminSetupPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
-    try admin_http.sendSetupPage(stream, allocator, cfg, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
-}
-
-fn sendAdminLoginPage(stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *const ServerConfig, maybe_error: ?[]const u8, status_code: u16, status_text: []const u8, close_connection: bool, is_head: bool) !void {
-    try admin_http.sendLoginPage(stream, allocator, cfg, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
-}
-
 fn sendAdminDashboardPage(
     io: std.Io,
-    stream: std.Io.net.Stream,
+    reply: *admin_reply.Reply,
     allocator: std.mem.Allocator,
     cfg: *const ServerConfig,
     credentials: AdminCredentials,
@@ -261,10 +253,8 @@ fn sendAdminDashboardPage(
     maybe_error: ?[]const u8,
     status_code: u16,
     status_text: []const u8,
-    close_connection: bool,
-    is_head: bool,
 ) !void {
-    try admin_http.sendDashboardPage(io, stream, allocator, cfg, credentials, maybe_notice, maybe_error, status_code, status_text, close_connection, is_head, adminHttpCallbacks());
+    try admin_http.sendDashboardPage(io, reply, allocator, cfg, credentials, maybe_notice, maybe_error, status_code, status_text, adminHttpCallbacks());
 }
 
 fn adminRenderMetrics(allocator: std.mem.Allocator) ![]const u8 {
@@ -285,8 +275,6 @@ fn adminHttpCallbacks() admin_http.Callbacks {
     return .{
         .render_activation_diff = renderActivationConfigDiff,
         .runtime_view = adminRuntimeView,
-        .send_response_headers = sendResponseWithConnectionAndHeaders,
-        .send_response_no_body_headers = sendResponseNoBodyWithConnectionAndHeaders,
         .validate_activation = validateConfigFileForActivation,
     };
 }
@@ -306,12 +294,11 @@ fn adminCallbacks() admin_runtime.Callbacks {
         .request_restart = adminRequestRestart,
         .runtime_view = adminRuntimeView,
         .send_dashboard_page = sendAdminDashboardPage,
-        .send_login_page = sendAdminLoginPage,
-        .send_method_not_allowed = sendMethodNotAllowedWithAllow,
-        .send_redirect = sendAdminRedirect,
-        .send_response = sendResponseWithConnection,
-        .send_response_no_body = sendResponseNoBodyWithConnectionAndHeaders,
-        .send_setup_page = sendAdminSetupPage,
+        .send_login_page = admin_http.sendLoginPage,
+        .send_method_not_allowed = admin_reply.sendMethodNotAllowed,
+        .send_redirect = admin_http.sendRedirect,
+        .send_response = admin_reply.sendResponse,
+        .send_setup_page = admin_http.sendSetupPage,
         .set_stream_timeouts = setStreamTimeouts,
         .shutdown_requested = &runtime_state.shutdown_requested,
         .validate_activation = validateConfigFileForActivation,
@@ -568,6 +555,7 @@ fn http2Callbacks() h2_server.Callbacks {
 fn http2RouterCallbacks() http2_router.Callbacks {
     return .{
         .access_log_set_handler = runtime_state.accessLogSetHandler,
+        .admin_response = buildAdminHttp2Response,
         .custom_not_found_response = h2DomainCustomNotFoundResponse,
         .error_response = h2CoolErrorResponse,
         .fetch_upstream_pool_response = fetchHttp2UpstreamPoolResponse,
@@ -681,7 +669,31 @@ fn handleNamedRoute(
 }
 
 fn routeAdminUi(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest, close_connection: bool, is_head: bool) !void {
-    try admin_runtime.handleUi(io, stream, allocator, cfg, req, close_connection, is_head, adminCallbacks());
+    const response = try buildAdminResponse(io, allocator, cfg, req);
+    defer response.deinit(allocator);
+    const headers = try response.renderHeaders(allocator);
+    defer allocator.free(headers);
+    if (is_head) {
+        try sendResponseNoBodyWithConnectionAndHeaders(stream, response.status_code, response.status_text, response.content_type, response.body.len, close_connection, headers);
+    } else {
+        try sendResponseWithConnectionAndHeaders(stream, response.status_code, response.status_text, response.content_type, response.body, close_connection, headers);
+    }
+}
+
+fn buildAdminResponse(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest) !admin_reply.Response {
+    var reply: admin_reply.Reply = .{ .allocator = allocator };
+    defer reply.deinit();
+    try admin_runtime.handleUi(io, &reply, allocator, cfg, req, std.mem.eql(u8, req.method, "HEAD"), adminCallbacks());
+    return reply.take();
+}
+
+fn buildAdminHttp2Response(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, req: HttpRequest) !H2BufferedResponse {
+    const response = try buildAdminResponse(io, allocator, cfg, req);
+    errdefer response.deinit(allocator);
+    const headers = try allocator.alloc(@import("h2_native.zig").Header, response.headers.len);
+    for (response.headers, headers) |source, *target| target.* = .{ .name = source.name, .value = source.value };
+    // Body and header values now belong to the HTTP/2 request arena.
+    return .{ .status_code = response.status_code, .content_type = response.content_type, .body = response.body, .headers = headers, .apply_custom_errors = false };
 }
 
 fn http1RouterCallbacks() http1_router.Callbacks {
