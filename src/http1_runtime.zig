@@ -9,6 +9,7 @@ const metrics_mod = @import("metrics.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const request_mod = @import("request.zig");
 const read_deadline = @import("read_deadline.zig");
+const write_deadline = @import("write_deadline.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
@@ -95,6 +96,8 @@ fn handleHttpRedirectConnection(
     allocator: std.mem.Allocator,
     callbacks: Callbacks,
 ) !void {
+    const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
+    defer write_deadline.restore(previous_write);
     read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
     defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -315,6 +318,8 @@ pub fn handleConnection(
     // Keep one connection worker alive across keep-alive requests.
     // Each request still gets a hard cap before the socket is closed.
     while (true) {
+        const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
+        defer write_deadline.restore(previous_write);
         if (callbacks.shutdown_requested.load(.acquire)) return;
         if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
             return;
@@ -364,11 +369,13 @@ pub fn handleConnection(
         }
 
         if (h2_support.isLikelyPreface(prefill)) {
+            write_deadline.clear(stream);
             try callbacks.handle_http2_preface(io, stream, req_alloc, cfg, prefill, process_env);
             return;
         }
 
         if (tls_client_hello.looksLikeTlsClientHello(prefill)) {
+            write_deadline.clear(stream);
             try callbacks.handle_tls_client_hello_probe(io, stream, allocator, cfg, prefill, process_env);
             return;
         }
@@ -395,7 +402,9 @@ pub fn handleConnection(
             .write_all = callbacks.stream_write_all,
             .set_read_timeout = callbacks.set_stream_read_timeout,
             .begin_read_deadline = read_deadline.restart,
+            .finish_interim_response = write_deadline.restart,
         }) catch |err| {
+            if (write_deadline.started(stream)) return err;
             if (err != error.ConnectionClosed) callbacks.metrics.requestParseError();
             switch (err) {
                 error.ConnectionClosed => return,
@@ -509,6 +518,7 @@ pub fn handleConnection(
             }
         };
         read_deadline.clear(stream);
+        write_deadline.restart(stream);
         handled_requests += 1;
         callbacks.metrics.requestStarted();
 
@@ -529,6 +539,7 @@ pub fn handleConnection(
             defer callbacks.clear_access_context();
 
             if (req.h2c_upgrade_tail.len > 0 or request_mod.isH2cUpgradeHeaders(req.headers)) {
+                write_deadline.clear(stream);
                 callbacks.access_log_set_handler("h2c_upgrade");
                 try callbacks.handle_http2_upgrade(io, stream, req_alloc, cfg, req, process_env);
                 return;

@@ -32,9 +32,12 @@ flow-control windows without renewal by PINGs or tiny credit updates. Expiry
 releases body memory/stream slots; partial wire-write failures close the
 connection instead of appending corrupt frame bytes. Wire tests cover plain/TLS,
 healthy-stream progress, partial input resumption, and blocked socket writes.
-The next work is wider HTTP/2 frame/stream conformance, HTTP/1 whole-response send
-deadlines, asynchronous backend routing, process-wide resource budgets, and
-config reader leases/reclamation.
+HTTP/1 responses now have a first-write-to-finish budget too, including Darwin
+sendfile and forwarded proxy body waits. Partial upstream responses never retry
+or append another HTTP status line. Interim replies, keep-alive requests, and
+upgraded tunnels retain separate lifetimes; plain/TLS wire tests cover them.
+The next work is wider HTTP/2 frame/stream conformance, asynchronous backend
+routing, process-wide resource budgets, and config reader leases/reclamation.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

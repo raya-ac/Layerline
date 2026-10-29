@@ -24,6 +24,7 @@ pub const StreamFns = struct {
     write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
     set_read_timeout: *const fn (std.Io.net.Stream, u32) anyerror!void,
     begin_read_deadline: ?*const fn (std.Io.net.Stream, u32) void = null,
+    finish_interim_response: ?*const fn (std.Io.net.Stream) void = null,
 };
 
 pub fn upstreamHashInput(req: HttpRequest) upstream.RequestHashInput {
@@ -252,6 +253,7 @@ pub fn parse(
     if (http_headers.findHeaderValue(headers, "Expect")) |expect| {
         if (!http_headers.hasConnectionToken(expect, "100-continue")) return error.ExpectationFailed;
         try fns.write_all(stream, "HTTP/1.1 100 Continue\r\n\r\n");
+        if (fns.finish_interim_response) |finish| finish(stream);
     }
 
     try fns.set_read_timeout(stream, read_body_timeout_ms);

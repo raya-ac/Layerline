@@ -157,7 +157,28 @@ This does not add a process-wide RSS cap, QUIC request deadlines, or verified
 Windows timeout enforcement. Upstream socket timeouts still apply; broader
 resource/transport gates remain.
 
-## HTTP/2 Response Deadlines
+## Response Deadlines
+
+HTTP/1 arms a fresh `write_timeout_ms` budget per response, beginning at its first
+write attempt rather than while reading the request or waiting for backend
+headers. Headers and body share that absolute monotonic deadline. Static files,
+byte ranges, buffered responses, redirects, and error pages use it. Darwin's
+plaintext sendfile path checks the same budget between bounded chunks, including
+retryable zero-progress results. TLS continues through the encrypted writer.
+
+A forwarded proxy body spends the remaining response budget while waiting for
+the upstream as well as while writing to the client. This applies to fixed,
+chunked, and close-delimited bodies, without extending a shorter upstream socket
+timeout. Once any response write has started, upstream errors close the client
+connection: they cannot trigger another attempt or append a second status line.
+Only an upstream failure before visible response bytes can use failover.
+
+Completed `100 Continue` responses leave a fresh budget for the final response;
+keep-alive requests also get independent budgets. A successful Upgrade handshake
+disarms the HTTP response budget before tunnel traffic begins. Tunnel socket
+timeouts and the server's shutdown deadline still apply. If starting the second
+tunnel pump fails, the first pump is interrupted and joined before its borrowed
+TLS/config state can be freed.
 
 `write_timeout_ms` is also an absolute transfer budget for each HTTP/2 response,
 starting when the response is queued for sending. It covers output headers, DATA,
@@ -171,14 +192,15 @@ the stream ID. Other streams can continue. The frame reader includes these
 deadlines in its next wait while preserving partially received frames and TLS
 records. Backend sockets do not inherit a downstream response write budget.
 
-Every raw write within a response frame uses the remaining absolute budget,
+Every raw write within an HTTP/2 response frame uses the remaining absolute budget,
 including TLS record writes. A failed or timed-out frame write closes the whole
 connection: another frame or GOAWAY cannot be appended after potentially partial
-frame/record bytes. Wire timeouts log phase `wire`. Neither event includes request
-paths, cookies, headers, or bodies.
+frame/record bytes. Wire timeouts log phase `wire`; HTTP/1 also identifies
+`sendfile` and forwarded-body `upstream` waits. These events do not include
+request paths, cookies, headers, or bodies.
 
-HTTP/1 writes and upstream operations still use socket-level timeouts rather than
-whole-response deadlines. The HTTP/2 connection worker currently routes backends
+Pre-response upstream operations and external PHP execution still have separate
+limits, not an end-to-end application deadline. The HTTP/2 connection worker currently routes backends
 synchronously, so an unrelated blocking backend operation can delay timer
 processing; output deadlines are checked again before sending. These controls
 are not an evented scheduler or a process-wide resource budget.

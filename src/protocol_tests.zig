@@ -17,6 +17,7 @@ test {
     _ = @import("concurrency.zig");
     _ = @import("read_deadline.zig");
     _ = @import("write_deadline.zig");
+    _ = @import("raw_proxy.zig");
     _ = @import("native_tls_runtime.zig");
 }
 

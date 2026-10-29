@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
+const write_deadline = @import("write_deadline.zig");
 
 const HAS_DARWIN_SENDFILE = switch (builtin.os.tag) {
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
@@ -451,9 +452,12 @@ fn trySendfileRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, 
     var offset = std.math.cast(std.c.off_t, start) orelse return error.FileTooBig;
     var remaining = body_len;
     var sent_total: usize = 0;
+    const budget = write_deadline.startWrite(stream);
+    defer if (budget) |state| state.restoreSocketTimeout(stream);
 
     while (remaining > 0) {
-        const chunk = @min(remaining, @as(usize, @intCast(std.math.maxInt(i32))));
+        if (budget) |state| try state.preparePhase(stream, "sendfile");
+        const chunk = @min(remaining, 64 * 1024);
         var len: std.c.off_t = @intCast(chunk);
         switch (std.c.errno(std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0))) {
             .SUCCESS => {},

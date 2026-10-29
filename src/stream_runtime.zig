@@ -49,7 +49,7 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     const io = activeIo();
     if (read_deadline.forStream(stream)) |budget| {
         if (try budget.remaining()) |remaining| {
-            try setStreamReadTimeout(stream, remaining);
+            try setStreamReadTimeout(stream, if (budget.restore_timeout_ms == 0) remaining else @min(remaining, budget.restore_timeout_ms));
         }
     }
     defer if (read_deadline.forStream(stream)) |budget| {
@@ -75,18 +75,14 @@ pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
 
 pub fn rawStreamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
     const io = activeIo();
-    const budget = write_deadline.forStream(stream);
+    const budget = write_deadline.startWrite(stream);
     defer if (budget) |state| {
-        setStreamWriteTimeout(stream, state.restore_timeout_ms) catch {};
+        state.restoreSocketTimeout(stream);
     };
     var written: usize = 0;
     while (written < bytes.len) {
         if (budget) |state| {
-            const remaining = state.remaining() catch |err| {
-                state.logTimeout();
-                return err;
-            };
-            if (remaining) |timeout_ms| try setStreamWriteTimeout(stream, timeout_ms);
+            try state.prepare(stream);
         }
         // netWrite expects a real scatter list here. Passing an empty one
         // looked tidy, then crashed in the vtable path.
@@ -135,9 +131,7 @@ pub fn setStreamReadTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
 }
 
 pub fn setStreamWriteTimeout(stream: std.Io.net.Stream, timeout_ms: u32) !void {
-    if (builtin.os.tag == .windows) return;
-    var tv = timeoutMsToTimeval(timeout_ms);
-    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    try write_deadline.setSocketTimeout(stream, timeout_ms);
 }
 
 pub fn setStreamTimeouts(stream: std.Io.net.Stream, read_timeout_ms: u32, write_timeout_ms: u32) !void {

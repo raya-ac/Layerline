@@ -56,6 +56,16 @@ pub fn install(state: State) void {
     active = state;
 }
 
+pub fn push(state: State) ?State {
+    const previous = active;
+    active = state;
+    return previous;
+}
+
+pub fn restore(previous: ?State) void {
+    active = previous;
+}
+
 pub fn begin(io: std.Io, stream: std.Io.net.Stream, timeout_ms: u32) void {
     active = .{ .io = io, .handle = stream.socket.handle, .deadline = .after(.now(io, .awake), timeout_ms), .restore_timeout_ms = timeout_ms };
 }

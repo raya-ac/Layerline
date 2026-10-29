@@ -6,6 +6,8 @@ const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
+const read_deadline = @import("read_deadline.zig");
+const write_deadline = @import("write_deadline.zig");
 
 const ChunkedBodyScanner = proxy_utils.ChunkedBodyScanner;
 const HttpRequest = request_mod.HttpRequest;
@@ -129,7 +131,7 @@ fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease:
 
 fn forwardFixedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, content_length: usize, callbacks: Callbacks) !bool {
     const initial = @min(body_tail.len, content_length);
-    if (initial > 0) callbacks.stream_write_all(stream, body_tail[0..initial]) catch return error.CloseConnection;
+    if (initial > 0) callbacks.stream_write_all(stream, body_tail[0..initial]) catch return error.DownstreamClosed;
     if (body_tail.len > content_length) return false;
 
     var remaining = content_length - initial;
@@ -139,7 +141,7 @@ fn forwardFixedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream,
         const n = try callbacks.stream_read(upstream_conn, buf[0..max_read]);
         if (n == 0) return error.BadGateway;
         remaining -= n;
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.CloseConnection;
+        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
     }
     return true;
 }
@@ -151,11 +153,11 @@ fn forwardChunkedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Strea
         var consumed: usize = 0;
         while (consumed < body_tail.len) : (consumed += 1) {
             if (try scanner.consume(body_tail[consumed])) {
-                callbacks.stream_write_all(stream, body_tail[0 .. consumed + 1]) catch return error.CloseConnection;
+                callbacks.stream_write_all(stream, body_tail[0 .. consumed + 1]) catch return error.DownstreamClosed;
                 return;
             }
         }
-        callbacks.stream_write_all(stream, body_tail) catch return error.CloseConnection;
+        callbacks.stream_write_all(stream, body_tail) catch return error.DownstreamClosed;
     }
 
     var buf: [8192]u8 = undefined;
@@ -166,26 +168,26 @@ fn forwardChunkedBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Strea
         var consumed: usize = 0;
         while (consumed < n) : (consumed += 1) {
             if (try scanner.consume(buf[consumed])) {
-                callbacks.stream_write_all(stream, buf[0 .. consumed + 1]) catch return error.CloseConnection;
+                callbacks.stream_write_all(stream, buf[0 .. consumed + 1]) catch return error.DownstreamClosed;
                 return;
             }
         }
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.CloseConnection;
+        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
     }
 }
 
 fn forwardUnknownLengthBody(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, body_tail: []const u8, callbacks: Callbacks) !void {
-    if (body_tail.len > 0) callbacks.stream_write_all(stream, body_tail) catch return error.CloseConnection;
+    if (body_tail.len > 0) callbacks.stream_write_all(stream, body_tail) catch return error.DownstreamClosed;
 
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = try callbacks.stream_read(upstream_conn, &buf);
         if (n == 0) break;
-        callbacks.stream_write_all(stream, buf[0..n]) catch return error.CloseConnection;
+        callbacks.stream_write_all(stream, buf[0..n]) catch return error.DownstreamClosed;
     }
 }
 
-fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !UpstreamResponseForwardResult {
+fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, req: HttpRequest, sticky_cookie_header: ?[]const u8, timeout_ms: u32, callbacks: Callbacks) !UpstreamResponseForwardResult {
     var response_buffer: [16 * 1024]u8 = undefined;
     var used: usize = 0;
 
@@ -216,8 +218,8 @@ fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
     }
     const framing = try proxy_utils.parseUpstreamResponseFraming(header_bytes, response_headers);
 
-    callbacks.stream_write_all(stream, header_bytes[0..status_line_end]) catch return error.CloseConnection;
-    callbacks.stream_write_all(stream, "\r\n") catch return error.CloseConnection;
+    callbacks.stream_write_all(stream, header_bytes[0..status_line_end]) catch return error.DownstreamClosed;
+    callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
 
     var headers = std.mem.splitSequence(u8, response_headers, "\r\n");
     while (headers.next()) |line| {
@@ -227,13 +229,24 @@ fn forwardResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
             const name = http_headers.trimValue(trimmed[0..colon]);
             if (proxy_utils.isSkippedProxyResponseHeader(name)) continue;
         }
-        callbacks.stream_write_all(stream, trimmed) catch return error.CloseConnection;
-        callbacks.stream_write_all(stream, "\r\n") catch return error.CloseConnection;
+        callbacks.stream_write_all(stream, trimmed) catch return error.DownstreamClosed;
+        callbacks.stream_write_all(stream, "\r\n") catch return error.DownstreamClosed;
     }
 
     if (sticky_cookie_header) |header| try callbacks.stream_write_all(stream, header);
     try callbacks.write_response_headers(stream);
-    callbacks.stream_write_all(stream, "Connection: close\r\n\r\n") catch return error.CloseConnection;
+    callbacks.stream_write_all(stream, "Connection: close\r\n\r\n") catch return error.DownstreamClosed;
+
+    // Once headers are visible, backend body waits spend the same transfer
+    // budget as writes. No retry or second status line is safe after this point.
+    const budget = write_deadline.forStream(stream);
+    const previous_read = if (budget) |state| read_deadline.push(.{
+        .io = callbacks.active_io(),
+        .handle = upstream_conn.socket.handle,
+        .deadline = state.deadline,
+        .restore_timeout_ms = timeout_ms,
+    }) else null;
+    defer if (budget != null) read_deadline.restore(previous_read);
 
     if (proxy_utils.responseHasNoBody(req.method, framing.status_code)) {
         return .{ .reusable = !framing.connection_close and body_tail.len == 0 };
@@ -276,8 +289,23 @@ fn forwardUpgradeResponse(stream: std.Io.net.Stream, upstream_conn: std.Io.net.S
     }
     if (status_code != 101) return error.BadGateway;
 
-    callbacks.stream_write_all(stream, header_bytes) catch return error.CloseConnection;
-    try callbacks.proxy_raw_bidirectional(upstream_conn, stream, body_tail);
+    callbacks.stream_write_all(stream, header_bytes) catch return error.DownstreamClosed;
+    write_deadline.clear(stream);
+    callbacks.proxy_raw_bidirectional(upstream_conn, stream, body_tail) catch return error.DownstreamClosed;
+}
+
+fn responseFailure(stream: std.Io.net.Stream, err: anyerror, callbacks: Callbacks) anyerror {
+    if (err == error.DownstreamClosed or err == error.WriteTimeout) return error.DownstreamClosed;
+    if (write_deadline.forStream(stream)) |budget| {
+        if (write_deadline.started(stream)) {
+            if (budget.deadline.expired(.now(callbacks.active_io(), .awake))) {
+                budget.logTimeoutPhase("upstream");
+                return error.DownstreamClosed;
+            }
+            return error.ResponseAborted;
+        }
+    }
+    return err;
 }
 
 fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !void {
@@ -367,13 +395,12 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     }
 
     if (upgrade_request) {
-        try forwardUpgradeResponse(stream, lease.stream, callbacks);
+        forwardUpgradeResponse(stream, lease.stream, callbacks) catch |err| return responseFailure(stream, err, callbacks);
         return error.CloseConnection;
     }
 
-    const result = forwardResponse(stream, lease.stream, req, sticky_cookie_header, callbacks) catch |err| switch (err) {
-        error.RequestTimeout => return err,
-        else => |e| return e,
+    const result = forwardResponse(stream, lease.stream, req, sticky_cookie_header, timeout_ms, callbacks) catch |err| {
+        return responseFailure(stream, err, callbacks);
     };
     releaseConnection(upstream, cfg, lease, result.reusable, callbacks.upstream_now_ms(), callbacks);
     lease_released = true;
@@ -547,6 +574,16 @@ pub fn forwardToPool(
         defer if (sticky_cookie) |header| allocator.free(header);
 
         forwardToUpstream(stream, allocator, upstream, req, cfg, runtime_policy.timeout_ms, sticky_cookie, callbacks) catch |err| switch (err) {
+            error.DownstreamClosed => {
+                upstream_mod.upstreamEndAttempt(upstream, lease);
+                return error.CloseConnection;
+            },
+            error.ResponseAborted => {
+                upstream_mod.upstreamEndAttempt(upstream, lease);
+                callbacks.metrics.upstreamRequestFailed();
+                if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) callbacks.metrics.upstreamEjected();
+                return error.CloseConnection;
+            },
             error.CloseConnection => {
                 upstream_mod.upstreamEndAttempt(upstream, lease);
                 upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);

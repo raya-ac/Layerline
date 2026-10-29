@@ -257,20 +257,24 @@ pub fn handleUpgrade(
         try flow.settings(payload);
     }
     try flow.open(1);
-    try ctx.stream_write_all(
-        stream,
-        "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Server: ",
-    );
-    try ctx.stream_write_all(stream, ctx.server_header);
-    try ctx.stream_write_all(
-        stream,
-        "\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Upgrade: h2c\r\n",
-    );
-    try ctx.write_request_id_header(stream);
-    try ctx.stream_write_all(stream, "\r\n");
+    {
+        const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
+        defer write_deadline.restore(previous_write);
+        try ctx.stream_write_all(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Server: ",
+        );
+        try ctx.stream_write_all(stream, ctx.server_header);
+        try ctx.stream_write_all(
+            stream,
+            "\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Upgrade: h2c\r\n",
+        );
+        try ctx.write_request_id_header(stream);
+        try ctx.stream_write_all(stream, "\r\n");
+    }
     ctx.record_response_sent(101, 0);
 
     try h2_support.sendSettings(stream, flow_mod.State.max_streams, cfg.max_request_bytes, ctx.stream_write_all);
