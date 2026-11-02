@@ -274,6 +274,9 @@ archive includes the raw JUnit reports, including the existing cleartext
 shared-listener exception; generated TLS private keys are excluded. Failed or
 incomplete checks cannot produce a passing receipt. Tool bootstrap failures are
 reported in the job log before verification starts.
+Both clients must support HTTP/2; macOS also requires HTTP/3 so a changed curl
+build cannot silently skip that coverage. The HTTP/3 smoke checks health and
+the homepage HTML byte-for-byte, not every asset or full QUIC conformance.
 
 Hosted jobs use temporary loopback fixtures as the ordinary runner user. They do
 not perform the separate root/PID1 systemd and cgroup/OOM tests, namespace-isolated

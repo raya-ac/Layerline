@@ -256,6 +256,23 @@ class H2:
         return self.barrier()
 
 
+def slow_header_deadline(peer, initial, fragments, detail):
+    started = time.monotonic()
+    peer.conn.sendall(initial)
+    for fragment in fragments:
+        time.sleep(.15)
+        try:
+            peer.conn.sendall(fragment)
+        except BrokenPipeError:
+            # A scheduler pause can carry this write past the 500ms deadline.
+            # The write failure alone proves nothing: still require GOAWAY.
+            assert time.monotonic() - started >= .5, "header connection closed before its original budget"
+            break
+    received = peer.until(lambda item: item[0] == 7)
+    assert int.from_bytes(received[-1][3][4:], "big") == 11, detail
+    assert time.monotonic() - started < .9, detail
+
+
 with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
     for secure in [False, True]:
         server = Server(pathlib.Path(tmp), secure)
@@ -433,27 +450,16 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
             h2 = H2(server)
             try:
                 block = fields()
-                started = time.monotonic()
-                h2.send(1, 1, 1, block[:1])
-                for part in block[1:4]:
-                    time.sleep(0.15)
-                    h2.send(9, 0, 1, bytes([part]))
-                received = h2.until(lambda f: f[0] == 7)
-                assert int.from_bytes(received[-1][3][4:], "big") == 11, "CONTINUATION traffic renewed the header deadline"
-                assert time.monotonic() - started < 0.9, "header fragments renewed the aggregate budget"
+                slow_header_deadline(h2, frame(1, 1, 1, block[:1]),
+                                     [frame(9, 0, 1, bytes([part])) for part in block[1:4]],
+                                     "CONTINUATION traffic renewed the header deadline")
             finally:
                 h2.conn.close()
             h2 = H2(server)
             try:
                 wire = frame(1, 5, 1, fields())
-                started = time.monotonic()
-                h2.conn.sendall(wire[:10])
-                for part in wire[10:13]:
-                    time.sleep(0.15)
-                    h2.conn.sendall(bytes([part]))
-                received = h2.until(lambda f: f[0] == 7)
-                assert int.from_bytes(received[-1][3][4:], "big") == 11
-                assert time.monotonic() - started < 0.9, "frame bytes renewed their assembly budget"
+                slow_header_deadline(h2, wire[:10], [bytes([part]) for part in wire[10:13]],
+                                     "frame bytes renewed their assembly budget")
             finally:
                 h2.conn.close()
             print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 stream expiry preserves healthy streams and partial frames; aggregate header deadline enforced")

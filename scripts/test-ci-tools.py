@@ -24,6 +24,15 @@ tools, verify = module("ci-tools"), module("ci-verify")
 
 
 class ToolChecks(unittest.TestCase):
+    def test_client_features_cannot_silently_remove_http3_coverage(self):
+        verify.require_curl_features("curl fixture\nFeatures: HTTP2 HTTP3 SSL\n", "darwin")
+        verify.require_curl_features("curl fixture\nFeatures: HTTP2 SSL\n", "linux")
+        with self.assertRaisesRegex(AssertionError, "HTTP/3"):
+            verify.require_curl_features("curl HTTP3 mentioned elsewhere\nFeatures: HTTP2 SSL\n", "darwin")
+        for platform in ["linux", "darwin"]:
+            with self.assertRaisesRegex(AssertionError, "HTTP/2"):
+                verify.require_curl_features("curl fixture\nFeatures: HTTP3 SSL\n", platform)
+
     def test_download_checks_hash_and_size_before_use(self):
         payload = b"download fixture"
         opener = SimpleNamespace(open=lambda *a, **k: io.BytesIO(payload))

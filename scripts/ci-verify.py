@@ -21,6 +21,13 @@ def sha(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def require_curl_features(version, platform):
+    features = next((line.split()[1:] for line in version.splitlines() if line.startswith("Features:")), [])
+    assert "HTTP2" in features, "independent curl client lacks HTTP/2"
+    if platform == "darwin":
+        assert "HTTP3" in features, "macOS CI must exercise the independent HTTP/3 client"
+
+
 def sources():
     result = {}
     names = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
@@ -119,12 +126,13 @@ def main():
             resource.setrlimit(resource.RLIMIT_NOFILE, (8192, hard))
         receipt["nofile_after"] = list(resource.getrlimit(resource.RLIMIT_NOFILE))
         curl = subprocess.check_output(["curl", "--version"], text=True)
-        assert "HTTP2" in curl.split(), "independent curl client lacks HTTP/2"
+        require_curl_features(curl, sys.platform)
         receipt["curl"] = curl
         receipt["openssl"] = subprocess.check_output(["openssl", "version"], text=True).strip()
         for script in (ROOT / "scripts").glob("*.py"):
             compile(script.read_text(), str(script), "exec")
         record_run("ci-tests", [sys.executable, "scripts/test-ci-tools.py", "-v"], output, checks)
+        record_run("deadline-fixture-tests", [sys.executable, "scripts/test-deadline-fixture.py", "-v"], output, checks)
         record_run("format", [paths["zig"], "fmt", "--check", "build.zig", "src"], output, checks)
         record_run("shell-syntax", ["bash", "-n", "scripts/verify-layerline.sh"], output, checks)
         record_run("units", [paths["zig"], "build", "test", "-Doptimize=" + args.mode, "--summary", "all", "-j2"], output, checks)
