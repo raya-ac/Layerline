@@ -68,6 +68,10 @@ before its record cap, requests fresh peer keys, and sends authenticated closure
 on normal HTTP/1 and HTTP/2 termination. Focused unit and independent OpenSSL
 fixtures cover key ordering, interrupted/split input and concurrent writers.
 Broader TLS profiles, mTLS/resumption, backend HTTP/2/3 and revocation remain gaps.
+Handshake failures now preserve their write epoch: after server Finished, alerts
+use application keys rather than plaintext. Failed flight writes close without
+appending another record. An independent OpenSSL peer covers held/corrupt client
+Finished and wrong-record failures across H1/H2 ALPN, plus early ALPN refusal.
 Configured listener material now has bounded DER envelope/SPKI admission,
 P-256 point and RSA modulus/exponent matching, key-strength limits and read-only
 CLI checks. Global/SNI tests cover bad material before DNS, rejected reloads and

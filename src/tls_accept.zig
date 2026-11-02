@@ -53,11 +53,6 @@ pub fn handleClientHelloProbe(
 
     var established = native_tls.establishTls13(stream, allocator, cfg, record, info, callbacks.active_io(), callbacks.raw_stream_read, callbacks.raw_stream_write_all) catch |err| {
         std.debug.print("Native TLS 1.3 handshake failed: {}\n", .{err});
-        const alert = switch (err) {
-            error.NoApplicationProtocol => native_tls.ALERT_NO_APPLICATION_PROTOCOL,
-            else => native_tls.ALERT_HANDSHAKE_FAILURE,
-        };
-        try native_tls.sendFatalAlert(stream, alert, callbacks.raw_stream_write_all);
         return;
     };
     defer established.channel.deinit();

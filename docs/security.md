@@ -770,6 +770,15 @@ backend budgets across plain/TLS HTTP/1, stalled headers/bodies/TLS handshakes,
 upgraded tunnels, active health probes and Linux backlog-stalled TCP/hostname
 dials. It also checks normal half-closed request completion inside the drain.
 
+TLS handshake failures retain the current write epoch. Pre-ServerHello failures
+can send a plaintext alert; after the server Finished, remaining handshake errors
+use an authenticated application-key alert. Failed flight writes close without
+appending an alert to a possibly partial record. The OpenSSL MemoryBIO peer in
+`scripts/verify-tls-handshake-alerts.py` withholds or corrupts client Finished and
+sends an unexpected record across both ALPN choices, checking encrypted alerts
+and the separate pre-ServerHello refusal path. These tests do not establish wider
+TLS profile or timing acceptance.
+
 To exercise an already-built release on its target OS without installing Zig,
 run `LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline bash scripts/verify-layerline.sh`.
 The verifier reports this explicitly and skips only compilation, not runtime checks.

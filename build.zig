@@ -218,6 +218,11 @@ pub fn build(b: *std.Build) void {
     backend_shutdown_checks.addArtifactArg(exe);
     b.step("test-shutdown-backends", "Test cancellation and joined shutdown of long-budget backend work")
         .dependOn(&backend_shutdown_checks.step);
+    const handshake_alert_checks = b.addSystemCommand(&.{"python3"});
+    handshake_alert_checks.addFileArg(b.path("scripts/verify-tls-handshake-alerts.py"));
+    handshake_alert_checks.addArtifactArg(exe);
+    b.step("test-tls-handshake-alerts", "Test TLS handshake error alerts with an independent OpenSSL peer")
+        .dependOn(&handshake_alert_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

@@ -160,6 +160,19 @@ pub fn sendFatalAlert(stream: std.Io.net.Stream, description: u8, raw_write_all:
     try raw_write_all(stream, &alert);
 }
 
+fn handshakeAlertDescription(err: anyerror) u8 {
+    return switch (err) {
+        error.NoApplicationProtocol => ALERT_NO_APPLICATION_PROTOCOL,
+        error.UnexpectedTlsRecordType => 10,
+        error.AuthenticationFailed => 20,
+        error.RequestTooLarge => 22,
+        error.BadTlsFinished => 50,
+        error.BadTlsFinishedVerifyData => 51,
+        error.OutOfMemory, error.EntropyUnavailable => 80,
+        else => ALERT_HANDSHAKE_FAILURE,
+    };
+}
+
 fn selectedAlpn(info: tls_client_hello.ClientHelloInfo) ?[]const u8 {
     if (info.offers_h2) return "h2";
     if (info.offers_http11) return "http/1.1";
@@ -712,6 +725,10 @@ pub fn establishTls13(
     raw_read: RawReadFn,
     raw_write_all: RawWriteAllFn,
 ) !Result {
+    var clear_alert_allowed = true;
+    errdefer |err| if (clear_alert_allowed) {
+        sendFatalAlert(stream, handshakeAlertDescription(err), raw_write_all) catch {};
+    };
     if (!info.supports_tls13) return error.UnsupportedTlsVersion;
     if (!info.offers_aes_128_gcm_sha256) return error.UnsupportedTlsCipherSuite;
     if (!info.offers_ecdsa_secp256r1_sha256 and !info.offers_rsa_pss_rsae_sha256 and !info.offers_ed25519) {
@@ -831,6 +848,9 @@ pub fn establishTls13(
         server_finished,
     });
 
+    // A failed flight write may have exposed part of a record. Close it instead
+    // of appending an alert to a record boundary we can no longer trust.
+    clear_alert_allowed = false;
     try sendPlainRecord(stream, CONTENT_TYPE_HANDSHAKE, server_hello, raw_write_all);
     var server_handshake_sequence: u64 = 0;
     try sendEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, CONTENT_TYPE_HANDSHAKE, encrypted_extensions, raw_write_all);
@@ -838,6 +858,16 @@ pub fn establishTls13(
     try sendEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, CONTENT_TYPE_HANDSHAKE, certificate_verify, raw_write_all);
     try sendEncryptedRecord(stream, allocator, server_handshake_keys, &server_handshake_sequence, CONTENT_TYPE_HANDSHAKE, server_finished, raw_write_all);
 
+    var app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&app_secrets));
+    errdefer |err| {
+        // Sending our Finished advances the write epoch, even while the peer's
+        // Finished is still missing or invalid (RFC 8446, Appendix A.2).
+        var keys = tls13_native.deriveTlsRecordKeys(app_secrets.server_application_traffic_secret);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&keys));
+        var sequence: u64 = 0;
+        sendEncryptedRecord(stream, allocator, keys, &sequence, CONTENT_TYPE_ALERT, &.{ 2, handshakeAlertDescription(err) }, raw_write_all) catch {};
+    }
     var client_handshake_sequence: u64 = 0;
     while (true) {
         const client_record = try readRecordRaw(stream, allocator, raw_read);
@@ -853,8 +883,6 @@ pub fn establishTls13(
         break;
     }
 
-    var app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&app_secrets));
     return .{
         .channel = .{
             .io = io,
@@ -869,4 +897,32 @@ pub fn establishTls13(
         },
         .alpn = alpn,
     };
+}
+
+test "failed TLS flight writes never append a plaintext alert or another record" {
+    const Fake = struct {
+        var writes: usize = 0;
+        var fail_at: usize = 0;
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            const current = writes;
+            writes += 1;
+            if (current == fail_at) return error.FixtureWriteFailure;
+        }
+    };
+    const client = try tls13_native.X25519.KeyPair.generateDeterministic(@splat(0x13));
+    var cfg = config_mod.defaultServerConfig();
+    for (0..6) |failure| {
+        Fake.writes = 0;
+        Fake.fail_at = failure;
+        try std.testing.expectError(error.FixtureWriteFailure, establishTls13(undefined, std.testing.allocator, &cfg, "\x16\x03\x03\x00\x01\x00", .{
+            .supports_tls13 = true,
+            .offers_aes_128_gcm_sha256 = true,
+            .offers_ecdsa_secp256r1_sha256 = true,
+            .x25519_key_share = client.public_key,
+        }, std.testing.io, Fake.read, Fake.write));
+        try std.testing.expectEqual(failure + 1, Fake.writes);
+    }
 }
