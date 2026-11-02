@@ -94,6 +94,11 @@ with concurrent bounded pipes, absolute deadlines, failed-exec reaping, a shared
 64-child admission limit, and shutdown group cleanup. Certificate commands have
 a separate positive `external_command_timeout_ms` setting (300000 by default).
 Raw command output is not logged; Cloudflare authorization travels through stdin.
+Cloudflare auto-DNS setup now uses typed JSON envelopes and serialized request
+bodies, escapes query components, and rejects ambiguous lookups and unsafe IDs.
+Malformed lookups cannot trigger a create/update; invalid mutation replies stop
+readiness without claiming to roll back a provider-side write. A local fake API
+covers create/update, zone lookup, escaping, malformed replies and bounded failure.
 RSA signing is isolated on bounded joined worker stacks, rather than overflowing
 the default small connection stack in Debug. Initial protocol selection no longer
 retains a duplicate HTTP request handler during TLS, and CGI environment encoding

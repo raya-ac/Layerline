@@ -99,7 +99,8 @@ class Cloudflare(http.server.BaseHTTPRequestHandler):
         arguments = [subprocess.run(["ps", "-p", pid, "-o", "args="], capture_output=True, text=True).stdout for pid in pids]
         length = int(self.headers.get("Content-Length", "0"))
         self.server.requests.append({"method": self.command, "auth": self.headers.get("Authorization"), "body": self.rfile.read(length), "argv": arguments, "pids": pids})
-        body = b'{"success":true,"result":[]}' if not self.server.fail else ('{"success":false,"errors":[{"message":"' + self.server.token + '"}]}').encode()
+        result = [] if self.command == "GET" else {"id": "fixture-record"}
+        body = json.dumps({"success": True, "result": result}).encode() if not self.server.fail else json.dumps({"success": False, "errors": [{"message": self.server.token}]}).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

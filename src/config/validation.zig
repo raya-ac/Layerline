@@ -2,6 +2,7 @@ const std = @import("std");
 const parsing = @import("parsing.zig");
 const policy_mod = @import("policy.zig");
 const types = @import("types.zig");
+const cloudflare_json = @import("../cloudflare_json.zig");
 
 const CompressionPolicy = types.CompressionPolicy;
 const DomainConfig = types.DomainConfig;
@@ -236,6 +237,10 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     }
     if (cfg.cloudflare_auto_deploy) {
         if (cfg.cloudflare_token == null or cfg.cloudflare_token.?.len == 0) return error.InvalidConfigValue;
+        if (!cloudflare_json.validToken(cfg.cloudflare_token.?)) return error.InvalidConfigValue;
+        if (cfg.cloudflare_zone_id) |id| {
+            if (!cloudflare_json.validId(id)) return error.InvalidConfigValue;
+        }
         if ((cfg.cloudflare_zone_id == null or cfg.cloudflare_zone_id.?.len == 0) and (cfg.cloudflare_zone_name == null or cfg.cloudflare_zone_name.?.len == 0)) return error.InvalidConfigValue;
         if (cfg.cloudflare_record_name == null or cfg.cloudflare_record_name.?.len == 0) return error.InvalidConfigValue;
         if (cfg.cloudflare_record_content == null or cfg.cloudflare_record_content.?.len == 0) return error.InvalidConfigValue;

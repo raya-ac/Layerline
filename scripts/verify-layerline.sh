@@ -778,6 +778,9 @@ python3 "$ROOT_DIR/scripts/verify-php-version.py" "$SERVER_BINARY"
 log "verifying child-process deadlines and cleanup"
 python3 "$ROOT_DIR/scripts/verify-child-processes.py" "$SERVER_BINARY"
 
+log "verifying structured Cloudflare DNS API handling"
+python3 "$ROOT_DIR/scripts/verify-cloudflare.py" "$SERVER_BINARY"
+
 log "verifying listener startup and control socket ownership"
 python3 "$ROOT_DIR/scripts/verify-listeners.py" "$SERVER_BINARY"
 

@@ -101,6 +101,21 @@ test "I/O pool limits parse without silently accepting unsafe settings" {
     try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&cfg));
 }
 
+test "Cloudflare activation rejects unsafe credentials and zone path components" {
+    var cfg = defaultServerConfig();
+    cfg.cloudflare_auto_deploy = true;
+    cfg.cloudflare_token = "fixture-token";
+    cfg.cloudflare_zone_id = "fixture-zone";
+    cfg.cloudflare_record_name = "fixture.invalid";
+    cfg.cloudflare_record_content = "203.0.113.1";
+    try config_mod.validateConfig(&cfg);
+    cfg.cloudflare_token = "token\r\nInjected: header";
+    try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&cfg));
+    cfg.cloudflare_token = "fixture-token";
+    cfg.cloudflare_zone_id = "../other-zone";
+    try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&cfg));
+}
+
 test "parses FastCGI tcp and unix endpoints" {
     const tcp = try parseFastcgiEndpoint("tcp://127.0.0.1:9000");
     try std.testing.expectEqualStrings("127.0.0.1", tcp.tcp.host);

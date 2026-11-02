@@ -4,6 +4,7 @@ const config_mod = @import("config.zig");
 const http_headers = @import("http_headers.zig");
 const metrics_mod = @import("metrics.zig");
 const child_process = @import("child_process.zig");
+const cloudflare_json = @import("cloudflare_json.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
@@ -189,29 +190,6 @@ test "failed external commands release both captured output buffers" {
     try std.testing.expectError(error.UnexpectedExit, runCommandCapture(std.testing.io, std.testing.allocator, "/bin/sh", &.{ "-c", "printf output; printf diagnostic >&2; exit 7" }, .{ .timeout_ms = 2000 }));
 }
 
-pub fn isCloudflareSuccess(payload: []const u8) bool {
-    return std.mem.indexOf(u8, payload, "\"success\":true") != null;
-}
-
-pub fn extractCloudflareFirstId(payload: []const u8) ?[]const u8 {
-    const result_pos = std.mem.indexOf(u8, payload, "\"result\":") orelse return null;
-    const payload_rest = payload[result_pos + "\"result\":".len ..];
-    const id_key = "\"id\":\"";
-    const id_pos = std.mem.indexOf(u8, payload_rest, id_key) orelse return null;
-    const start = id_pos + id_key.len;
-    const end = std.mem.indexOfScalar(u8, payload_rest[start..], '"') orelse return null;
-    return payload_rest[start .. start + end];
-}
-
-pub fn extractCloudflareError(payload: []const u8) ?[]const u8 {
-    const errors_pos = std.mem.indexOf(u8, payload, "\"errors\":[") orelse return null;
-    const marker = "\"message\":\"";
-    const msg_pos = std.mem.indexOf(u8, payload[errors_pos..], marker) orelse return null;
-    const msg_start = msg_pos + marker.len;
-    const msg_end = std.mem.indexOfScalar(u8, payload[errors_pos + msg_start ..], '"') orelse return null;
-    return payload[errors_pos + msg_start .. errors_pos + msg_start + msg_end];
-}
-
 pub fn callCloudflareApi(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -222,6 +200,7 @@ pub fn callCloudflareApi(
     payload: ?[]const u8,
     options: CommandOptions,
 ) ![]const u8 {
+    if (!cloudflare_json.validToken(token)) return error.InvalidCloudflareToken;
     const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ api_base, endpoint });
     defer allocator.free(url);
 
@@ -234,16 +213,19 @@ pub fn callCloudflareApi(
         "curl",
         "--disable",
         "-fsS",
+        "--globoff",
+        "--proto",
+        "=http,https",
         "-X",
         method,
         "-H",
         "@-",
     });
     if (payload) |body| {
-        try args.append(allocator, "-d");
+        try args.append(allocator, "--data-binary");
         try args.append(allocator, body);
     }
-    try args.append(allocator, url);
+    try args.appendSlice(allocator, &.{ "--url", url });
 
     var command_options = options;
     command_options.input = auth_header;
@@ -280,27 +262,27 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
 
     if (zone_id == null and cfg.cloudflare_zone_name != null) {
         const zone_name = cfg.cloudflare_zone_name.?;
-        const zone_lookup_ep = try std.fmt.allocPrint(allocator, "/zones?name={s}", .{zone_name});
+        const escaped_zone_name = try cloudflare_json.escapeComponent(allocator, zone_name);
+        defer allocator.free(escaped_zone_name);
+        const zone_lookup_ep = try std.fmt.allocPrint(allocator, "/zones?name={s}", .{escaped_zone_name});
         defer allocator.free(zone_lookup_ep);
 
         const zone_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", zone_lookup_ep, null, options);
         defer allocator.free(zone_payload);
 
-        if (!isCloudflareSuccess(zone_payload)) {
+        zone_id_owned = cloudflare_json.lookupId(allocator, zone_payload) catch |err| {
+            if (err == error.OutOfMemory) return err;
             std.debug.print("Cloudflare zone lookup failed.\n", .{});
             return error.CloudflareZoneLookupFailed;
-        }
-
-        if (extractCloudflareFirstId(zone_payload)) |found_zone_id| {
-            zone_id_owned = try allocator.dupe(u8, found_zone_id);
-            zone_id = zone_id_owned;
-        }
+        };
+        zone_id = zone_id_owned;
     }
 
     if (zone_id == null) {
         std.debug.print("Cloudflare deployment needs --cf-zone-id or --cf-zone-name.\n", .{});
         return error.CloudflareZoneMissing;
     }
+    if (!cloudflare_json.validId(zone_id.?)) return error.InvalidCloudflareZoneId;
 
     var record_name = if (cfg.cloudflare_record_name) |name| trimValue(name) else "";
     if (record_name.len == 0 and cfg.letsencrypt_domains != null) {
@@ -334,61 +316,36 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
         return error.CloudflareRecordContentMissing;
     }
 
+    const escaped_record_name = try cloudflare_json.escapeComponent(allocator, record_name);
+    defer allocator.free(escaped_record_name);
+    const escaped_record_type = try cloudflare_json.escapeComponent(allocator, record_type);
+    defer allocator.free(escaped_record_type);
     const list_endpoint = try std.fmt.allocPrint(
         allocator,
         "/zones/{s}/dns_records?type={s}&name={s}",
-        .{ zone_id.?, record_type, record_name },
+        .{ zone_id.?, escaped_record_type, escaped_record_name },
     );
     defer allocator.free(list_endpoint);
 
     const list_payload = try callCloudflareApi(io, allocator, token, api_base, "GET", list_endpoint, null, options);
     defer allocator.free(list_payload);
 
-    if (!isCloudflareSuccess(list_payload)) {
+    const existing_record_id = cloudflare_json.lookupId(allocator, list_payload) catch |err| {
+        if (err == error.OutOfMemory) return err;
         std.debug.print("Cloudflare DNS lookup failed.\n", .{});
         return error.CloudflareDnsLookupFailed;
-    }
+    };
+    defer if (existing_record_id) |id| allocator.free(id);
 
-    const existing_record_id = extractCloudflareFirstId(list_payload);
-
-    const record_payload = if (cfg.cloudflare_record_comment) |raw_comment| blk: {
-        const comment = trimValue(raw_comment);
-        if (comment.len == 0) {
-            break :blk try std.fmt.allocPrint(
-                allocator,
-                "{{\"type\":\"{s}\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":{d},\"proxied\":{s}}}",
-                .{
-                    record_type,
-                    record_name,
-                    final_content,
-                    cfg.cloudflare_record_ttl,
-                    if (cfg.cloudflare_record_proxied) "true" else "false",
-                },
-            );
-        }
-        break :blk try std.fmt.allocPrint(
-            allocator,
-            "{{\"type\":\"{s}\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":{d},\"proxied\":{s},\"comment\":\"{s}\"}}",
-            .{
-                record_type,
-                record_name,
-                final_content,
-                cfg.cloudflare_record_ttl,
-                if (cfg.cloudflare_record_proxied) "true" else "false",
-                comment,
-            },
-        );
-    } else try std.fmt.allocPrint(
-        allocator,
-        "{{\"type\":\"{s}\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":{d},\"proxied\":{s}}}",
-        .{
-            record_type,
-            record_name,
-            final_content,
-            cfg.cloudflare_record_ttl,
-            if (cfg.cloudflare_record_proxied) "true" else "false",
-        },
-    );
+    const comment = trimValue(cfg.cloudflare_record_comment orelse "");
+    const record_payload = try cloudflare_json.encodeRecord(allocator, .{
+        .type = record_type,
+        .name = record_name,
+        .content = final_content,
+        .ttl = cfg.cloudflare_record_ttl,
+        .proxied = cfg.cloudflare_record_proxied,
+        .comment = if (comment.len == 0) null else comment,
+    });
     defer allocator.free(record_payload);
 
     const method: []const u8 = if (existing_record_id != null) "PUT" else "POST";
@@ -401,13 +358,14 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
     const deploy_payload = try callCloudflareApi(io, allocator, token, api_base, method, endpoint, record_payload, options);
     defer allocator.free(deploy_payload);
 
-    if (!isCloudflareSuccess(deploy_payload)) {
+    cloudflare_json.validateMutation(allocator, deploy_payload, existing_record_id) catch |err| {
+        if (err == error.OutOfMemory) return err;
         std.debug.print("Cloudflare DNS update failed.\n", .{});
         return error.CloudflareRecordUpdateFailed;
-    }
+    };
 
     const action = if (existing_record_id != null) "updated" else "created";
-    std.debug.print("Cloudflare DNS {s}: {s} {s} -> {s}\n", .{ action, record_name, record_type, final_content });
+    std.debug.print("{{\"event\":\"server.cloudflare_dns\",\"action\":\"{s}\"}}\n", .{action});
 }
 
 pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {

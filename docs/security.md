@@ -378,6 +378,32 @@ and configured environment. Use an isolated PHP-FPM service for untrusted code.
 Native HTTP/2 PHP currently requires FastCGI, and Windows child lifetime handling
 has not been accepted.
 
+## Cloudflare DNS Setup
+
+Auto-DNS setup parses typed JSON envelopes, not text fragments. A DNS list must have
+a boolean root `success` and an array `result`; zero entries permits creation,
+one entry permits updating its direct ID, and multiple entries fail instead of
+choosing an arbitrary record. Missing/malformed results, duplicate relevant keys,
+nested-only success flags and unsafe IDs stop setup before a DNS write. IDs must
+be 1-32 ASCII letters, digits, hyphens or underscores. Zone lookups must return
+exactly one entry. Whitespace, field order, escaped keys and unrelated metadata
+are allowed.
+
+Request fields use JSON serialization, query values use URI-component encoding,
+and authorization tokens cannot contain whitespace or control bytes. Curl URL
+globbing is disabled and its protocols are limited to HTTP/HTTPS. API tokens
+still travel through stdin; success logs contain only the operation, not record
+values or comments. Keep the normal HTTPS API base for real deployments; an HTTP
+base is useful for isolated local tests but does not protect credentials in transit.
+
+Mutation replies must contain a successful result object with a safe ID; PUT
+replies must identify the requested record. A failed or unrecognizable mutation
+reply prevents readiness, but cannot undo a write already accepted by the provider.
+Helpers retain their output limits, deadlines, shutdown and child cleanup rules.
+The local fake-API suite covers these paths without making real DNS changes.
+The envelope shapes follow Cloudflare's [zone list](https://developers.cloudflare.com/api/resources/zones/methods/list/)
+and [DNS record API](https://developers.cloudflare.com/api/resources/dns/subresources/records/) contracts.
+
 ## RSA Signing
 
 RSA TLS signing uses joined, separately sized worker stacks instead of the small
