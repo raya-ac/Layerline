@@ -90,6 +90,17 @@ test "connection defaults are bounded and explicit limits survive normalization"
     try std.testing.expectEqual(64, cfg.max_concurrent_connections);
 }
 
+test "I/O pool limits parse without silently accepting unsafe settings" {
+    var cfg = defaultServerConfig();
+    try applyConfigLine(&cfg, std.testing.allocator, "io_thread_limit", "16");
+    try applyConfigLine(&cfg, std.testing.allocator, "io_stack_size", "2097152");
+    try config_mod.validateConfig(&cfg);
+    try std.testing.expectEqual(16, cfg.io_thread_limit);
+    try std.testing.expectEqual(2097152, cfg.io_stack_size);
+    try applyConfigLine(&cfg, std.testing.allocator, "io_thread_limit", "0");
+    try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&cfg));
+}
+
 test "parses FastCGI tcp and unix endpoints" {
     const tcp = try parseFastcgiEndpoint("tcp://127.0.0.1:9000");
     try std.testing.expectEqualStrings("127.0.0.1", tcp.tcp.host);

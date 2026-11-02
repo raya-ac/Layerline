@@ -132,6 +132,8 @@ tls = false
 #cf_record_comment = managed by Layerline
 #max_requests_per_connection = 256
 #worker_stack_size = 262144
+#io_thread_limit = 128
+#io_stack_size = 1048576
 #max_php_output_bytes = 2097152
 #read_header_timeout_ms = 10000
 #read_body_timeout_ms = 30000
@@ -237,7 +239,7 @@ printf 'cert-renew\n' | nc -U /tmp/layerline-admin.sock
 
 Upstream target scopes are `global <index>`, `route <route-name> <index>`, `domain <domain-name> <index>`, and `domain-route <domain-name> <route-name> <index>`. `upstream-eject` and the alias `upstream-drain` stop new attempts to that target for the requested millisecond duration while existing active requests finish; `upstream-recover` clears the manual/passive ejection state.
 
-`reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
+`reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. Heap and I/O pool limits also require a restart. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
 
 `SIGHUP` follows the same in-memory reload path as the admin `reload` command. If the candidate config changes listener-bound settings, Layerline logs `SIGHUP reload blocked` and keeps serving the current snapshot.
 

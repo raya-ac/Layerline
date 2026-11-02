@@ -784,6 +784,9 @@ python3 "$ROOT_DIR/scripts/verify-listeners.py" "$SERVER_BINARY"
 log "verifying native systemd lifecycle notifications"
 python3 "$ROOT_DIR/scripts/verify-systemd-notify.py" "$SERVER_BINARY"
 
+log "verifying I/O runtime capacity and resource settings"
+python3 "$ROOT_DIR/scripts/verify-runtime-budgets.py" "$SERVER_BINARY"
+
 log "verifying shared application memory limits and overload recovery"
 python3 "$ROOT_DIR/scripts/verify-memory-budgets.py" "$SERVER_BINARY"
 

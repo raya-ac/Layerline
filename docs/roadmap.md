@@ -111,7 +111,14 @@ page-accounted limit and protected Unix-control/emergency-response capacity.
 Overload tests hold incomplete uploads until allocations fail, check plaintext
 and encrypted 503s plus admin access, then verify repeated recovery and cache
 reclamation. HTTP/3 retained slots now age out instead of persisting forever.
-This does not yet cap stacks, Zig I/O internals, child RSS or kernel resources.
+The owned Zig I/O runtime now shares the heap hierarchy for bootstrap and task
+allocations and has explicit restart-only worker/stack limits. DNS work uses
+rejectable concurrent admission rather than running inline when saturated.
+The packaged Linux unit adds memory, task and descriptor ceilings, including
+child processes; hard cgroup exhaustion can kill/restart the service. These do
+not turn allocator counters into RSS accounting or provide portable OS limits.
+Global descriptor reservation/admission and Darwin resolver cancellation remain
+open, alongside wider protocol conformance.
 Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
 the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
 Systemd startup now waits for Layerline's native readiness signal after all

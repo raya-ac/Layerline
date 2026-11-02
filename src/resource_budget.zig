@@ -14,6 +14,7 @@ pub var overload_responses = std.atomic.Value(usize).init(0);
 pub threadlocal var emergency_write: bool = false;
 pub var http2: Budget = .{ .backing = normal.allocator(), .limit = 256 * 1024 * 1024 };
 pub var http3: Budget = .{ .backing = normal.allocator(), .limit = 64 * 1024 * 1024 };
+pub var io: Budget = .{ .backing = normal.allocator(), .limit = 16 * 1024 * 1024 };
 pub const max_http2_jobs = 64;
 pub var http2_jobs = std.atomic.Value(usize).init(0);
 

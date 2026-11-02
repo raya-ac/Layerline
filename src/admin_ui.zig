@@ -451,6 +451,8 @@ pub fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Alloc
     try appendAdminNumberInput(out, allocator, "External command timeout ms", "external_command_timeout_ms", cfg.external_command_timeout_ms);
     try appendAdminNumberInput(out, allocator, "Worker stack bytes", "worker_stack_size", cfg.worker_stack_size);
     try appendAdminNumberInput(out, allocator, "Application heap budget bytes", "memory_budget_bytes", cfg.memory_budget_bytes);
+    try appendAdminNumberInput(out, allocator, "I/O thread limit", "io_thread_limit", cfg.io_thread_limit);
+    try appendAdminNumberInput(out, allocator, "I/O stack bytes", "io_stack_size", cfg.io_stack_size);
 
     try out.appendSlice(allocator,
         \\  </div>

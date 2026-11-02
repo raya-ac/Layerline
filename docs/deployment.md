@@ -52,7 +52,7 @@ sudo systemctl reload layerline
 sudo journalctl -u layerline -f
 ```
 
-The packaged unit validates the config file first, then sends `SIGHUP` so Layerline can load a compatible config snapshot without dropping existing connections. Listener-bound edits still need `sudo systemctl restart layerline`. The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Keep `LimitNOFILE=1048576` unless the host has a lower global cap.
+The packaged unit validates the config file first, then sends `SIGHUP` so Layerline can load a compatible config snapshot without dropping existing connections. Listener-bound edits still need `sudo systemctl restart layerline`. The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Its file-descriptor ceiling is `LimitNOFILE=65536`; adjust it for the intended connection count and upstream pools without exceeding the host's global limits.
 
 The unit uses `Type=notify` and `NotifyAccess=main`. Layerline sends native
 `READY=1` only after certificate setup, all configured listener binds and
@@ -133,6 +133,41 @@ sudo sysctl --system
 ```
 
 Keep the systemd `LimitNOFILE` and the shell `ulimit -n` aligned with expected connection counts. Compression-enabled deployments raise Layerline worker stack size to at least 512 KiB, so test memory pressure before enabling huge connection fan-in and dynamic gzip together.
+
+The packaged service adds a Linux cgroup boundary: `MemoryHigh=1G`,
+`MemoryMax=1536M`, `MemorySwapMax=0` and `TasksMax=2048`. These include Layerline's child processes and
+threads, unlike the application allocator budget. `MemoryHigh` causes reclamation
+and throttling; the hard maximum can trigger an OOM kill and a service restart.
+`OOMPolicy=stop` makes a child OOM stop the unit rather than leaving a partly
+failed service running; `Restart=always` then restarts it.
+Swap is disabled for the unit so oversized child allocations cannot consume
+host swap as an alternative to the resident-memory limit.
+These are last-resort host protection, not graceful overload handling. Review
+them alongside connection counts, stack settings and external commands. Raise
+them in a service drop-in when deliberately sizing a larger deployment. See the
+[systemd resource-control reference](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
+
+Layerline owns its Zig I/O runtime rather than using the default unbounded
+concurrent pool. `io_thread_limit` defaults to 128 (range 8 to 4096), and
+`io_stack_size` defaults to 1048576 bytes (range 1 MiB to 64 MiB). Both are
+restart-only settings, also available as `--io-thread-limit` and `--io-stack-size`.
+I/O task allocations and bootstrap storage share the application heap cap; the
+`io` allocator tier additionally caps retained task metadata at 16 MiB. Pool
+admission does not run rejected DNS/dial work inline. Exhaustion can reject a
+backend attempt or stream; it must not silently create more workers. Metrics
+report retained and busy I/O threads, configured limits, stacks and allocator use.
+Idle pool threads can remain allocated for reuse up to the configured ceiling.
+
+The heap cap is still not RSS or virtual-address-space accounting. Stack guards,
+TLS/runtime overhead, kernel buffers and child memory need the OS boundary above.
+Standalone/non-systemd deployments must provide equivalent OS limits themselves.
+Application-wide descriptor reservation/admission and stronger Darwin resolver
+cancellation guarantees remain separate work.
+
+`sudo python3 scripts/verify-runtime-budgets.py /absolute/path/to/layerline --systemd`
+checks the packaged limits against real cgroup/process files, then deliberately
+exhausts a separate 64 MiB transient unit with a certificate helper. Run it on an
+isolated acceptance host; it does not change or pressure the production service.
 
 ## macOS launchd
 

@@ -152,12 +152,12 @@ fn connectMany(host: HostName, io: std.Io, port: u16, results: *ResultQueue) !vo
     defer results.close(io);
     var buffer: [32]HostName.LookupResult = undefined;
     var resolved: std.Io.Queue(HostName.LookupResult) = .init(&buffer);
-    var lookup = io.async(HostName.lookup, .{ host, io, &resolved, HostName.LookupOptions{ .port = port } });
+    var lookup = io.concurrent(HostName.lookup, .{ host, io, &resolved, HostName.LookupOptions{ .port = port } }) catch return error.BackendCapacity;
     defer lookup.cancel(io) catch {};
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     while (resolved.getOne(io)) |result| switch (result) {
-        .address => |address| group.async(io, enqueueAddress, .{ io, address, results }),
+        .address => |address| group.concurrent(io, enqueueAddress, .{ io, address, results }) catch return error.BackendCapacity,
         .canonical_name => {},
     } else |err| switch (err) {
         error.Canceled => return err,
@@ -171,7 +171,7 @@ pub fn connectHost(host: HostName, io: std.Io, port: u16) !Stream {
     if (builtin.os.tag == .windows) return host.connect(io, port, .{ .mode = .stream });
     var buffer: [32]anyerror!Stream = undefined;
     var results: ResultQueue = .init(&buffer);
-    var producer = io.async(connectMany, .{ host, io, port, &results });
+    var producer = io.concurrent(connectMany, .{ host, io, port, &results }) catch return error.BackendCapacity;
     defer {
         producer.cancel(io) catch {};
         while (results.getOneUncancelable(io)) |result| {

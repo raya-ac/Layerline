@@ -203,6 +203,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_concurrent_connections == 0) return error.InvalidConfigValue;
     if (cfg.memory_budget_bytes < @import("../resource_budget.zig").minimum_limit) return error.InvalidConfigValue;
+    try @import("../runtime_io.zig").validate(cfg.io_thread_limit, cfg.io_stack_size);
     if (cfg.worker_stack_size < types.DEFAULT_WORKER_STACK_BYTES) return error.InvalidConfigValue;
     if (cfg.read_header_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.read_body_timeout_ms == 0) return error.InvalidConfigValue;

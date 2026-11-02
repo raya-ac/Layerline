@@ -170,28 +170,35 @@ graceful_shutdown_timeout_ms = 500
                 # still be encrypted, rather than leaked as plaintext or lost.
                 spare = connect()
                 head_spare = connect()
+                # Bootstrap and I/O metadata now count toward the same cap.
+                # Finish these handshakes before uploads consume request space;
+                # a handshake refusal cannot prove encrypted HTTP 503 framing.
+                for _ in range(8):
+                    held.append(connect())
                 denied = False
-                for _ in range(16):
-                    conn = connect()
-                    held.append(conn)
+                uploads = 0
+                for conn in list(held):
                     conn.sendall(b"POST /api/echo HTTP/1.1\r\nHost: memory.test\r\nContent-Length: 524288\r\n\r\n")
                     conn.settimeout(.15)
                     try:
                         first = conn.recv(16384)
                     except TimeoutError:
+                        uploads += 1
                         continue
                     overloaded(response(conn, first))
                     denied = True
                     held.remove(conn)
                     conn.close()
                     break
-                assert denied and held, "requests did not reach the shared allocation cap"
-                spare.sendall(b"GET /health HTTP/1.1\r\nHost: memory.test\r\nConnection: close\r\n\r\n")
-                overloaded(response(spare))
+                assert denied and uploads > 0, "requests did not reach the shared allocation cap"
+                # Each method gets a fresh pressure cycle. Closing the GET's
+                # TLS channel can legitimately free enough for a following HEAD.
+                probe = spare if cycle == 0 else head_spare
+                method = b"GET" if cycle == 0 else b"HEAD"
+                probe.sendall(method + b" /health HTTP/1.1\r\nHost: memory.test\r\nConnection: close\r\n\r\n")
+                overloaded(response(probe), head_only=cycle == 1)
                 spare.close()
                 spare = None
-                head_spare.sendall(b"HEAD /health HTTP/1.1\r\nHost: memory.test\r\nConnection: close\r\n\r\n")
-                overloaded(response(head_spare), head_only=True)
                 head_spare.close()
                 head_spare = None
                 values = metrics(admin)

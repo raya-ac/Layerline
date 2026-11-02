@@ -490,10 +490,15 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
         "# HELP layerline_heap_limit_bytes Application allocator limit per pool.\n# TYPE layerline_heap_limit_bytes gauge\n" ++
         "# HELP layerline_heap_peak_bytes Peak reserved allocator bytes per pool.\n# TYPE layerline_heap_peak_bytes gauge\n" ++
         "# HELP layerline_heap_rejections_total Allocation or growth attempts rejected per pool.\n# TYPE layerline_heap_rejections_total counter\n");
-    inline for (.{ .{ "total", &resource_budget.total }, .{ "normal", &resource_budget.normal }, .{ "control", &resource_budget.control }, .{ "http3", &resource_budget.http3 } }) |entry| {
+    inline for (.{ .{ "total", &resource_budget.total }, .{ "normal", &resource_budget.normal }, .{ "control", &resource_budget.control }, .{ "http3", &resource_budget.http3 }, .{ "io", &resource_budget.io } }) |entry| {
         try heap.print(allocator, "layerline_heap_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_limit_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_peak_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_rejections_total{{pool=\"{s}\"}} {d}\n", .{ entry[0], entry[1].used.load(.acquire), entry[0], entry[1].limit, entry[0], entry[1].peak.load(.acquire), entry[0], entry[1].rejected.load(.acquire) });
     }
     try heap.print(allocator, "# HELP layerline_overload_responses_total Minimal HTTP/1 overload responses completed.\n# TYPE layerline_overload_responses_total counter\nlayerline_overload_responses_total {d}\n", .{resource_budget.overload_responses.load(.acquire)});
     try heap.print(allocator, "# HELP layerline_supervisor_notification_failures_total Runtime supervisor notification send failures.\n# TYPE layerline_supervisor_notification_failures_total counter\nlayerline_supervisor_notification_failures_total {d}\n", .{systemd_notify.failures.load(.monotonic)});
+    const pool = @import("runtime_io.zig").snapshot();
+    try heap.print(allocator, "# HELP layerline_io_threads Retained I/O pool threads.\n# TYPE layerline_io_threads gauge\nlayerline_io_threads {d}\n" ++
+        "# HELP layerline_io_busy_threads Admitted I/O pool tasks.\n# TYPE layerline_io_busy_threads gauge\nlayerline_io_busy_threads {d}\n" ++
+        "# HELP layerline_io_thread_limit Maximum I/O pool threads.\n# TYPE layerline_io_thread_limit gauge\nlayerline_io_thread_limit {d}\n" ++
+        "# HELP layerline_io_stack_size_bytes Configured stack size per I/O thread, excluding runtime and kernel overhead.\n# TYPE layerline_io_stack_size_bytes gauge\nlayerline_io_stack_size_bytes {d}\n", .{ pool.threads, pool.busy, pool.limit, pool.stack_size });
     return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources, config_resources, heap.items });
 }

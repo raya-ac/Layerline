@@ -173,6 +173,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const ServerConfig) !void {
     if (active.memory_budget_bytes != candidate.memory_budget_bytes) return error.ReloadRequiresRestart;
+    if (active.io_thread_limit != candidate.io_thread_limit or active.io_stack_size != candidate.io_stack_size) return error.ReloadRequiresRestart;
     if (!std.mem.eql(u8, active.host, candidate.host)) return error.ReloadRequiresRestart;
     if (active.port != candidate.port) return error.ReloadRequiresRestart;
     if (active.tls_enabled != candidate.tls_enabled) return error.ReloadRequiresRestart;
@@ -872,6 +873,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (!(try cli_config.prepare(init, resource_budget.allocator(), &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
     try resource_budget.configure(cfg.memory_budget_bytes);
+    try @import("runtime_io.zig").configure(init.io, cfg.io_thread_limit, cfg.io_stack_size);
     supervisor = try systemd_notify.Notifier.init(init.environ_map);
     try supervisor.starting();
     defer supervisor.stopping(init.io);

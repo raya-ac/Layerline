@@ -208,6 +208,7 @@ def fields(path=b"/health", method=b"GET"):
 
 class H2:
     def __init__(self, server, wire=False, initial_window=None, receive_buffer=None):
+        self.timeline = []
         self.conn = TLSWire(server) if wire else server.connect("h2", receive_buffer)
         settings = b"" if initial_window is None else struct.pack("!HI", 4, initial_window)
         self.conn.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, settings))
@@ -216,6 +217,7 @@ class H2:
     @classmethod
     def upgrade(cls, server):
         client = cls.__new__(cls)
+        client.timeline = []
         client.conn = server.connect()
         client.conn.sendall(b"GET /queued.bin HTTP/1.1\r\nHost: local\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAQAAAAA\r\n\r\n")
         assert header(client.conn).startswith(b"HTTP/1.1 101"), "h2c upgrade failed"
@@ -228,7 +230,9 @@ class H2:
 
     def receive(self):
         head = exact(self.conn, 9)
-        return head[3], head[4], int.from_bytes(head[5:], "big") & 0x7fffffff, exact(self.conn, int.from_bytes(head[:3], "big"))
+        item = head[3], head[4], int.from_bytes(head[5:], "big") & 0x7fffffff, exact(self.conn, int.from_bytes(head[:3], "big"))
+        self.timeline.append((item, time.monotonic()))
+        return item
 
     def until(self, match):
         frames = []
@@ -249,7 +253,7 @@ class H2:
     def upload(self):
         self.send(1, 4, 1, fields(b"/api/echo", b"POST"))
         self.send(0, 0, 1, b"a")
-        self.barrier()
+        return self.barrier()
 
 
 with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
@@ -312,7 +316,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                         received = h2.until(lambda f: f == (3, 0, 1, (8).to_bytes(4, "big")))
                     assert (3, 0, 1, (8).to_bytes(4, "big")) in received, "PING/window traffic renewed a queued response deadline"
                     assert not any(k == 7 for k, _, _, _ in received)
-                    elapsed = time.monotonic() - started
+                    # Measure receipt of the reset, not unrelated healthy
+                    # requests that deliberately continue after the expiry.
+                    elapsed = next(at for item, at in h2.timeline if item == (3, 0, 1, (8).to_bytes(4, "big"))) - started
                     assert elapsed < 0.9, ("zero-window output survived its response budget", elapsed, progress, received, server.log.read_text())
                     h2.send(8, 0, 1, (65535).to_bytes(4, "big"))
                     assert not any(k == 0 and s == 1 for k, _, s, _ in h2.barrier()), "expired response resumed sending"
@@ -397,8 +403,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
 
             h2 = H2(server)
             try:
-                h2.upload()
-                received = []
+                # A scheduler pause can let the body expire during this first
+                # PING barrier. Keep its frames in the same response timeline.
+                received = h2.upload()
                 for stream in [3, 5, 7, 9, 11]:
                     time.sleep(0.08)
                     h2.send(0, 0, 1, b"x")
