@@ -482,6 +482,17 @@ pub fn deriveTlsRecordKeys(traffic_secret: [32]u8) TlsRecordKeys {
     };
 }
 
+pub fn nextTlsTrafficSecret(traffic_secret: [32]u8) [32]u8 {
+    return hkdfExpandLabel(traffic_secret, "traffic upd", "", 32);
+}
+
+test "TLS traffic updates use the RFC label and an empty context" {
+    // Independent HMAC-SHA256 expansion of the encoded HKDF label.
+    var expected_bytes: [32]u8 = undefined;
+    const expected = try std.fmt.hexToBytes(&expected_bytes, "6332e2593a296a14c6899a806d3cb01f8565c17a5002e5ab4bcd2e79a6811b84");
+    try std.testing.expectEqualSlices(u8, expected, &nextTlsTrafficSecret(@splat(0)));
+}
+
 pub fn encryptTlsRecord(
     allocator: std.mem.Allocator,
     keys: TlsRecordKeys,

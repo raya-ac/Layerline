@@ -6,6 +6,7 @@ const routing = @import("routing.zig");
 const tls13_native = @import("tls13_native.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
+const write_deadline = @import("write_deadline.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -18,6 +19,10 @@ const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
 const CONTENT_TYPE_ALERT: u8 = 0x15;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+const MAX_KEY_RECORDS = @import("upstream_tls_client.zig").max_key_records;
+const PEER_UPDATE_MARGIN = @min(MAX_KEY_RECORDS / 2, 1024);
+const UPDATE_REPLY: u8 = 1;
+const UPDATE_REQUEST: u8 = 2;
 
 pub const RawReadFn = *const fn (std.Io.net.Stream, []u8) anyerror!usize;
 pub const RawWriteAllFn = *const fn (std.Io.net.Stream, []const u8) anyerror!void;
@@ -28,6 +33,8 @@ pub const Channel = struct {
     allocator: std.mem.Allocator,
     client_application_keys: tls13_native.TlsRecordKeys,
     server_application_keys: tls13_native.TlsRecordKeys,
+    client_application_secret: ?[32]u8 = null,
+    server_application_secret: ?[32]u8 = null,
     raw_read: RawReadFn,
     raw_write_all: RawWriteAllFn,
     client_sequence: u64 = 0,
@@ -42,6 +49,10 @@ pub const Channel = struct {
     failed: std.atomic.Value(bool) = .init(false),
     sent_close_notify: bool = false,
     received_close_notify: bool = false,
+    post_handshake: [5]u8 = undefined,
+    post_handshake_used: usize = 0,
+    pending_key_updates: std.atomic.Value(u8) = .init(0),
+    read_update_requested: bool = false,
 
     pub fn deinit(self: *Channel) void {
         if (self.pending_plaintext) |pending| self.allocator.free(pending);
@@ -53,6 +64,11 @@ pub const Channel = struct {
         self.record_used = 0;
         std.crypto.secureZero(u8, std.mem.asBytes(&self.client_application_keys));
         std.crypto.secureZero(u8, std.mem.asBytes(&self.server_application_keys));
+        if (self.client_application_secret) |*secret| std.crypto.secureZero(u8, secret);
+        if (self.server_application_secret) |*secret| std.crypto.secureZero(u8, secret);
+        self.client_application_secret = null;
+        self.server_application_secret = null;
+        self.post_handshake_used = 0;
     }
 
     fn readRecord(self: *Channel) ![]u8 {
@@ -229,7 +245,15 @@ pub fn readApplicationData(channel: *Channel, out: []u8) anyerror!usize {
     return readApplicationRecord(channel, out) catch |err| {
         // H2 wakes a partially read connection when a backend job completes.
         // Like a stream timeout, this is scheduling, not invalid TLS input.
-        if (err != error.RequestTimeout and err != error.DispatchReady) channel.failed.store(true, .release);
+        if (err != error.RequestTimeout and err != error.DispatchReady) {
+            const alert: ?u8 = switch (err) {
+                error.InvalidTlsKeyUpdate => 47,
+                error.UnexpectedTlsHandshake, error.TlsHandshakeInterleaved => 10,
+                else => null,
+            };
+            if (alert) |description| sendApplicationAlert(channel, description) catch {};
+            channel.failed.store(true, .release);
+        }
         return err;
     };
 }
@@ -279,6 +303,18 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
 
         switch (decrypted.content_type) {
             CONTENT_TYPE_APPLICATION_DATA => {
+                if (channel.post_handshake_used != 0) {
+                    decrypted.deinit(channel.allocator);
+                    return error.TlsHandshakeInterleaved;
+                }
+                if (!channel.read_update_requested and channel.client_sequence >= MAX_KEY_RECORDS - PEER_UPDATE_MARGIN) {
+                    channel.read_update_requested = true;
+                    _ = channel.pending_key_updates.fetchOr(UPDATE_REQUEST, .acq_rel);
+                    drainKeyUpdates(channel) catch |err| {
+                        decrypted.deinit(channel.allocator);
+                        return err;
+                    };
+                }
                 if (decrypted.payload.len == 0) {
                     decrypted.deinit(channel.allocator);
                     continue;
@@ -288,13 +324,14 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
             },
             CONTENT_TYPE_ALERT => {
                 defer decrypted.deinit(channel.allocator);
+                if (channel.post_handshake_used != 0) return error.TlsHandshakeInterleaved;
                 if (decrypted.payload.len != 2 or decrypted.payload[1] != 0) return error.TlsAlert;
                 channel.received_close_notify = true;
                 return 0;
             },
             CONTENT_TYPE_HANDSHAKE => {
-                decrypted.deinit(channel.allocator);
-                return error.UnexpectedTlsHandshake;
+                defer decrypted.deinit(channel.allocator);
+                try receiveKeyUpdate(channel, decrypted.payload);
             },
             else => {
                 decrypted.deinit(channel.allocator);
@@ -304,6 +341,86 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
     }
 }
 
+fn rotateApplicationKeys(secret: *?[32]u8, keys: *tls13_native.TlsRecordKeys, sequence: *u64) !void {
+    const current = if (secret.*) |*value| value else return error.TlsTrafficSecretUnavailable;
+    var next = tls13_native.nextTlsTrafficSecret(current.*);
+    defer std.crypto.secureZero(u8, &next);
+    std.crypto.secureZero(u8, current);
+    current.* = next;
+    std.crypto.secureZero(u8, std.mem.asBytes(keys));
+    keys.* = tls13_native.deriveTlsRecordKeys(next);
+    sequence.* = 0;
+}
+
+fn sendControlRecord(channel: *Channel, content_type: u8, payload: []const u8) !void {
+    // A TLS control reply is not the first byte of an HTTP response. Preserve
+    // an already-started transfer budget, but do not arm a lazy one here.
+    const previous = write_deadline.forStream(channel.stream);
+    const unstarted = if (previous) |state| state.lazy and state.deadline.at == null else false;
+    if (unstarted) {
+        var control = previous.?;
+        control.lazy = false;
+        _ = write_deadline.push(control);
+    }
+    defer if (unstarted) write_deadline.restore(previous);
+    try sendEncryptedRecord(channel.stream, channel.allocator, channel.server_application_keys, &channel.server_sequence, content_type, payload, channel.raw_write_all);
+}
+
+fn sendKeyUpdateLocked(channel: *Channel, request_peer: bool) !void {
+    errdefer channel.failed.store(true, .release);
+    if (channel.server_application_secret == null) return error.TlsTrafficSecretUnavailable;
+    try sendControlRecord(channel, CONTENT_TYPE_HANDSHAKE, &.{ 0x18, 0, 0, 1, @intFromBool(request_peer) });
+    // The update itself must finish under the old key before sequence zero.
+    try rotateApplicationKeys(&channel.server_application_secret, &channel.server_application_keys, &channel.server_sequence);
+}
+
+fn flushKeyUpdatesLocked(channel: *Channel) !void {
+    if (channel.failed.load(.acquire)) return error.TlsSessionFailed;
+    const pending = channel.pending_key_updates.swap(0, .acq_rel);
+    if (channel.sent_close_notify) return;
+    if (pending & UPDATE_REPLY != 0) try sendKeyUpdateLocked(channel, false);
+    if (pending & UPDATE_REQUEST != 0) try sendKeyUpdateLocked(channel, true);
+}
+
+fn drainKeyUpdates(channel: *Channel) !void {
+    // Tunnel readers must not wait behind a backpressured writer. The writer
+    // checks before each record and again after unlocking to close the handoff race.
+    while (channel.pending_key_updates.load(.acquire) != 0) {
+        if (!channel.write_mutex.tryLock()) return;
+        const result = flushKeyUpdatesLocked(channel);
+        channel.write_mutex.unlock(channel.io);
+        try result;
+    }
+}
+
+fn receiveKeyUpdate(channel: *Channel, payload: []const u8) !void {
+    if (payload.len == 0 or payload.len > channel.post_handshake.len - channel.post_handshake_used) return error.UnexpectedTlsHandshake;
+    @memcpy(channel.post_handshake[channel.post_handshake_used..][0..payload.len], payload);
+    channel.post_handshake_used += payload.len;
+    if (channel.post_handshake[0] != 0x18) return error.UnexpectedTlsHandshake;
+    if (channel.post_handshake_used >= 4 and !std.mem.eql(u8, channel.post_handshake[1..4], &.{ 0, 0, 1 })) return error.InvalidTlsKeyUpdate;
+    if (channel.post_handshake_used < channel.post_handshake.len) return;
+    const request = channel.post_handshake[4];
+    if (request > 1) return error.InvalidTlsKeyUpdate;
+    channel.post_handshake_used = 0;
+    try rotateApplicationKeys(&channel.client_application_secret, &channel.client_application_keys, &channel.client_sequence);
+    channel.read_update_requested = false;
+    _ = channel.pending_key_updates.fetchAnd(~UPDATE_REQUEST, .acq_rel);
+    if (request == 1) _ = channel.pending_key_updates.fetchOr(UPDATE_REPLY, .acq_rel);
+    try drainKeyUpdates(channel);
+}
+
+fn sendApplicationAlert(channel: *Channel, description: u8) !void {
+    if (!channel.write_mutex.tryLock()) {
+        channel.failed.store(true, .release);
+        return;
+    }
+    defer channel.write_mutex.unlock(channel.io);
+    if (channel.failed.load(.acquire) or channel.sent_close_notify) return;
+    defer channel.failed.store(true, .release);
+    try sendControlRecord(channel, CONTENT_TYPE_ALERT, &.{ 2, description });
+}
+
 pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
     var accepted: usize = 0;
     try writeApplicationDataCounted(channel, bytes, &accepted);
@@ -311,11 +428,19 @@ pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
 
 pub fn writeApplicationDataCounted(channel: *Channel, bytes: []const u8, accepted: *usize) !void {
     channel.write_mutex.lockUncancelable(channel.io);
-    defer channel.write_mutex.unlock(channel.io);
+    const result = writeApplicationDataLocked(channel, bytes, accepted);
+    channel.write_mutex.unlock(channel.io);
+    try result;
+    try drainKeyUpdates(channel);
+}
+
+fn writeApplicationDataLocked(channel: *Channel, bytes: []const u8, accepted: *usize) !void {
     if (channel.failed.load(.acquire) or channel.sent_close_notify) return error.TlsSessionFailed;
     errdefer channel.failed.store(true, .release);
     var offset: usize = 0;
     while (offset < bytes.len) {
+        try flushKeyUpdatesLocked(channel);
+        if (channel.server_sequence >= MAX_KEY_RECORDS - 1) try sendKeyUpdateLocked(channel, false);
         const chunk_len = @min(bytes.len - offset, MAX_INNER_PLAINTEXT_BYTES - 1);
         try sendEncryptedRecord(
             channel.stream,
@@ -334,10 +459,18 @@ pub fn writeApplicationDataCounted(channel: *Channel, bytes: []const u8, accepte
 
 pub fn end(channel: *Channel) !void {
     channel.write_mutex.lockUncancelable(channel.io);
-    defer channel.write_mutex.unlock(channel.io);
+    const result = endLocked(channel);
+    channel.write_mutex.unlock(channel.io);
+    try result;
+    try drainKeyUpdates(channel);
+}
+
+fn endLocked(channel: *Channel) !void {
     if (channel.failed.load(.acquire)) return error.TlsSessionFailed;
     if (channel.sent_close_notify) return;
     errdefer channel.failed.store(true, .release);
+    try flushKeyUpdatesLocked(channel);
+    if (channel.server_sequence >= MAX_KEY_RECORDS - 1) try sendKeyUpdateLocked(channel, false);
     try sendEncryptedRecord(channel.stream, channel.allocator, channel.server_application_keys, &channel.server_sequence, CONTENT_TYPE_ALERT, &.{ 1, 0 }, channel.raw_write_all);
     channel.sent_close_notify = true;
 }
@@ -716,7 +849,8 @@ pub fn establishTls13(
         break;
     }
 
-    const app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
+    var app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&app_secrets));
     return .{
         .channel = .{
             .io = io,
@@ -724,6 +858,8 @@ pub fn establishTls13(
             .allocator = allocator,
             .client_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.client_application_traffic_secret),
             .server_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.server_application_traffic_secret),
+            .client_application_secret = app_secrets.client_application_traffic_secret,
+            .server_application_secret = app_secrets.server_application_traffic_secret,
             .raw_read = raw_read,
             .raw_write_all = raw_write_all,
         },

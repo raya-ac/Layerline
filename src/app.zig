@@ -601,6 +601,7 @@ fn http2Callbacks() h2_server.Callbacks {
         .error_response = h2CoolErrorResponse,
         .dispatch = .{ .prepare = prepareHttp2Request, .deliver = deliverHttp2Request },
         .write_all = streamWriteAll,
+        .finish_tls_output = stream_runtime.finishTlsOutput,
         .shutdown_requested = &runtime_state.shutdown_requested,
     };
 }

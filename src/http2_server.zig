@@ -28,8 +28,14 @@ pub const Callbacks = struct {
     error_response: ErrorResponseFn,
     dispatch: dispatch.Callbacks,
     write_all: WriteAllFn,
+    finish_tls_output: *const fn (std.Io.net.Stream) anyerror!void,
     shutdown_requested: *std.atomic.Value(bool),
 };
+
+fn drainClosing(io: std.Io, stream: std.Io.net.Stream, callbacks: Callbacks) void {
+    callbacks.finish_tls_output(stream) catch {};
+    h2_support.drainClosing(io, stream);
+}
 
 const HeaderFragment = struct { bytes: []u8, self_dependency: bool = false };
 
@@ -254,7 +260,7 @@ pub fn runFrameLoop(
             else => 1,
         };
         h2_support.sendGoaway(stream, flow.last_stream_id, code, callbacks.write_all) catch return err;
-        h2_support.drainClosing(io, stream);
+        drainClosing(io, stream, callbacks);
         return err;
     };
 }
@@ -308,7 +314,7 @@ fn runFrames(
             draining = true;
         }
         if (draining and body_states.items.len == 0 and flow.streams.items.len == 0 and jobs.count() == 0) {
-            h2_support.drainClosing(io, stream);
+            drainClosing(io, stream, callbacks);
             return;
         }
 
@@ -335,7 +341,7 @@ fn runFrames(
                     (continuation_id != 0 and continuation_deadline.expired(now)))
                 {
                     try h2_support.sendGoaway(stream, flow.last_stream_id, if (reader.frame_started == null and continuation_id == 0 and !first_frame) 0 else 0xb, callbacks.write_all);
-                    h2_support.drainClosing(io, stream);
+                    drainClosing(io, stream, callbacks);
                     return;
                 }
                 // A stream body/response budget expired. Reset it on the next
@@ -349,7 +355,7 @@ fn runFrames(
             (continuation_id != 0 and continuation_deadline.expired(now)))
         {
             try h2_support.sendGoaway(stream, flow.last_stream_id, 0xb, callbacks.write_all);
-            h2_support.drainClosing(io, stream);
+            drainClosing(io, stream, callbacks);
             return;
         }
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
@@ -547,7 +553,7 @@ fn runFrames(
 
         if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection and body_states.items.len == 0 and flow.streams.items.len == 0) {
             try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
-            h2_support.drainClosing(io, stream);
+            drainClosing(io, stream, callbacks);
             return;
         }
     }

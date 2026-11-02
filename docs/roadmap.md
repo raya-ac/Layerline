@@ -63,8 +63,11 @@ reset/disconnect cleanup and root rotation with pinned old readers. H2 backend
 responses are still buffered and the backend HTTP protocol remains HTTP/1.1.
 The independent certificate corpus is not entirely passing; [the TLS work notes](upstream-tls.md)
 retain profile differences, unsupported algorithms and wider conformance/release
-gates. Native listener KeyUpdate, broader TLS profiles, mTLS/resumption, backend
-HTTP/2/3 and revocation are still gaps, not completed roadmap items.
+gates. The native listener now reassembles TLS 1.3 KeyUpdate messages, rotates
+before its record cap, requests fresh peer keys, and sends authenticated closure
+on normal HTTP/1 and HTTP/2 termination. Focused unit and independent OpenSSL
+fixtures cover key ordering, interrupted/split input and concurrent writers.
+Broader TLS profiles, mTLS/resumption, backend HTTP/2/3 and revocation remain gaps.
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 

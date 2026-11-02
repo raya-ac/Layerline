@@ -681,6 +681,21 @@ no insecure option or plaintext fallback. The native downstream TLS path now
 reserves nonces before writes, poisons output after fatal input/partial-write
 failure, supports authenticated write-half-close and rejects unauthenticated EOF.
 Resumable read timeouts and H2 backend-completion wakeups retain partial records.
+The listener retains partial TLS 1.3 KeyUpdate messages across those interruptions,
+rejects malformed/interleaved updates, and resets record counters only after an
+authenticated update. Replies finish under the old outgoing key before rotation.
+It rotates output before the per-key cap and requests fresh peer keys with bounded
+headroom; an unresponsive peer still reaches the hard cap and is disconnected.
+Tunnel readers queue replies without waiting behind a blocked writer, which
+flushes pending control before its next application record and after releasing
+the write lock. A partial control write poisons output just like a partial data
+write. Control replies do not start an unarmed HTTP response deadline or renew an
+existing one. Normal HTTP/1 closes and HTTP/2 terminal drains send `close_notify`
+before TCP half-close. `scripts/verify-native-tls.py` checks both protocols with
+independent OpenSSL key rotations, exact reply counts, split HTTP/2 frames and
+authenticated closure. Unit tests cover invalid updates, allocation failures,
+near-cap rotation and a blocked concurrent writer; these are not a complete TLS
+conformance suite.
 Handshake key generation and
 RSA-PSS salt require secure entropy without the I/O API's weaker fallback.
 Temporary key PEM/DER buffers, retired configured private keys and traffic state

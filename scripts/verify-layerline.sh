@@ -837,5 +837,6 @@ log "verifying upstream framing and HTTP/2 response metadata"
 python3 "$ROOT_DIR/scripts/verify-upstream-framing.py" "$SERVER_BINARY"
 python3 "$ROOT_DIR/scripts/verify-proxy-accounting.py" "$SERVER_BINARY"
 python3 "$ROOT_DIR/scripts/verify-https-upstreams.py" "$SERVER_BINARY"
+python3 "$ROOT_DIR/scripts/verify-native-tls.py" "$SERVER_BINARY"
 
 log "Layerline verification passed"

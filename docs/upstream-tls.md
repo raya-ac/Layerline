@@ -207,12 +207,16 @@ rejections remain interoperability gaps.
 ## remaining boundaries
 
 Wider independent certificate/TLS conformance, unsupported policy/algorithm
-coverage, revocation, resumption, mTLS, proactive key updates, backend HTTP/2/3
-and streaming H2 responses remain work. The native client-facing TLS server still
-has a narrower cipher/group profile and rejects post-handshake KeyUpdate; origin
-client support does not imply server support. Both channels fail closed at their
-per-key record cap. Runtime changes must pass native/Linux regression and the
-candidate, rollback and live-route gates before deployment.
+coverage, revocation, resumption, mTLS, proactive origin key updates, backend
+HTTP/2/3 and streaming H2 responses remain work. The native client-facing TLS
+server has a narrower cipher/group profile, but now supports fragmented TLS 1.3
+KeyUpdate, proactive output rotation and requests for peer rotation. Its separate
+`zig build test-native-tls` fixture uses an independent, certificate-verifying
+OpenSSL client over HTTP/1.1 and HTTP/2, including split HTTP/2 frames and normal
+authenticated shutdown. This is selected interoperability evidence, not complete
+TLS conformance. Both channels retain their hard per-key record cap. Runtime
+changes must pass native/Linux regression and the candidate, rollback and
+live-route gates before deployment.
 
 Identity and path checks follow the separate responsibilities described in
 [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html) and

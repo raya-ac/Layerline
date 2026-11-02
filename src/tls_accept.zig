@@ -63,6 +63,7 @@ pub fn handleClientHelloProbe(
 
     callbacks.set_tls_channel(&established.channel);
     defer callbacks.clear_tls_channel();
+    defer native_tls.end(&established.channel) catch {};
 
     std.debug.print(
         "TLS 1.3 native connection accepted sni={s} alpn={s}\n",

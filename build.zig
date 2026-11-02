@@ -105,6 +105,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_tls_pem_tests = b.addRunArtifact(tls_pem_tests);
 
+    const key_update_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_tls_key_update_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const static_cache_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/static_cache.zig"),
@@ -133,6 +141,7 @@ pub fn build(b: *std.Build) void {
     const run_reactor_tests = b.addRunArtifact(reactor_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(key_update_tests).step);
     const certificate_probe = b.addExecutable(.{
         .name = "upstream-certificate-probe",
         .root_module = b.createModule(.{
@@ -171,6 +180,11 @@ pub fn build(b: *std.Build) void {
     https_checks.addArtifactArg(exe);
     b.step("test-https-upstreams", "Test authenticated HTTPS proxy traffic, pools, tunnels and reloads")
         .dependOn(&https_checks.step);
+    const native_tls_checks = b.addSystemCommand(&.{"python3"});
+    native_tls_checks.addFileArg(b.path("scripts/verify-native-tls.py"));
+    native_tls_checks.addArtifactArg(exe);
+    b.step("test-native-tls", "Test native TLS key updates and closure with independent OpenSSL clients")
+        .dependOn(&native_tls_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

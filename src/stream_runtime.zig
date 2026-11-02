@@ -39,6 +39,11 @@ pub fn currentTlsChannel() ?*TlsChannel {
     return current_tls_channel;
 }
 
+pub fn finishTlsOutput(stream: std.Io.net.Stream) !void {
+    const channel = current_tls_channel orelse return;
+    if (channel.stream.socket.handle == stream.socket.handle) try native_tls.end(channel);
+}
+
 pub fn isTlsConnection() bool {
     return current_tls_channel != null;
 }
