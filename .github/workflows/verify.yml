@@ -1,0 +1,61 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.mode }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        mode: [Debug, ReleaseFast]
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Select independent clients
+        if: runner.os == 'macOS'
+        run: |
+          for formula in curl openssl@3; do
+            prefix=$(brew --prefix "$formula")
+            test -d "$prefix/bin"
+            printf '%s\n' "$prefix/bin" >> "$GITHUB_PATH"
+          done
+      - name: Prepare pinned test tools
+        run: python3 scripts/ci-tools.py "$RUNNER_TEMP/layerline-tools" --export-github-path
+      - name: Verify build and wire behavior
+        env:
+          VERIFY_MODE: ${{ matrix.mode }}
+        run: python3 scripts/ci-verify.py --mode "$VERIFY_MODE" --tools "$RUNNER_TEMP/layerline-tools" --output "$RUNNER_TEMP/layerline-evidence"
+      - name: Retain binaries and verification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layerline-${{ matrix.os }}-${{ matrix.mode }}-${{ github.sha }}
+          path: ${{ runner.temp }}/layerline-evidence/
+          if-no-files-found: warn
+          retention-days: 14

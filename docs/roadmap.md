@@ -207,6 +207,11 @@ datagram tests include full queues and sender credentials; an optional real
 systemd gate checks activation, delayed certificate setup, reloads and listener
 failure. This is not backend-health verification, watchdog monitoring or socket
 activation support.
+Hosted verification now has a checked-in workflow for Linux/macOS Debug and
+ReleaseFast unit/wire suites plus ReleaseSafe units, with pinned tools and
+source-bound result artifacts. It has no production credentials or automatic
+deployment. Real manager/resource tests, namespace-isolated candidate checks,
+live-site comparisons and guarded promotion remain separate release work.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

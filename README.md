@@ -48,6 +48,7 @@ zig build test
 ```
 
 the verifier starts temporary local servers. [benchmarking](docs/benchmarking.md) is separate.
+github also runs the unit and wire tests on linux and macos. it doesn't deploy automatically.
 
 <p align="center">
   <img src="public/laina-v2.png" alt="laina, layerline's mascot" width="160">

@@ -253,6 +253,34 @@ http_redirect_status = 308
 
 With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --webroot` loop. For production, prefer the systemd `layerline-cert-renew.timer` because its certbot deploy hook reloads Layerline only after a renewed certificate is deployed. Renewal updates the certificate files on disk, and `SIGHUP` reload picks up compatible TLS material without a full process restart. Operators can also run `cert-renew` through the local admin socket to perform the configured renewal and then reload TLS material for new connections.
 
+## Hosted Checks
+
+The `verify` GitHub Actions workflow runs on pushes to `main`, pull requests and
+manual dispatch. Ubuntu 24.04 and macOS 15 each run Debug and ReleaseFast unit
+and complete local wire suites; the Debug jobs also run ReleaseSafe units.
+The jobs raise only their own soft descriptor limit to 8192 when necessary;
+the low-limit fixtures still set and test their original smaller limits.
+
+Zig 0.16.0 archives and the existing h2spec source revision are checksum-pinned.
+The h2spec client is built with pinned Go 1.27.3, read-only module inputs and no
+CGO, Makefile or generator execution. Go is a test-tool compiler, not a Layerline
+runtime dependency. Python 3.13 drives the fixtures. Actions use full commit pins,
+read-only repository permission, no persisted checkout credentials and no caches.
+No production credentials or deployment commands are part of this workflow.
+
+Each started verification retains its checkout/source hashes, tool and server
+hashes, per-command exit codes, logs and result receipt for 14 days. The H2
+archive includes the raw JUnit reports, including the existing cleartext
+shared-listener exception; generated TLS private keys are excluded. Failed or
+incomplete checks cannot produce a passing receipt. Tool bootstrap failures are
+reported in the job log before verification starts.
+
+Hosted jobs use temporary loopback fixtures as the ordinary runner user. They do
+not perform the separate root/PID1 systemd and cgroup/OOM tests, namespace-isolated
+release checks, per-site origin comparisons, public certificate checks, mail
+acceptance or rollback drills. A green workflow is not deployment authorization,
+full protocol/PKIX conformance, or a reason to waive an unexplained failed run.
+
 ## Smoke Checks
 
 Run these before moving traffic:
