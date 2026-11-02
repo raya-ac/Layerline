@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 const builtin = @import("builtin");
 
 const acme_renewal = @import("acme_renewal.zig");
@@ -29,7 +30,6 @@ pub const Callbacks = struct {
     http1: http1_runtime.Callbacks,
     http3: http3_server.Callbacks,
     reload_signal: *const fn (std.Io) void,
-    send_cool_error: *const fn (std.Io.net.Stream, std.mem.Allocator, u16, []const u8, []const u8) anyerror!void,
     upstream: upstream_runtime.Callbacks,
 };
 
@@ -68,6 +68,7 @@ const Workers = struct {
 const ShutdownDeadlineContext = struct {
     ctx: Context,
     complete: *std.atomic.Value(bool),
+    workers_stopped: *std.atomic.Value(bool),
     connections: *concurrency_mod.State,
     admin: ?*admin_listener.Listener,
 };
@@ -97,6 +98,9 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
             children_stopped = native_spawn.tryStopAll(ctx.io);
         }
         if (elapsed >= ctx.cfg.graceful_shutdown_timeout_ms) {
+            // The main thread can still be asleep in its drain poll after the
+            // last worker releases its lease. Nothing remains to force-kill.
+            if (state.workers_stopped.load(.acquire) and state.connections.active() == 0) return;
             forceShutdown(ctx, state.connections, state.admin);
         }
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
@@ -132,7 +136,7 @@ fn shutdownWatcherTask(ctx: ShutdownWatcherContext) void {
 
     if (ctx.wake_host) |host| {
         if (ctx.wake_port != 0) {
-            if (stream_runtime.connectTcpHost(std.heap.page_allocator, host, ctx.wake_port)) |wake| {
+            if (stream_runtime.connectTcpHost(resource_budget.allocator(), host, ctx.wake_port)) |wake| {
                 stream_runtime.streamClose(wake);
             } else |_| {}
         }
@@ -283,13 +287,9 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
         if (!concurrency.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.metrics.connectionRejected();
             std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{active_cfg.max_concurrent_connections});
-            ctx.callbacks.send_cool_error(
-                conn,
-                ctx.allocator,
-                503,
-                "Service Unavailable",
-                "Maximum concurrent connections reached. Try again in a moment.",
-            ) catch {};
+            // No TLS session exists at admission. Close overloaded HTTPS
+            // sockets rather than sending an unencrypted HTTP error.
+            if (!active_cfg.tls_enabled) http1_runtime.sendOverload(ctx.io, conn, false, ctx.callbacks.http1) catch {};
             stream_runtime.streamClose(conn);
             lease.deinit();
             continue;
@@ -355,12 +355,14 @@ pub fn run(ctx: Context) !void {
 
     var workers = Workers{};
     var shutdown_complete = std.atomic.Value(bool).init(false);
-    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .connections = &concurrency, .admin = if (admin) |*value| value else null }});
+    var workers_stopped = std.atomic.Value(bool).init(false);
+    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .workers_stopped = &workers_stopped, .connections = &concurrency, .admin = if (admin) |*value| value else null }});
     defer {
         ctx.shutdown_requested.store(true, .release);
         std.debug.print("Shutdown requested; draining workers for up to {d}ms.\n", .{ctx.cfg.graceful_shutdown_timeout_ms});
         concurrency.beginDrain(ctx.io);
         workers.join();
+        workers_stopped.store(true, .release);
         concurrency_mod.waitForDrain(ctx.io, &concurrency, ctx.cfg.graceful_shutdown_timeout_ms);
         if (concurrency.active() != 0) {
             // The independent deadline guard exits before this wait can overrun.

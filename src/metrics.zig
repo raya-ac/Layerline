@@ -483,5 +483,15 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
         "# HELP layerline_config_owned_bytes Retained reload arenas, excluding process-owned boot config and pool allocations.\n" ++
         "# TYPE layerline_config_owned_bytes gauge\nlayerline_config_owned_bytes {d}\n", .{ snapshots.generation, snapshots.snapshots, snapshots.readers, snapshots.owned_bytes });
     defer allocator.free(config_resources);
-    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources, config_resources });
+    var heap = std.ArrayList(u8).empty;
+    defer heap.deinit(allocator);
+    try heap.appendSlice(allocator, "# HELP layerline_heap_bytes Application allocations: total/normal/control charge pages, protocol pools charge logical bytes. Nested pools overlap; not RSS.\n# TYPE layerline_heap_bytes gauge\n" ++
+        "# HELP layerline_heap_limit_bytes Application allocator limit per pool.\n# TYPE layerline_heap_limit_bytes gauge\n" ++
+        "# HELP layerline_heap_peak_bytes Peak reserved allocator bytes per pool.\n# TYPE layerline_heap_peak_bytes gauge\n" ++
+        "# HELP layerline_heap_rejections_total Allocation or growth attempts rejected per pool.\n# TYPE layerline_heap_rejections_total counter\n");
+    inline for (.{ .{ "total", &resource_budget.total }, .{ "normal", &resource_budget.normal }, .{ "control", &resource_budget.control }, .{ "http3", &resource_budget.http3 } }) |entry| {
+        try heap.print(allocator, "layerline_heap_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_limit_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_peak_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_rejections_total{{pool=\"{s}\"}} {d}\n", .{ entry[0], entry[1].used.load(.acquire), entry[0], entry[1].limit, entry[0], entry[1].peak.load(.acquire), entry[0], entry[1].rejected.load(.acquire) });
+    }
+    try heap.print(allocator, "# HELP layerline_overload_responses_total Minimal HTTP/1 overload responses completed.\n# TYPE layerline_overload_responses_total counter\nlayerline_overload_responses_total {d}\n", .{resource_budget.overload_responses.load(.acquire)});
+    return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources, config_resources, heap.items });
 }

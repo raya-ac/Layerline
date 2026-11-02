@@ -781,6 +781,9 @@ python3 "$ROOT_DIR/scripts/verify-child-processes.py" "$SERVER_BINARY"
 log "verifying listener startup and control socket ownership"
 python3 "$ROOT_DIR/scripts/verify-listeners.py" "$SERVER_BINARY"
 
+log "verifying shared application memory limits and overload recovery"
+python3 "$ROOT_DIR/scripts/verify-memory-budgets.py" "$SERVER_BINARY"
+
 log "verifying HTTP/1 response transfer budgets"
 python3 "$ROOT_DIR/scripts/verify-http1-transfer.py" "$SERVER_BINARY"
 

@@ -635,6 +635,8 @@ pub fn applyConfigLine(cfg: *ServerConfig, allocator: std.mem.Allocator, key: []
         cfg.max_concurrent_connections = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "worker_stack_size")) {
         cfg.worker_stack_size = try parseConfigUsize(v);
+    } else if (std.mem.eql(u8, k, "memory_budget_bytes")) {
+        cfg.memory_budget_bytes = try parseConfigUsize(v);
     } else if (std.mem.eql(u8, k, "read_header_timeout_ms")) {
         cfg.read_header_timeout_ms = try parseConfigU32(v);
     } else if (std.mem.eql(u8, k, "read_body_timeout_ms")) {

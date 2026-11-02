@@ -14,6 +14,7 @@ const write_deadline = @import("write_deadline.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const native_accept = @import("native_accept.zig");
 const listener_state = @import("listener_state.zig");
+const resource_budget = @import("resource_budget.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const ConcurrencyState = concurrency_mod.State;
@@ -23,6 +24,56 @@ const ServerConfig = config_mod.ServerConfig;
 const ServerMetrics = metrics_mod.ServerMetrics;
 
 const MAX_CHUNK_LINE_BYTES = 4096;
+
+pub fn sendOverload(io: std.Io, stream: std.Io.net.Stream, is_head: bool, callbacks: Callbacks) !void {
+    // A second status line would corrupt a response already on the wire.
+    if (write_deadline.started(stream)) return;
+    const previous = write_deadline.pushHttp1(io, stream, 1000);
+    defer write_deadline.restore(previous);
+    const previous_emergency = resource_budget.emergency_write;
+    resource_budget.emergency_write = true;
+    defer resource_budget.emergency_write = previous_emergency;
+    const headers = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\nRetry-After: 1\r\nCache-Control: no-store\r\n\r\n";
+    // Keep this tiny reply in one write/record. Rejecting before consuming the
+    // rest of an upload can reset TCP when the connection closes.
+    try callbacks.stream_write_all(stream, if (is_head) headers else headers ++ "server busy\n");
+    _ = resource_budget.overload_responses.fetchAdd(1, .monotonic);
+    callbacks.metrics.responseSent(503, if (is_head) 0 else 12);
+    callbacks.emit_access_log(503, if (is_head) 0 else 12);
+}
+
+test "overload output respects HEAD and cannot append to a started response" {
+    const Fake = struct {
+        var output: [1024]u8 = undefined;
+        var used: usize = 0;
+        fn write(stream: std.Io.net.Stream, bytes: []const u8) !void {
+            try std.testing.expect(resource_budget.emergency_write);
+            _ = write_deadline.startWrite(stream);
+            @memcpy(output[used..][0..bytes.len], bytes);
+            used += bytes.len;
+        }
+        fn log(_: u16, _: usize) void {}
+    };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    const previous = write_deadline.pushHttp1(std.testing.io, stream, 1000);
+    defer write_deadline.restore(previous);
+    var metrics = ServerMetrics.init();
+    var callbacks: Callbacks = undefined;
+    callbacks.stream_write_all = Fake.write;
+    callbacks.emit_access_log = Fake.log;
+    callbacks.metrics = &metrics;
+    Fake.used = 0;
+    try sendOverload(std.testing.io, stream, true, callbacks);
+    try std.testing.expect(std.mem.endsWith(u8, Fake.output[0..Fake.used], "\r\n\r\n"));
+    try std.testing.expect(!resource_budget.emergency_write);
+    Fake.used = 0;
+    try sendOverload(std.testing.io, stream, false, callbacks);
+    try std.testing.expect(std.mem.endsWith(u8, Fake.output[0..Fake.used], "\r\n\r\nserver busy\n"));
+    _ = write_deadline.startWrite(stream);
+    Fake.used = 0;
+    try sendOverload(std.testing.io, stream, false, callbacks);
+    try std.testing.expectEqual(0, Fake.used);
+}
 
 pub const Callbacks = struct {
     access_log_set_error: *const fn ([]const u8) void,
@@ -98,9 +149,13 @@ fn handleHttpRedirectConnection(
     cfg: *ServerConfig,
     allocator: std.mem.Allocator,
     callbacks: Callbacks,
-) !void {
+) anyerror!void {
     const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
     defer write_deadline.restore(previous_write);
+    var head_request = false;
+    errdefer |err| if (err == error.OutOfMemory) {
+        sendOverload(io, stream, head_request, callbacks) catch {};
+    };
     read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
     defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -126,11 +181,12 @@ fn handleHttpRedirectConnection(
             );
             return;
         },
-        else => |e| return e,
+        else => return @as(anyerror!void, err),
     };
     if (prefill_len == 0) return;
     concurrency_mod.setCurrentIdle(io, false);
     const prefill = prefill_buf[0..prefill_len];
+    head_request = std.mem.startsWith(u8, prefill, "HEAD ");
 
     if (h2_support.isLikelyPreface(prefill) or tls_client_hello.looksLikeTlsClientHello(prefill) or native_tls.isHttp3OverTcpProbe(prefill)) {
         try callbacks.send_cool_error_with_connection(
@@ -154,6 +210,7 @@ fn handleHttpRedirectConnection(
         if (err != error.ConnectionClosed) callbacks.metrics.requestParseError();
         switch (err) {
             error.ConnectionClosed => return,
+            error.OutOfMemory => return @as(anyerror!void, err),
             error.RequestTimeout => {
                 try callbacks.send_cool_error_with_connection(stream, req_alloc, 408, "Request Timeout", "The request took too long to read.", true, false, null);
                 return;
@@ -223,7 +280,7 @@ fn handleHttpRedirectConnection(
         callbacks.access_log_set_error(@errorName(err));
         callbacks.emit_access_log(0, 0);
         callbacks.metrics.routeError();
-        return err;
+        return @as(anyerror!void, err);
     };
     if (!access_ctx.logged) callbacks.emit_access_log(0, 0);
 }
@@ -279,13 +336,7 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
         const active_cfg = lease.cfg;
         if (!ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.callbacks.metrics.connectionRejected();
-            ctx.callbacks.send_cool_error(
-                conn,
-                ctx.allocator,
-                503,
-                "Service Unavailable",
-                "Maximum concurrent connections reached. Try again in a moment.",
-            ) catch {};
+            sendOverload(ctx.io, conn, false, ctx.callbacks) catch {};
             ctx.callbacks.stream_close(conn);
             lease.deinit();
             continue;
@@ -361,7 +412,7 @@ pub fn handleHttp1Connection(
     process_env: *const std.process.Environ.Map,
     initial_prefill: []const u8,
     callbacks: Callbacks,
-) !void {
+) anyerror!void {
     defer read_deadline.clear(stream);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -375,6 +426,11 @@ pub fn handleHttp1Connection(
     while (true) {
         const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
         defer write_deadline.restore(previous_write);
+        var is_http1 = true;
+        var head_request = false;
+        errdefer |err| if (err == error.OutOfMemory and is_http1) {
+            sendOverload(io, stream, head_request, callbacks) catch {};
+        };
         if (callbacks.shutdown_requested.load(.acquire)) return;
         if (cfg.max_requests_per_connection > 0 and handled_requests >= cfg.max_requests_per_connection) {
             return;
@@ -415,12 +471,13 @@ pub fn handleHttp1Connection(
                 );
                 return;
             },
-            else => |e| return e,
+            else => return @as(anyerror!void, err),
         };
         if (prefill_len == 0) return;
         concurrency_mod.setCurrentIdle(io, false);
         if (callbacks.shutdown_requested.load(.acquire)) return;
         const prefill = prefill_buf[0..prefill_len];
+        head_request = std.mem.startsWith(u8, prefill, "HEAD ");
 
         callbacks.set_stream_read_timeout(stream, cfg.read_header_timeout_ms) catch |err| {
             std.debug.print("Socket header timeout setup failed: {}\n", .{err});
@@ -432,10 +489,11 @@ pub fn handleHttp1Connection(
             .begin_read_deadline = read_deadline.restart,
             .finish_interim_response = write_deadline.restart,
         }) catch |err| {
-            if (write_deadline.started(stream)) return err;
+            if (write_deadline.started(stream)) return @as(anyerror!void, err);
             if (err != error.ConnectionClosed) callbacks.metrics.requestParseError();
             switch (err) {
                 error.ConnectionClosed => return,
+                error.OutOfMemory => return @as(anyerror!void, err),
                 error.RequestTimeout => {
                     try callbacks.send_cool_error_with_connection(
                         stream,
@@ -547,6 +605,7 @@ pub fn handleHttp1Connection(
         };
         read_deadline.clear(stream);
         write_deadline.restart(stream);
+        head_request = std.mem.eql(u8, req.method, "HEAD");
         handled_requests += 1;
         callbacks.metrics.requestStarted();
 
@@ -568,6 +627,7 @@ pub fn handleHttp1Connection(
             defer if (!access_ctx.logged) callbacks.emit_access_log(0, 0);
 
             if (req.h2c_upgrade_tail.len > 0 or request_mod.isH2cUpgradeHeaders(req.headers)) {
+                is_http1 = false;
                 write_deadline.clear(stream);
                 callbacks.access_log_set_handler("h2c_upgrade");
                 try callbacks.handle_http2_upgrade(io, stream, req_alloc, cfg, req, process_env);
@@ -582,11 +642,17 @@ pub fn handleHttp1Connection(
 
             callbacks.route_request(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
                 error.CloseConnection => break,
+                error.OutOfMemory => {
+                    callbacks.access_log_set_error("OutOfMemory");
+                    callbacks.metrics.routeError();
+                    try sendOverload(io, stream, std.mem.eql(u8, req.method, "HEAD"), callbacks);
+                    return;
+                },
                 else => {
                     callbacks.access_log_set_error(@errorName(err));
                     callbacks.emit_access_log(0, 0);
                     callbacks.metrics.routeError();
-                    return err;
+                    return @as(anyerror!void, err);
                 },
             };
         }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 
 const config_mod = @import("config.zig");
 const error_pages = @import("error_pages.zig");
@@ -88,7 +89,7 @@ pub fn sendResponseWithConnectionAndHeaders(
     extra_headers: ?[]const u8,
     ctx: Context,
 ) !void {
-    const prepared = try response_body.prepare(std.heap.page_allocator, .{
+    const prepared = try response_body.prepare(resource_budget.allocator(), .{
         .status_code = status_code,
         .content_type = content_type,
         .body = body,
@@ -100,7 +101,7 @@ pub fn sendResponseWithConnectionAndHeaders(
         .compression_work_buffer_bytes = ctx.compression_work_buffer_bytes,
         .metrics = ctx.metrics,
     });
-    defer prepared.deinit(std.heap.page_allocator);
+    defer prepared.deinit(resource_budget.allocator());
 
     const body_len = prepared.body.len;
     var header_buffer: [4096]u8 = undefined;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 
 const config_mod = @import("config.zig");
 
@@ -67,8 +68,8 @@ pub const Store = struct {
         defer self.mutex.unlock();
 
         const allocator = self.allocator orelse blk: {
-            self.allocator = std.heap.smp_allocator;
-            break :blk std.heap.smp_allocator;
+            self.allocator = resource_budget.allocator();
+            break :blk resource_budget.allocator();
         };
 
         self.pruneExpiredLocked(now_ms);

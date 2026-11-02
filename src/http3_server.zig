@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 
 const config_mod = @import("config.zig");
 const config_store = @import("config_store.zig");
@@ -28,11 +29,15 @@ pub const Callbacks = struct {
 const HTTP3_INITIAL_PADDING_BYTES = 600;
 const HTTP3_MAX_DATAGRAM_BYTES = 1200;
 const HTTP3_CONNECTION_TABLE_CAPACITY = 1024;
+const HTTP3_HANDSHAKE_LIFETIME_MS = 10_000;
+const HTTP3_IDLE_LIFETIME_MS = 30_000;
 const QUIC_SHORT_PACKET_NUMBER_BYTES = 4;
 const QUIC_AEAD_TAG_BYTES = 16;
 const HTTP3_MAX_REQUEST_STREAM_BYTES = config_mod.DEFAULT_MAX_BODY_BYTES + config_mod.DEFAULT_MAX_REQUEST_BYTES;
 
 const Http3InitialAssembly = struct {
+    created_ms: ?i64 = null,
+    last_active_ms: i64 = 0,
     has_scid: bool = false,
     scid: quic_native.ConnectionId = .{},
     has_original_dcid: bool = false,
@@ -62,6 +67,11 @@ const Http3InitialAssembly = struct {
     request_stream_contiguous_len: usize = 0,
     request_stream_fin_seen: bool = false,
     request_stream_final_size: usize = 0,
+
+    fn touch(self: *Http3InitialAssembly, now_ms: i64) void {
+        if (self.created_ms == null) self.created_ms = now_ms;
+        self.last_active_ms = now_ms;
+    }
 
     fn matches(self: *const Http3InitialAssembly, scid: []const u8) bool {
         return self.has_scid and std.mem.eql(u8, self.scid.slice(), scid);
@@ -173,7 +183,55 @@ const Http3ConnectionTable = struct {
         }
         return error.Http3ConnectionCapacityExceeded;
     }
+
+    fn expire(self: *Http3ConnectionTable, now_ms: i64) usize {
+        var removed: usize = 0;
+        for (self.entries, self.active) |*entry, *is_active| {
+            if (!is_active.*) continue;
+            // Initial keys are public. More Initial traffic must not renew a
+            // half-open slot indefinitely. This is resource aging, not PTO.
+            const expires = if (entry.created_ms) |created|
+                if (entry.handshake_done) now_ms - entry.last_active_ms >= HTTP3_IDLE_LIFETIME_MS else now_ms - created >= HTTP3_HANDSHAKE_LIFETIME_MS
+            else
+                true;
+            if (!expires) continue;
+            entry.deinit(self.allocator);
+            is_active.* = false;
+            self.active_count -= 1;
+            removed += 1;
+        }
+        return removed;
+    }
 };
+
+test "HTTP3 resource aging reclaims half-open and idle allocations" {
+    var budget: resource_budget.Budget = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    const a = budget.allocator();
+    var table = try Http3ConnectionTable.init(a, 2);
+    defer table.deinit();
+    const base = budget.used.load(.acquire);
+    const half_open = try table.acquire();
+    half_open.touch(0);
+    try half_open.crypto.appendNTimes(a, 1, 200);
+    half_open.touch(9_999);
+    const established = try table.acquire();
+    established.touch(0);
+    established.handshake_done = true;
+    try established.request_stream.appendNTimes(a, 1, 200);
+    try std.testing.expectError(error.Http3ConnectionCapacityExceeded, table.acquire());
+    try std.testing.expectEqual(0, table.expire(9_999));
+    try std.testing.expectEqual(1, table.expire(10_000));
+    try std.testing.expectEqual(1, table.active_count);
+    established.touch(29_999);
+    try std.testing.expectEqual(0, table.expire(30_000));
+    try std.testing.expectEqual(1, table.expire(59_999));
+    try std.testing.expectEqual(base, budget.used.load(.acquire));
+    const failed_reset = try table.acquire();
+    try failed_reset.crypto.appendNTimes(a, 1, 200);
+    try std.testing.expectEqual(1, table.expire(60_000));
+    try std.testing.expectEqual(base, budget.used.load(.acquire));
+    _ = try table.acquire();
+}
 
 fn packetKeysFromTls(keys: tls13_native.QuicPacketKeys) quic_native.PacketKeys {
     return .{ .key = keys.key, .iv = keys.iv, .hp = keys.hp };
@@ -330,9 +388,13 @@ fn appendHttp3RequestStreamData(
 
     if (end > assembly.request_stream.items.len) {
         const old_len = assembly.request_stream.items.len;
-        try assembly.request_stream.resize(allocator, end);
+        // Grow both backing buffers before publishing either length. If the
+        // second allocation fails, the next packet can safely retry the range.
+        try assembly.request_stream.ensureTotalCapacity(allocator, end);
+        try assembly.request_stream_filled.ensureTotalCapacity(allocator, end);
+        assembly.request_stream.items.len = end;
+        assembly.request_stream_filled.items.len = end;
         @memset(assembly.request_stream.items[old_len..end], 0);
-        try assembly.request_stream_filled.resize(allocator, end);
         @memset(assembly.request_stream_filled.items[old_len..end], 0);
     }
 
@@ -360,7 +422,7 @@ fn appendHttp3RequestStreamData(
     assembly.request_stream_finished = assembly.request_stream_fin_seen and assembly.request_stream_contiguous_len >= assembly.request_stream_final_size;
 }
 
-fn findHttp3Request(allocator: std.mem.Allocator, assembly: *Http3InitialAssembly, plaintext: []const u8) !?Http3Request {
+fn findHttp3Request(allocator: std.mem.Allocator, state_allocator: std.mem.Allocator, assembly: *Http3InitialAssembly, plaintext: []const u8) !?Http3Request {
     var offset: usize = 0;
     while (offset < plaintext.len) {
         const frame_type_vi = try h3_native.decodeVarInt(plaintext[offset..]);
@@ -397,7 +459,7 @@ fn findHttp3Request(allocator: std.mem.Allocator, assembly: *Http3InitialAssembl
                 if ((stream_id.value & 0x03) == 0) {
                     const fin = (frame_type & 0x01) != 0;
                     try appendHttp3RequestStreamData(
-                        allocator,
+                        state_allocator,
                         assembly,
                         stream_id.value,
                         stream_offset,
@@ -804,11 +866,11 @@ fn sendHttp3ShortPlaintext(
     plaintext: []const u8,
 ) !void {
     var padded: ?[]u8 = null;
-    defer if (padded) |buf| std.heap.page_allocator.free(buf);
+    defer if (padded) |buf| resource_budget.http3.allocator().free(buf);
 
     var packet_plaintext = plaintext;
     if (packet_plaintext.len < 16) {
-        const buf = try std.heap.page_allocator.alloc(u8, 16);
+        const buf = try resource_budget.http3.allocator().alloc(u8, 16);
         @memcpy(buf[0..packet_plaintext.len], packet_plaintext);
         @memset(buf[packet_plaintext.len..], 0);
         padded = buf;
@@ -816,13 +878,13 @@ fn sendHttp3ShortPlaintext(
     }
 
     const packet_number = try assembly.server_application_packets.takeNext();
-    const packet = try quic_native.buildProtectedShortPacket(std.heap.page_allocator, .{
+    const packet = try quic_native.buildProtectedShortPacket(resource_budget.http3.allocator(), .{
         .dcid = assembly.scid.slice(),
         .packet_number = packet_number,
         .keys = assembly.server_application_keys,
         .plaintext = packet_plaintext,
     });
-    defer std.heap.page_allocator.free(packet);
+    defer resource_budget.http3.allocator().free(packet);
 
     try socket.send(io, peer, packet);
 }
@@ -839,13 +901,13 @@ fn sendHttp3ResponsePacket(
     server_header: []const u8,
     callbacks: Callbacks,
 ) !usize {
-    const ack_frame = try quic_native.buildAckFrame(std.heap.page_allocator, largest_client_packet_number, 0);
-    defer std.heap.page_allocator.free(ack_frame);
-    const control_data = try buildHttp3ControlStreamData(std.heap.page_allocator);
-    defer std.heap.page_allocator.free(control_data);
-    const control_stream = try quic_native.buildStreamFrame(std.heap.page_allocator, 3, control_data, false);
-    defer std.heap.page_allocator.free(control_stream);
-    var response_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const ack_frame = try quic_native.buildAckFrame(resource_budget.http3.allocator(), largest_client_packet_number, 0);
+    defer resource_budget.http3.allocator().free(ack_frame);
+    const control_data = try buildHttp3ControlStreamData(resource_budget.http3.allocator());
+    defer resource_budget.http3.allocator().free(control_data);
+    const control_stream = try quic_native.buildStreamFrame(resource_budget.http3.allocator(), 3, control_data, false);
+    defer resource_budget.http3.allocator().free(control_stream);
+    var response_arena = std.heap.ArenaAllocator.init(resource_budget.http3.allocator());
     defer response_arena.deinit();
     const response_data = try buildHttp3RoutedResponseData(io, response_arena.allocator(), cfg, process_env, server_header, request, callbacks);
 
@@ -858,11 +920,11 @@ fn sendHttp3ResponsePacket(
     // one ordered response even though we ship it as multiple QUIC packets.
     while (include_control or response_offset < response_data.len) {
         var plaintext = std.ArrayListUnmanaged(u8).empty;
-        defer plaintext.deinit(std.heap.page_allocator);
+        defer plaintext.deinit(resource_budget.http3.allocator());
 
         if (include_control) {
-            try plaintext.appendSlice(std.heap.page_allocator, ack_frame);
-            try plaintext.appendSlice(std.heap.page_allocator, control_stream);
+            try plaintext.appendSlice(resource_budget.http3.allocator(), ack_frame);
+            try plaintext.appendSlice(resource_budget.http3.allocator(), control_stream);
             include_control = false;
         }
 
@@ -874,14 +936,14 @@ fn sendHttp3ResponsePacket(
             const chunk_len = try maxHttp3StreamChunkLen(available, request.stream_id, @intCast(response_offset), remaining);
             const fin = chunk_len == remaining;
             const response_stream = try quic_native.buildStreamFrameAt(
-                std.heap.page_allocator,
+                resource_budget.http3.allocator(),
                 request.stream_id,
                 @intCast(response_offset),
                 response_data[response_offset .. response_offset + chunk_len],
                 fin,
             );
-            defer std.heap.page_allocator.free(response_stream);
-            try plaintext.appendSlice(std.heap.page_allocator, response_stream);
+            defer resource_budget.http3.allocator().free(response_stream);
+            try plaintext.appendSlice(resource_budget.http3.allocator(), response_stream);
             response_offset += chunk_len;
         }
 
@@ -906,7 +968,7 @@ test "extracts HTTP/3 request path from a request stream" {
 
     var assembly = Http3InitialAssembly{};
     defer assembly.deinit(std.testing.allocator);
-    const request = (try findHttp3Request(std.testing.allocator, &assembly, stream_frame)).?;
+    const request = (try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, stream_frame)).?;
     try std.testing.expectEqual(@as(u64, 0), request.stream_id);
     try std.testing.expectEqualStrings("GET", request.method);
     try std.testing.expectEqualStrings("/health", request.path);
@@ -1009,16 +1071,33 @@ test "reassembles ordered HTTP/3 request stream data across packets" {
     var assembly = Http3InitialAssembly{};
     defer assembly.deinit(std.testing.allocator);
 
-    try std.testing.expect((try findHttp3Request(std.testing.allocator, &assembly, first_stream)) == null);
-    const request = (try findHttp3Request(std.testing.allocator, &assembly, second_stream)).?;
-    defer {
-        std.testing.allocator.free(request.headers);
-        std.testing.allocator.free(request.body);
+    {
+        var packet_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer packet_arena.deinit();
+        try std.testing.expect((try findHttp3Request(packet_arena.allocator(), std.testing.allocator, &assembly, first_stream)) == null);
     }
+    var packet_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer packet_arena.deinit();
+    const request = (try findHttp3Request(packet_arena.allocator(), std.testing.allocator, &assembly, second_stream)).?;
 
     try std.testing.expectEqualStrings("POST", request.method);
     try std.testing.expectEqualStrings("/api/echo", request.path);
     try std.testing.expectEqualStrings("hello", request.body);
+}
+
+test "HTTP3 failed reassembly growth leaves both buffer lengths retryable" {
+    var budget: resource_budget.Budget = .{ .backing = std.testing.allocator, .limit = 200 };
+    const a = budget.allocator();
+    var assembly = Http3InitialAssembly{};
+    defer assembly.deinit(a);
+    const payload = [_]u8{42} ** 150;
+    try std.testing.expectError(error.OutOfMemory, appendHttp3RequestStreamData(a, &assembly, 0, 0, &payload, true));
+    try std.testing.expectEqual(0, assembly.request_stream.items.len);
+    try std.testing.expectEqual(0, assembly.request_stream_filled.items.len);
+    budget.limit = 4096;
+    try appendHttp3RequestStreamData(a, &assembly, 0, 0, &payload, true);
+    try std.testing.expectEqualSlices(u8, &payload, assembly.request_stream.items);
+    try std.testing.expect(assembly.request_stream_finished);
 }
 
 test "reassembles out-of-order HTTP/3 request stream data" {
@@ -1045,8 +1124,8 @@ test "reassembles out-of-order HTTP/3 request stream data" {
     var assembly = Http3InitialAssembly{};
     defer assembly.deinit(std.testing.allocator);
 
-    try std.testing.expect((try findHttp3Request(std.testing.allocator, &assembly, tail_stream)) == null);
-    const request = (try findHttp3Request(std.testing.allocator, &assembly, head_stream)).?;
+    try std.testing.expect((try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, tail_stream)) == null);
+    const request = (try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, head_stream)).?;
     defer {
         std.testing.allocator.free(request.headers);
         std.testing.allocator.free(request.body);
@@ -1164,7 +1243,7 @@ pub const Listener = struct {
         var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port);
         const socket = try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer socket.close(io);
-        return .{ .socket = socket, .connections = try Http3ConnectionTable.init(std.heap.page_allocator, HTTP3_CONNECTION_TABLE_CAPACITY) };
+        return .{ .socket = socket, .connections = try Http3ConnectionTable.init(resource_budget.http3.allocator(), HTTP3_CONNECTION_TABLE_CAPACITY) };
     }
 
     pub fn deinit(self: *Listener, io: std.Io) void {
@@ -1183,6 +1262,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
     var recv_buf: [4096]u8 = undefined;
 
     while (!shutdown_requested.load(.acquire)) {
+        _ = connections.expire(std.Io.Timestamp.now(io, .awake).toMilliseconds());
         const msg = socket.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
             if (err == error.Timeout or err == error.MessageOversize or err == error.PortUnreachable or err == error.ConnectionResetByPeer) continue;
@@ -1233,7 +1313,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     }
 
                     const decrypted = quic_native.decryptProtectedLongPacketWithKeys(
-                        std.heap.page_allocator,
+                        resource_budget.http3.allocator(),
                         packet[0..packet_len],
                         assembly.client_handshake_keys,
                     ) catch |err| {
@@ -1241,9 +1321,11 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                         packet_cursor += packet_len;
                         continue;
                     };
-                    defer std.heap.page_allocator.free(decrypted.plaintext);
+                    defer resource_budget.http3.allocator().free(decrypted.plaintext);
 
-                    quic_native.appendCryptoData(std.heap.page_allocator, decrypted.plaintext, &assembly.client_handshake_crypto) catch |err| {
+                    assembly.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+
+                    quic_native.appendCryptoData(resource_budget.http3.allocator(), decrypted.plaintext, &assembly.client_handshake_crypto) catch |err| {
                         std.debug.print("HTTP/3 client Handshake CRYPTO parse failed from {f}: {}\n", .{ msg.from, err });
                         packet_cursor += packet_len;
                         continue;
@@ -1280,18 +1362,18 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     assembly.handshake_done = true;
                 }
 
-                const ack_frame = quic_native.buildAckFrame(std.heap.page_allocator, largest_handshake_packet_number, 0) catch |err| {
+                const ack_frame = quic_native.buildAckFrame(resource_budget.http3.allocator(), largest_handshake_packet_number, 0) catch |err| {
                     std.debug.print("HTTP/3 Handshake ACK frame build failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
-                defer std.heap.page_allocator.free(ack_frame);
+                defer resource_budget.http3.allocator().free(ack_frame);
                 var handshake_ack_plaintext = std.ArrayListUnmanaged(u8).empty;
-                defer handshake_ack_plaintext.deinit(std.heap.page_allocator);
-                handshake_ack_plaintext.appendSlice(std.heap.page_allocator, ack_frame) catch |err| {
+                defer handshake_ack_plaintext.deinit(resource_budget.http3.allocator());
+                handshake_ack_plaintext.appendSlice(resource_budget.http3.allocator(), ack_frame) catch |err| {
                     std.debug.print("HTTP/3 Handshake ACK plaintext build failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
-                handshake_ack_plaintext.appendNTimes(std.heap.page_allocator, 0, 16) catch |err| {
+                handshake_ack_plaintext.appendNTimes(resource_budget.http3.allocator(), 0, 16) catch |err| {
                     std.debug.print("HTTP/3 Handshake ACK padding build failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
@@ -1299,7 +1381,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     std.debug.print("HTTP/3 Handshake ACK packet number failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
-                const ack_packet = quic_native.buildProtectedLongPacket(std.heap.page_allocator, .{
+                const ack_packet = quic_native.buildProtectedLongPacket(resource_budget.http3.allocator(), .{
                     .packet_type = .handshake,
                     .dcid = assembly.scid.slice(),
                     .scid = assembly.server_cid.slice(),
@@ -1310,7 +1392,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     std.debug.print("HTTP/3 Handshake ACK packet build failed for {f}: {}\n", .{ msg.from, err });
                     continue;
                 };
-                defer std.heap.page_allocator.free(ack_packet);
+                defer resource_budget.http3.allocator().free(ack_packet);
                 socket.send(io, &msg.from, ack_packet) catch |err| {
                     std.debug.print("HTTP/3 Handshake ACK send failed for {f}: {}\n", .{ msg.from, err });
                     continue;
@@ -1322,7 +1404,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
 
                 if (packet_cursor < msg.data.len and (msg.data[packet_cursor] & 0x80) == 0) {
                     const short = quic_native.decryptProtectedShortPacketWithKeys(
-                        std.heap.page_allocator,
+                        resource_budget.http3.allocator(),
                         msg.data[packet_cursor..],
                         assembly.server_cid.len,
                         assembly.client_application_keys,
@@ -1330,10 +1412,11 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                         std.debug.print("HTTP/3 coalesced 1-RTT decrypt failed from {f}: {}\n", .{ msg.from, err });
                         continue;
                     };
-                    defer std.heap.page_allocator.free(short.plaintext);
-                    var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer resource_budget.http3.allocator().free(short.plaintext);
+                    assembly.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+                    var request_arena = std.heap.ArenaAllocator.init(resource_budget.http3.allocator());
                     defer request_arena.deinit();
-                    const request_opt = findHttp3Request(request_arena.allocator(), assembly, short.plaintext) catch |err| {
+                    const request_opt = findHttp3Request(request_arena.allocator(), connections.allocator, assembly, short.plaintext) catch |err| {
                         if (!assembly.h3_response_sent) {
                             std.debug.print("HTTP/3 coalesced request parse failed from {f}: {}\n", .{ msg.from, err });
                         }
@@ -1364,7 +1447,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             }
 
             const decrypted = quic_native.decryptProtectedShortPacketWithKeys(
-                std.heap.page_allocator,
+                resource_budget.http3.allocator(),
                 msg.data,
                 assembly.server_cid.len,
                 assembly.client_application_keys,
@@ -1372,11 +1455,12 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 1-RTT decrypt failed from {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(decrypted.plaintext);
+            defer resource_budget.http3.allocator().free(decrypted.plaintext);
+            assembly.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
 
-            var request_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            var request_arena = std.heap.ArenaAllocator.init(resource_budget.http3.allocator());
             defer request_arena.deinit();
-            const request_opt = findHttp3Request(request_arena.allocator(), assembly, decrypted.plaintext) catch |err| {
+            const request_opt = findHttp3Request(request_arena.allocator(), connections.allocator, assembly, decrypted.plaintext) catch |err| {
                 if (!assembly.h3_response_sent) {
                     std.debug.print("HTTP/3 request parse failed from {f}: {}\n", .{ msg.from, err });
                 }
@@ -1425,11 +1509,11 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
         const decrypted = if (existing_assembly) |assembly|
             if (assembly.has_original_dcid)
                 quic_native.decryptClientInitialWithOriginalDcid(
-                    std.heap.page_allocator,
+                    resource_budget.http3.allocator(),
                     msg.data,
                     assembly.original_dcid.slice(),
                 ) catch |stored_err| fresh: {
-                    const fresh_decrypted = quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch {
+                    const fresh_decrypted = quic_native.decryptClientInitial(resource_budget.http3.allocator(), msg.data) catch {
                         std.debug.print(
                             "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
                             .{
@@ -1446,7 +1530,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     break :fresh fresh_decrypted;
                 }
             else
-                quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
+                quic_native.decryptClientInitial(resource_budget.http3.allocator(), msg.data) catch |err| {
                     std.debug.print(
                         "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
                         .{
@@ -1461,7 +1545,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 }
         else fresh: {
             used_fresh_initial_keys = true;
-            break :fresh quic_native.decryptClientInitial(std.heap.page_allocator, msg.data) catch |err| {
+            break :fresh quic_native.decryptClientInitial(resource_budget.http3.allocator(), msg.data) catch |err| {
                 std.debug.print(
                     "HTTP/3 QUIC Initial from {f}: version=0x{x}, dcid_len={d}, scid_len={d}; decrypt failed: {}\n",
                     .{
@@ -1475,7 +1559,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 continue;
             };
         };
-        defer std.heap.page_allocator.free(decrypted.plaintext);
+        defer resource_budget.http3.allocator().free(decrypted.plaintext);
 
         const assembly = existing_assembly orelse (connections.acquire() catch |err| {
             std.debug.print("HTTP/3 connection table is full; dropping Initial from {f}: {}\n", .{ msg.from, err });
@@ -1483,13 +1567,14 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
         });
 
         if (existing_assembly == null or !assembly.has_original_dcid or used_fresh_initial_keys or (!assembly.server_flight_sent and !assembly.matches(initial.long.scid.slice()))) {
-            assembly.reset(std.heap.page_allocator, initial.long.dcid.slice(), initial.long.scid.slice()) catch |err| {
+            assembly.reset(resource_budget.http3.allocator(), initial.long.dcid.slice(), initial.long.scid.slice()) catch |err| {
                 std.debug.print("HTTP/3 state reset failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
         }
 
-        quic_native.appendCryptoData(std.heap.page_allocator, decrypted.plaintext, &assembly.crypto) catch |err| {
+        assembly.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+        quic_native.appendCryptoData(resource_budget.http3.allocator(), decrypted.plaintext, &assembly.crypto) catch |err| {
             std.debug.print(
                 "HTTP/3 QUIC Initial from {f}: packet_number={d}, plaintext_bytes={d}; CRYPTO reassembly failed: {}\n",
                 .{ msg.from, decrypted.packet_number, decrypted.plaintext.len, err },
@@ -1538,7 +1623,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             var server_random: [32]u8 = undefined;
             io.random(&server_random);
             const server_kp = tls13_native.X25519.KeyPair.generate(io);
-            const server_hello = tls13_native.buildServerHello(std.heap.page_allocator, .{
+            const server_hello = tls13_native.buildServerHello(resource_budget.http3.allocator(), .{
                 .legacy_session_id = hello.legacy_session_id,
                 .random = server_random,
                 .x25519_public_key = server_kp.public_key,
@@ -1546,7 +1631,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 TLS ServerHello build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(server_hello);
+            defer resource_budget.http3.allocator().free(server_hello);
 
             const shared = tls13_native.X25519.scalarmult(server_kp.secret_key, client_key) catch |err| {
                 std.debug.print("HTTP/3 TLS X25519 shared-secret failed for {f}: {}\n", .{ msg.from, err });
@@ -1563,37 +1648,37 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 server CID tracking failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            const ack_frame = quic_native.buildAckFrame(std.heap.page_allocator, decrypted.packet_number, 0) catch |err| {
+            const ack_frame = quic_native.buildAckFrame(resource_budget.http3.allocator(), decrypted.packet_number, 0) catch |err| {
                 std.debug.print("HTTP/3 QUIC ACK frame build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(ack_frame);
+            defer resource_budget.http3.allocator().free(ack_frame);
 
-            const crypto_frame = quic_native.buildCryptoFrame(std.heap.page_allocator, 0, server_hello) catch |err| {
+            const crypto_frame = quic_native.buildCryptoFrame(resource_budget.http3.allocator(), 0, server_hello) catch |err| {
                 std.debug.print("HTTP/3 QUIC CRYPTO frame build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(crypto_frame);
+            defer resource_budget.http3.allocator().free(crypto_frame);
 
             var initial_plaintext = std.ArrayListUnmanaged(u8).empty;
-            defer initial_plaintext.deinit(std.heap.page_allocator);
-            initial_plaintext.appendSlice(std.heap.page_allocator, ack_frame) catch |err| {
+            defer initial_plaintext.deinit(resource_budget.http3.allocator());
+            initial_plaintext.appendSlice(resource_budget.http3.allocator(), ack_frame) catch |err| {
                 std.debug.print("HTTP/3 QUIC plaintext build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            initial_plaintext.appendSlice(std.heap.page_allocator, crypto_frame) catch |err| {
+            initial_plaintext.appendSlice(resource_budget.http3.allocator(), crypto_frame) catch |err| {
                 std.debug.print("HTTP/3 QUIC plaintext build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
             // QUIC Initial datagrams are intentionally bulky. Some clients will
             // read the ServerHello from a small packet and still reject the flight.
-            initial_plaintext.appendNTimes(std.heap.page_allocator, 0, HTTP3_INITIAL_PADDING_BYTES) catch |err| {
+            initial_plaintext.appendNTimes(resource_budget.http3.allocator(), 0, HTTP3_INITIAL_PADDING_BYTES) catch |err| {
                 std.debug.print("HTTP/3 QUIC Initial padding build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
 
             const initial_secrets = quic_native.deriveInitialSecrets(initial.long.dcid.slice());
-            const response = quic_native.buildProtectedLongPacket(std.heap.page_allocator, .{
+            const response = quic_native.buildProtectedLongPacket(resource_budget.http3.allocator(), .{
                 .packet_type = .initial,
                 .dcid = initial.long.scid.slice(),
                 .scid = &server_cid,
@@ -1604,32 +1689,32 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 QUIC server Initial build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(response);
+            defer resource_budget.http3.allocator().free(response);
 
-            const transport_params = quic_native.buildDefaultTransportParameters(std.heap.page_allocator, initial.long.dcid.slice(), &server_cid) catch |err| {
+            const transport_params = quic_native.buildDefaultTransportParameters(resource_budget.http3.allocator(), initial.long.dcid.slice(), &server_cid) catch |err| {
                 std.debug.print("HTTP/3 QUIC transport parameter build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(transport_params);
+            defer resource_budget.http3.allocator().free(transport_params);
 
-            const encrypted_extensions = tls13_native.buildEncryptedExtensions(std.heap.page_allocator, "h3", transport_params) catch |err| {
+            const encrypted_extensions = tls13_native.buildEncryptedExtensions(resource_budget.http3.allocator(), "h3", transport_params) catch |err| {
                 std.debug.print("HTTP/3 TLS EncryptedExtensions build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(encrypted_extensions);
+            defer resource_budget.http3.allocator().free(encrypted_extensions);
 
             const cert_key = tls13_native.Ed25519.KeyPair.generate(io);
-            const cert_der = tls13_native.buildSelfSignedEd25519Certificate(std.heap.page_allocator, cert_key, "localhost") catch |err| {
+            const cert_der = tls13_native.buildSelfSignedEd25519Certificate(resource_budget.http3.allocator(), cert_key, "localhost") catch |err| {
                 std.debug.print("HTTP/3 TLS self-signed certificate build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(cert_der);
+            defer resource_budget.http3.allocator().free(cert_der);
 
-            const certificate_msg = tls13_native.buildCertificate(std.heap.page_allocator, &.{cert_der}) catch |err| {
+            const certificate_msg = tls13_native.buildCertificate(resource_budget.http3.allocator(), &.{cert_der}) catch |err| {
                 std.debug.print("HTTP/3 TLS Certificate build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(certificate_msg);
+            defer resource_budget.http3.allocator().free(certificate_msg);
 
             const cert_verify_hash = tls13_native.transcriptHash(&.{
                 assembly.crypto.items,
@@ -1641,11 +1726,11 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 TLS CertificateVerify signature failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            const certificate_verify_msg = tls13_native.buildCertificateVerify(std.heap.page_allocator, .ed25519, &cert_verify_signature) catch |err| {
+            const certificate_verify_msg = tls13_native.buildCertificateVerify(resource_budget.http3.allocator(), .ed25519, &cert_verify_signature) catch |err| {
                 std.debug.print("HTTP/3 TLS CertificateVerify build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(certificate_verify_msg);
+            defer resource_budget.http3.allocator().free(certificate_verify_msg);
 
             const finished_hash = tls13_native.transcriptHash(&.{
                 assembly.crypto.items,
@@ -1655,13 +1740,13 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 certificate_verify_msg,
             });
             const server_finished_msg = tls13_native.buildFinished(
-                std.heap.page_allocator,
+                resource_budget.http3.allocator(),
                 tls13_native.finishedVerifyData(traffic.server_finished_key, finished_hash),
             ) catch |err| {
                 std.debug.print("HTTP/3 TLS Finished build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(server_finished_msg);
+            defer resource_budget.http3.allocator().free(server_finished_msg);
 
             assembly.traffic = traffic;
             assembly.client_handshake_keys = client_handshake_keys;
@@ -1677,35 +1762,35 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             assembly.has_handshake_keys = true;
 
             var server_handshake_flight = std.ArrayListUnmanaged(u8).empty;
-            defer server_handshake_flight.deinit(std.heap.page_allocator);
-            server_handshake_flight.appendSlice(std.heap.page_allocator, encrypted_extensions) catch |err| {
+            defer server_handshake_flight.deinit(resource_budget.http3.allocator());
+            server_handshake_flight.appendSlice(resource_budget.http3.allocator(), encrypted_extensions) catch |err| {
                 std.debug.print("HTTP/3 TLS server flight build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            server_handshake_flight.appendSlice(std.heap.page_allocator, certificate_msg) catch |err| {
+            server_handshake_flight.appendSlice(resource_budget.http3.allocator(), certificate_msg) catch |err| {
                 std.debug.print("HTTP/3 TLS server flight build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            server_handshake_flight.appendSlice(std.heap.page_allocator, certificate_verify_msg) catch |err| {
+            server_handshake_flight.appendSlice(resource_budget.http3.allocator(), certificate_verify_msg) catch |err| {
                 std.debug.print("HTTP/3 TLS server flight build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            server_handshake_flight.appendSlice(std.heap.page_allocator, server_finished_msg) catch |err| {
+            server_handshake_flight.appendSlice(resource_budget.http3.allocator(), server_finished_msg) catch |err| {
                 std.debug.print("HTTP/3 TLS server flight build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
 
-            const handshake_crypto = quic_native.buildCryptoFrame(std.heap.page_allocator, 0, server_handshake_flight.items) catch |err| {
+            const handshake_crypto = quic_native.buildCryptoFrame(resource_budget.http3.allocator(), 0, server_handshake_flight.items) catch |err| {
                 std.debug.print("HTTP/3 QUIC Handshake CRYPTO frame build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(handshake_crypto);
+            defer resource_budget.http3.allocator().free(handshake_crypto);
 
             const server_handshake_packet_number = assembly.server_handshake_packets.takeNext() catch |err| {
                 std.debug.print("HTTP/3 server Handshake packet number failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            const handshake_response = quic_native.buildProtectedLongPacket(std.heap.page_allocator, .{
+            const handshake_response = quic_native.buildProtectedLongPacket(resource_budget.http3.allocator(), .{
                 .packet_type = .handshake,
                 .dcid = initial.long.scid.slice(),
                 .scid = &server_cid,
@@ -1716,15 +1801,15 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 QUIC server Handshake build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            defer std.heap.page_allocator.free(handshake_response);
+            defer resource_budget.http3.allocator().free(handshake_response);
 
             var server_datagram = std.ArrayListUnmanaged(u8).empty;
-            defer server_datagram.deinit(std.heap.page_allocator);
-            server_datagram.appendSlice(std.heap.page_allocator, response) catch |err| {
+            defer server_datagram.deinit(resource_budget.http3.allocator());
+            server_datagram.appendSlice(resource_budget.http3.allocator(), response) catch |err| {
                 std.debug.print("HTTP/3 QUIC server datagram build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            server_datagram.appendSlice(std.heap.page_allocator, handshake_response) catch |err| {
+            server_datagram.appendSlice(resource_budget.http3.allocator(), handshake_response) catch |err| {
                 std.debug.print("HTTP/3 QUIC server datagram build failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };

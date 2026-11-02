@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 const read_deadline = @import("read_deadline.zig");
 const builtin = @import("builtin");
 const admin_listener = @import("admin_listener.zig");
@@ -364,6 +365,9 @@ fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
     var command_timeout_buffer: [10]u8 = undefined;
     const external_command_timeout_ms = if (posted_command_timeout.len > 0) posted_command_timeout else try std.fmt.bufPrint(&command_timeout_buffer, "{d}", .{cfg.external_command_timeout_ms});
     const worker_stack_size = admin_support.adminTrimmedField(fields.items, "worker_stack_size");
+    var memory_budget_buffer: [32]u8 = undefined;
+    const posted_memory_budget = admin_support.adminTrimmedField(fields.items, "memory_budget_bytes");
+    const memory_budget_bytes = if (posted_memory_budget.len > 0) posted_memory_budget else try std.fmt.bufPrint(&memory_budget_buffer, "{d}", .{cfg.memory_budget_bytes});
 
     const settings = [_]AdminConfigSetting{
         .{ .key = "host", .value = host },
@@ -408,6 +412,7 @@ fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
         .{ .key = "idle_timeout_ms", .value = idle_timeout_ms },
         .{ .key = "external_command_timeout_ms", .value = external_command_timeout_ms },
         .{ .key = "worker_stack_size", .value = worker_stack_size },
+        .{ .key = "memory_budget_bytes", .value = memory_budget_bytes },
     };
 
     admin_support.validateAdminSettingsPatch(allocator, cfg, settings[0..], tls_cert, tls_key) catch |err| {
@@ -971,7 +976,7 @@ pub fn serveSocketTask(ctx: SocketContext) void {
             ctx.callbacks.close_stream(conn);
             continue;
         }
-        handleConnection(conn, std.heap.page_allocator, ctx.cfg, ctx.callbacks) catch |err| {
+        handleConnection(conn, resource_budget.control.allocator(), ctx.cfg, ctx.callbacks) catch |err| {
             std.debug.print("Admin command failed: {}\n", .{err});
         };
         ctx.callbacks.close_stream(conn);

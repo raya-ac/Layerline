@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 const config_mod = @import("config.zig");
 const config_store = @import("config_store.zig");
 
@@ -48,7 +49,7 @@ pub fn renewalTask(ctx: Context) void {
             const cfg = lease.cfg;
             const now_ms = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
             if (schedule.ready(cfg.tls_auto and cfg.letsencrypt_renew, now_ms, cfg.letsencrypt_renew_interval_ms)) {
-                ctx.renew_certs(ctx.io, std.heap.page_allocator, cfg) catch |err| {
+                ctx.renew_certs(ctx.io, resource_budget.allocator(), cfg) catch |err| {
                     std.debug.print("Let's Encrypt renewal failed: {}\n", .{err});
                 };
             }

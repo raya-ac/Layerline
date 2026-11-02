@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 
 const config_mod = @import("config.zig");
 const routing = @import("routing.zig");
@@ -199,8 +200,9 @@ fn sendEncryptedRecord(
     raw_write_all: RawWriteAllFn,
 ) !void {
     if (sequence.* == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
-    const record = try tls13_native.encryptTlsRecord(allocator, keys, sequence.*, inner_content_type, payload);
-    defer allocator.free(record);
+    const output_allocator = if (resource_budget.emergency_write) resource_budget.control.allocator() else allocator;
+    const record = try tls13_native.encryptTlsRecord(output_allocator, keys, sequence.*, inner_content_type, payload);
+    defer output_allocator.free(record);
     try raw_write_all(stream, record);
     sequence.* += 1;
 }

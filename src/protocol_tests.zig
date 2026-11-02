@@ -5,6 +5,16 @@ const h2_support = @import("http2_support.zig");
 const cache = @import("buffered_cache.zig");
 const static_files = @import("static_files.zig");
 
+test "application heap budget has a positive default and rejects undersized config" {
+    const config = @import("config.zig");
+    var cfg = config.defaultServerConfig();
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.memory_budget_bytes);
+    try config.applyConfigLine(&cfg, std.testing.allocator, "memory_budget_bytes", "8388608");
+    try config.validateConfig(&cfg);
+    cfg.memory_budget_bytes -= 1;
+    try std.testing.expectError(error.InvalidConfigValue, config.validateConfig(&cfg));
+}
+
 test "external command deadlines have a positive default and reject invalid config" {
     const config = @import("config.zig");
     var cfg = config.defaultServerConfig();

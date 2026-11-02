@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 const php_version = @import("php_version.zig");
 const routing = @import("routing.zig");
 const static_files = @import("static_files.zig");
@@ -64,7 +65,7 @@ fn fastcgiKeepaliveConfigured(cfg: *const ServerConfig) bool {
 
 fn closeIdleFastcgiConnection(conn: FastcgiIdleConnection, callbacks: Callbacks) void {
     callbacks.stream_close(conn.stream);
-    std.heap.page_allocator.free(conn.endpoint_name);
+    resource_budget.allocator().free(conn.endpoint_name);
     callbacks.metrics.fastcgiConnectionDiscarded();
 }
 
@@ -73,7 +74,7 @@ pub fn deinitKeepalivePool(callbacks: Callbacks) void {
     callbacks.fastcgi_pool.mutex.lockUncancelable(io);
     defer callbacks.fastcgi_pool.mutex.unlock(io);
     while (callbacks.fastcgi_pool.idle.pop()) |conn| closeIdleFastcgiConnection(conn, callbacks);
-    callbacks.fastcgi_pool.idle.deinit(std.heap.page_allocator);
+    callbacks.fastcgi_pool.idle.deinit(resource_budget.allocator());
     callbacks.fastcgi_pool.idle = .empty;
 }
 
@@ -144,7 +145,7 @@ fn fastcgiAcquireConnection(allocator: std.mem.Allocator, endpoint_name: []const
                     closeIdleFastcgiConnection(reused, callbacks);
                     return err;
                 };
-                std.heap.page_allocator.free(reused.endpoint_name);
+                resource_budget.allocator().free(reused.endpoint_name);
                 callbacks.metrics.fastcgiConnectionReused();
                 return .{
                     .stream = reused.stream,
@@ -179,7 +180,7 @@ fn fastcgiReleaseConnection(endpoint_name: []const u8, cfg: *const ServerConfig,
         return;
     }
 
-    const owned_endpoint = std.heap.page_allocator.dupe(u8, endpoint_name) catch {
+    const owned_endpoint = resource_budget.allocator().dupe(u8, endpoint_name) catch {
         callbacks.stream_close(lease.stream);
         callbacks.metrics.fastcgiConnectionDiscarded();
         return;
@@ -199,7 +200,7 @@ fn fastcgiReleaseConnection(endpoint_name: []const u8, cfg: *const ServerConfig,
         closeIdleFastcgiConnection(callbacks.fastcgi_pool.idle.orderedRemove(0), callbacks);
     }
 
-    callbacks.fastcgi_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
+    callbacks.fastcgi_pool.idle.append(resource_budget.allocator(), idle_conn) catch {
         closeIdleFastcgiConnection(idle_conn, callbacks);
         return;
     };

@@ -158,6 +158,42 @@ admission refuses the stream instead of starting more backend work. The gauges
 storage, caches, thread stacks, kernel buffers, and other protocols, so it is not
 a full process memory or thread cap.
 
+All explicit application allocations now sit beneath `memory_budget_bytes`
+(512 MiB by default, minimum 8 MiB). The root and normal/control pools charge
+page-rounded allocations, including boot/reload config, native TLS, caches,
+protocol buffers, pools, logging and background tasks. HTTP/2 retains its
+256 MiB logical sub-limit; HTTP/3 has a 64 MiB logical sub-limit. These nested
+pools overlap: do not sum their gauges. Zig startup/I/O internals, thread stacks,
+foreign libraries, subprocesses, socket buffers and kernel allocations are not
+covered. This is an application heap budget, not an RSS or host-sandbox promise.
+
+One eighth of the budget, capped at 16 MiB, is unavailable to request allocations
+and reserved for serialized Unix admin commands and emergency TLS output. A
+failed config reload leaves the active snapshot intact. Budget changes require
+a restart. Before any final HTTP/1 output, allocation failure can return a small
+503 with `Retry-After: 1`; after output starts, the connection closes without
+appending another response. TLS handshake failures close without sending plaintext.
+The reserved pool is itself bounded, so a failed emergency allocation can still
+close a connection. Public HTTP admin/metrics routes do not bypass the request
+budget. `layerline_heap_{bytes,limit_bytes,peak_bytes,rejections_total}` expose
+per-pool accounting; `layerline_overload_responses_total` counts completed minimal
+503s. Allocation rejections schedule cache reclamation outside allocator/cache
+locks so retained entries cannot permanently strand request capacity.
+Connection-admission rejection uses the bounded minimal response on plaintext
+listeners. A full HTTPS connection gate closes before handshaking and never
+sends an unencrypted HTTP error to a TLS client.
+
+HTTP/3 table slots and their retained buffers expire after an absolute ten seconds
+without a completed handshake, or thirty seconds of established inactivity.
+Decryptable Initial traffic cannot extend the half-open deadline; Initial keys
+are public and are not an authentication claim. These are resource-aging bounds,
+not complete QUIC loss recovery or interoperability guarantees.
+Request reassembly now owns its buffers outside per-packet arenas. Failed
+growth of its parallel data/presence buffers commits neither length, so a later
+packet cannot index a marker buffer that was never allocated.
+The shutdown guard also checks joined background workers and zero active leases
+before forcing exit: a sleeping drain poll alone is not live work.
+
 Cache budgets charge keys, headers and
 entry metadata as well as bodies, and each cache has a 4096-entry ceiling.
 These are live-data budgets, not exact process RSS limits.

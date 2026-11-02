@@ -105,6 +105,13 @@ through joined shutdown, and protects Unix control socket ownership with a lock,
 kernel peer credentials and crash-recovery checks. Tests cover occupied ports,
 path collisions, malformed datagrams, restart and cross-UID access. Full process
 resource budgets and wider HTTP/2 frame/stream conformance remain open.
+The explicit application heap is now shared across protocols, TLS, caches,
+configurations, logging and background tasks, with a restart-only configurable
+page-accounted limit and protected Unix-control/emergency-response capacity.
+Overload tests hold incomplete uploads until allocations fail, check plaintext
+and encrypted 503s plus admin access, then verify repeated recovery and cache
+reclamation. HTTP/3 retained slots now age out instead of persisting forever.
+This does not yet cap stacks, Zig I/O internals, child RSS or kernel resources.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

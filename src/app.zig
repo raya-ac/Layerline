@@ -32,6 +32,7 @@ const proxy_utils = @import("proxy_utils.zig");
 const raw_proxy = @import("raw_proxy.zig");
 const request_mod = @import("request.zig");
 const runtime_state = @import("runtime_state.zig");
+const resource_budget = @import("resource_budget.zig");
 const server_runtime = @import("server_runtime.zig");
 const server_identity = @import("server_identity.zig");
 const static_cache = @import("static_cache.zig");
@@ -167,6 +168,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const ServerConfig) !void {
+    if (active.memory_budget_bytes != candidate.memory_budget_bytes) return error.ReloadRequiresRestart;
     if (!std.mem.eql(u8, active.host, candidate.host)) return error.ReloadRequiresRestart;
     if (active.port != candidate.port) return error.ReloadRequiresRestart;
     if (active.tls_enabled != candidate.tls_enabled) return error.ReloadRequiresRestart;
@@ -183,7 +185,7 @@ fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const Se
 fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerConfig) !void {
     // A browser request arena is reset after the reply. Each publication owns
     // separate storage until its last connection/background reader exits.
-    const allocator = std.heap.page_allocator;
+    const allocator = resource_budget.allocator();
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer {
@@ -234,10 +236,16 @@ fn renderActivationConfigDiff(io: std.Io, allocator: std.mem.Allocator, active: 
 fn reloadSignalWatcherTask(io: std.Io) void {
     bindThreadIo(io);
     while (!runtime_state.shutdown_requested.load(.acquire)) {
+        if (resource_budget.pressure.swap(false, .acq_rel)) {
+            // Allocations can fail while a cache mutex is held. Reclaim here,
+            // never from inside the allocator's rejection path.
+            const removed = adminPurgeCaches("");
+            std.debug.print("server.memory_pressure: reclaimed {d} cache entries\n", .{removed});
+        }
         if (runtime_state.reload_requested.swap(false, .acq_rel)) {
             var lease = runtime_state.acquireConfig();
             defer lease.deinit();
-            reloadConfigInMemory(io, std.heap.page_allocator, lease.cfg) catch |err| {
+            reloadConfigInMemory(io, resource_budget.allocator(), lease.cfg) catch |err| {
                 std.debug.print("SIGHUP reload blocked: {}\n", .{err});
                 continue;
             };
@@ -846,37 +854,38 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = defaultServerConfig();
 
-    if (!(try cli_config.prepare(init, std.heap.page_allocator, &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
+    if (!(try cli_config.prepare(init, resource_budget.allocator(), &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
+    try resource_budget.configure(cfg.memory_budget_bytes);
 
     if (cfg.tls_auto) {
-        ensureLetsEncryptSetup(init.io, std.heap.page_allocator, &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
+        ensureLetsEncryptSetup(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
             std.debug.print("Let's Encrypt automation failed: {}\n", .{err});
             return err;
         };
     }
 
-    ensureCloudflareDeployment(init.io, std.heap.page_allocator, &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
+    ensureCloudflareDeployment(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
         std.debug.print("Cloudflare deployment failed: {}\n", .{err});
         return err;
     };
 
-    loadAllConfiguredTlsMaterials(init.io, std.heap.page_allocator, &cfg) catch |err| {
+    loadAllConfiguredTlsMaterials(init.io, resource_budget.allocator(), &cfg) catch |err| {
         std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
         return err;
     };
-    try runtime_state.config_store.installInitial(std.heap.page_allocator, &cfg, retireConfig);
+    try runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig);
     runtime_state.server_metrics.config_store = &runtime_state.config_store;
     defer runtime_state.config_store.deinit();
     defer {
         runtime_state.buffered_response_cache.deinit();
         runtime_state.static_response_cache.deinit();
         php_runtime.deinitKeepalivePool(phpCallbacks());
-        deinitConfiguredTlsMaterials(std.heap.page_allocator, &cfg);
+        deinitConfiguredTlsMaterials(resource_budget.allocator(), &cfg);
     }
 
     try server_runtime.run(.{
         .io = init.io,
-        .allocator = std.heap.page_allocator,
+        .allocator = resource_budget.allocator(),
         .cfg = &cfg,
         .process_env = init.environ_map,
         .metrics = &runtime_state.server_metrics,
@@ -891,7 +900,6 @@ pub fn main(init: std.process.Init) !void {
             .http1 = http1RuntimeCallbacks(),
             .http3 = http3Callbacks(),
             .reload_signal = reloadSignalWatcherTask,
-            .send_cool_error = sendCoolError,
             .upstream = upstreamRuntimeCallbacks(),
         },
     });

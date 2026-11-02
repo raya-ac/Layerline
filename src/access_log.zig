@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 
 var file_mutex: std.Io.Mutex = .init;
 
@@ -24,7 +25,7 @@ pub const Writer = struct {
 
     pub fn securityBlock(self: *Writer, io: std.Io, sink: []const u8, method: []const u8, protocol: []const u8, path: []const u8, rule: []const u8) void {
         var out = std.ArrayList(u8).empty;
-        const allocator = std.heap.page_allocator;
+        const allocator = resource_budget.allocator();
         defer out.deinit(allocator);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
@@ -47,7 +48,7 @@ pub const Writer = struct {
         ctx.logged = true;
 
         var out = std.ArrayList(u8).empty;
-        const allocator = std.heap.page_allocator;
+        const allocator = resource_budget.allocator();
         defer out.deinit(allocator);
 
         const now_real_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const resource_budget = @import("resource_budget.zig");
 const php_version = @import("php_version.zig");
 const config_mod = @import("config.zig");
 const config_store = @import("config_store.zig");
@@ -80,7 +81,7 @@ pub fn deinitConfigPools(io: std.Io, cfg: *ServerConfig, metrics: *metrics_mod.S
                 close_stream(conn.stream);
                 counters.upstreamConnectionDiscarded();
             }
-            upstream.keepalive_pool.idle.deinit(std.heap.page_allocator);
+            upstream.keepalive_pool.idle.deinit(resource_budget.allocator());
             upstream.keepalive_pool.idle = .empty;
         }
         fn pool(context: std.Io, targets: *UpstreamPoolConfig, counters: *metrics_mod.ServerMetrics, close_stream: *const fn (std.Io.net.Stream) void) void {
@@ -122,8 +123,8 @@ test "retired global route domain and domain-route pools close all idle descript
         .{ "server_route_proxy.site.app", "http://127.0.0.1:9003" },
     }) |entry| try config_mod.applyConfigLine(&cfg, allocator, entry[0], entry[1]);
     const pools = [_]*UpstreamPoolConfig{ &cfg.upstream.?, &cfg.routes.items[0].upstream.?, &cfg.domains.items[0].upstream.?, &cfg.domains.items[0].routes.items[0].upstream.? };
-    try cfg.h2_upstream.?.keepalive_pool.idle.append(std.heap.page_allocator, .{ .stream = .{ .socket = .{ .handle = 122, .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
-    for (pools, 0..) |pool, index| try pool.targets.items[0].keepalive_pool.idle.append(std.heap.page_allocator, .{ .stream = .{ .socket = .{ .handle = @intCast(123 + index), .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
+    try cfg.h2_upstream.?.keepalive_pool.idle.append(resource_budget.allocator(), .{ .stream = .{ .socket = .{ .handle = 122, .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
+    for (pools, 0..) |pool, index| try pool.targets.items[0].keepalive_pool.idle.append(resource_budget.allocator(), .{ .stream = .{ .socket = .{ .handle = @intCast(123 + index), .address = undefined } }, .expires_at_ms = 1000, .requests_served = 1 });
     deinitConfigPools(std.testing.io, &cfg, &metrics, Fake.close);
     try std.testing.expectEqual(5, Fake.closed);
     try std.testing.expectEqual(0, cfg.h2_upstream.?.keepalive_pool.idle.capacity);
@@ -188,7 +189,7 @@ fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease:
         closeIdleConnection(upstream.keepalive_pool.idle.orderedRemove(0), callbacks);
     }
 
-    upstream.keepalive_pool.idle.append(std.heap.page_allocator, idle_conn) catch {
+    upstream.keepalive_pool.idle.append(resource_budget.allocator(), idle_conn) catch {
         callbacks.stream_close(idle_conn.stream);
         callbacks.metrics.upstreamConnectionDiscarded();
         return;
@@ -219,8 +220,8 @@ fn forwardInterim(stream: std.Io.net.Stream, head: upstream_reader.Head, callbac
 
 fn sendVersionNotice(stream: std.Io.net.Stream, req: HttpRequest, version: php_version.Version, callbacks: Callbacks) !void {
     php_version.log(version);
-    const message = try php_version.updateMessage(std.heap.page_allocator, version);
-    defer std.heap.page_allocator.free(message);
+    const message = try php_version.updateMessage(resource_budget.allocator(), version);
+    defer resource_budget.allocator().free(message);
     if (std.mem.eql(u8, req.method, "HEAD")) {
         try callbacks.send_response_no_body_headers(stream, 503, "Service Unavailable", "text/plain; charset=utf-8", message.len, true, "Cache-Control: no-store\r\n");
     } else {
@@ -628,12 +629,12 @@ fn sleepHealthInterval(io: std.Io, interval_ms: u32, callbacks: Callbacks) void 
 pub fn healthCheckTask(ctx: HealthCheckContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
     var schedule = HealthSchedule{};
-    defer schedule.deadlines.deinit(std.heap.page_allocator);
+    defer schedule.deadlines.deinit(resource_budget.allocator());
     while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
         const delay: u32 = cycle: {
             var lease = ctx.acquire_config();
             defer lease.deinit();
-            break :cycle runHealthCheckCycle(&schedule, std.heap.page_allocator, lease.cfg, ctx.callbacks) catch 250;
+            break :cycle runHealthCheckCycle(&schedule, resource_budget.allocator(), lease.cfg, ctx.callbacks) catch 250;
         };
         sleepHealthInterval(ctx.io, delay, ctx.callbacks);
     }

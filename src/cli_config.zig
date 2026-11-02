@@ -94,6 +94,9 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
             admin_command = "status";
         } else if (std.mem.eql(u8, arg, "--runtime-validate")) {
             admin_command = "validate-runtime";
+        } else if (std.mem.eql(u8, arg, "--memory-budget-bytes")) {
+            const value = args.next() orelse return error.InvalidConfigValue;
+            cfg.memory_budget_bytes = std.fmt.parseInt(usize, value, 10) catch return error.InvalidConfigValue;
         } else if (std.mem.eql(u8, arg, "--tls")) {
             if (args.next()) |value| {
                 cfg.tls_enabled = parseBool(value) orelse cfg.tls_enabled;
