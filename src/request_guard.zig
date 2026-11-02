@@ -126,10 +126,20 @@ fn multipart(content_type: []const u8, body: []const u8) ?Rule {
     }
 }
 
+fn isRuntimeOverride(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "PHP_VALUE") or std.ascii.eqlIgnoreCase(name, "PHP_ADMIN_VALUE") or
+        std.ascii.eqlIgnoreCase(name, "PHP-Value") or std.ascii.eqlIgnoreCase(name, "PHP-Admin-Value");
+}
+
 pub fn inspect(allocator: std.mem.Allocator, req: request.HttpRequest) !?Rule {
-    for ([_][]const u8{ req.path, req.query, req.headers, req.body }) |part|
+    for ([_][]const u8{ req.path, req.query, req.headers, req.trailers, req.body }) |part|
         if (try probe(allocator, part)) |rule| return rule;
     if (contains(req.query, "auto_prepend_file") or contains(req.query, "allow_url_include")) return .php_runtime_override;
+    var trailers = std.mem.splitSequence(u8, req.trailers, "\r\n");
+    while (trailers.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (isRuntimeOverride(line[0..colon])) return .php_runtime_override;
+    }
     var lines = std.mem.splitSequence(u8, req.headers, "\r\n");
     var content_type: ?[]const u8 = null;
     var encoding: ?[]const u8 = null;
@@ -137,8 +147,7 @@ pub fn inspect(allocator: std.mem.Allocator, req: request.HttpRequest) !?Rule {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
         const value = headers.trimValue(line[colon + 1 ..]);
-        if (std.ascii.eqlIgnoreCase(name, "PHP_VALUE") or std.ascii.eqlIgnoreCase(name, "PHP_ADMIN_VALUE") or
-            std.ascii.eqlIgnoreCase(name, "PHP-Value") or std.ascii.eqlIgnoreCase(name, "PHP-Admin-Value")) return .php_runtime_override;
+        if (isRuntimeOverride(name)) return .php_runtime_override;
         if (std.ascii.eqlIgnoreCase(name, "Content-Type")) {
             if (content_type != null) return .multipart_headers;
             content_type = value;
@@ -163,6 +172,11 @@ test "guard detects encoded probes, override headers and abusive multipart" {
     req.query = "%2570hp2%2573hell";
     try std.testing.expectEqual(Rule.php2shell_probe, (try inspect(std.testing.allocator, req)).?);
     req.query = "";
+    req.trailers = "X-Meta: %2570hp2%2573hell";
+    try std.testing.expectEqual(Rule.php2shell_probe, (try inspect(std.testing.allocator, req)).?);
+    req.trailers = "PHP_ADMIN_VALUE: memory_limit=-1";
+    try std.testing.expectEqual(Rule.php_runtime_override, (try inspect(std.testing.allocator, req)).?);
+    req.trailers = "";
     req.headers = "PHP_ADMIN_VALUE: memory_limit=-1";
     try std.testing.expectEqual(Rule.php_runtime_override, (try inspect(std.testing.allocator, req)).?);
     req.headers = "Content-Type: multipart/form-data; boundary=boundary";

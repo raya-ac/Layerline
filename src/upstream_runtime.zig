@@ -439,11 +439,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     if (!saw_forwarded_proto) try out.print(allocator, "X-Forwarded-Proto: {s}\r\n", .{forwarded_proto});
     if (callbacks.current_request_id().len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{callbacks.current_request_id()});
 
-    if (upgrade_request and req.body.len == 0) {
-        try out.appendSlice(allocator, "\r\n");
-    } else {
-        try out.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
-    }
+    try @import("proxy_request_body.zig").appendFraming(allocator, &out, req, upgrade_request);
     const request_line = try out.toOwnedSlice(allocator);
     defer allocator.free(request_line);
 
@@ -451,12 +447,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
         error.RequestTimeout => return err,
         else => |e| return e,
     };
-    if (req.body.len > 0) {
-        callbacks.stream_write_all(lease.stream, req.body) catch |err| switch (err) {
-            error.RequestTimeout => return err,
-            else => |e| return e,
-        };
-    }
+    try @import("proxy_request_body.zig").write(lease.stream, req, callbacks.stream_write_all);
 
     if (upgrade_request) {
         forwardUpgradeResponse(stream, allocator, lease.stream, req, callbacks) catch |err| return responseFailure(stream, lease.stream, err, callbacks);

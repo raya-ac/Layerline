@@ -128,6 +128,7 @@ fn completeBody(
     _: *const std.process.Environ.Map,
     states: *std.ArrayList(h2_support.RequestState),
     state_index: usize,
+    trailers: []const u8,
     flow: *flow_mod.State,
     jobs: *dispatch.Dispatcher,
     callbacks: Callbacks,
@@ -141,8 +142,10 @@ fn completeBody(
             return;
         }
     }
-    state.req.body = state.body.items;
-    try submitRequest(jobs, stream, flow, state.stream_id, state.req, callbacks);
+    var req = state.req;
+    req.body = state.body.items;
+    req.trailers = trailers;
+    try submitRequest(jobs, stream, flow, state.stream_id, req, callbacks);
 }
 
 fn handleDataFrame(
@@ -208,7 +211,7 @@ fn handleDataFrame(
     try h2_support.sendWindowUpdate(stream, frame.header.stream_id, frame.payload.len, callbacks.write_all);
 
     if ((frame.header.flags & h2_native.FLAG_END_STREAM) == 0) return;
-    try completeBody(io, stream, scratch_allocator, state_allocator, cfg, process_env, states, state_index, flow, jobs, callbacks);
+    try completeBody(io, stream, scratch_allocator, state_allocator, cfg, process_env, states, state_index, "", flow, jobs, callbacks);
 }
 
 fn expireBodies(io: std.Io, stream: std.Io.net.Stream, allocator: std.mem.Allocator, states: *std.ArrayList(h2_support.RequestState), flow: *flow_mod.State, callbacks: Callbacks) !void {
@@ -451,9 +454,14 @@ fn runFrames(
                         flow.cancel(frame.header.stream_id);
                         h2_support.removeRequestState(&body_states, allocator, i);
                     } else {
-                        // Optional trailer metadata is validated and discarded,
-                        // never merged into routing/authentication headers.
-                        try completeBody(io, stream, req_alloc, allocator, cfg, process_env, &body_states, i, flow, &jobs, callbacks);
+                        const trailers = @import("request_trailers.zig").fromFields(req_alloc, decoded.headers.items, body_states.items[i].req.headers) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+                            flow.cancel(frame.header.stream_id);
+                            h2_support.removeRequestState(&body_states, allocator, i);
+                            break :headers;
+                        };
+                        try completeBody(io, stream, req_alloc, allocator, cfg, process_env, &body_states, i, trailers, flow, &jobs, callbacks);
                     }
                     break :headers;
                 }

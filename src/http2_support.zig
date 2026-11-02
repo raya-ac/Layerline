@@ -59,6 +59,7 @@ pub const RequestState = struct {
         allocator.free(self.req.path);
         allocator.free(self.req.query);
         allocator.free(self.req.headers);
+        allocator.free(self.req.trailers);
         self.body.deinit(allocator);
     }
 };
@@ -174,6 +175,8 @@ pub fn cloneRequest(allocator: std.mem.Allocator, req: request_mod.HttpRequest) 
     const query = try allocator.dupe(u8, req.query);
     errdefer allocator.free(query);
     const headers = try allocator.dupe(u8, req.headers);
+    errdefer allocator.free(headers);
+    const trailers = try allocator.dupe(u8, req.trailers);
     return .{
         .method = method,
         .path = path,
@@ -181,16 +184,19 @@ pub fn cloneRequest(allocator: std.mem.Allocator, req: request_mod.HttpRequest) 
         .headers = headers,
         .version = req.version,
         .body = "",
+        .trailers = trailers,
         .close_connection = true,
     };
 }
 
 fn cloneWithAllocationFailures(allocator: std.mem.Allocator) !void {
-    const req = try cloneRequest(allocator, .{ .method = "POST", .path = "/upload", .query = "x=y", .headers = "Host: local", .body = "", .version = "HTTP/2.0", .close_connection = true });
-    allocator.free(req.method);
-    allocator.free(req.path);
-    allocator.free(req.query);
-    allocator.free(req.headers);
+    const req = try cloneRequest(allocator, .{ .method = "POST", .path = "/upload", .query = "x=y", .headers = "Host: local", .body = "", .trailers = "digest: one", .version = "HTTP/2.0", .close_connection = true });
+    defer allocator.free(req.method);
+    defer allocator.free(req.path);
+    defer allocator.free(req.query);
+    defer allocator.free(req.headers);
+    defer allocator.free(req.trailers);
+    try std.testing.expectEqualStrings("digest: one", req.trailers);
 }
 
 test "HTTP2 request cloning cleans up when an allocation fails" {
@@ -306,14 +312,10 @@ pub fn validateRequestFields(fields: anytype) !void {
 
 pub fn validateTrailerFields(fields: anytype) !void {
     try validateRequestFields(fields);
+    if (fields.len > http_headers.MAX_HTTP1_HEADER_FIELDS) return error.BadRequest;
     for (fields) |header| {
         if (header.name[0] == ':') return error.BadRequest;
-        // Trailers must never change framing, routing, authentication, or the
-        // interpretation of content already received. Keep them out of headers.
-        for ([_][]const u8{ "host", "content-length", "content-type", "content-encoding", "content-range", "authorization", "proxy-authorization", "cookie", "expect", "range", "te", "trailer" }) |name| {
-            if (std.mem.eql(u8, header.name, name)) return error.BadRequest;
-        }
-        if (std.mem.startsWith(u8, header.name, "if-")) return error.BadRequest;
+        try @import("request_trailers.zig").validateField(header.name, header.value, "");
     }
 }
 

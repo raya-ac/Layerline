@@ -191,7 +191,7 @@ fn policyUsable(policy: Policy) bool {
 pub fn requestCanUse(req: request_mod.HttpRequest, policy: Policy) bool {
     if (!policyUsable(policy)) return false;
     if (!std.mem.eql(u8, req.method, "GET")) return false;
-    if (req.body.len != 0) return false;
+    if (req.body.len != 0 or req.trailers.len != 0) return false;
     if (http_headers.findHeaderValue(req.headers, "Authorization") != null) return false;
     if (http_headers.findHeaderValue(req.headers, "Cookie") != null) return false;
     // Conditional and partial responses need their own cache evaluation.
@@ -354,7 +354,7 @@ test "microcache bounds empty bodies and large response metadata" {
 
 test "buffered microcache bypasses private request and response state" {
     const policy = Policy{ .enabled = true, .max_bytes = 1024, .max_entry_bytes = 1024, .ttl_ms = 1000 };
-    const req = request_mod.HttpRequest{
+    var req = request_mod.HttpRequest{
         .method = "GET",
         .path = "/api/echo",
         .query = "",
@@ -364,6 +364,11 @@ test "buffered microcache bypasses private request and response state" {
         .close_connection = true,
     };
     try std.testing.expect(!requestCanUse(req, policy));
+    req.headers = "";
+    req.trailers = "content-digest: sha-256=:test:";
+    try std.testing.expect(!requestCanUse(req, policy));
+    req.trailers = "";
+    try std.testing.expect(requestCanUse(req, policy));
 
     const headers = [_]Header{.{ .name = "set-cookie", .value = "session=secret" }};
     const response = BufferedResponse{ .status_code = 200, .content_type = "text/plain", .body = "ok", .headers = headers[0..] };

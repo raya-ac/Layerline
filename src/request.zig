@@ -11,6 +11,7 @@ pub const HttpRequest = struct {
     headers: []const u8,
     version: []const u8,
     body: []const u8,
+    trailers: []const u8 = "",
     close_connection: bool,
     h2c_upgrade_tail: []const u8 = "",
 
@@ -258,7 +259,7 @@ pub fn parse(
 
     try fns.set_read_timeout(stream, read_body_timeout_ms);
     if (fns.begin_read_deadline) |begin| begin(stream, read_body_timeout_ms);
-    const body_read = try request_body.readBody(stream, allocator, headers, body_tail, max_body_bytes, max_chunk_line_bytes, fns.read);
+    const body_read = try request_body.readBody(stream, allocator, headers, body_tail, max_body_bytes, max_chunk_line_bytes, max_request_bytes, fns.read);
     const close_connection = http_headers.parseConnectionClose(version, headers) or body_read.discarded_pipeline_bytes;
 
     return HttpRequest{
@@ -268,6 +269,7 @@ pub fn parse(
         .headers = headers,
         .version = version,
         .body = body_read.body,
+        .trailers = body_read.trailers,
         .close_connection = close_connection,
     };
 }

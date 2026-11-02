@@ -814,6 +814,9 @@ python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
 log "verifying HTTP/2 stream lifecycle and error delivery"
 python3 "$ROOT_DIR/scripts/verify-h2-state.py" "$SERVER_BINARY"
 
+log "verifying request trailer forwarding and isolation"
+python3 "$ROOT_DIR/scripts/verify-request-trailers.py" "$SERVER_BINARY"
+
 if [[ -n ${LAYERLINE_H2SPEC:-} ]]; then
   log "verifying independent HTTP/2 conformance"
   python3 "$ROOT_DIR/scripts/verify-h2-conformance.py" "$SERVER_BINARY" --h2spec "$LAYERLINE_H2SPEC" --strict

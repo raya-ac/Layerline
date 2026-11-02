@@ -83,7 +83,7 @@ pub const Dispatcher = struct {
             break;
         };
         const index = slot orelse return error.DispatchLimit;
-        const bytes = req.method.len + req.path.len + req.query.len + req.headers.len + req.body.len;
+        const bytes = req.method.len + req.path.len + req.query.len + req.headers.len + req.body.len + req.trailers.len;
         if (bytes > flow_mod.State.max_queued_bytes -| self.request_bytes) return error.DispatchLimit;
         var current = admitted.load(.acquire);
         while (true) {

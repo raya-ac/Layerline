@@ -167,45 +167,7 @@ pub const Reader = struct {
 };
 
 fn parseChunkSize(value: []const u8) !usize {
-    var end: usize = 0;
-    while (end < value.len and std.ascii.isHex(value[end])) end += 1;
-    if (end == 0) return error.BadGateway;
-    const size = std.fmt.parseInt(usize, value[0..end], 16) catch return error.BadGateway;
-    var cursor = end;
-    while (cursor < value.len) {
-        while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t')) cursor += 1;
-        if (cursor == value.len or value[cursor] != ';') return error.BadGateway;
-        cursor += 1;
-        while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t')) cursor += 1;
-        const name = cursor;
-        while (cursor < value.len and headers.isHeaderNameByte(value[cursor])) cursor += 1;
-        if (cursor == name) return error.BadGateway;
-        while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t')) cursor += 1;
-        if (cursor == value.len or value[cursor] != '=') continue;
-        cursor += 1;
-        while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t')) cursor += 1;
-        if (cursor == value.len) return error.BadGateway;
-        if (value[cursor] != '"') {
-            const start = cursor;
-            while (cursor < value.len and headers.isHeaderNameByte(value[cursor])) cursor += 1;
-            if (cursor == start) return error.BadGateway;
-        } else {
-            cursor += 1;
-            while (true) {
-                if (cursor == value.len) return error.BadGateway;
-                var character = value[cursor];
-                cursor += 1;
-                if (character == '"') break;
-                if (character == '\\') {
-                    if (cursor == value.len) return error.BadGateway;
-                    character = value[cursor];
-                    cursor += 1;
-                }
-                if ((character < 32 and character != '\t') or character == 127) return error.BadGateway;
-            }
-        }
-    }
-    return size;
+    return @import("http_chunked.zig").parseSize(value) catch error.BadGateway;
 }
 
 const Fake = struct {

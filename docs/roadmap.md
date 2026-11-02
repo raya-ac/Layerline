@@ -9,7 +9,7 @@ admin bootstrap/session/origin controls, static handle containment, PHP alias
 diagnostic gating, cache metadata accounting, and config reader-lease reclamation
 are implemented. Native PHP2Shell input controls and exposed-version update
 notices are covered by [the security policy and tests](security.md). Remaining
-work includes wider HTTP/2 conformance and request-trailer forwarding, portable
+work includes wider HTTP/2 conformance and upstream streaming, portable
 OS resource limits and command sandboxing, and full HTTP/3 interoperability.
 
 Reloads reclaim retired arenas and HTTP idle pools after their last reader exits;
@@ -41,8 +41,14 @@ length metadata. Hop-field nominations across repeated Connection headers are
 scrubbed. Informational replies are forwarded while upstream work is in progress,
 and validated response trailers end HTTP/2 streams after flow-controlled DATA.
 Trailer responses bypass microcache/recompression until those features preserve
-their metadata; request trailer forwarding and streaming final HTTP/2 upstream
-bodies remain separate work.
+their metadata; streaming final HTTP/2 upstream bodies remains separate work.
+HTTP/1 chunked and HTTP/2 terminal request trailers now survive dispatch and
+reach reverse proxies as a separate chunked trailer section. Actual field names
+replace client declarations, duplicates retain order, and requests with trailers
+bypass microcache. Metadata/count limits, strict chunk syntax, original body
+deadlines and the native security guard cover both request paths. CGI/FastCGI
+environment mapping and experimental HTTP/3 request-trailer decoding are not
+included in this forwarding support.
 The experimental HTTP/3 buffered encoder preserves the same section ordering and
 HEAD/304 length metadata, with codec and allocation-failure tests; this does not
 close its external interoperability, flow-control or live streaming gaps.

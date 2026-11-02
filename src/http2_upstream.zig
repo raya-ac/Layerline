@@ -102,9 +102,9 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     defer request.deinit(allocator);
     try request.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, proxy_path });
     try appendForwardedRequestHeaders(allocator, &request, req, upstream, cfg, callbacks);
-    try request.print(allocator, "Content-Length: {d}\r\n\r\n", .{req.body.len});
-    try request.appendSlice(allocator, req.body);
+    try @import("proxy_request_body.zig").appendFraming(allocator, &request, req, false);
     try callbacks.stream_write_all(upstream_conn, request.items);
+    try @import("proxy_request_body.zig").write(upstream_conn, req, callbacks.stream_write_all);
 
     const reader = try upstream_reader.Reader.create(allocator, upstream_conn, callbacks.stream_read);
     defer allocator.destroy(reader);

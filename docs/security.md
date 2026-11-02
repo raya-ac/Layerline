@@ -400,6 +400,40 @@ HTTP/1 rejection probe returns 400, and the same invalid-preface test passes on
 the ALPN-selected TLS connection. TLS-only runs require every selected case to
 pass. A qualified cleartext run must not be described as 147 raw test passes.
 
+## Request Trailers
+
+HTTP/1 chunked requests and HTTP/2 terminal HEADERS retain trailer fields in a
+separate request section. Both reverse-proxy paths forward that section with
+HTTP/1.1 chunked framing, regenerate `Trailer` from actual field names, and never
+promote values into the initial headers. Repeated fields keep their order. This
+does not add streaming uploads; request bodies are still buffered within their
+existing limit before proxying. CGI/FastCGI do not receive trailer fields as CGI
+environment variables, and experimental HTTP/3 request-trailer decoding remains
+separate work.
+
+Trailer sections have at most 100 fields and use `max_request_bytes` as their
+metadata budget, including per-field overhead. HTTP/1 chunk extensions consume
+the same metadata budget and each chunk/trailer line has a 4096-byte limit.
+HTTP/1 requires CRLF and shares the strict chunk-size/extension grammar with the
+upstream response reader. HTTP/2 retains its decoded field-list bound and requires
+the terminal END_STREAM flag. The original body deadline includes waiting for
+trailers; receiving body bytes does not renew it.
+
+Known framing, routing, authentication, cache-control and content-interpretation
+fields are rejected, including Connection-nominated fields and forwarded identity
+headers. Unknown extension fields remain metadata, not trusted request headers.
+The native PHP2Shell guard also inspects trailers before routing and logs its
+normal denial response. Requests carrying trailers bypass the buffered microcache
+even when their body is empty. Allocation failure, reset and disconnect retain
+the existing owned cleanup and dispatcher admission limits.
+
+[`verify-request-trailers.py`](../scripts/verify-request-trailers.py) checks the
+actual upstream wire representation over plain/TLS HTTP/1 and HTTP/2: empty,
+binary and 64 KiB bodies, duplicate order, split trailer blocks, HPACK continuity,
+upstream connection reuse, cache isolation, metadata rejection, body deadlines,
+security denials and unrelated-stream recovery. These boundaries follow the
+separate-section model in [RFC 9112 section 7.1.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.2).
+
 ## Backend deadlines
 
 `upstream_timeout_ms` and its domain/route overrides now bound a complete proxy
