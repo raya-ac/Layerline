@@ -68,6 +68,12 @@ before its record cap, requests fresh peer keys, and sends authenticated closure
 on normal HTTP/1 and HTTP/2 termination. Focused unit and independent OpenSSL
 fixtures cover key ordering, interrupted/split input and concurrent writers.
 Broader TLS profiles, mTLS/resumption, backend HTTP/2/3 and revocation remain gaps.
+Configured listener key matching also needs strict parsed SPKI and key-strength
+validation: the current byte search can accept malformed certificate data.
+Startup certbot webroot issuance runs before normal listeners and still needs
+an already reachable challenge endpoint; native first-boot HTTP-01 bootstrap is
+not complete. Origin trust preflight and fake-helper tests do not close either
+of these gaps.
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 

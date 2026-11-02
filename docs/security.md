@@ -622,6 +622,14 @@ trust and signing material until config readers and idle pools have retired.
 provisioning with disposable certificate/DNS fixtures; it uses no real provider.
 These fixtures do not verify first-boot HTTP-01 reachability.
 
+Configured listener PEM loading still has a separate validation gap: the leaf
+key match uses a byte search rather than parsed SubjectPublicKeyInfo. Even a
+public-key byte string wrapped in a CERTIFICATE PEM label can pass that check.
+Strict certificate structure, key matching and listener key-strength checks
+remain required work. The files come from the operator's configuration; this
+finding is not evidence that a remote client can bypass authentication. A
+successful material load alone does not prove that clients can use the chain.
+
 TCP TLS and experimental QUIC connection diagnostics quote and escape unauthenticated SNI and ALPN bytes,
 including terminal controls and non-ASCII bytes. Each field is capped at 256 input
 bytes before escaping, with explicit truncation. TCP wire tests cover forged lines,
