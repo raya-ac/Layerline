@@ -115,6 +115,7 @@ pub fn decodeCertificateChainPem(allocator: std.mem.Allocator, pem: []const u8) 
     var start_index: usize = 0;
     while (findPemBlock(pem, "CERTIFICATE", start_index)) |block| {
         const cert = try decodeBase64PemBody(allocator, block.body);
+        errdefer allocator.free(cert);
         try chain.append(allocator, cert);
         start_index = block.next_index;
     }
@@ -129,20 +130,17 @@ pub fn decodePrivateKeyPem(
 ) !ConfiguredPrivateKey {
     if (findPemBlock(pem, "EC PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
-        defer allocator.free(decoded);
-        defer std.crypto.secureZero(u8, decoded);
+        defer freeSecret(allocator, decoded);
         return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(decoded) };
     }
     if (findPemBlock(pem, "RSA PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
-        defer allocator.free(decoded);
-        defer std.crypto.secureZero(u8, decoded);
+        defer freeSecret(allocator, decoded);
         return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, decoded) };
     }
     if (findPemBlock(pem, "PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
-        defer allocator.free(decoded);
-        defer std.crypto.secureZero(u8, decoded);
+        defer freeSecret(allocator, decoded);
         return parsePkcs8PrivateKey(allocator, decoded);
     }
     return error.MissingPrivateKeyPemBlock;
@@ -197,12 +195,21 @@ fn findPemBlock(bytes: []const u8, label: []const u8, start_index: usize) ?PemBl
     };
 }
 
+fn freeSecret(allocator: std.mem.Allocator, bytes: []u8) void {
+    std.crypto.secureZero(u8, bytes);
+    // Observe the wipe while owned: Allocator.free poisons bytes in Debug.
+    if (@import("builtin").is_test) std.debug.assert(std.mem.allEqual(u8, bytes, 0));
+    allocator.free(bytes);
+}
+
 fn decodeBase64PemBody(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
     const decoded = try allocator.alloc(u8, decoder.calcSizeUpperBound(body.len));
-    errdefer allocator.free(decoded);
+    defer freeSecret(allocator, decoded);
     const len = try decoder.decode(decoded, body);
-    return allocator.realloc(decoded, len);
+    // A shrinking realloc may move and free the original secret buffer.
+    // Keep it owned until an exact-sized copy exists, then erase every exit.
+    return allocator.dupe(u8, decoded[0..len]);
 }
 
 fn parseSec1EcPrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair {
@@ -231,7 +238,7 @@ fn parsePkcs1RsaPrivateKey(allocator: std.mem.Allocator, der: []const u8) !tls13
     const public_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
     errdefer allocator.free(public_exponent);
     const private_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
-    errdefer allocator.free(private_exponent);
+    errdefer freeSecret(allocator, private_exponent);
 
     if (modulus.len < 64 or modulus.len > 512) return error.UnsupportedRsaModulusLength;
     if (private_exponent.len == 0 or private_exponent.len > modulus.len) return error.InvalidRsaPrivateExponent;
@@ -316,6 +323,44 @@ test "decodes certificate PEM blocks" {
     try std.testing.expectEqual(@as(usize, 2), chain.len);
     try std.testing.expectEqualStrings("abc", chain[0]);
     try std.testing.expectEqualStrings("def", chain[1]);
+    const Check = struct {
+        fn load(allocator: std.mem.Allocator, source: []const u8) !void {
+            const owned = try decodeCertificateChainPem(allocator, source);
+            defer {
+                for (owned) |cert| allocator.free(cert);
+                allocator.free(owned);
+            }
+            try std.testing.expectEqual(2, owned.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.load, .{pem});
+}
+
+test "PEM decode scratch is erased on success invalid input and exact-copy allocation failure" {
+    const allocator = std.testing.allocator;
+    const output = try decodeBase64PemBody(allocator, "YWJj\n");
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("abc", output);
+    try std.testing.expectError(error.InvalidCharacter, decodeBase64PemBody(allocator, "YWJj!"));
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, decodeBase64PemBody(failing.allocator(), "YWJj"));
+}
+
+test "malformed RSA key cleanup erases its owned private exponent" {
+    const allocator = std.testing.allocator;
+    const modulus = [_]u8{0x55} ** 32;
+    const secret = [_]u8{0x33} ** 16;
+    const exponent = "\x01\x00\x01";
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendTlv(allocator, &body, 0x02, "\x00");
+    try appendTlv(allocator, &body, 0x02, &modulus);
+    try appendTlv(allocator, &body, 0x02, exponent);
+    try appendTlv(allocator, &body, 0x02, &secret);
+    var der = std.ArrayList(u8).empty;
+    defer der.deinit(allocator);
+    try appendTlv(allocator, &der, 0x30, body.items);
+    try std.testing.expectError(error.UnsupportedRsaModulusLength, parsePkcs1RsaPrivateKey(allocator, der.items));
 }
 
 test "parses SEC1 ECDSA P-256 private keys" {
