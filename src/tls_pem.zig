@@ -1,6 +1,7 @@
 const std = @import("std");
 const tls13_native = @import("tls13_native.zig");
 const certificate_key = @import("tls_certificate_key.zig");
+const rsa_parameters = @import("tls_rsa_parameters.zig");
 
 const EC_PUBLIC_KEY_OID = "\x2a\x86\x48\xce\x3d\x02\x01";
 const PRIME256V1_OID = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
@@ -93,6 +94,12 @@ const DerReader = struct {
         return tlv.value;
     }
 
+    fn readPositiveInteger(self: *DerReader) ![]const u8 {
+        const value = certificate_key.positive(try self.readExpected(0x02)) catch return error.InvalidPrivateKeyInteger;
+        if (value.len == 1 and value[0] == 0) return error.InvalidPrivateKeyInteger;
+        return value;
+    }
+
     fn readLength(self: *DerReader) !usize {
         if (self.offset >= self.bytes.len) return error.TruncatedDer;
         const first = self.bytes[self.offset];
@@ -101,7 +108,8 @@ const DerReader = struct {
 
         const count = first & 0x7f;
         if (count == 0 or count > @sizeOf(usize)) return error.UnsupportedDerLength;
-        if (self.bytes.len < self.offset + count) return error.TruncatedDer;
+        if (count > self.bytes.len - self.offset) return error.TruncatedDer;
+        if (self.bytes[self.offset] == 0) return error.NonCanonicalDerLength;
 
         var len: usize = 0;
         var i: usize = 0;
@@ -109,6 +117,7 @@ const DerReader = struct {
             len = (len << 8) | self.bytes[self.offset + i];
         }
         self.offset += count;
+        if (len < 128) return error.NonCanonicalDerLength;
         return len;
     }
 };
@@ -137,18 +146,19 @@ pub fn decodePrivateKeyPem(
     allocator: std.mem.Allocator,
     pem: []const u8,
 ) !ConfiguredPrivateKey {
+    if (pem.len > 32 * 1024) return error.PrivateKeyTooLarge;
     if (findPemBlock(pem, "EC PRIVATE KEY", 0)) |block| {
-        const decoded = try decodeBase64PemBody(allocator, block.body);
+        const decoded = try decodePrivateKeyBlock(allocator, block.body);
         defer freeSecret(allocator, decoded);
         return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(decoded) };
     }
     if (findPemBlock(pem, "RSA PRIVATE KEY", 0)) |block| {
-        const decoded = try decodeBase64PemBody(allocator, block.body);
+        const decoded = try decodePrivateKeyBlock(allocator, block.body);
         defer freeSecret(allocator, decoded);
         return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, decoded) };
     }
     if (findPemBlock(pem, "PRIVATE KEY", 0)) |block| {
-        const decoded = try decodeBase64PemBody(allocator, block.body);
+        const decoded = try decodePrivateKeyBlock(allocator, block.body);
         defer freeSecret(allocator, decoded);
         return parsePkcs8PrivateKey(allocator, decoded);
     }
@@ -224,6 +234,13 @@ fn decodeBase64PemBody(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     return allocator.dupe(u8, decoded[0..len]);
 }
 
+fn decodePrivateKeyBlock(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const decoded = try decodeBase64PemBody(allocator, body);
+    errdefer freeSecret(allocator, decoded);
+    if (decoded.len > 16 * 1024) return error.PrivateKeyTooLarge;
+    return decoded;
+}
+
 fn parseSec1EcPrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair {
     var reader = DerReader{ .bytes = der };
     var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
@@ -244,17 +261,25 @@ fn parsePkcs1RsaPrivateKey(allocator: std.mem.Allocator, der: []const u8) !tls13
     var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
     if (!reader.done()) return error.TrailingDerData;
 
-    _ = try seq.readExpected(0x02);
-    const modulus = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    if (!std.mem.eql(u8, try seq.readExpected(0x02), "\x00")) return error.UnsupportedRsaPrivateKeyVersion;
+    const modulus = try allocator.dupe(u8, try seq.readPositiveInteger());
     errdefer allocator.free(modulus);
-    const public_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    const public_exponent = try allocator.dupe(u8, try seq.readPositiveInteger());
     errdefer allocator.free(public_exponent);
-    const private_exponent = try allocator.dupe(u8, trimDerInteger(try seq.readExpected(0x02)));
+    const private_exponent = try allocator.dupe(u8, try seq.readPositiveInteger());
     errdefer freeSecret(allocator, private_exponent);
 
     if (modulus.len < 64 or modulus.len > 512) return error.UnsupportedRsaModulusLength;
     if (private_exponent.len == 0 or private_exponent.len > modulus.len) return error.InvalidRsaPrivateExponent;
     if (public_exponent.len == 0 or public_exponent.len > 4) return error.InvalidRsaPublicExponent;
+
+    const p = try seq.readPositiveInteger();
+    const q = try seq.readPositiveInteger();
+    const dp = try seq.readPositiveInteger();
+    const dq = try seq.readPositiveInteger();
+    const q_inverse = try seq.readPositiveInteger();
+    if (!seq.done()) return error.TrailingDerData;
+    try rsa_parameters.validate(.{ .n = modulus, .e = public_exponent, .d = private_exponent, .p = p, .q = q, .dp = dp, .dq = dq, .q_inverse = q_inverse });
 
     return .{
         .modulus = modulus,
@@ -268,18 +293,24 @@ fn parsePkcs8PrivateKey(allocator: std.mem.Allocator, der: []const u8) !Configur
     var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
     if (!reader.done()) return error.TrailingDerData;
 
-    _ = try seq.readExpected(0x02);
+    if (!std.mem.eql(u8, try seq.readExpected(0x02), "\x00")) return error.UnsupportedPkcs8Version;
     var algorithm = DerReader{ .bytes = try seq.readExpected(0x30) };
     const algorithm_oid = try algorithm.readExpected(0x06);
     const wrapped_private_key = try seq.readExpected(0x04);
+    if (!seq.done()) return error.UnsupportedPrivateKeyAttributes;
 
     if (std.mem.eql(u8, algorithm_oid, EC_PUBLIC_KEY_OID)) {
         const curve_oid = try algorithm.readExpected(0x06);
         if (!std.mem.eql(u8, curve_oid, PRIME256V1_OID)) return error.UnsupportedPrivateKeyCurve;
+        if (!algorithm.done()) return error.InvalidPrivateKeyAlgorithmParameters;
         return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(wrapped_private_key) };
     }
 
     if (std.mem.eql(u8, algorithm_oid, RSA_ENCRYPTION_OID)) {
+        if (!algorithm.done()) {
+            if ((try algorithm.readExpected(0x05)).len != 0) return error.InvalidPrivateKeyAlgorithmParameters;
+        }
+        if (!algorithm.done()) return error.InvalidPrivateKeyAlgorithmParameters;
         return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, wrapped_private_key) };
     }
 
@@ -482,26 +513,83 @@ test "parses SEC1 ECDSA P-256 private keys" {
     try std.testing.expectEqualSlices(u8, &kp.public_key.toUncompressedSec1(), &parsed.public_key.toUncompressedSec1());
 }
 
-test "parses PKCS1 RSA private keys" {
-    var modulus = [_]u8{0x55} ** 128;
-    modulus[0] = 0x7f;
-    var private_exponent = [_]u8{0x33} ** 128;
-    private_exponent[0] = 0x11;
+// Public field primes give this disposable parser fixture consistent parameters.
+// Its 511-bit modulus is deliberately below the listener's strength floor.
+const test_rsa_p: u512 = (@as(u512, 1) << 255) - 19;
+const test_rsa_q: u512 = (@as(u512, 1) << 256) - (@as(u512, 1) << 32) - 977;
+const test_rsa_d: u512 = 0x5853a7ac5853a7ac5853a7ac5853a7ac5853a7ac5853a7ac5853a7abfffffea0c3573ca8c3573ca8c3573ca8c3573ca8c3573ca8c3573ca8c3573cb69069a45;
+const test_rsa_fields = [_]u512{ 0, test_rsa_p * test_rsa_q, 65537, test_rsa_d, test_rsa_p, test_rsa_q, test_rsa_d % (test_rsa_p - 1), test_rsa_d % (test_rsa_q - 1), 0x28f76850bc845fdc8674621ed31c18efa7f088f300b9acac56f3a3dd1055f41f };
 
+fn testRsaDer(allocator: std.mem.Allocator, values: []const u512) ![]u8 {
     var body = std.ArrayList(u8).empty;
-    defer body.deinit(std.testing.allocator);
-    try appendTlv(std.testing.allocator, &body, 0x02, "\x00");
-    try appendTlv(std.testing.allocator, &body, 0x02, &modulus);
-    try appendTlv(std.testing.allocator, &body, 0x02, "\x01\x00\x01");
-    try appendTlv(std.testing.allocator, &body, 0x02, &private_exponent);
-
+    defer body.deinit(allocator);
+    for (values) |value| {
+        var bytes: [65]u8 = @splat(0);
+        std.mem.writeInt(u512, bytes[1..65], value, .big);
+        const integer = trimDerInteger(bytes[1..]);
+        const sign: usize = @intFromBool(integer[0] & 0x80 != 0);
+        try appendTlv(allocator, &body, 0x02, bytes[bytes.len - integer.len - sign ..]);
+    }
     var der = std.ArrayList(u8).empty;
-    defer der.deinit(std.testing.allocator);
-    try appendTlv(std.testing.allocator, &der, 0x30, body.items);
+    errdefer der.deinit(allocator);
+    try appendTlv(allocator, &der, 0x30, body.items);
+    return der.toOwnedSlice(allocator);
+}
 
-    var parsed = try parsePkcs1RsaPrivateKey(std.testing.allocator, der.items);
+test "parses complete consistent PKCS1 RSA private keys" {
+    const der = try testRsaDer(std.testing.allocator, &test_rsa_fields);
+    defer std.testing.allocator.free(der);
+    var parsed = try parsePkcs1RsaPrivateKey(std.testing.allocator, der);
     defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(u8, &modulus, parsed.modulus);
+    try std.testing.expectEqual(test_rsa_fields[1], std.mem.readVarInt(u512, parsed.modulus, .big));
     try std.testing.expectEqualStrings("\x01\x00\x01", parsed.public_exponent);
-    try std.testing.expectEqualSlices(u8, &private_exponent, parsed.private_exponent);
+    try std.testing.expectEqual(test_rsa_d, std.mem.readVarInt(u512, parsed.private_exponent, .big));
+}
+
+test "RSA private admission rejects changed components missing CRT and unsupported versions" {
+    for (1..test_rsa_fields.len) |index| {
+        var fields = test_rsa_fields;
+        fields[index] ^= 1;
+        const der = try testRsaDer(std.testing.allocator, &fields);
+        defer std.testing.allocator.free(der);
+        try std.testing.expectError(error.InvalidRsaPrivateKey, parsePkcs1RsaPrivateKey(std.testing.allocator, der));
+    }
+    const missing = try testRsaDer(std.testing.allocator, test_rsa_fields[0..4]);
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectError(error.TruncatedDer, parsePkcs1RsaPrivateKey(std.testing.allocator, missing));
+    var fields = test_rsa_fields;
+    fields[0] = 1;
+    const multi = try testRsaDer(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(multi);
+    try std.testing.expectError(error.UnsupportedRsaPrivateKeyVersion, parsePkcs1RsaPrivateKey(std.testing.allocator, multi));
+}
+
+test "private DER integers and lengths reject ambiguous encodings" {
+    for ([_][]const u8{ "\x02\x00", "\x02\x01\x80", "\x02\x02\x00\x01", "\x02\x01\x00" }) |bytes| {
+        var reader = DerReader{ .bytes = bytes };
+        try std.testing.expectError(error.InvalidPrivateKeyInteger, reader.readPositiveInteger());
+    }
+    for ([_][]const u8{ "\x02\x81\x01\x01", "\x02\x82\x00\x01\x01" }) |bytes| {
+        var reader = DerReader{ .bytes = bytes };
+        try std.testing.expectError(error.NonCanonicalDerLength, reader.readExpected(0x02));
+    }
+}
+
+test "RSA admission cleans up every failed owned allocation" {
+    const Check = struct {
+        fn load(allocator: std.mem.Allocator, der: []const u8) !void {
+            var key = try parsePkcs1RsaPrivateKey(allocator, der);
+            defer key.deinit(allocator);
+        }
+    };
+    const der = try testRsaDer(std.testing.allocator, &test_rsa_fields);
+    defer std.testing.allocator.free(der);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.load, .{der});
+}
+
+test "private key input has independent PEM and decoded DER limits" {
+    try std.testing.expectError(error.PrivateKeyTooLarge, decodePrivateKeyPem(std.testing.allocator, &(@as([32 * 1024 + 1]u8, @splat('x')))));
+    const pem = try testPem(std.testing.allocator, "RSA PRIVATE KEY", &(@as([16 * 1024 + 1]u8, @splat(0x33))));
+    defer std.testing.allocator.free(pem);
+    try std.testing.expectError(error.PrivateKeyTooLarge, decodePrivateKeyPem(std.testing.allocator, pem));
 }

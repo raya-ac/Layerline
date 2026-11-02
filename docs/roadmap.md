@@ -81,8 +81,10 @@ before publishing ServerHello; it does not preempt an individual crypto operatio
 Configured listener material now has bounded DER envelope/SPKI admission,
 P-256 point and RSA modulus/exponent matching, key-strength limits and read-only
 CLI checks. Global/SNI tests cover bad material before DNS, rejected reloads and
-verified certificate rotation. This is not full PKIX or RSA private-parameter
-validation.
+verified certificate rotation. Private RSA admission now checks the complete
+two-prime tuple and CRT consistency, with canonical DER and bounded input sizes.
+This is not full PKIX, factor-primality or key-generation-quality validation;
+SEC1 metadata checks remain open.
 Startup certbot webroot issuance runs before normal listeners and still needs
 an already reachable challenge endpoint; native first-boot HTTP-01 bootstrap is
 not complete. Origin trust preflight and fake-helper tests do not close that gap.

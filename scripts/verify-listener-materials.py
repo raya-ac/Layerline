@@ -178,8 +178,13 @@ with tempfile.TemporaryDirectory(prefix="layerline-listener-materials-", dir="/t
     traditional = run("openssl", "rsa", "-in", str(rsa_key), "-traditional")
     rsa_fields = parts(parts(unpem("RSA PRIVATE KEY", traditional))[0][1])
     assert len(rsa_fields) == 9 and all(tag == 2 for tag, _ in rsa_fields)
-    rsa_fields[2] = (2, b"\x03")
-    wrong_exponent = pem("RSA PRIVATE KEY", der(0x30, b"".join(der(tag, value) for tag, value in rsa_fields)))
+
+    def rsa_pem(fields):
+        return pem("RSA PRIVATE KEY", der(0x30, b"".join(der(tag, value) for tag, value in fields)))
+
+    altered_exponent = rsa_fields.copy()
+    altered_exponent[2] = (2, b"\x03")
+    wrong_exponent = rsa_pem(altered_exponent)
     changed_curve = bytearray(ec_der)
     curve = b"\x2a\x86\x48\xce\x3d\x03\x01\x07"
     changed_curve[changed_curve.index(curve) + len(curve) - 1] ^= 1
@@ -197,12 +202,63 @@ with tempfile.TemporaryDirectory(prefix="layerline-listener-materials-", dir="/t
         "excessive chain": (ec.read_bytes() * 17, ec_key.read_bytes()),
         "oversized certificate": (pem("CERTIFICATE", ec_der + bytes(128 * 1024)), ec_key.read_bytes()),
     }
+    for index, name in enumerate(["private exponent", "p", "q", "dP", "dQ", "q inverse"], start=3):
+        fields = rsa_fields.copy()
+        value = bytearray(fields[index][1])
+        value[-1] ^= 1
+        fields[index] = (2, bytes(value))
+        cases[f"RSA altered {name}"] = (rsa.read_bytes(), rsa_pem(fields))
+    for name, index, value in [
+        ("zero private exponent", 3, b"\0"),
+        ("multi-prime version without factors", 0, b"\1"),
+        ("negative modulus", 1, rsa_fields[1][1].lstrip(b"\0")),
+        ("nonminimal exponent", 2, b"\0" + rsa_fields[2][1]),
+    ]:
+        fields = rsa_fields.copy()
+        fields[index] = (2, value)
+        cases[f"RSA {name}"] = (rsa.read_bytes(), rsa_pem(fields))
+    cases["RSA missing CRT fields"] = (rsa.read_bytes(), rsa_pem(rsa_fields[:4]))
+    cases["RSA trailing private field"] = (rsa.read_bytes(), rsa_pem(rsa_fields + [(2, b"\1")]))
+    rsa_der = unpem("RSA PRIVATE KEY", traditional)
+    assert rsa_der[1] & 0x80
+    ambiguous_length = rsa_der[:1] + bytes([rsa_der[1] + 1, 0]) + rsa_der[2:]
+    cases["RSA nonminimal DER length"] = (rsa.read_bytes(), pem("RSA PRIVATE KEY", ambiguous_length))
+    pkcs8 = parts(parts(unpem("PRIVATE KEY", rsa_key.read_bytes()))[0][1])
+    algorithm = parts(pkcs8[1][1])
+
+    def pkcs8_pem(fields):
+        return pem("PRIVATE KEY", der(0x30, b"".join(der(tag, value) for tag, value in fields)))
+
+    fields = pkcs8.copy()
+    fields[0] = (2, b"\1")
+    cases["PKCS8 unsupported version"] = (rsa.read_bytes(), pkcs8_pem(fields))
+    cases["PKCS8 unsupported attributes"] = (rsa.read_bytes(), pkcs8_pem(pkcs8 + [(0xa0, b"")]))
+    for name, parameters in [
+        ("nonempty NULL", [(5, b"\0")]),
+        ("duplicate parameters", [(5, b""), (5, b"")]),
+        ("wrong parameter tag", [(4, b"")]),
+    ]:
+        fields = pkcs8.copy()
+        fields[1] = (0x30, b"".join(der(tag, value) for tag, value in algorithm[:1] + parameters))
+        cases[f"PKCS8 RSA {name}"] = (rsa.read_bytes(), pkcs8_pem(fields))
+    fields = pkcs8.copy()
+    fields[1] = (0x30, der(*algorithm[0]))
+    absent_rsa_parameters = pkcs8_pem(fields)
+    fields = parts(parts(unpem("PRIVATE KEY", ec_key.read_bytes()))[0][1])
+    ec_algorithm = parts(fields[1][1])
+    fields[1] = (0x30, b"".join(der(tag, value) for tag, value in ec_algorithm + ec_algorithm[1:]))
+    cases["PKCS8 duplicate named curve"] = (ec.read_bytes(), pkcs8_pem(fields))
+    cases["oversized private PEM"] = (rsa.read_bytes(), traditional + b" " * (32 * 1024))
+    cases["oversized private DER"] = (rsa.read_bytes(), pem("RSA PRIVATE KEY", bytes(16 * 1024 + 1)))
     csr, signed = root / "leaf.csr", root / "pss-leaf.pem"
     run("openssl", "req", "-new", "-key", str(ec_key), "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-out", str(csr))
     run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(rsa), "-CAkey", str(rsa_key), "-set_serial", "7", "-days", "1", "-copy_extensions", "copy", "-sigopt", "rsa_padding_mode:pss", "-out", str(signed))
+    rsa4096, rsa4096_key = certificate("rsa4096", "rsa:4096")
     positives = [(ec.read_bytes(), ec_key.read_bytes(), ec, ec_der),
                  (rsa.read_bytes(), traditional, rsa, unpem("CERTIFICATE", rsa.read_bytes())),
                  (rsa.read_bytes(), rsa_key.read_bytes(), rsa, unpem("CERTIFICATE", rsa.read_bytes())),
+                 (rsa.read_bytes(), absent_rsa_parameters, rsa, unpem("CERTIFICATE", rsa.read_bytes())),
+                 (rsa4096.read_bytes(), rsa4096_key.read_bytes(), rsa4096, unpem("CERTIFICATE", rsa4096.read_bytes())),
                  (signed.read_bytes() + rsa.read_bytes(), ec_key.read_bytes(), rsa, unpem("CERTIFICATE", signed.read_bytes())),
                  (other_ec.read_bytes(), other_ec_key.read_bytes(), other_ec, other_ec_der)]
     api = http.server.ThreadingHTTPServer(("127.0.0.1", 0), API)
