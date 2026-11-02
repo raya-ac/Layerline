@@ -108,7 +108,7 @@ def exact(conn, count):
     while len(result) < count:
         part = conn.recv(count - len(result))
         if not part:
-            raise EOFError("connection closed early")
+            raise EOFError("connection closed early", {"wanted": count, "received": len(result)})
         result += part
     return result
 
@@ -256,6 +256,14 @@ class H2:
         return self.barrier()
 
 
+def transfer_failure_details(peer, started, total, secure):
+    # Keep frame sizes and times, not the fake application's large payloads.
+    frames = [{"kind": item[0], "flags": item[1], "stream": item[2], "bytes": len(item[3]), "seconds": at - started}
+              for item, at in peer.timeline[-8:]]
+    print("deadline transfer failure:", {"tls": secure, "seconds": time.monotonic() - started,
+                                       "complete_data_bytes": total, "last_frames": frames}, file=sys.stderr, flush=True)
+
+
 def slow_header_deadline(peer, initial, fragments, detail):
     started = time.monotonic()
     peer.conn.sendall(initial)
@@ -343,11 +351,11 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                     h2.conn.close()
 
             h2 = H2(server)
+            started = time.monotonic()
+            total = 0
             try:
-                started = time.monotonic()
                 h2.send(1, 5, 1, fields(b"/queued.bin"))
                 received = []
-                total = 0
                 while total < 65535:
                     item = h2.receive()
                     received.append(item)
@@ -361,6 +369,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                 h2.send(1, 5, 3, fields())
                 received = h2.until(lambda f: f[0] == 0 and f[1] & 1 and f[2] == 3)
                 assert any(k == 0 and s == 3 and p == b"ok\n" for k, _, s, p in received)
+            except BaseException:
+                transfer_failure_details(h2, started, total, secure)
+                raise
             finally:
                 h2.conn.close()
             for cut in [4, 16]:

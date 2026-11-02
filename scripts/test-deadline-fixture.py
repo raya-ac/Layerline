@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Offline checks for a late writer observing a required terminal GOAWAY."""
 import ast
+import contextlib
+import io
 from pathlib import Path
+import sys
 import unittest
+from unittest import mock
 
 source = Path(__file__).with_name("verify-deadlines.py")
 tree = ast.parse(source.read_text())
@@ -97,6 +101,35 @@ class DeadlineFixtureTests(unittest.TestCase):
         peer = Peer(clock, received_at=.95)
         with self.assertRaisesRegex(AssertionError, "original deadline"):
             self.run_probe(clock, peer)
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def load(self, name):
+        node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        namespace = {"time": mock.Mock(monotonic=lambda: .6), "sys": sys}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+        return namespace[name]
+
+    def test_truncated_reads_still_fail_with_exact_byte_counts(self):
+        peer = mock.Mock(recv=mock.Mock(side_effect=[b"abc", b""]))
+        with self.assertRaises(EOFError) as caught:
+            self.load("exact")(peer, 9)
+        self.assertEqual(caught.exception.args[1], {"wanted": 9, "received": 3})
+
+    def test_complete_fragmented_reads_are_unchanged(self):
+        peer = mock.Mock(recv=mock.Mock(side_effect=[b"abc", b"def"]))
+        self.assertEqual(self.load("exact")(peer, 6), b"abcdef")
+
+    def test_failure_context_is_bounded_and_contains_no_application_bytes(self):
+        peer = mock.Mock(timeline=[((0, 0, number, b"private fake payload\n" * 32768), .1) for number in range(20)])
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.load("transfer_failure_details")(peer, 0, 16384, True)
+        self.assertNotIn("private fake payload", output.getvalue())
+        self.assertEqual(output.getvalue().count("'kind':"), 8)
+        self.assertIn("'complete_data_bytes': 16384", output.getvalue())
+        self.assertIn("'seconds': 0.6", output.getvalue())
+        self.assertLess(len(output.getvalue()), 2000)
 
 
 if __name__ == "__main__":
