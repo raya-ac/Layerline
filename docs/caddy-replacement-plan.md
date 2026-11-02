@@ -42,7 +42,8 @@ First-time certbot webroot issuance still requires an already reachable challeng
 endpoint: the helper currently runs before Layerline's normal listeners start.
 The redirect listener serves challenges after startup, not during that initial
 helper call. Native first-boot HTTP-01 bootstrap remains open. Configured listener
-certificate loading also needs strict parsed SPKI/key-strength validation; its
-current byte-search match is not sufficient certificate validation.
+loading now validates bounded DER envelopes, matches parsed SPKI public keys and
+enforces listener key-strength limits. Its admission/rotation tests do not prove
+full PKIX or RSA private-parameter validation.
 
 Layerline should not be described as a general Caddy/nginx replacement while the audit blockers remain. Existing deployments need an explicit risk assessment and tested rollback; successful small HTTP requests alone do not establish HTTP/2 flow-control correctness, safe admin exposure, or resource bounds. HTTP/3 remains experimental until the configured-certificate and external-client gates pass.

@@ -622,13 +622,23 @@ trust and signing material until config readers and idle pools have retired.
 provisioning with disposable certificate/DNS fixtures; it uses no real provider.
 These fixtures do not verify first-boot HTTP-01 reachability.
 
-Configured listener PEM loading still has a separate validation gap: the leaf
-key match uses a byte search rather than parsed SubjectPublicKeyInfo. Even a
-public-key byte string wrapped in a CERTIFICATE PEM label can pass that check.
-Strict certificate structure, key matching and listener key-strength checks
-remain required work. The files come from the operator's configuration; this
-finding is not evidence that a remote client can bypass authentication. A
-successful material load alone does not prove that clients can use the chain.
+Configured listener PEM loading now reads bounded DER certificate envelopes and
+matches the leaf's SubjectPublicKeyInfo, not a byte string anywhere in the file.
+ECDSA matches the P-256 curve and full public point; RSA matches both modulus and
+exponent and requires 2048-4096-bit odd moduli with supported positive exponents.
+Chains are capped at 16 certificates, each at 128 KiB of DER, within the existing
+512 KiB PEM-file cap. Malformed/trailing envelopes, bad intermediates and
+misleading key bytes in extensions cannot pass this check. CLI validation and
+doctor check present files without provisioning; missing ACME inputs may defer
+until issuance. Startup loads listener material before DNS changes.
+`zig build test-listener-materials` checks global/SNI scopes, rejected activation
+and reload, retained connections, and verified EC/RSA/RSA-PSS-chain rotation.
+The listener parser does not impose origin trust policy: unknown extension
+contents and signature profiles remain for the client to interpret. This is not
+issuer/path, hostname, expiry or revocation validation, nor a proof of RSA
+private-parameter consistency. A material load alone does not prove that every
+client trusts or can use the chain. The original finding concerned configured
+input/readiness, not a proven remote authentication bypass.
 
 TCP TLS and experimental QUIC connection diagnostics quote and escape unauthenticated SNI and ALPN bytes,
 including terminal controls and non-ASCII bytes. Each field is capped at 256 input

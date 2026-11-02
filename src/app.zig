@@ -841,13 +841,12 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    ensureCloudflareDeployment(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
-        std.debug.print("Cloudflare deployment failed: {}\n", .{err});
-        return err;
-    };
-
     loadAllConfiguredTlsMaterials(init.io, resource_budget.allocator(), &cfg) catch |err| {
         std.debug.print("Failed to load configured TLS material: {}\n", .{err});
+        return err;
+    };
+    ensureCloudflareDeployment(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
+        std.debug.print("Cloudflare deployment failed: {}\n", .{err});
         return err;
     };
     try runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig);

@@ -208,6 +208,11 @@ pub fn build(b: *std.Build) void {
     startup_material_checks.addArtifactArg(child_worker);
     b.step("test-startup-materials", "Test origin trust preflight before certificate/DNS side effects")
         .dependOn(&startup_material_checks.step);
+    const listener_material_checks = b.addSystemCommand(&.{"python3"});
+    listener_material_checks.addFileArg(b.path("scripts/verify-listener-materials.py"));
+    listener_material_checks.addArtifactArg(exe);
+    b.step("test-listener-materials", "Test configured certificate keys, admission and live rotation")
+        .dependOn(&listener_material_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

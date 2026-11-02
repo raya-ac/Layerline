@@ -430,6 +430,16 @@ tls_key = /etc/letsencrypt/live/example.com/privkey.pem
 
 The configured certificate path supports ECDSA P-256 private keys in SEC1 (`BEGIN EC PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form, plus RSA private keys in PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`) PEM form.
 
+Listener RSA keys must be 2048-4096 bits. The leaf's parsed public key must match
+the configured key, including its algorithm/curve and RSA public exponent.
+Certificate chains contain at most 16 certificates, with a 128 KiB DER cap per
+certificate and a 512 KiB PEM-file cap. Envelope parsing is separate from issuer
+trust, hostname and validity-period decisions made by clients.
+`--validate-config` and `--doctor` check present listener pairs without calling
+ACME or DNS helpers. Missing inputs may defer when `tls_auto = true`; that does
+not establish first-boot challenge reachability. Rejected validation/reload
+preserves the published certificate, even if its files on disk have changed.
+
 ### Auto Let's Encrypt
 
 The server can run `certbot` in webroot mode automatically on startup when both `--tls-auto true` and `--letsencrypt-domains` are provided. With `letsencrypt_renew = true`, Layerline also starts a background `certbot renew` loop; the default interval is 12 hours.

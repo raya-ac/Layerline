@@ -20,6 +20,22 @@ pub fn loadFromPaths(
     return tls_pem.loadMaterialFromPem(allocator, cert_pem, key_pem);
 }
 
+fn validatePair(io: std.Io, allocator: std.mem.Allocator, cert: ?[]const u8, key: ?[]const u8, allow_missing: bool) !void {
+    if (cert == null and key == null) return;
+    if (cert == null or key == null) return error.InvalidTlsConfig;
+    var material = loadFromPaths(io, allocator, cert.?, key.?) catch |err| {
+        if (allow_missing and err == error.FileNotFound) return;
+        return err;
+    };
+    material.deinit(allocator);
+}
+
+pub fn validateFiles(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
+    // Validation never invokes ACME. On first issuance its files may not exist yet.
+    if (cfg.tls_enabled) try validatePair(io, allocator, cfg.tls_cert, cfg.tls_key, cfg.tls_auto);
+    for (cfg.domains.items) |domain| try validatePair(io, allocator, domain.tls_cert, domain.tls_key, cfg.tls_auto);
+}
+
 pub fn loadAll(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
     if (cfg.tls_enabled) {
         if (cfg.tls_cert == null and cfg.tls_key == null) {

@@ -597,12 +597,26 @@ with tempfile.TemporaryDirectory(prefix="layerline-https-proxy-", dir="/tmp") as
     ca, leaf, key = certificates(folder, "trusted-root")
     other_ca, other_leaf, other_key = certificates(folder, "untrusted-root")
     worker_certificates(folder)
+    large_ca, large_leaf, large_key = certificates(folder, "downstream-large-root", large=True)
+    large_der = ssl.PEM_cert_to_DER_cert(large_leaf.read_text())
+    assert 16384 < len(large_der) <= 128 * 1024, "large certificate must cross records within the listener limit"
     large_chain = folder / "downstream-large-chain.pem"
-    large_chain.write_bytes(leaf.read_bytes() * 48)
-    assert len(ssl.PEM_cert_to_DER_cert(leaf.read_text())) * 48 > 16384
+    # Fragment one real certificate, not a chain inflated past its admission cap.
+    large_chain.write_bytes(large_leaf.read_bytes() + large_ca.read_bytes())
+    assert large_chain.read_bytes().count(b"-----BEGIN CERTIFICATE-----") == 2
     origin = Origin(leaf, key, ssl.TLSVersion.TLSv1_3)
     try:
-        with server(folder, origin, ca, True, extra=f"tls_cert = {large_chain}\ntls_key = {key}") as port:
+        with server(folder, origin, ca, True, extra=f"tls_cert = {large_chain}\ntls_key = {large_key}") as port:
+            verified = ssl.create_default_context(cafile=str(large_ca))
+            verified.set_alpn_protocols(["http/1.1"])
+            with socket.create_connection(("127.0.0.1", port), timeout=4) as raw:
+                with verified.wrap_socket(raw, server_hostname="origin.example.test") as connection:
+                    assert connection.getpeercert(binary_form=True) == large_der
+                    assert connection.selected_alpn_protocol() == "http/1.1"
+                    connection.sendall(b"GET /fixed HTTP/1.1\r\nHost: browser-supplied.example\r\nConnection: close\r\n\r\n")
+                    with http.client.HTTPResponse(connection) as response:
+                        response.begin()
+                        assert (response.status, response.read()) == (200, body)
             assert request(port, True) == (200, body)
             client = H2(port, True)
             try:
@@ -612,7 +626,8 @@ with tempfile.TemporaryDirectory(prefix="layerline-https-proxy-", dir="/tmp") as
                 client.close()
     finally:
         origin.close()
-    results.append({"case": "large native server Certificate message fragments across authenticated TLS records"})
+    results.append({"case": "large native server Certificate message fragments across authenticated TLS records",
+                    "certificate_bytes": len(large_der), "chain_certificates": 2, "certificate_verified": True})
     print("ok: real native listener large certificate fragmentation", flush=True)
     for secure in [False, True]:
         key_updates(folder, ca, leaf, key, secure)

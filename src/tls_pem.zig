@@ -1,5 +1,6 @@
 const std = @import("std");
 const tls13_native = @import("tls13_native.zig");
+const certificate_key = @import("tls_certificate_key.zig");
 
 const EC_PUBLIC_KEY_OID = "\x2a\x86\x48\xce\x3d\x02\x01";
 const PRIME256V1_OID = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
@@ -121,6 +122,7 @@ pub fn decodeCertificateChainPem(allocator: std.mem.Allocator, pem: []const u8) 
 
     var start_index: usize = 0;
     while (findPemBlock(pem, "CERTIFICATE", start_index)) |block| {
+        if (chain.items.len == 16) return error.CertificateChainTooLong;
         const cert = try decodeBase64PemBody(allocator, block.body);
         errdefer allocator.free(cert);
         try chain.append(allocator, cert);
@@ -166,13 +168,16 @@ pub fn loadMaterialFromPem(
 
     var private_key = try decodePrivateKeyPem(allocator, key_pem);
     errdefer private_key.deinit(allocator);
+    const leaf = try certificate_key.parse(chain[0]);
+    for (chain[1..]) |certificate| _ = try certificate_key.parse(certificate);
     switch (private_key) {
         .ecdsa_p256 => |key_pair| {
             const public_key_sec1 = key_pair.public_key.toUncompressedSec1();
-            if (std.mem.indexOf(u8, chain[0], &public_key_sec1) == null) return error.CertificateKeyMismatch;
+            if (!std.mem.eql(u8, try leaf.p256(), &public_key_sec1)) return error.CertificateKeyMismatch;
         },
         .rsa => |key| {
-            if (std.mem.indexOf(u8, chain[0], key.modulus) == null) return error.CertificateKeyMismatch;
+            const public = try leaf.rsa();
+            if (!std.mem.eql(u8, public.modulus, key.modulus) or !std.mem.eql(u8, public.exponent, key.public_exponent)) return error.CertificateKeyMismatch;
         },
     }
 
@@ -311,6 +316,96 @@ fn appendTlv(allocator: std.mem.Allocator, out: *std.ArrayList(u8), tag: u8, val
     try out.append(allocator, tag);
     try appendDerLength(allocator, out, value.len);
     try out.appendSlice(allocator, value);
+}
+
+fn testPem(allocator: std.mem.Allocator, label: []const u8, bytes: []const u8) ![]u8 {
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    return std.fmt.allocPrint(allocator, "-----BEGIN {s}-----\n{s}\n-----END {s}-----\n", .{ label, encoded, label });
+}
+
+fn testKeyPem(allocator: std.mem.Allocator, pair: tls13_native.EcdsaP256Sha256.KeyPair) ![]u8 {
+    const bytes = [_]u8{ 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20 } ++ pair.secret_key.toBytes();
+    return testPem(allocator, "EC PRIVATE KEY", &bytes);
+}
+
+fn expectMaterialError(expected: anyerror, cert: []const u8, key: []const u8) !void {
+    if (loadMaterialFromPem(std.testing.allocator, cert, key)) |result| {
+        var material = result;
+        material.deinit(std.testing.allocator);
+        return error.InvalidCertificateAccepted;
+    } else |err| try std.testing.expectEqual(expected, err);
+}
+
+test "listener key matching rejects public-key bytes pretending to be a certificate" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x27));
+    const key = try testKeyPem(allocator, pair);
+    defer freeSecret(allocator, key);
+    const cert = try testPem(allocator, "CERTIFICATE", &pair.public_key.toUncompressedSec1());
+    defer allocator.free(cert);
+    try expectMaterialError(error.CertificateMalformed, cert, key);
+}
+
+test "listener key matching rejects a different public key appended after a valid certificate" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x27));
+    const other = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x28));
+    const key = try testKeyPem(allocator, other);
+    defer freeSecret(allocator, key);
+    const der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, pair, "localhost");
+    defer allocator.free(der);
+    const extra = try std.mem.concat(allocator, u8, &.{ der, &other.public_key.toUncompressedSec1() });
+    defer allocator.free(extra);
+    const cert = try testPem(allocator, "CERTIFICATE", extra);
+    defer allocator.free(cert);
+    try expectMaterialError(error.CertificateMalformed, cert, key);
+}
+
+test "listener key matching checks the curve and every failed owned allocation" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x27));
+    const key = try testKeyPem(allocator, pair);
+    defer freeSecret(allocator, key);
+    const der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, pair, "localhost");
+    defer allocator.free(der);
+    const cert = try testPem(allocator, "CERTIFICATE", der);
+    defer allocator.free(cert);
+    const Check = struct {
+        fn load(backing: std.mem.Allocator, c: []const u8, k: []const u8) !void {
+            var material = try loadMaterialFromPem(backing, c, k);
+            defer material.deinit(backing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.load, .{ cert, key });
+    const position = std.mem.indexOf(u8, der, PRIME256V1_OID).?;
+    der[position + PRIME256V1_OID.len - 1] ^= 1;
+    const invalid = try testPem(allocator, "CERTIFICATE", der);
+    defer allocator.free(invalid);
+    try expectMaterialError(error.CertificateKeyMismatch, invalid, key);
+}
+
+test "listener key matching bounds chains and checks intermediate envelopes" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x27));
+    const key = try testKeyPem(allocator, pair);
+    defer freeSecret(allocator, key);
+    const der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, pair, "localhost");
+    defer allocator.free(der);
+    const cert = try testPem(allocator, "CERTIFICATE", der);
+    defer allocator.free(cert);
+    const extra = try std.mem.concat(allocator, u8, &.{ cert, "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n" });
+    defer allocator.free(extra);
+    try expectMaterialError(error.CertificateMalformed, extra, key);
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(allocator);
+    for (0..16) |_| try chain.appendSlice(allocator, cert);
+    var material = try loadMaterialFromPem(allocator, chain.items, key);
+    defer material.deinit(allocator);
+    try std.testing.expectEqual(16, material.certificate_chain.len);
+    try chain.appendSlice(allocator, cert);
+    try expectMaterialError(error.CertificateChainTooLong, chain.items, key);
 }
 
 test "decodes certificate PEM blocks" {
