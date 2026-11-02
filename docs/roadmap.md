@@ -81,7 +81,10 @@ The [September 5 code audit](audit-2026-09-05.md) takes priority over the histor
 
 Worker shutdown ownership now retains/joins background threads before cleanup;
 an independent deadline guard exits without freeing borrowed runtime state if a
-worker remains stuck. Wire/process tests cover active HTTP/1 and HTTP/2 drain,
+worker remains stuck. A bounded cleanup reserve now cancels connection-owned
+backend work and tunnel pumps before that guard, while health probes cancel
+immediately on shutdown. Valid half-closed HTTP/1 requests can still finish during
+the drain. Wire/process tests cover active HTTP/1 and HTTP/2 drain,
 new-stream refusal, blocked reads/writes, and zero-window deadline expiry.
 Absolute client read deadlines now cover HTTP/1 header/body phases, TLS reads,
 HTTP/2 frame/header-block assembly, and independent pending uploads. Real trickle

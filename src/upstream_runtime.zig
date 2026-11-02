@@ -12,6 +12,7 @@ const upstream_idle = @import("upstream_idle.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const backend_deadline = @import("backend_deadline.zig");
+const request_cancel = @import("request_cancel.zig");
 const upstream_reader = @import("upstream_reader.zig");
 const upstream_tls = @import("upstream_tls.zig");
 const upstream_connection = @import("upstream_connection.zig");
@@ -611,6 +612,9 @@ fn sleepHealthInterval(io: std.Io, interval_ms: u32, callbacks: Callbacks) void 
 }
 
 pub fn healthCheckTask(ctx: HealthCheckContext) void {
+    const previous_cancel = request_cancel.active;
+    request_cancel.active = ctx.callbacks.shutdown_requested;
+    defer request_cancel.active = previous_cancel;
     ctx.callbacks.bind_thread_io(ctx.io);
     var schedule = HealthSchedule{};
     defer schedule.deadlines.deinit(resource_budget.allocator());

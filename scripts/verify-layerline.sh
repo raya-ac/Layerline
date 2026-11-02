@@ -772,6 +772,9 @@ PID=
 log "verifying active process shutdown"
 python3 "$ROOT_DIR/scripts/verify-shutdown.py" "$SERVER_BINARY"
 
+log "verifying joined shutdown of long-budget backends"
+python3 "$ROOT_DIR/scripts/verify-shutdown-backends.py" "$SERVER_BINARY"
+
 log "verifying absolute read deadlines"
 python3 "$ROOT_DIR/scripts/verify-deadlines.py" "$SERVER_BINARY"
 

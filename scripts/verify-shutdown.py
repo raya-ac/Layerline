@@ -112,6 +112,7 @@ route_upstream_health_check_timeout_ms.backend = 100
             assert events and events[0]["active_connections"] > 0, text
             assert "All connection and background workers stopped." not in text, text
             assert 0.15 <= elapsed < 2, elapsed
+        return elapsed
 
     def close(self):
         if self.process.poll() is None:
@@ -252,10 +253,11 @@ with tempfile.TemporaryDirectory(prefix="layerline-shutdown-") as tmp:
                 assert header.startswith(b"HTTP/1.1 200"), header
             try:
                 server.stop()
-                server.finish(1)
+                elapsed = server.finish(0)
+                assert .10 <= elapsed < 2, elapsed
             finally:
                 conn.close()
-        print("ok: blocked reads, HTTP/2 windows and blocked writes hit the absolute shutdown deadline without unsafe cleanup")
+        print("ok: blocked reads, HTTP/2 windows and blocked writes cancel and join inside the shutdown budget")
     finally:
         for server in servers:
             server.close()

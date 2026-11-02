@@ -94,12 +94,17 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
     }
     const start = std.Io.Timestamp.now(ctx.io, .awake);
     ctx.supervisor.stopping(ctx.io);
-    var children_stopped = false;
+    var cleanup_started = false;
     while (!state.complete.load(.acquire)) {
         const elapsed = start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
-        const child_cutoff = ctx.cfg.graceful_shutdown_timeout_ms -| @as(u32, 100);
-        if (!children_stopped and elapsed >= child_cutoff) {
-            children_stopped = native_spawn.tryStopAll(ctx.io);
+        const reserve = @min(@as(u32, 250), ctx.cfg.graceful_shutdown_timeout_ms / 2);
+        const cleanup_cutoff = ctx.cfg.graceful_shutdown_timeout_ms - reserve;
+        if (elapsed >= cleanup_cutoff) {
+            if (!cleanup_started) {
+                // Keep time to join canceled work before the independent guard.
+                cleanup_started = state.connections.tryCancelAll(ctx.io);
+            }
+            _ = native_spawn.tryStopAll(ctx.io);
         }
         if (elapsed >= ctx.cfg.graceful_shutdown_timeout_ms) {
             // The main thread can still be asleep in its drain poll after the

@@ -534,7 +534,7 @@ The startup OS/inherited snapshot is not refreshed if another process changes
 the running server's limit. Other platforms do not enable this adapter. See
 [descriptor admission](security.md#descriptor-admission) for its scope.
 
-`SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for connection and background workers to drain. HTTP/2 refuses new streams while completing existing work. A stuck worker triggers a logged exit with status 1 at the deadline, without freeing runtime state that worker still borrows; see [shutdown ownership](security.md#shutdown-ownership).
+`SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for connection and background workers to drain. HTTP/2 refuses new streams while completing existing work. The final 250 ms, or half of a shorter budget, are reserved to cancel and join unfinished requests; health probes cancel when shutdown starts. A worker still stuck at the deadline triggers a logged exit with status 1 without freeing runtime state it still borrows; see [shutdown ownership](security.md#shutdown-ownership).
 Common host limits to revisit before aggressive load tests:
 
 - Linux/macOS: set the open-file limit for the measured connection budget, including upstream and admin sockets.

@@ -8,6 +8,7 @@ pub const Connection = struct {
     previous: ?*Connection = null,
     next: ?*Connection = null,
     idle: bool = true,
+    canceled: std.atomic.Value(bool) = .init(false),
 };
 
 threadlocal var current_connection: ?*Connection = null;
@@ -26,6 +27,7 @@ pub const State = struct {
     mutex: std.Io.Mutex = .init,
     head: ?*Connection = null,
     draining: bool = false,
+    aborting: bool = false,
 
     pub fn init(metrics: *metrics_mod.ServerMetrics) State {
         return .{
@@ -52,7 +54,10 @@ pub const State = struct {
         if (self.head) |head| head.previous = node;
         self.head = node;
         current_connection = node;
-        if (self.draining) node.stream.shutdown(io, .recv) catch {};
+        if (self.aborting) {
+            node.canceled.store(true, .release);
+            node.stream.shutdown(io, .both) catch {};
+        } else if (self.draining) node.stream.shutdown(io, .recv) catch {};
     }
 
     pub fn unregister(self: *State, io: std.Io, node: *Connection) void {
@@ -79,6 +84,19 @@ pub const State = struct {
         self.metrics.connectionClosed();
         // Publishing zero is the worker's final access to shared runtime state.
         _ = self.active_connections.fetchSub(1, .acq_rel);
+    }
+
+    pub fn tryCancelAll(self: *State, io: std.Io) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock(io);
+        self.aborting = true;
+        var cursor = self.head;
+        while (cursor) |node| : (cursor = node.next) {
+            node.canceled.store(true, .release);
+            // Signal, don't close: the registered worker still owns this handle.
+            node.stream.shutdown(io, .both) catch {};
+        }
+        return true;
     }
 
     pub fn active(self: *State) usize {
@@ -110,4 +128,36 @@ test "connection gate stops at its limit and released capacity is reusable" {
     try std.testing.expectEqual(0, state.active());
     try std.testing.expectEqual(0, metrics.active_connections.load(.monotonic));
     try std.testing.expectEqual(3, metrics.connections_total.load(.monotonic));
+}
+
+test "shutdown cancellation covers busy connections and late worker registration" {
+    const Fake = struct {
+        var shutdowns: usize = 0;
+        fn shutdown(_: ?*anyopaque, _: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+            std.debug.assert(how == .both);
+            shutdowns += 1;
+        }
+    };
+    Fake.shutdowns = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.netShutdown = Fake.shutdown;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var metrics = metrics_mod.ServerMetrics.init();
+    var state = State.init(&metrics);
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    var first: Connection = .{ .state = &state, .stream = stream, .idle = false };
+    var late: Connection = .{ .state = &state, .stream = stream };
+    state.register(io, &first);
+    defer state.unregister(io, &first);
+    state.mutex.lockUncancelable(io);
+    const busy = state.tryCancelAll(io);
+    state.mutex.unlock(io);
+    try std.testing.expect(!busy);
+    try std.testing.expect(!first.canceled.load(.acquire));
+    try std.testing.expect(state.tryCancelAll(io));
+    try std.testing.expect(first.canceled.load(.acquire));
+    state.register(io, &late);
+    defer state.unregister(io, &late);
+    try std.testing.expect(late.canceled.load(.acquire));
+    try std.testing.expectEqual(2, Fake.shutdowns);
 }

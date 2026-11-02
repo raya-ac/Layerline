@@ -2,6 +2,7 @@ const std = @import("std");
 
 const native_tls = @import("native_tls_runtime.zig");
 const upstream_tls = @import("upstream_tls.zig");
+const request_cancel = @import("request_cancel.zig");
 
 pub const Callbacks = struct {
     active_io: *const fn () std.Io,
@@ -19,6 +20,7 @@ const StreamContext = struct {
     dst: std.Io.net.Stream,
     tls_channel: ?*native_tls.Channel = null,
     upstream_channel: ?*upstream_tls.Channel = null,
+    canceled: ?*const std.atomic.Value(bool) = null,
     callbacks: Callbacks,
 };
 
@@ -28,6 +30,9 @@ fn proxyStream(ctx: StreamContext) void {
     defer ctx.callbacks.clear_tls_channel();
     const previous_upstream = upstream_tls.bind(ctx.upstream_channel);
     defer _ = upstream_tls.bind(previous_upstream);
+    const previous_cancel = request_cancel.active;
+    request_cancel.active = ctx.canceled;
+    defer request_cancel.active = previous_cancel;
 
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -58,13 +63,14 @@ fn proxyWithSpawner(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_payload:
     const io = callbacks.active_io();
     const tls_channel = callbacks.current_tls_channel();
     const upstream_channel = upstream_tls.current();
-    const t1 = try spawn(.{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .callbacks = callbacks });
+    const canceled = request_cancel.active;
+    const t1 = try spawn(.{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .canceled = canceled, .callbacks = callbacks });
     errdefer {
         a.shutdown(io, .recv) catch {};
         b.shutdown(io, .send) catch {};
         t1.join();
     }
-    const t2 = try spawn(.{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .callbacks = callbacks });
+    const t2 = try spawn(.{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .canceled = canceled, .callbacks = callbacks });
     t1.join();
     t2.join();
 }
@@ -128,4 +134,49 @@ test "second pump spawn failure interrupts and joins the first pump" {
     }, fixture.spawn));
     try std.testing.expect(fixture.stopped.load(.acquire));
     try std.testing.expect(fixture.finished.load(.acquire));
+}
+
+test "tunnel pumps borrow their owner's cancellation flag until both threads join" {
+    const Fake = struct {
+        var io: std.Io = undefined;
+        var observed: std.atomic.Value(usize) = .init(0);
+        fn activeIo() std.Io {
+            return io;
+        }
+        fn bind(_: std.Io) void {}
+        fn tls() ?*native_tls.Channel {
+            return null;
+        }
+        fn setTls(_: ?*native_tls.Channel) void {}
+        fn clearTls() void {}
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            request_cancel.check() catch |err| {
+                _ = observed.fetchAdd(1, .monotonic);
+                return err;
+            };
+            return 0;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {}
+        fn shutdown(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {}
+    };
+    Fake.observed.store(0, .release);
+    var vtable = std.testing.io.vtable.*;
+    vtable.netShutdown = Fake.shutdown;
+    Fake.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var canceled = std.atomic.Value(bool).init(true);
+    const previous = request_cancel.active;
+    request_cancel.active = &canceled;
+    defer request_cancel.active = previous;
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    try proxyWithSpawner(stream, stream, "", .{
+        .active_io = Fake.activeIo,
+        .bind_thread_io = Fake.bind,
+        .clear_tls_channel = Fake.clearTls,
+        .current_tls_channel = Fake.tls,
+        .set_tls_channel = Fake.setTls,
+        .stream_read = Fake.read,
+        .stream_write_all = Fake.write,
+    }, spawnStream);
+    try std.testing.expectEqual(2, Fake.observed.load(.acquire));
+    try std.testing.expect(request_cancel.active == &canceled);
 }

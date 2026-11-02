@@ -213,6 +213,11 @@ pub fn build(b: *std.Build) void {
     listener_material_checks.addArtifactArg(exe);
     b.step("test-listener-materials", "Test configured certificate keys, admission and live rotation")
         .dependOn(&listener_material_checks.step);
+    const backend_shutdown_checks = b.addSystemCommand(&.{"python3"});
+    backend_shutdown_checks.addFileArg(b.path("scripts/verify-shutdown-backends.py"));
+    backend_shutdown_checks.addArtifactArg(exe);
+    b.step("test-shutdown-backends", "Test cancellation and joined shutdown of long-budget backend work")
+        .dependOn(&backend_shutdown_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

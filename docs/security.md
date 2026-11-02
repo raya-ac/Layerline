@@ -261,7 +261,12 @@ metrics updates before publishing their final concurrency release.
 
 The graceful shutdown timeout covers the whole worker drain. HTTP/2 sends GOAWAY,
 refuses new streams, and lets existing uploads and flow-controlled responses
-finish within that period. If a connection or background operation is still
+finish during the drain. The final 250 ms, or half of a shorter budget, are
+reserved for cleanup: connection-owned flags cancel remaining backend work and
+registered sockets are shut down without transferring handle ownership. Tunnel
+pumps borrow that flag until both threads join; health probes cancel when shutdown
+starts. A peer's write-half-close alone does not cancel a valid HTTP/1 request.
+If a connection or background operation is still
 stuck at the deadline, a separate guard logs `server.shutdown_timeout`, removes
 the admin socket, and exits with status 1 without unwinding runtime destructors.
 The OS then reclaims process memory together instead of freeing config/caches
@@ -760,6 +765,10 @@ PKIX, revocation or browser-root-program acceptance is claimed.
 health, and reload workers. It checks idle shutdown, in-flight HTTP/1 uploads,
 HTTP/2 upload/response drain with new-stream refusal, and deadline expiry for
 blocked request reads, zero-window responses, and blocked large-file writes.
+`scripts/verify-shutdown-backends.py` requires joined shutdown with 120-second
+backend budgets across plain/TLS HTTP/1, stalled headers/bodies/TLS handshakes,
+upgraded tunnels, active health probes and Linux backlog-stalled TCP/hostname
+dials. It also checks normal half-closed request completion inside the drain.
 
 To exercise an already-built release on its target OS without installing Zig,
 run `LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline bash scripts/verify-layerline.sh`.

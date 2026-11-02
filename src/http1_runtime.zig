@@ -15,6 +15,7 @@ const tls_client_hello = @import("tls_client_hello.zig");
 const native_accept = @import("native_accept.zig");
 const listener_state = @import("listener_state.zig");
 const resource_budget = @import("resource_budget.zig");
+const request_cancel = @import("request_cancel.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const ConcurrencyState = concurrency_mod.State;
@@ -298,6 +299,9 @@ fn serveHttpRedirectConnectionTask(
     const cfg = lease.cfg;
     callbacks.set_response_config(cfg);
     var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
+    const previous_cancel = request_cancel.active;
+    request_cancel.active = &registration.canceled;
+    defer request_cancel.active = previous_cancel;
     state.register(io, &registration);
     defer {
         state.unregister(io, &registration);
@@ -675,6 +679,9 @@ pub fn serveConnectionTask(
     const cfg = lease.cfg;
     callbacks.set_response_config(cfg);
     var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
+    const previous_cancel = request_cancel.active;
+    request_cancel.active = &registration.canceled;
+    defer request_cancel.active = previous_cancel;
     state.register(io, &registration);
 
     // One worker thread owns one stream; always release the slot and close stream.
