@@ -246,6 +246,7 @@ pub fn render(allocator: std.mem.Allocator, active: *const ServerConfig, candida
     changes += try appendBoolChange(&out, allocator, "global.tls", active.tls_enabled, candidate.tls_enabled);
     changes += try appendIntChange(&out, allocator, u32, "global.external_command_timeout_ms", active.external_command_timeout_ms, candidate.external_command_timeout_ms);
     changes += try appendIntChange(&out, allocator, usize, "global.memory_budget_bytes", active.memory_budget_bytes, candidate.memory_budget_bytes);
+    changes += try appendIntChange(&out, allocator, usize, "global.descriptor_limit", active.descriptor_limit, candidate.descriptor_limit);
     changes += try appendIntChange(&out, allocator, usize, "global.io_thread_limit", active.io_thread_limit, candidate.io_thread_limit);
     changes += try appendIntChange(&out, allocator, usize, "global.io_stack_size", active.io_stack_size, candidate.io_stack_size);
     changes += try appendOptionalStringChange(&out, allocator, "global.tls_cert", active.tls_cert, candidate.tls_cert);

@@ -7,6 +7,7 @@ const admin_runtime = @import("admin_runtime.zig");
 const admin_listener = @import("admin_listener.zig");
 const listener_state = @import("listener_state.zig");
 const native_accept = @import("native_accept.zig");
+const descriptors = @import("descriptor_budget.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
 const config_store = @import("config_store.zig");
@@ -184,6 +185,8 @@ fn printStartupSummary(cfg: *const ServerConfig) void {
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
     std.debug.print("Worker stack: {d} bytes\n", .{cfg.worker_stack_size});
     std.debug.print("I/O pool: at most {d} workers, {d} bytes per stack\n", .{ cfg.io_thread_limit, cfg.io_stack_size });
+    const descriptor_state = descriptors.snapshot();
+    if (descriptor_state.enabled) std.debug.print("Descriptor reservations: {d} requested, {d} effective, {d} control, {d} rejection\n", .{ descriptor_state.configured, descriptor_state.effective, descriptor_state.limits[1], descriptor_state.limits[2] });
     if (cfg.upstream != null) {
         const pool = cfg.upstream.?;
         std.debug.print(
@@ -290,9 +293,8 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
 
         var lease = ctx.callbacks.acquire_config();
         const active_cfg = lease.cfg;
-        if (!concurrency.tryAcquire(active_cfg.max_concurrent_connections)) {
+        if (descriptors.emergency(conn.socket.handle) or !concurrency.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.metrics.connectionRejected();
-            std.debug.print("Rejecting connection: max concurrency reached ({d})\n", .{active_cfg.max_concurrent_connections});
             // No TLS session exists at admission. Close overloaded HTTPS
             // sockets rather than sending an unencrypted HTTP error.
             if (!active_cfg.tls_enabled) http1_runtime.sendOverload(ctx.io, conn, false, ctx.callbacks.http1) catch {};

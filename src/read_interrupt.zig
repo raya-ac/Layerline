@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const read_deadline = @import("read_deadline.zig");
 const system = std.posix.system;
+const descriptors = @import("descriptor_budget.zig");
 
 pub threadlocal var active: ?*Scope = null;
 
@@ -10,12 +11,19 @@ pub const Wake = struct {
 
     pub fn init() !Wake {
         if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
-        return .{ .fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) };
+        var ticket = try descriptors.acquire(2);
+        defer ticket.deinit();
+        const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+        errdefer for (fds) |fd| {
+            _ = system.close(fd);
+        };
+        try ticket.adoptAll(&fds);
+        return .{ .fds = fds };
     }
 
     pub fn deinit(self: *Wake) void {
-        _ = system.close(self.fds[0]);
-        _ = system.close(self.fds[1]);
+        descriptors.closeNative(self.fds[0]);
+        descriptors.closeNative(self.fds[1]);
     }
 
     pub fn signal(self: *Wake) void {

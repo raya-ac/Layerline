@@ -122,8 +122,13 @@ rejectable concurrent admission rather than running inline when saturated.
 The packaged Linux unit adds memory, task and descriptor ceilings, including
 child processes; hard cgroup exhaustion can kill/restart the service. These do
 not turn allocator counters into RSS accounting or provide portable OS limits.
-Global descriptor reservation/admission and Darwin resolver cancellation remain
-open, alongside wider protocol conformance.
+Managed descriptor reservation/admission now covers Linux/macOS I/O and native
+socket/pipe paths, with OS-clamped restart-only limits, protected Unix control,
+bounded early rejection and per-pool metrics. Low-RLIMIT plaintext/TLS tests
+exercise H1/H2 overload, control/reload, partial CGI rollback and recovery.
+Private resolver/filesystem allowances and inherited handles are not exact OS
+handle accounting. Sanitizing operator-inherited child descriptors, Darwin
+resolver cancellation and wider protocol conformance remain open.
 Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
 the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
 Systemd startup now waits for Layerline's native readiness signal after all

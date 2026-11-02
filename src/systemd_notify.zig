@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const descriptors = @import("descriptor_budget.zig");
 
 pub var failures: std.atomic.Value(usize) = .init(0);
 
@@ -37,10 +38,16 @@ pub const Notifier = struct {
         const linux = std.os.linux;
         // One nonblocking datagram, no allocation or retained descriptor. A full
         // manager queue must not stall request handling or the shutdown guard.
+        var ticket = try descriptors.acquireClass(.control, 1);
+        defer ticket.deinit();
         const result = linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
         if (posix.errno(result) != .SUCCESS) return error.NotifySocketFailed;
         const fd: posix.fd_t = @intCast(result);
-        defer _ = linux.close(fd);
+        ticket.adopt(fd) catch |err| {
+            _ = linux.close(fd);
+            return err;
+        };
+        defer descriptors.closeNative(fd);
         var address: linux.sockaddr.un = std.mem.zeroes(linux.sockaddr.un);
         address.family = linux.AF.UNIX;
         @memcpy(address.path[0..self.length], self.path[0..self.length]);

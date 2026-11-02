@@ -132,6 +132,7 @@ tls = false
 #cf_record_comment = managed by Layerline
 #max_requests_per_connection = 256
 #worker_stack_size = 262144
+#descriptor_limit = 4096
 #io_thread_limit = 128
 #io_stack_size = 1048576
 #max_php_output_bytes = 2097152
@@ -491,11 +492,30 @@ zig build run -- \
   --max-static-bytes 10485760
 ```
 
-When overloaded, the server returns `503 Service Unavailable` and stops accepting additional work instead of growing past the limit.
+When overloaded, plaintext connection admission can return a minimal `503 Service Unavailable`.
+HTTPS admission closes before the handshake rather than sending plaintext to a TLS client.
+Requests on established connections can return 503 before response output begins;
+after output begins, failure closes the transfer without appending another response.
 This process still uses one worker thread per accepted socket, so extreme live-connection fan-in should use a dedicated L4/edge balancing tier while native evented IO is built out.
 The default is 1,024 concurrent connections, not a claim of one-million-connection
 capacity. Explicit overrides remain supported; budget thread stacks, request and
 response buffers, upstream sockets, and file descriptors before increasing it.
+
+`descriptor_limit` (CLI `--descriptor-limit`) defaults to 4096, accepts 32 through
+1048576, and requires a restart. On Linux/macOS the effective managed reservation
+limit is the smaller of that value and the startup soft `RLIMIT_NOFILE` minus
+inherited open handles and 32 handles of kernel headroom. Startup fails if fewer
+than 32 reservations remain. The protected Unix-control partition is one quarter
+of the effective limit, capped at 32; two more slots are reserved for rejecting
+new connections, and ordinary work gets the rest. Listeners, accepted/upstream
+sockets, files and child pipes share this limit, so it is not a socket count.
+Pending operations also reserve capacity, including eight transient slots for
+resolver internals and bounded filesystem allowances. Metrics distinguish owned
+handles from reservations and expose each pool's limit, peak and rejections.
+The startup OS/inherited snapshot is not refreshed if another process changes
+the running server's limit. Other platforms do not enable this adapter. See
+[descriptor admission](security.md#descriptor-admission) for its scope.
+
 `SIGHUP` reloads compatible config changes in memory. `SIGINT` and `SIGTERM` stop accepting new connections and wait up to `graceful_shutdown_timeout_ms` for connection and background workers to drain. HTTP/2 refuses new streams while completing existing work. A stuck worker triggers a logged exit with status 1 at the deadline, without freeing runtime state that worker still borrows; see [shutdown ownership](security.md#shutdown-ownership).
 Common host limits to revisit before aggressive load tests:
 

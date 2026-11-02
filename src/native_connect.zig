@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const socket_io = @import("socket_io.zig");
+const descriptors = @import("descriptor_budget.zig");
 const Stream = std.Io.net.Stream;
 const IpAddress = std.Io.net.IpAddress;
 const HostName = std.Io.net.HostName;
@@ -80,6 +81,8 @@ fn finish(io: std.Io, stream: Stream, address: *const std.posix.sockaddr, len: s
 
 fn connectAddress(io: std.Io, family: std.posix.sa_family_t, address: *const std.posix.sockaddr, len: std.posix.socklen_t) !Stream {
     try io.checkCancel();
+    var ticket = try descriptors.acquire(1);
+    defer ticket.deinit();
     const flags: u32 = std.posix.SOCK.STREAM | if (builtin.os.tag == .linux) std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK else 0;
     const protocol: u32 = if (family == std.posix.AF.UNIX) 0 else std.posix.IPPROTO.TCP;
     const handle = while (true) {
@@ -92,6 +95,7 @@ fn connectAddress(io: std.Io, family: std.posix.sa_family_t, address: *const std
     };
     var stream = Stream{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } };
     errdefer stream.close(io);
+    try ticket.adopt(handle);
     if (builtin.os.tag != .linux) {
         const options = [_]struct { command: i32, value: usize }{
             .{ .command = std.posix.F.SETFD, .value = std.posix.FD_CLOEXEC },

@@ -820,6 +820,7 @@ fn buildHttp3RoutedResponseData(
     }
     const response = callbacks.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
         error.OutOfMemory => return err,
+        error.BackendCapacity, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => return buildHttp3ErrorResponseData(allocator, server_header, 503, "Service Unavailable", "Local server resources are exhausted.", is_head),
         else => return buildHttp3ErrorResponseData(allocator, server_header, 500, "Internal Server Error", "Internal server error while routing HTTP/3 request.", is_head),
     };
     return buildHttp3BufferedResponseData(allocator, server_header, response, is_head);

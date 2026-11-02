@@ -97,6 +97,9 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
         } else if (std.mem.eql(u8, arg, "--memory-budget-bytes")) {
             const value = args.next() orelse return error.InvalidConfigValue;
             cfg.memory_budget_bytes = std.fmt.parseInt(usize, value, 10) catch return error.InvalidConfigValue;
+        } else if (std.mem.eql(u8, arg, "--descriptor-limit")) {
+            const value = args.next() orelse return error.InvalidConfigValue;
+            cfg.descriptor_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidConfigValue;
         } else if (std.mem.eql(u8, arg, "--io-thread-limit")) {
             const value = args.next() orelse return error.InvalidConfigValue;
             cfg.io_thread_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidConfigValue;

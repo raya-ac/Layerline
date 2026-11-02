@@ -153,7 +153,7 @@ fn handleHttpRedirectConnection(
     const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
     defer write_deadline.restore(previous_write);
     var head_request = false;
-    errdefer |err| if (err == error.OutOfMemory) {
+    errdefer |err| if (err == error.OutOfMemory or @import("descriptor_budget.zig").capacityError(err)) {
         sendOverload(io, stream, head_request, callbacks) catch {};
     };
     read_deadline.begin(io, stream, cfg.read_header_timeout_ms);
@@ -334,7 +334,7 @@ pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
 
         var lease = ctx.callbacks.acquire_config();
         const active_cfg = lease.cfg;
-        if (!ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
+        if (@import("descriptor_budget.zig").emergency(conn.socket.handle) or !ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
             ctx.callbacks.metrics.connectionRejected();
             sendOverload(ctx.io, conn, false, ctx.callbacks) catch {};
             ctx.callbacks.stream_close(conn);
@@ -428,7 +428,7 @@ pub fn handleHttp1Connection(
         defer write_deadline.restore(previous_write);
         var is_http1 = true;
         var head_request = false;
-        errdefer |err| if (err == error.OutOfMemory and is_http1) {
+        errdefer |err| if ((err == error.OutOfMemory or @import("descriptor_budget.zig").capacityError(err)) and is_http1) {
             sendOverload(io, stream, head_request, callbacks) catch {};
         };
         if (callbacks.shutdown_requested.load(.acquire)) return;
@@ -642,8 +642,8 @@ pub fn handleHttp1Connection(
 
             callbacks.route_request(io, stream, req_alloc, cfg, req, process_env) catch |err| switch (err) {
                 error.CloseConnection => break,
-                error.OutOfMemory => {
-                    callbacks.access_log_set_error("OutOfMemory");
+                error.OutOfMemory, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
+                    callbacks.access_log_set_error(@errorName(err));
                     callbacks.metrics.routeError();
                     try sendOverload(io, stream, std.mem.eql(u8, req.method, "HEAD"), callbacks);
                     return;

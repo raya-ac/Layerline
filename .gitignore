@@ -8,4 +8,5 @@ zig-out/
 *.so
 *.dll
 *.exe
+__pycache__/
 

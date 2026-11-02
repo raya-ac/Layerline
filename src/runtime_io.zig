@@ -1,5 +1,6 @@
 const std = @import("std");
 const resource_budget = @import("resource_budget.zig");
+const descriptor_io = @import("descriptor_io.zig");
 
 pub const default_thread_limit = 128;
 pub const minimum_thread_limit = 8;
@@ -63,13 +64,20 @@ pub fn run(minimal: std.process.Init.Minimal, comptime app: fn (std.process.Init
         .async_limit = .limited(default_thread_limit),
         .concurrent_limit = .limited(default_thread_limit),
     });
-    defer runtime.deinit();
+    const io = descriptor_io.install(runtime.io()) catch |err| {
+        runtime.deinit();
+        return err;
+    };
+    defer {
+        runtime.deinit();
+        descriptor_io.uninstall();
+    }
     active = &runtime;
     defer active = null;
     var environment = try minimal.environ.createMap(arena.allocator());
     defer environment.deinit();
     const preopens = try std.process.Preopens.init(arena.allocator());
-    try app(.{ .minimal = minimal, .arena = &arena, .gpa = allocator, .io = runtime.io(), .environ_map = &environment, .preopens = preopens });
+    try app(.{ .minimal = minimal, .arena = &arena, .gpa = allocator, .io = io, .environ_map = &environment, .preopens = preopens });
 }
 
 test "runtime limits reject unsafe stacks and unbounded thread settings" {

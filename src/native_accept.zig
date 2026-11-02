@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const descriptors = @import("descriptor_budget.zig");
 const posix = std.posix;
 
 fn flags(handle: std.Io.net.Socket.Handle, command: i32, value: usize) !usize {
@@ -34,6 +35,11 @@ pub fn retryable(err: anyerror) bool {
 
 fn accept(server: *std.Io.net.Server, io: std.Io) !std.Io.net.Stream {
     if (builtin.os.tag == .windows) return server.accept(io);
+    var ticket = descriptors.acquire(1) catch |err| if (descriptors.current_class == .normal)
+        try descriptors.acquireClass(.emergency, 1)
+    else
+        return err;
+    defer ticket.deinit();
     var address: std.Io.Threaded.PosixAddress = undefined;
     var length: posix.socklen_t = @sizeOf(@TypeOf(address));
     while (true) {
@@ -46,6 +52,7 @@ fn accept(server: *std.Io.net.Server, io: std.Io) !std.Io.net.Stream {
             .SUCCESS => {
                 const stream = std.Io.net.Stream{ .socket = .{ .handle = @intCast(rc), .address = std.Io.Threaded.addressFromPosix(&address) } };
                 errdefer stream.close(io);
+                try ticket.adopt(stream.socket.handle);
                 if (builtin.os.tag != .linux) {
                     _ = try flags(stream.socket.handle, posix.F.SETFD, posix.FD_CLOEXEC);
                     const current = try flags(stream.socket.handle, posix.F.GETFL, 0);

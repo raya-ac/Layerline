@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const native_accept = @import("native_accept.zig");
+const descriptors = @import("descriptor_budget.zig");
 const posix = std.posix;
 
 const Identity = struct {
@@ -74,11 +75,14 @@ fn openParent(io: std.Io, canonical: []const u8) !std.Io.Dir {
 }
 
 fn stale(io: std.Io, path: []const u8) !bool {
+    var ticket = try descriptors.acquire(1);
+    defer ticket.deinit();
     const flags = posix.SOCK.STREAM | if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK else @as(u32, 0);
     const fd = posix.system.socket(posix.AF.UNIX, @intCast(flags), 0);
     if (posix.errno(fd) != .SUCCESS) return error.SocketProbeFailed;
     const stream = std.Io.net.Stream{ .socket = .{ .handle = @intCast(fd), .address = .{ .ip4 = .loopback(0) } } };
     defer stream.close(io);
+    try ticket.adopt(stream.socket.handle);
     if (builtin.os.tag == .macos) {
         if (posix.errno(posix.system.fcntl(stream.socket.handle, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC))) != .SUCCESS or
             posix.errno(posix.system.fcntl(stream.socket.handle, posix.F.SETFL, @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK")))) != .SUCCESS)
@@ -110,6 +114,8 @@ pub const Listener = struct {
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Listener {
         if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.OperationUnsupported;
+        const scope = descriptors.Scope.enter(.control);
+        defer scope.deinit();
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidAdminSocketPath;
         const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", allocator);
         defer allocator.free(canonical);

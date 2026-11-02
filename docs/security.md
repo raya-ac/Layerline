@@ -119,6 +119,35 @@ not isolation from root or another process running as the server UID; keep the
 runtime directory and its ancestors under trusted ownership. These Unix control
 ownership checks are currently supported on Linux and macOS, not Windows.
 
+## Descriptor admission
+
+On Linux and macOS, the process-owned I/O adapter reserves capacity before
+managed file, directory, network and pipe creation. Returned handles retain their
+reservation until close finishes. The registry drops ownership before the close
+syscall, then releases capacity afterward, so reuse of the same numeric handle
+cannot erase its next owner's entry. Paired-handle adoption is all-or-nothing.
+Native dialing, interrupt pipes, CGI setup and notification sockets use the same
+registry. Partial pipe setup releases its handles without forking a child.
+
+The restart-only `descriptor_limit` defaults to 4096 and is clamped against the
+startup soft nofile limit, inherited open handles and 32 handles of headroom.
+Serialized Unix admin commands, SIGHUP reloads and systemd notifications use a
+separate bounded control partition. Public web admin routes do not get that
+reservation. Two slots allow early connection rejection; plaintext can receive
+a minimal 503, while HTTPS closes before handshaking. Existing requests map
+local descriptor exhaustion to 503 before output, without retrying an upstream
+or marking it unhealthy. Control capacity is bounded too, not an availability
+guarantee against exhausted host-wide resources.
+
+`layerline_descriptor_owned_by_pool` counts registered live handles;
+`layerline_descriptor_reservations` also includes pending operations and private
+resolver/filesystem allowances. These are managed accounting, not a promise to
+track every libc/runtime handle, future plugin, or child process descriptor.
+Inherited handles stay baseline-only, and changing OS limits after startup does
+not refresh the snapshot. Keep OS ceilings in place. Low-RLIMIT plaintext/TLS
+tests cover H1/H2 saturation, HEAD framing, protected control/reload, failed CGI
+pipe setup, upstream-health isolation and repeated recovery.
+
 ## Files and memory
 
 Static assets, precompressed sidecars, custom error documents, and ACME tokens
@@ -359,6 +388,11 @@ and reap the direct child. Remaining members of the child's process group receiv
 SIGKILL; a SIGTERM-ignoring child cannot turn cleanup into an indefinite wait.
 The leader stays unreaped until group signaling is complete, avoiding PID reuse
 races. The shutdown registry uses the same ownership lock when signaling/reaping.
+
+Managed handles are close-on-exec, but operator-inherited non-close-on-exec
+handles above standard input/output/error are not yet sanitized in the fork
+child. Do not launch Layerline with sensitive inheritable handles. Child
+descriptor isolation remains a hardening gap; these controls are not a sandbox.
 
 Certificate commands use the positive `external_command_timeout_ms` setting,
 defaulting to 300000 ms. DNS/public-IP helpers use the lesser of that value and

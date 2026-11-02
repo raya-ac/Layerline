@@ -496,6 +496,23 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
     try heap.print(allocator, "# HELP layerline_overload_responses_total Minimal HTTP/1 overload responses completed.\n# TYPE layerline_overload_responses_total counter\nlayerline_overload_responses_total {d}\n", .{resource_budget.overload_responses.load(.acquire)});
     try heap.print(allocator, "# HELP layerline_supervisor_notification_failures_total Runtime supervisor notification send failures.\n# TYPE layerline_supervisor_notification_failures_total counter\nlayerline_supervisor_notification_failures_total {d}\n", .{systemd_notify.failures.load(.monotonic)});
     const pool = @import("runtime_io.zig").snapshot();
+    const descriptors = @import("descriptor_budget.zig");
+    const descriptor_state = descriptors.snapshot();
+    try heap.print(allocator, "# HELP layerline_descriptor_enabled Descriptor admission enabled on this platform.\n# TYPE layerline_descriptor_enabled gauge\nlayerline_descriptor_enabled {d}\n" ++
+        "# HELP layerline_descriptor_configured_limit Requested descriptor reservation limit.\n# TYPE layerline_descriptor_configured_limit gauge\nlayerline_descriptor_configured_limit {d}\n" ++
+        "# HELP layerline_descriptor_effective_limit Reservation limit after startup OS and inherited-handle clamping.\n# TYPE layerline_descriptor_effective_limit gauge\nlayerline_descriptor_effective_limit {d}\n" ++
+        "# HELP layerline_descriptor_kernel_limit Startup RLIMIT_NOFILE soft limit, not continuously refreshed.\n# TYPE layerline_descriptor_kernel_limit gauge\nlayerline_descriptor_kernel_limit {d}\n" ++
+        "# HELP layerline_descriptor_inherited Open handles observed before installing admission.\n# TYPE layerline_descriptor_inherited gauge\nlayerline_descriptor_inherited {d}\n" ++
+        "# HELP layerline_descriptor_owned Tracked returned/native descriptors, excluding private resolver/internal handles.\n# TYPE layerline_descriptor_owned gauge\nlayerline_descriptor_owned {d}\n", .{ @intFromBool(descriptor_state.enabled), descriptor_state.configured, descriptor_state.effective, descriptor_state.kernel_limit, descriptor_state.inherited, descriptor_state.owned });
+    try heap.appendSlice(allocator, "# HELP layerline_descriptor_reservations Managed reservations, including pending syscalls and private resolver/filesystem allowances.\n# TYPE layerline_descriptor_reservations gauge\n" ++
+        "# HELP layerline_descriptor_owned_by_pool Tracked returned/native handles per partition.\n# TYPE layerline_descriptor_owned_by_pool gauge\n" ++
+        "# HELP layerline_descriptor_limit Reservation capacity per partition.\n# TYPE layerline_descriptor_limit gauge\n" ++
+        "# HELP layerline_descriptor_peak Peak simultaneous reservations per partition.\n# TYPE layerline_descriptor_peak gauge\n" ++
+        "# HELP layerline_descriptor_rejections_total Rejected reservations or handle adoption attempts per partition.\n# TYPE layerline_descriptor_rejections_total counter\n");
+    inline for (std.meta.tags(descriptors.Class), 0..) |class, index| {
+        try heap.print(allocator, "layerline_descriptor_owned_by_pool{{pool=\"{s}\"}} {d}\n", .{ @tagName(class), descriptor_state.owned_by_class[index] });
+        try heap.print(allocator, "layerline_descriptor_reservations{{pool=\"{s}\"}} {d}\nlayerline_descriptor_limit{{pool=\"{s}\"}} {d}\nlayerline_descriptor_peak{{pool=\"{s}\"}} {d}\nlayerline_descriptor_rejections_total{{pool=\"{s}\"}} {d}\n", .{ @tagName(class), descriptor_state.used[index], @tagName(class), descriptor_state.limits[index], @tagName(class), descriptor_state.peak[index], @tagName(class), descriptor_state.rejected[index] });
+    }
     try heap.print(allocator, "# HELP layerline_io_threads Retained I/O pool threads.\n# TYPE layerline_io_threads gauge\nlayerline_io_threads {d}\n" ++
         "# HELP layerline_io_busy_threads Admitted I/O pool tasks.\n# TYPE layerline_io_busy_threads gauge\nlayerline_io_busy_threads {d}\n" ++
         "# HELP layerline_io_thread_limit Maximum I/O pool threads.\n# TYPE layerline_io_thread_limit gauge\nlayerline_io_thread_limit {d}\n" ++

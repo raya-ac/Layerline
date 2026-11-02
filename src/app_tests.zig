@@ -2,6 +2,7 @@ const std = @import("std");
 
 test {
     _ = @import("systemd_notify.zig");
+    _ = @import("descriptor_io.zig");
 }
 
 const acme_mod = @import("acme.zig");
@@ -99,6 +100,19 @@ test "I/O pool limits parse without silently accepting unsafe settings" {
     try std.testing.expectEqual(2097152, cfg.io_stack_size);
     try applyConfigLine(&cfg, std.testing.allocator, "io_thread_limit", "0");
     try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&cfg));
+}
+
+test "descriptor settings validate bounds and appear in activation diffs" {
+    var active = defaultServerConfig();
+    var candidate = active;
+    try applyConfigLine(&candidate, std.testing.allocator, "descriptor_limit", "64");
+    try config_mod.validateConfig(&candidate);
+    try std.testing.expectEqual(64, candidate.descriptor_limit);
+    const diff = try config_diff.render(std.testing.allocator, &active, &candidate);
+    defer std.testing.allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "global.descriptor_limit") != null);
+    candidate.descriptor_limit = 31;
+    try std.testing.expectError(error.InvalidConfigValue, config_mod.validateConfig(&candidate));
 }
 
 test "Cloudflare activation rejects unsafe credentials and zone path components" {

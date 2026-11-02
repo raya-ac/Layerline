@@ -456,7 +456,8 @@ pub fn buildHttp2FastcgiResponse(
     const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
     defer allocator.free(script_path);
 
-    const script = static_files.openRootScript(io, php_root, rel_path) catch {
+    const script = static_files.openRootScript(io, php_root, rel_path) catch |err| {
+        if (@import("descriptor_budget.zig").capacityError(err) or err == error.OutOfMemory) return err;
         return callbacks.h2_error_response(allocator, 404, "Not Found", "The requested resource was not found on this server.");
     };
     defer script.close(io);
@@ -529,7 +530,8 @@ pub fn handleScript(
     const script_path = try std.fs.path.join(allocator, &.{ php_root, rel_path });
     defer allocator.free(script_path);
 
-    const script = static_files.openRootScript(io, php_root, rel_path) catch {
+    const script = static_files.openRootScript(io, php_root, rel_path) catch |err| {
+        if (@import("descriptor_budget.zig").capacityError(err) or err == error.OutOfMemory) return err;
         try callbacks.send_not_found_for_method(allocator, stream, close_connection, is_head);
         return;
     };

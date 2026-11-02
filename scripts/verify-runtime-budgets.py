@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from wire_h2 import H2, frame
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "zig-out/bin/layerline"
@@ -94,48 +95,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
-
-
-def frame(kind, flags, stream, payload=b""):
-    return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
-
-
-class H2:
-    def __init__(self, port):
-        self.connection = socket.create_connection(("127.0.0.1", port), timeout=3)
-        self.connection.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0))
-
-    def request(self, stream, path):
-        def literal(name, value):
-            assert len(name) < 127 and len(value) < 127
-            return b"\0" + bytes([len(name)]) + name + bytes([len(value)]) + value
-        self.connection.sendall(frame(1, 5, stream, b"\x82\x86" + literal(b":authority", b"localhost") + literal(b":path", path)))
-
-    def exact(self, count):
-        result = b""
-        while len(result) < count:
-            part = self.connection.recv(count - len(result))
-            if not part:
-                raise EOFError("HTTP/2 transport ended under I/O pressure")
-            result += part
-        return result
-
-    def until(self, predicate):
-        until = time.monotonic() + 3
-        while True:
-            self.connection.settimeout(max(.01, until - time.monotonic()))
-            header = self.exact(9)
-            kind, flags, stream = header[3], header[4], int.from_bytes(header[5:], "big")
-            payload = self.exact(int.from_bytes(header[:3], "big"))
-            if kind == 4 and not flags & 1:
-                self.connection.sendall(frame(4, 1, 0))
-            assert kind != 7, ("unexpected GOAWAY", payload)
-            if predicate(kind, flags, stream, payload):
-                return
-            assert time.monotonic() < until
-
-    def close(self):
-        self.connection.close()
 
 
 def wire(folder):

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Deadline = @import("read_deadline.zig").Deadline;
+const descriptors = @import("descriptor_budget.zig");
 
 // Darwin cannot create CLOEXEC pipes atomically. Serialize their creation and
 // fork so another command cannot inherit an intermediate pipe endpoint.
@@ -97,7 +98,7 @@ pub const ExecFailure = enum(u8) {
 };
 
 fn close(handle: posix.fd_t) void {
-    _ = posix.system.close(handle);
+    descriptors.closeNative(handle);
 }
 
 fn systemFailure(cause: posix.E) anyerror {
@@ -121,6 +122,8 @@ fn control(handle: posix.fd_t, command: i32, value: usize) !usize {
 }
 
 fn pipe() ![2]posix.fd_t {
+    var ticket = try descriptors.acquire(2);
+    defer ticket.deinit();
     var ends: [2]posix.fd_t = undefined;
     while (true) {
         const result = if (builtin.os.tag == .linux) posix.system.pipe2(&ends, .{ .CLOEXEC = true }) else std.c.pipe(&ends);
@@ -130,10 +133,20 @@ fn pipe() ![2]posix.fd_t {
             else => |cause| return systemFailure(cause),
         }
     }
+    ticket.adoptAll(&ends) catch |err| {
+        for (ends) |fd| _ = posix.system.close(fd);
+        return err;
+    };
     errdefer for (ends) |fd| close(fd);
     for (&ends) |*fd| {
         if (fd.* < 3) {
+            var duplicate = try descriptors.acquire(1);
+            defer duplicate.deinit();
             const replacement: posix.fd_t = @intCast(try control(fd.*, posix.F.DUPFD_CLOEXEC, 3));
+            duplicate.adopt(replacement) catch |err| {
+                _ = posix.system.close(replacement);
+                return err;
+            };
             close(fd.*);
             fd.* = replacement;
         }
@@ -250,7 +263,9 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
         redirect(pipes[0][0], 0, error_fd);
         redirect(pipes[1][1], 1, error_fd);
         redirect(pipes[2][1], 2, error_fd);
-        for (pipes) |ends| for (ends) |fd| if (fd != error_fd) close(fd);
+        for (pipes) |ends| for (ends) |fd| if (fd != error_fd) {
+            _ = posix.system.close(fd);
+        };
         var failure: ExecFailure = .not_found;
         for (paths.items) |path| {
             while (true) switch (posix.errno(posix.system.execve(path.ptr, arguments.ptr, envp))) {

@@ -158,11 +158,29 @@ backend attempt or stream; it must not silently create more workers. Metrics
 report retained and busy I/O threads, configured limits, stacks and allocator use.
 Idle pool threads can remain allocated for reuse up to the configured ceiling.
 
+`descriptor_limit` defaults to 4096 managed reservations (range 32 to 1048576),
+also available as `--descriptor-limit`, and requires a restart. Linux/macOS clamp
+it to startup soft nofile minus inherited handles and 32 handles of headroom;
+insufficient room for the minimum fails startup. The control partition is one
+quarter of that effective limit capped at 32, plus two separate rejection slots.
+The remainder covers ordinary listeners, clients, upstreams, files, pipes and
+pending operations. H2 connections also retain interrupt pipes. Size this budget
+alongside connection counts, not as their synonym. Descriptor metrics report
+requested/effective/kernel/inherited values and per-pool ownership, reservations,
+peaks and rejections. Private resolver/filesystem allowances are charged without
+claiming to count every underlying OS handle. Runtime changes to the OS limit
+do not refresh the startup snapshot. Other platforms lack this adapter.
+
+`python3 scripts/verify-descriptor-budgets.py /absolute/path/to/layerline` runs
+isolated low-RLIMIT children, fills ordinary capacity, verifies protected Unix
+control and reload, then checks overload framing, partial CGI rollback and
+recovery on plaintext/TLS H1/H2. It does not pressure the production process.
+
 The heap cap is still not RSS or virtual-address-space accounting. Stack guards,
 TLS/runtime overhead, kernel buffers and child memory need the OS boundary above.
 Standalone/non-systemd deployments must provide equivalent OS limits themselves.
-Application-wide descriptor reservation/admission and stronger Darwin resolver
-cancellation guarantees remain separate work.
+Stronger Darwin resolver cancellation guarantees and sanitizing operator-inherited
+child descriptors remain separate work.
 
 `sudo python3 scripts/verify-runtime-budgets.py /absolute/path/to/layerline --systemd`
 checks the packaged limits against real cgroup/process files, then deliberately
