@@ -429,15 +429,107 @@ pub fn sendRst(stream: std.Io.net.Stream, stream_id: u32, code: u32, write_all: 
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, code, .big);
     try sendFrame(stream, h2_native.FRAME_RST_STREAM, 0, stream_id, &payload, write_all);
+    if (@import("http2_flow.zig").active) |flow| {
+        if (flow.record(stream_id)) |record| record.locally_reset = true;
+    }
+}
+
+pub fn drainClosing(io: std.Io, stream: std.Io.net.Stream) void {
+    drainClosingWith(io, stream, @import("socket_io.zig").read);
+}
+
+fn drainClosingWith(io: std.Io, stream: std.Io.net.Stream, comptime read: anytype) void {
+    // Closing with unread TCP data can erase the GOAWAY with a transport reset.
+    // Half-close first, then discard only a bounded amount of raw transport
+    // input. No TLS/application data is interpreted after this terminal error.
+    stream.shutdown(io, .send) catch return;
+    const deadline = @import("read_deadline.zig").Deadline.after(.now(io, .awake), 50);
+    var bytes: [1024]u8 = undefined;
+    var remaining: usize = 64 * 1024;
+    while (remaining != 0) {
+        _ = deadline.remaining(.now(io, .awake)) catch return;
+        const count = read(io, stream, bytes[0..@min(bytes.len, remaining)], @import("socket_io.zig").Options{ .timeout_ms = 50, .deadline = deadline }) catch return;
+        if (count == 0) return;
+        remaining -= count;
+    }
+}
+
+test "terminal drain has byte and absolute time bounds and never owns the final close" {
+    const Fake = struct {
+        var mode: u8 = 0;
+        var calls: usize = 0;
+        var total: usize = 0;
+        fn shutdown(_: ?*anyopaque, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+            std.debug.assert(handle == 123 and how == .send);
+        }
+        fn read(io: std.Io, _: std.Io.net.Stream, bytes: []u8, _: @import("socket_io.zig").Options) !usize {
+            calls += 1;
+            if (mode == 1) return error.Canceled;
+            if (mode == 2) try io.sleep(.fromMilliseconds(60), .awake);
+            total += bytes.len;
+            return bytes.len;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.netShutdown = Fake.shutdown;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = 123, .address = undefined } };
+    for (0..3) |mode| {
+        Fake.mode = @intCast(mode);
+        Fake.calls = 0;
+        Fake.total = 0;
+        drainClosingWith(io, stream, Fake.read);
+        try std.testing.expectEqual(if (mode == 0) @as(usize, 64) else 1, Fake.calls);
+        try std.testing.expectEqual(@as(usize, if (mode == 0) 65536 else if (mode == 1) 0 else 1024), Fake.total);
+    }
+}
+
+test "only completed stream resets mark the locally closed history" {
+    const flow_mod = @import("http2_flow.zig");
+    var flow: flow_mod.State = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer flow.deinit();
+    const previous = flow_mod.active;
+    flow_mod.active = &flow;
+    defer flow_mod.active = previous;
+    const Fake = struct {
+        var fail: bool = false;
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            if (fail) return error.InjectedWriteFailure;
+        }
+    };
+    try flow.noteStream(1);
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = 123, .address = undefined } };
+    Fake.fail = true;
+    try std.testing.expectError(error.CloseConnection, sendRst(stream, 1, 1, Fake.write));
+    try std.testing.expect(!flow.record(1).?.locally_reset);
+    Fake.fail = false;
+    try sendRst(stream, 1, 1, Fake.write);
+    try std.testing.expect(flow.record(1).?.locally_reset);
 }
 
 pub fn sendHeaderBlock(stream: std.Io.net.Stream, stream_id: u32, block: []const u8, end_stream: bool, write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+    var continuation = false;
+    if (@import("http2_flow.zig").active) |flow| {
+        if (flow.encoder_resize_pending) {
+            const flags: u8 = (if (end_stream) h2_native.FLAG_END_STREAM else @as(u8, 0)) |
+                (if (block.len == 0) h2_native.FLAG_END_HEADERS else @as(u8, 0));
+            try sendFrame(stream, h2_native.FRAME_HEADERS, flags, stream_id, "\x20", write_all);
+            flow.encoder_resize_pending = false;
+            continuation = true;
+            if (block.len == 0) return;
+        }
+    }
+    if (block.len == 0) {
+        try sendFrame(stream, h2_native.FRAME_HEADERS, h2_native.FLAG_END_HEADERS | (if (end_stream) h2_native.FLAG_END_STREAM else @as(u8, 0)), stream_id, "", write_all);
+        return;
+    }
     var offset: usize = 0;
     while (offset < block.len) {
         const end = @min(offset + 16384, block.len);
         const flags: u8 = (if (end == block.len) h2_native.FLAG_END_HEADERS else @as(u8, 0)) |
-            (if (offset == 0 and end_stream) h2_native.FLAG_END_STREAM else @as(u8, 0));
-        try sendFrame(stream, if (offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, block[offset..end], write_all);
+            (if (!continuation and offset == 0 and end_stream) h2_native.FLAG_END_STREAM else @as(u8, 0));
+        try sendFrame(stream, if (!continuation and offset == 0) h2_native.FRAME_HEADERS else 0x9, flags, stream_id, block[offset..end], write_all);
         offset = end;
     }
 }
@@ -449,6 +541,39 @@ pub fn sendSettings(stream: std.Io.net.Stream, max_streams: u32, header_bytes: u
     std.mem.writeInt(u16, payload[6..8], 6, .big);
     std.mem.writeInt(u32, payload[8..12], @intCast(@min(header_bytes, std.math.maxInt(u32))), .big);
     try sendFrame(stream, h2_native.FRAME_SETTINGS, 0, 0, &payload, write_all);
+}
+
+test "peer table reductions lead the next field block and preserve END_STREAM across continuation" {
+    const flow_mod = @import("http2_flow.zig");
+    var flow: flow_mod.State = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    defer flow.deinit();
+    const previous = flow_mod.active;
+    flow_mod.active = &flow;
+    defer flow_mod.active = previous;
+    const Fake = struct {
+        var output: std.ArrayList(u8) = .empty;
+        var fail = false;
+        fn write(_: std.Io.net.Stream, bytes: []const u8) !void {
+            if (fail) return error.InjectedWriteFailure;
+            try output.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    Fake.output = .empty;
+    defer Fake.output.deinit(std.testing.allocator);
+    try flow.settings("\x00\x01\x00\x00\x00\x08\x00\x01\x00\x00\x10\x00");
+    try std.testing.expectEqual(0, flow.encoder_table_limit);
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = 123, .address = undefined } };
+    Fake.fail = true;
+    try std.testing.expectError(error.CloseConnection, sendHeaderBlock(stream, 1, "\x88", true, Fake.write));
+    try std.testing.expect(flow.encoder_resize_pending);
+    Fake.fail = false;
+    try sendHeaderBlock(stream, 1, "\x88", true, Fake.write);
+    try std.testing.expect(!flow.encoder_resize_pending);
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x01\x01\x01\x00\x00\x00\x01\x20" ++
+        "\x00\x00\x01\x09\x04\x00\x00\x00\x01\x88", Fake.output.items);
+    Fake.output.clearRetainingCapacity();
+    try sendHeaderBlock(stream, 3, "", true, Fake.write);
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x00\x01\x05\x00\x00\x00\x03", Fake.output.items);
 }
 
 pub fn makeGoawayPayload(last_stream_id: u32, code: u32) [8]u8 {

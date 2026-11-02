@@ -811,6 +811,16 @@ python3 "$ROOT_DIR/scripts/verify-admin-http2.py" "$SERVER_BINARY"
 log "verifying HTTP/2 backend isolation and resource cleanup"
 python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
 
+log "verifying HTTP/2 stream lifecycle and error delivery"
+python3 "$ROOT_DIR/scripts/verify-h2-state.py" "$SERVER_BINARY"
+
+if [[ -n ${LAYERLINE_H2SPEC:-} ]]; then
+  log "verifying independent HTTP/2 conformance"
+  python3 "$ROOT_DIR/scripts/verify-h2-conformance.py" "$SERVER_BINARY" --h2spec "$LAYERLINE_H2SPEC" --strict
+else
+  log "independent h2spec gate skipped (LAYERLINE_H2SPEC is unset)"
+fi
+
 log "verifying absolute backend attempt deadlines and retry safety"
 python3 "$ROOT_DIR/scripts/verify-backend-deadlines.py" "$SERVER_BINARY"
 

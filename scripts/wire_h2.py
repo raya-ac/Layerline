@@ -50,18 +50,27 @@ class H2:
 
     def response(self, stream):
         headers, body = bytearray(), bytearray()
+        ended, pending = False, False
         def complete(kind, flags, number, payload):
+            nonlocal ended, pending
             if number != stream:
                 return False
             assert kind != 3, ("response reset", stream, payload)
             if kind in [1, 9]:
                 headers.extend(payload)
+                pending = not bool(flags & 4)
             if kind == 0:
                 body.extend(payload)
-            return kind in [0, 1] and flags & 1
+            if kind in [0, 1] and flags & 1:
+                ended = True
+            return ended and not pending
         self.until(complete)
         # These tests inspect the stock encoder's first :status field. Wider
         # interoperability tests must use an independent HPACK implementation.
+        # The server's stateless encoder can declare a zero dynamic table after
+        # peer SETTINGS reductions. That instruction is not a response field.
+        if headers.startswith(b"\x20"):
+            del headers[:1]
         if headers.startswith(b"\x88"):
             status = 200
         else:

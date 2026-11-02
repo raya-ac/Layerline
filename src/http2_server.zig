@@ -31,9 +31,12 @@ pub const Callbacks = struct {
     shutdown_requested: *std.atomic.Value(bool),
 };
 
-fn headerFragment(frame: h2_support.Frame) ![]u8 {
+const HeaderFragment = struct { bytes: []u8, self_dependency: bool = false };
+
+fn headerFragment(frame: h2_support.Frame) !HeaderFragment {
     var offset: usize = 0;
     var padding: usize = 0;
+    var self_dependency = false;
     if (frame.header.flags & h2_native.FLAG_PADDED != 0) {
         if (frame.payload.len == 0) return error.FrameSize;
         padding = frame.payload[0];
@@ -41,10 +44,11 @@ fn headerFragment(frame: h2_support.Frame) ![]u8 {
     }
     if (frame.header.flags & h2_native.FLAG_PRIORITY != 0) {
         if (frame.payload.len < offset + 5) return error.FrameSize;
+        self_dependency = std.mem.readInt(u32, frame.payload[offset..][0..4], .big) & 0x7fffffff == frame.header.stream_id;
         offset += 5;
     }
     if (frame.payload.len < offset + padding) return error.BadRequest;
-    return frame.payload[offset .. frame.payload.len - padding];
+    return .{ .bytes = frame.payload[offset .. frame.payload.len - padding], .self_dependency = self_dependency };
 }
 
 fn submitRequest(jobs: *dispatch.Dispatcher, stream: std.Io.net.Stream, flow: *flow_mod.State, id: u32, req: request_mod.HttpRequest, callbacks: Callbacks) !void {
@@ -68,23 +72,24 @@ fn handleHeadersFrame(
     jobs: *dispatch.Dispatcher,
     callbacks: Callbacks,
 ) !void {
-    const req = h2_support.parseRequest(allocator, decoded) catch {
-        const response = try callbacks.error_response(allocator, 400, "Bad Request", "Missing required HTTP/2 pseudo-headers.");
-        try callbacks.send_response(stream, allocator, frame.header.stream_id, response, false);
+    const req = h2_support.parseRequest(allocator, decoded) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+        flow.cancel(frame.header.stream_id);
         return;
     };
 
     const expected_content_length = h2_support.parseRequestContentLength(req.headers) catch {
-        const response = try callbacks.error_response(allocator, 400, "Bad Request", "Invalid HTTP/2 Content-Length header.");
-        try callbacks.send_response(stream, allocator, frame.header.stream_id, response, false);
+        try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+        flow.cancel(frame.header.stream_id);
         return;
     };
 
     if ((frame.header.flags & h2_native.FLAG_END_STREAM) != 0) {
         if (expected_content_length) |content_length| {
             if (content_length != 0) {
-                const response = try callbacks.error_response(allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-                try callbacks.send_response(stream, allocator, frame.header.stream_id, response, false);
+                try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+                flow.cancel(frame.header.stream_id);
                 return;
             }
         }
@@ -117,7 +122,7 @@ fn handleHeadersFrame(
 fn completeBody(
     _: std.Io,
     stream: std.Io.net.Stream,
-    scratch_allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     state_allocator: std.mem.Allocator,
     _: *ServerConfig,
     _: *const std.process.Environ.Map,
@@ -131,8 +136,8 @@ fn completeBody(
     defer h2_support.removeRequestState(states, state_allocator, state_index);
     if (state.expected_content_length) |length| {
         if (state.body.items.len != length) {
-            const response = try callbacks.error_response(scratch_allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-            try callbacks.send_response(stream, scratch_allocator, state.stream_id, response, false);
+            try h2_support.sendRst(stream, state.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+            flow.cancel(state.stream_id);
             return;
         }
     }
@@ -169,8 +174,13 @@ fn handleDataFrame(
     // stream was reset or the request is rejected below.
     try h2_support.sendWindowUpdate(stream, 0, frame.payload.len, callbacks.write_all);
     const state_index = h2_support.findRequestState(states, frame.header.stream_id) orelse {
+        if (flow.record(frame.header.stream_id)) |previous| {
+            if (previous.peer_reset) return error.StreamClosed;
+            if (previous.locally_reset) return;
+        }
         try h2_support.sendRst(stream, frame.header.stream_id, ERROR_STREAM_CLOSED, callbacks.write_all);
         flow.cancel(frame.header.stream_id);
+        jobs.cancel(frame.header.stream_id);
         return;
     };
     const state = &states.items[state_index];
@@ -188,8 +198,8 @@ fn handleDataFrame(
     if (state.expected_content_length) |content_length| {
         if (state.body.items.len + data.len > content_length) {
             h2_support.removeRequestState(states, state_allocator, state_index);
-            const response = try callbacks.error_response(scratch_allocator, 400, "Bad Request", "HTTP/2 Content-Length did not match the received request body.");
-            try callbacks.send_response(stream, scratch_allocator, frame.header.stream_id, response, false);
+            try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+            flow.cancel(frame.header.stream_id);
             return;
         }
     }
@@ -236,10 +246,12 @@ pub fn runFrameLoop(
             error.FrameSize => ERROR_FRAME_SIZE,
             error.ExcessiveLoad => 0xb,
             error.Compression => 9,
+            error.StreamClosed => ERROR_STREAM_CLOSED,
             error.OutOfMemory => 2,
             else => 1,
         };
-        h2_support.sendGoaway(stream, flow.last_stream_id, code, callbacks.write_all) catch {};
+        h2_support.sendGoaway(stream, flow.last_stream_id, code, callbacks.write_all) catch return err;
+        h2_support.drainClosing(io, stream);
         return err;
     };
 }
@@ -272,11 +284,12 @@ fn runFrames(
         for (body_states.items) |*state| state.deinit(allocator);
         body_states.deinit(allocator);
     }
-    var requests_seen: usize = 0;
+    var requests_seen: usize = @intFromBool(initial_request != null);
     var last_stream_id: u32 = initial_stream_id;
     var first_frame = true;
     var continuation_id: u32 = 0;
     var continuation_flags: u8 = 0;
+    var continuation_self_dependency = false;
     var continuation = std.ArrayList(u8).empty;
     defer continuation.deinit(allocator);
     var draining = false;
@@ -287,12 +300,13 @@ fn runFrames(
         try jobs.pump(stream, flow, callbacks.write_all);
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
         try flow.expire(stream, callbacks.write_all);
-        if (callbacks.shutdown_requested.load(.acquire)) {
-            if (!draining) {
-                try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
-                draining = true;
-            }
-            if (body_states.items.len == 0 and flow.streams.items.len == 0 and jobs.count() == 0) return;
+        if (callbacks.shutdown_requested.load(.acquire) and !draining) {
+            try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+            draining = true;
+        }
+        if (draining and body_states.items.len == 0 and flow.streams.items.len == 0 and jobs.count() == 0) {
+            h2_support.drainClosing(io, stream);
+            return;
         }
 
         _ = arena.reset(.retain_capacity);
@@ -318,6 +332,7 @@ fn runFrames(
                     (continuation_id != 0 and continuation_deadline.expired(now)))
                 {
                     try h2_support.sendGoaway(stream, flow.last_stream_id, if (reader.frame_started == null and continuation_id == 0 and !first_frame) 0 else 0xb, callbacks.write_all);
+                    h2_support.drainClosing(io, stream);
                     return;
                 }
                 // A stream body/response budget expired. Reset it on the next
@@ -331,6 +346,7 @@ fn runFrames(
             (continuation_id != 0 and continuation_deadline.expired(now)))
         {
             try h2_support.sendGoaway(stream, flow.last_stream_id, 0xb, callbacks.write_all);
+            h2_support.drainClosing(io, stream);
             return;
         }
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
@@ -341,6 +357,7 @@ fn runFrames(
             first_frame = false;
             if (frame.header.frame_type != h2_native.FRAME_SETTINGS or frame.header.flags & h2_native.FLAG_ACK != 0) return error.BadRequest;
         }
+        var self_dependency = false;
         if (continuation_id != 0) {
             if (frame.header.frame_type != 0x9 or frame.header.stream_id != continuation_id) return error.BadRequest;
             if (frame.payload.len > cfg.max_request_bytes - continuation.items.len) return error.BadRequest;
@@ -348,6 +365,7 @@ fn runFrames(
             if (frame.header.flags & h2_native.FLAG_END_HEADERS == 0) continue;
             frame.header = .{ .length = continuation.items.len, .frame_type = h2_native.FRAME_HEADERS, .flags = continuation_flags | h2_native.FLAG_END_HEADERS, .stream_id = continuation_id };
             frame.payload = continuation.items;
+            self_dependency = continuation_self_dependency;
             continuation_id = 0;
         } else if (frame.header.frame_type == 0x9) return error.BadRequest;
 
@@ -369,13 +387,16 @@ fn runFrames(
             },
             h2_native.FRAME_HEADERS => headers: {
                 if (frame.header.stream_id == 0 or frame.header.stream_id % 2 == 0) return error.BadRequest;
-                const fragment = try headerFragment(frame);
+                const parsed = try headerFragment(frame);
+                const fragment = parsed.bytes;
+                self_dependency = self_dependency or parsed.self_dependency;
                 if (frame.header.flags & h2_native.FLAG_END_HEADERS == 0) {
                     continuation.clearRetainingCapacity();
                     if (fragment.len > cfg.max_request_bytes) return error.BadRequest;
                     try continuation.appendSlice(allocator, fragment);
                     continuation_id = frame.header.stream_id;
                     continuation_flags = frame.header.flags & h2_native.FLAG_END_STREAM;
+                    continuation_self_dependency = self_dependency;
                     continuation_deadline = .after(reader.completed_started, cfg.read_header_timeout_ms);
                     continue;
                 }
@@ -389,6 +410,37 @@ fn runFrames(
                     else => return error.Compression,
                 };
                 defer decoded.deinit(req_alloc);
+
+                const opening = frame.header.stream_id > last_stream_id;
+                if (opening) {
+                    last_stream_id = frame.header.stream_id;
+                    if (draining or callbacks.shutdown_requested.load(.acquire) or
+                        (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection))
+                    {
+                        try h2_support.sendRst(stream, frame.header.stream_id, ERROR_REFUSED_STREAM, callbacks.write_all);
+                        break :headers;
+                    }
+                    // Count refused/malformed attempts too, so their history
+                    // cannot grow beyond the configured connection request cap.
+                    requests_seen += 1;
+                    try flow.noteStream(frame.header.stream_id);
+                }
+                if (!opening) {
+                    if (flow.record(frame.header.stream_id)) |previous| {
+                        if (previous.peer_reset) return error.StreamClosed;
+                        if (previous.locally_reset) break :headers;
+                    }
+                }
+
+                // Even a rejected priority prefix can carry HPACK updates. Keep
+                // decoding above the reset, including across CONTINUATION.
+                if (self_dependency) {
+                    try h2_support.sendRst(stream, frame.header.stream_id, ERROR_PROTOCOL, callbacks.write_all);
+                    flow.cancel(frame.header.stream_id);
+                    jobs.cancel(frame.header.stream_id);
+                    if (h2_support.findRequestState(&body_states, frame.header.stream_id)) |i| h2_support.removeRequestState(&body_states, allocator, i);
+                    break :headers;
+                }
 
                 if (h2_support.findRequestState(&body_states, frame.header.stream_id)) |i| {
                     const valid = frame.header.flags & h2_native.FLAG_END_STREAM != 0 and
@@ -405,16 +457,16 @@ fn runFrames(
                     }
                     break :headers;
                 }
-                if (frame.header.stream_id <= last_stream_id) {
+                if (!opening) {
+                    const previous = flow.record(frame.header.stream_id) orelse {
+                        if (draining or (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection)) break :headers;
+                        return error.BadRequest;
+                    };
+                    if (previous.locally_reset) break :headers;
+                    if (flow.find(frame.header.stream_id) == null) return error.StreamClosed;
                     try h2_support.sendRst(stream, frame.header.stream_id, ERROR_STREAM_CLOSED, callbacks.write_all);
                     flow.cancel(frame.header.stream_id);
-                    break :headers;
-                }
-                last_stream_id = frame.header.stream_id;
-                if (draining or callbacks.shutdown_requested.load(.acquire) or
-                    (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection))
-                {
-                    try h2_support.sendRst(stream, frame.header.stream_id, ERROR_REFUSED_STREAM, callbacks.write_all);
+                    jobs.cancel(frame.header.stream_id);
                     break :headers;
                 }
                 flow.open(frame.header.stream_id) catch |err| {
@@ -422,7 +474,6 @@ fn runFrames(
                     try h2_support.sendRst(stream, frame.header.stream_id, ERROR_REFUSED_STREAM, callbacks.write_all);
                     break :headers;
                 };
-                requests_seen += 1;
                 if (!h2_support.headerListFits(decoded.headers.items, cfg.max_request_bytes)) {
                     const response = try callbacks.error_response(req_alloc, 431, "Request Header Fields Too Large", "Decoded HTTP/2 headers exceed the configured limit.");
                     try callbacks.send_response(stream, req_alloc, frame.header.stream_id, response, false);
@@ -432,17 +483,29 @@ fn runFrames(
             },
             h2_native.FRAME_DATA => {
                 if (frame.header.stream_id == 0 or frame.header.stream_id % 2 == 0 or frame.header.stream_id > last_stream_id) return error.BadRequest;
+                if (flow.record(frame.header.stream_id) == null and
+                    (draining or (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection)))
+                {
+                    try h2_support.sendWindowUpdate(stream, 0, frame.payload.len, callbacks.write_all);
+                    continue;
+                }
                 try handleDataFrame(io, stream, req_alloc, allocator, cfg, process_env, &body_states, frame, flow, &jobs, callbacks);
             },
             h2_native.FRAME_GOAWAY => {
                 if (frame.header.stream_id != 0) return error.BadRequest;
                 if (frame.payload.len < 8) return error.FrameSize;
-                return;
+                if (std.mem.readInt(u32, frame.payload[4..8], .big) != ERROR_NO_ERROR) return;
+                if (!draining) try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+                draining = true;
             },
-            h2_native.FRAME_WINDOW_UPDATE => {
+            h2_native.FRAME_WINDOW_UPDATE => update: {
                 if (frame.payload.len != 4) return error.FrameSize;
                 if (frame.header.stream_id > last_stream_id) return error.BadRequest;
                 const increment = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7fffffff;
+                if (flow.record(frame.header.stream_id)) |previous| {
+                    if (previous.locally_reset) break :update;
+                    if (previous.peer_reset and increment == 0) return error.BadRequest;
+                }
                 flow.update(frame.header.stream_id, increment) catch |err| {
                     if (frame.header.stream_id == 0) return err;
                     try h2_support.sendRst(stream, frame.header.stream_id, if (err == error.FlowControl) 3 else 1, callbacks.write_all);
@@ -453,15 +516,19 @@ fn runFrames(
             h2_native.FRAME_RST_STREAM => {
                 if (frame.payload.len != 4) return error.FrameSize;
                 if (frame.header.stream_id == 0 or frame.header.stream_id > last_stream_id) return error.BadRequest;
+                if (flow.record(frame.header.stream_id)) |previous| previous.peer_reset = true;
                 flow.cancel(frame.header.stream_id);
                 jobs.cancel(frame.header.stream_id);
                 if (h2_support.findRequestState(&body_states, frame.header.stream_id)) |i| h2_support.removeRequestState(&body_states, allocator, i);
             },
             0x2 => {
                 if (frame.header.stream_id == 0) return error.BadRequest;
-                if (frame.payload.len != 5) {
-                    try h2_support.sendRst(stream, frame.header.stream_id, ERROR_FRAME_SIZE, callbacks.write_all);
+                if (frame.payload.len != 5 or (std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7fffffff == frame.header.stream_id)) {
+                    const previous = flow.record(frame.header.stream_id);
+                    if (previous == null or previous.?.peer_reset) return if (frame.payload.len != 5) error.FrameSize else error.BadRequest;
+                    try h2_support.sendRst(stream, frame.header.stream_id, if (frame.payload.len != 5) ERROR_FRAME_SIZE else ERROR_PROTOCOL, callbacks.write_all);
                     flow.cancel(frame.header.stream_id);
+                    jobs.cancel(frame.header.stream_id);
                     if (h2_support.findRequestState(&body_states, frame.header.stream_id)) |i| h2_support.removeRequestState(&body_states, allocator, i);
                 }
             },
@@ -472,6 +539,7 @@ fn runFrames(
 
         if (cfg.max_requests_per_connection > 0 and requests_seen >= cfg.max_requests_per_connection and body_states.items.len == 0 and flow.streams.items.len == 0) {
             try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
+            h2_support.drainClosing(io, stream);
             return;
         }
     }

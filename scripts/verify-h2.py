@@ -122,6 +122,27 @@ with Client() as client:
     assert any(k == 0 and f & 1 and p == b"ok\n" for k, f, _, p in frames)
 
 for split in [False, True]:
+    with Client(window=65535) as client:
+        insertion = b"\x40" + literal(b"x-priority-state", b"kept")[1:]
+        block = headers(b"/health") + insertion
+        priority = (0x80000001).to_bytes(4, "big") + b"\0"
+        if split:
+            client.send(1, 1 | 32, 1, priority + block[:7])
+            client.send(9, 4, 1, block[7:])
+        else:
+            client.send(1, 5 | 32, 1, priority + block)
+        client.send(1, 5, 3, headers(b"/health") + b"\xbe")
+        frames = client.barrier(lambda items: any(k == 0 and s == 3 and f & 1 for k, f, s, _ in items))
+        assert (3, 0, 1, (1).to_bytes(4, "big")) in frames, "self-dependent priority did not reset its stream"
+        assert not any(k in [0, 1] and s == 1 for k, _, s, _ in frames), "self-dependent request was routed"
+        # Frames already queued by a peer before our reset still update HPACK,
+        # but must not resurrect the stream or kill another valid request.
+        client.send(1, 5, 1, headers(b"/health") + b"\x40" + literal(b"x-after-reset", b"kept")[1:])
+        client.send(1, 5, 5, headers(b"/health") + b"\xbe")
+        frames = client.barrier(lambda items: any(k == 0 and s == 5 and f & 1 for k, f, s, _ in items))
+        assert not any(s == 1 for _, _, s, _ in frames), "locally reset stream was not minimally processed"
+
+for split in [False, True]:
     with Client() as client:
         # Hold every response at a zero stream window to reach the stream cap.
         for stream in range(1, 257, 2):
@@ -171,12 +192,20 @@ for name, value, flags in [(b":path", b"/health", 5), (b"content-length", b"0", 
         assert not any(k in (0, 1) and s == 1 for k, _, s, _ in frames), "invalid request was routed"
         assert any(k == 0 and s == 3 and f & 1 for k, f, s, _ in frames), "invalid trailers killed an unrelated stream"
 
+# Both overflowing updates may already be in TCP's receive queue when the
+# first is rejected. The terminal GOAWAY must survive closing that socket.
+for _ in range(64):
+    with Client(window=65535) as client:
+        client.window(0, 0x7fffffff)
+        client.window(0, 0x7fffffff)
+        assert client.goaway() == 3, "connection overflow lost its FLOW_CONTROL_ERROR GOAWAY"
+
 with Client(window=65535) as client:
     client.send(1, 4, 1, headers(b"/api/echo", b"POST") + literal(b"content-length", b"6"))
     client.send(0, 0, 1, b"hello")
     client.send(1, 5, 1, b"")
     frames = client.barrier()
-    assert not any(k == 1 and s == 1 and p.startswith(b"\x88") for k, _, s, p in frames), "trailers bypassed Content-Length"
+    assert (3, 0, 1, (1).to_bytes(4, "big")) in frames, "trailer completion did not reset a Content-Length mismatch"
 
 with Client(window=65535) as client:
     # Repeating a small dynamic index must not bypass the decoded byte budget.

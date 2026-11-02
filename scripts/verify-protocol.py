@@ -50,8 +50,8 @@ def http2(extra, path=b"/health"):
             head = exact(conn, 9)
             payload = exact(conn, int.from_bytes(head[:3], "big"))
             stream = int.from_bytes(head[5:], "big")
-            if head[3] == 1 and stream == 1:
-                return payload
+            if head[3] in [1, 3] and stream == 1:
+                return head[3], payload
         raise AssertionError("HTTP/2 response missing")
 
 
@@ -71,7 +71,8 @@ for request in bad_requests:
 status, _, body = http1(b"GET http://custom404.test/ HTTP/1.1\r\nHost: wrong.test\r\nConnection: close\r\n\r\n")
 assert status == 200 and b"custom domain root" in body, "absolute authority must select the virtual host"
 
-assert http2([]).startswith(b"\x88"), "valid HTTP/2 request must still return 200"
+kind, block = http2([])
+assert kind == 1 and block.startswith(b"\x88"), "valid HTTP/2 request must still return 200"
 for extra in [
     [(b"x-test", b"ok\r\nContent-Length: 99")],
     [(b"connection", b"keep-alive")],
@@ -79,7 +80,7 @@ for extra in [
     [(b":path", b"/other")],
     [(b"host", b"other.test")],
 ]:
-    assert http2(extra).startswith(b"\x8c"), ("HTTP/2 invalid fields were accepted", extra)
+    assert http2(extra) == (3, (1).to_bytes(4, "big")), ("HTTP/2 invalid fields were not reset with PROTOCOL_ERROR", extra)
 
 print("ok: wire-level HTTP/1 framing, authority routing, and HTTP/2 header validation")
 
@@ -111,8 +112,8 @@ thread.start()
 try:
     for path in ["/public", "/private", "/no-cache", "/short"]:
         for _ in range(2):
-            response = http2([], ("/verify-cache" + path).encode())
-            assert response.startswith(b"\x88"), (path, response)
+            kind, response = http2([], ("/verify-cache" + path).encode())
+            assert kind == 1 and response.startswith(b"\x88"), (path, kind, response)
         assert counts[path] == (1 if path == "/public" else 2), (path, counts[path])
     http2([(b"cache-control", b"no-cache")], b"/verify-cache/public")
     assert counts["/public"] == 2, "request no-cache must reach the origin"

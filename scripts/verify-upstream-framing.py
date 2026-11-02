@@ -356,7 +356,8 @@ route_proxy.app = http://127.0.0.1:{origin.server_port}
                     for index, value in enumerate([b" value", b"value ", b"\tvalue", b"value\t"], 40):
                         stream = index * 2 + 1
                         connection.request(stream, "/app/never", extra=[(b"x-test", value)])
-                        assert connection.reply(stream)[0] == [400], (value, connection.blocks[stream])
+                        connection.until(lambda: (3, 0, stream, (1).to_bytes(4, "big")) in connection.frames)
+                        assert not connection.blocks[stream], ("malformed fields were routed instead of reset", value)
                     connection.request(99, "/health", end=False)
                     connection.conn.sendall(frame(1, 5, 99, literal(b"digest", b" bad")))
                     connection.until(lambda: any(k == 3 and s == 99 for k, _, s, _ in connection.frames))

@@ -9,8 +9,8 @@ admin bootstrap/session/origin controls, static handle containment, PHP alias
 diagnostic gating, cache metadata accounting, and config reader-lease reclamation
 are implemented. Native PHP2Shell input controls and exposed-version update
 notices are covered by [the security policy and tests](security.md). Remaining
-work includes wider HTTP/2 conformance and request-trailer forwarding, process-wide
-resource budgets, and full HTTP/3 interoperability.
+work includes wider HTTP/2 conformance and request-trailer forwarding, portable
+OS resource limits and command sandboxing, and full HTTP/3 interoperability.
 
 Reloads reclaim retired arenas and HTTP idle pools after their last reader exits;
 the 32-generation ceiling now bounds simultaneous readers/cleanup rather than
@@ -23,6 +23,17 @@ them into request headers, keeps HPACK synchronized on refused streams, bounds
 decoded header bytes, advertises actual stream/header limits, restores connection
 credit for discarded DATA, and reports frame-size errors with the correct code.
 Raw wire tests cover these paths; this is not a claim of full HTTP/2 conformance.
+
+Independent h2spec coverage now has a pinned, isolated loopback harness with raw
+JUnit and binary hashes, plus native plain/TLS stream-state tests. Protocol errors
+reset malformed requests; bounded connection history distinguishes skipped,
+half-closed and reset streams without losing HPACK state. New refused/malformed
+stream attempts also consume the configured request cap. Terminal GOAWAY delivery
+uses a bounded transport half-close/drain. The legacy cleartext invalid-preface
+test has an explicit shared-listener qualification, cross-checked against an
+HTTP/1 400 and the passing TLS case; raw failures remain visible. This is an
+external RFC 7540/7541 corpus gate, not full RFC 9113/HTTP/2 feature acceptance.
+Peer graceful GOAWAY also drains existing requests instead of abandoning them.
 
 Both proxy paths now use bounded message framing rather than treating EOF as the
 only response boundary. HTTP/2 checks edge whitespace and preserves HEAD/304
@@ -67,8 +78,9 @@ this completion field is not yet emitted by every response handler/protocol.
 HTTP/2 backend routing now uses bounded concurrent tasks (eight per connection,
 64 process-wide), while frame parsing, HPACK, TLS output, and flow control stay on
 the connection thread. A blocked backend no longer stalls PINGs or independent
-stream deadlines. Shared HTTP/2 allocator requests have a 256 MiB cap; this does
-not cover TLS, caches, stacks, kernel memory, or other protocols. Plain/TLS wire
+stream deadlines. Shared HTTP/2 allocator requests have a 256 MiB sublimit inside
+the application heap budget described below; this is not RSS or kernel-memory
+accounting. Plain/TLS wire
 tests cover admission, idle rearming, resets, and joined disconnect cleanup.
 Proxy/FastCGI attempts and health probes now use absolute backend budgets across
 dialing, writes, and reads. Automatic proxy retries exclude non-idempotent
@@ -107,8 +119,8 @@ code or cover uninterruptible kernel operations. Listener startup now prepares e
 configured endpoint before accepting traffic, propagates fatal listener failures
 through joined shutdown, and protects Unix control socket ownership with a lock,
 kernel peer credentials and crash-recovery checks. Tests cover occupied ports,
-path collisions, malformed datagrams, restart and cross-UID access. Full process
-resource budgets and wider HTTP/2 frame/stream conformance remain open.
+path collisions, malformed datagrams, restart and cross-UID access. Portable OS
+resource limits and wider HTTP/2 frame/stream conformance remain open.
 The explicit application heap is now shared across protocols, TLS, caches,
 configurations, logging and background tasks, with a restart-only configurable
 page-accounted limit and protected Unix-control/emergency-response capacity.

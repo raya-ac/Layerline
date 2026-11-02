@@ -357,6 +357,49 @@ and allocation failure release upstream attempt leases without retrying or
 ejecting a healthy target. This is not a fully evented socket scheduler:
 downstream writes can still occupy the connection thread until their deadline.
 
+## HTTP/2 protocol errors
+
+Malformed fields, missing/duplicated pseudo-headers and mismatched Content-Length
+reset the request with `PROTOCOL_ERROR`, rather than only sending an HTTP 400.
+Allocation failure remains a local resource error. Rejected priority prefixes
+still decode their full HPACK block, including CONTINUATION, before resetting.
+Layerline validates self-dependencies for legacy compatibility without retaining
+a priority dependency tree or claiming weighted priority scheduling.
+Peer header-table reductions are signaled at the start of the next outgoing
+field block, including informational replies and trailers. The current stateless
+encoder chooses an empty dynamic table after a reduction; outgoing dynamic-table
+compression remains performance work, not an implemented capability. Continuation
+framing preserves the original END_STREAM while carrying the size update.
+
+Connection-owned, heap-accounted stream history distinguishes skipped IDs,
+remote half-close, completed streams, and resets sent or received. New malformed
+and refused stream attempts count toward `max_requests_per_connection`; history
+does not accumulate past that cap. Queued frames after a local reset are minimally
+processed without reviving routing or losing HPACK/connection credit. A peer reset
+does not trigger more per-stream replies. Terminal connection errors half-close
+the transport after GOAWAY and discard at most 64 KiB for at most 50 ms, preventing
+ordinary queued input from turning the close into a TCP reset that hides GOAWAY.
+This is bounded best-effort shutdown, not guaranteed delivery against a flooding
+peer or an uninterruptible kernel operation.
+An incoming `GOAWAY(NO_ERROR)` stops new admission while existing uploads and
+responses finish; a nonzero peer error still terminates the connection.
+
+`scripts/verify-h2-state.py` exercises these paths over plain/TLS, including repeated
+connection-window overflow. The optional independent gate is
+`python3 scripts/verify-h2-conformance.py /absolute/path/to/layerline --h2spec /absolute/path/to/h2spec --strict`.
+It pins h2spec 2.6.0 at `af83a65f0b6273ef38bf778d400d98892e7653d8` and saves raw
+JUnit/logs plus artifact hashes. Set `LAYERLINE_H2SPEC` to run it inside the full
+verifier. The tester is a development tool, not a server dependency.
+
+The legacy [h2spec corpus](https://github.com/summerwind/h2spec) covers RFC 7540/7541,
+not every requirement of [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html).
+Its cleartext invalid-preface case sends non-H2 text to the shared HTTP/1+H2 port
+and mistakes the HTTP/1 400 response for an incomplete H2 frame. That raw failure
+is retained and can be qualified only if it is the sole failure, the explicit
+HTTP/1 rejection probe returns 400, and the same invalid-preface test passes on
+the ALPN-selected TLS connection. TLS-only runs require every selected case to
+pass. A qualified cleartext run must not be described as 147 raw test passes.
+
 ## Backend deadlines
 
 `upstream_timeout_ms` and its domain/route overrides now bound a complete proxy

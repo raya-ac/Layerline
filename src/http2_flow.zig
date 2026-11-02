@@ -22,12 +22,35 @@ pub const State = struct {
     io: std.Io,
     write_timeout_ms: u32 = 30000,
     streams: std.ArrayList(Pending) = .empty,
+    history: std.ArrayList(StreamRecord) = .empty,
     connection_window: i64 = 65535,
     initial_window: i64 = 65535,
+    encoder_table_limit: u32 = 4096,
+    encoder_resize_pending: bool = false,
     queued_bytes: usize = 0,
     last_stream_id: u32 = 0,
     pub const max_streams = 128;
     pub const max_queued_bytes = 64 * 1024 * 1024;
+
+    pub const StreamRecord = struct { id: u32, locally_reset: bool = false, peer_reset: bool = false };
+
+    pub fn record(self: *State, id: u32) ?*StreamRecord {
+        var low: usize = 0;
+        var high = self.history.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const item = &self.history.items[middle];
+            if (item.id == id) return item;
+            if (item.id < id) low = middle + 1 else high = middle;
+        }
+        return null;
+    }
+
+    pub fn noteStream(self: *State, id: u32) !void {
+        if (self.record(id) != null) return;
+        if (self.history.items.len != 0 and self.history.items[self.history.items.len - 1].id > id) return error.BadRequest;
+        try self.history.append(self.allocator, .{ .id = id });
+    }
 
     pub fn deinit(self: *State) void {
         for (self.streams.items) |item| {
@@ -35,6 +58,7 @@ pub const State = struct {
             if (item.trailers) |trailers| self.allocator.free(trailers);
         }
         self.streams.deinit(self.allocator);
+        self.history.deinit(self.allocator);
     }
 
     pub fn find(self: *State, id: u32) ?usize {
@@ -45,6 +69,7 @@ pub const State = struct {
     pub fn open(self: *State, id: u32) !void {
         if (self.find(id) != null) return error.BadRequest;
         if (self.streams.items.len >= max_streams) return error.StreamLimit;
+        try self.noteStream(id);
         try self.streams.append(self.allocator, .{ .id = id, .window = self.initial_window });
         self.last_stream_id = @max(self.last_stream_id, id);
     }
@@ -69,6 +94,13 @@ pub const State = struct {
             const id = std.mem.readInt(u16, payload[offset..][0..2], .big);
             const value = std.mem.readInt(u32, payload[offset + 2 ..][0..4], .big);
             switch (id) {
+                1 => if (value < self.encoder_table_limit) {
+                    // Outgoing fields currently use only static indices and
+                    // literals. Choosing zero respects every intervening peer
+                    // reduction, without pretending to own a dynamic encoder.
+                    self.encoder_table_limit = 0;
+                    self.encoder_resize_pending = true;
+                },
                 2 => if (value > 1) {
                     return error.BadRequest;
                 },
@@ -190,6 +222,27 @@ pub const State = struct {
         }
     }
 };
+
+test "stream history preserves skipped IDs and releases storage at every allocation failure" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var state: State = .{ .io = std.testing.io, .allocator = allocator };
+            defer state.deinit();
+            try state.noteStream(1);
+            try state.open(1);
+            state.cancel(1);
+            try state.open(5);
+            try std.testing.expect(state.record(1) != null);
+            try std.testing.expect(state.record(3) == null);
+            try std.testing.expectError(error.BadRequest, state.noteStream(3));
+            try std.testing.expect(!state.record(5).?.locally_reset);
+            state.record(1).?.locally_reset = true;
+            try std.testing.expect(state.record(1).?.locally_reset);
+            try std.testing.expectEqual(2, state.history.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
 
 test "settings preserve consumed credit and reject overflow" {
     var state = State{ .allocator = std.testing.allocator, .io = std.testing.io };
