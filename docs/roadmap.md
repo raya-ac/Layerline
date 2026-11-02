@@ -127,7 +127,12 @@ socket/pipe paths, with OS-clamped restart-only limits, protected Unix control,
 bounded early rejection and per-pool metrics. Low-RLIMIT plaintext/TLS tests
 exercise H1/H2 overload, control/reload, partial CGI rollback and recovery.
 Private resolver/filesystem allowances and inherited handles are not exact OS
-handle accounting. Sanitizing operator-inherited child descriptors, Darwin
+handle accounting. Child execs now use a descriptor allowlist: Linux closes all
+but standard I/O and its temporary status pipe with `close_range` or a fail-closed
+raw `/proc` fallback; macOS uses native `CLOEXEC_DEFAULT` spawn actions. Tests
+exercise inherited high handles above soft nofile, CGI/certificate helpers,
+concurrent HTTP/2 churn and forced Linux fallback. Parent handles stay intact;
+child credentials/environment/filesystem access are not sandboxed. Darwin
 resolver cancellation and wider protocol conformance remain open.
 Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
 the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.

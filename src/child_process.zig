@@ -143,7 +143,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, options: Options) !std.proc
     defer cleanup(io, &child);
     var exec_status: ?std.Io.File = started.exec_status;
     defer close(io, &exec_status);
-    try nonblocking(exec_status.?);
+    if (exec_status) |file| try nonblocking(file);
     if (child.stdin) |file| try nonblocking(file);
     if (options.input.len == 0) close(io, &child.stdin);
     try nonblocking(child.stdout.?);

@@ -378,21 +378,42 @@ Timeouts return 504, output/exec failures return 502, and local process/descript
 or allocation exhaustion returns 503 before response output.
 
 CGI, certificate, and DNS helper commands share a 64-child process-wide admission
-limit, held through cleanup. Layerline owns each PID immediately after fork,
-including failed execs, rather than relying on the standard spawn error path.
-Only prebuilt arguments/environment and async-signal-safe syscalls run in the
-fork child. A close-on-exec status pipe reports launch failure to the parent.
-Launch serialization prevents another command from inheriting a partially
-configured Darwin pipe. Normal completion and failure close all parent endpoints
+limit, held through cleanup. Linux takes PID ownership immediately after fork,
+including failed execs; macOS publishes each successful native spawn under the
+same launch/cleanup lock. Darwin reports spawn failures synchronously and reaps
+them internally. Only prebuilt arguments/environment, fixed stack storage and
+raw syscalls run in the Linux fork child; no allocator, registry locks, I/O runtime
+or logging. A close-on-exec status pipe reports Linux launch failure to the parent.
+Normal completion and failure close all parent endpoints
 and reap the direct child. Remaining members of the child's process group receive
 SIGKILL; a SIGTERM-ignoring child cannot turn cleanup into an indefinite wait.
 The leader stays unreaped until group signaling is complete, avoiding PID reuse
 races. The shutdown registry uses the same ownership lock when signaling/reaping.
 
-Managed handles are close-on-exec, but operator-inherited non-close-on-exec
-handles above standard input/output/error are not yet sanitized in the fork
-child. Do not launch Layerline with sensitive inheritable handles. Child
-descriptor isolation remains a hardening gap; these controls are not a sandbox.
+Child execs inherit only their owned standard-input/output/error pipes. Linux
+closes every other child descriptor except its temporary exec-status pipe, using
+two zero-flag `close_range` calls. This fast path requires Linux 5.9 or later.
+If unavailable or blocked, it enumerates the child's own trusted `/proc/self/fd`
+with raw `openat`/`getdents64`/`close` and a fixed 4 KiB buffer. If neither path
+works, launch fails as `ChildSetupFailed` without executing the program. There is
+no parent-side snapshot race or soft-nofile-bound close loop: inherited high
+handles are removed even after the soft limit has been lowered.
+
+macOS uses `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; only the three explicit
+`dup2` targets survive. Unrelated operator handles and handles created concurrently
+by server threads cannot leak through a create-then-CLOEXEC window. Neither path
+closes or changes the parent's inherited handles. Wire tests first prove their
+probe detects inheritable file/directory/socket/pipe/high-numbered handles, then
+check CGI, certificate helpers, standard I/O, groups and concurrent H2 churn. A
+self-only seccomp filter forces the Linux fallback during acceptance.
+See the [Linux interface](https://man7.org/linux/man-pages/man2/close_range.2.html)
+and [Darwin kernel allowlist](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exec.c).
+
+This is descriptor isolation, not a sandbox: commands still have their configured
+environment, credentials, filesystem/network permissions and the ability to open
+new handles or escape a process group. Keep scripts and commands trusted and use
+least-privilege OS isolation. Blocking kernel/filesystem operations, including a
+native Darwin spawn, can delay a worker beyond a userspace deadline.
 
 Certificate commands use the positive `external_command_timeout_ms` setting,
 defaulting to 300000 ms. DNS/public-IP helpers use the lesser of that value and

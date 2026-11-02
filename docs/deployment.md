@@ -179,8 +179,20 @@ recovery on plaintext/TLS H1/H2. It does not pressure the production process.
 The heap cap is still not RSS or virtual-address-space accounting. Stack guards,
 TLS/runtime overhead, kernel buffers and child memory need the OS boundary above.
 Standalone/non-systemd deployments must provide equivalent OS limits themselves.
-Stronger Darwin resolver cancellation guarantees and sanitizing operator-inherited
-child descriptors remain separate work.
+Stronger Darwin resolver cancellation guarantees remain separate work.
+
+CGI and helper execs now inherit only their owned standard I/O pipes. Linux 5.9+
+uses `close_range`; older kernels or restricted syscall policies need a trusted,
+accessible `/proc/self/fd` for the raw-syscall fallback. If both mechanisms fail,
+the command is not executed. macOS uses the native spawn descriptor allowlist.
+High inherited handles are removed from the child even above a lowered soft
+nofile limit; the parent's handles remain untouched. This does not restrict a
+command's filesystem/network access, environment or credentials. Native spawn
+and other blocking kernel operations are not a hard realtime deadline guarantee.
+`python3 scripts/verify-child-descriptors.py /absolute/path/to/layerline` exercises
+isolated inheritable handles, CGI/helper launches and concurrent HTTP/2 churn;
+the test launcher needs a hard nofile limit of at least 4097 to create its high
+handle before lowering its own soft limit to 128.
 
 `sudo python3 scripts/verify-runtime-budgets.py /absolute/path/to/layerline --systemd`
 checks the packaged limits against real cgroup/process files, then deliberately

@@ -3,6 +3,8 @@ const std = @import("std");
 test {
     _ = @import("systemd_notify.zig");
     _ = @import("descriptor_io.zig");
+    _ = @import("child_descriptors.zig");
+    _ = @import("native_spawn_darwin.zig");
 }
 
 const acme_mod = @import("acme.zig");

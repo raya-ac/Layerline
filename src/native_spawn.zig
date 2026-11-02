@@ -4,8 +4,8 @@ const posix = std.posix;
 const Deadline = @import("read_deadline.zig").Deadline;
 const descriptors = @import("descriptor_budget.zig");
 
-// Darwin cannot create CLOEXEC pipes atomically. Serialize their creation and
-// fork so another command cannot inherit an intermediate pipe endpoint.
+// Keep PID publication and group cleanup under one ownership lock. Child-side
+// descriptor isolation does not rely on other threads setting CLOEXEC in time.
 var launch_mutex: std.Io.Mutex = .init;
 pub const max_children = 64;
 var children: [max_children]posix.pid_t = @splat(0);
@@ -78,7 +78,7 @@ pub fn tryStopAll(io: std.Io) bool {
 
 pub const Spawned = struct {
     child: std.process.Child,
-    exec_status: std.Io.File,
+    exec_status: ?std.Io.File,
 };
 
 pub const ExecFailure = enum(u8) {
@@ -237,12 +237,33 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
     const slot = for (&children) |*owned| {
         if (owned.* == 0) break owned;
     } else return error.ChildCapacity;
-    var pipes: [4][2]posix.fd_t = undefined;
+    const pipe_count = if (builtin.os.tag == .macos) 3 else 4;
+    var pipes: [pipe_count][2]posix.fd_t = undefined;
     var made: usize = 0;
     errdefer for (pipes[0..made]) |ends| for (ends) |fd| close(fd);
     while (made < pipes.len) : (made += 1) pipes[made] = try pipe();
     try check(io, deadline, shutdown);
-    const pid: posix.pid_t = while (true) {
+    const pid: posix.pid_t = if (comptime builtin.os.tag == .macos) darwin: {
+        var prepared = try @import("native_spawn_darwin.zig").Prepared.init(&pipes);
+        defer prepared.deinit();
+        var failure: anyerror = error.FileNotFound;
+        for (paths.items) |path| {
+            while (true) {
+                try check(io, deadline, shutdown);
+                const pid = prepared.spawn(path.ptr, arguments.ptr, envp) catch |err| switch (err) {
+                    error.Interrupted => continue,
+                    error.FileNotFound => break,
+                    error.AccessDenied => {
+                        failure = err;
+                        break;
+                    },
+                    else => return err,
+                };
+                break :darwin pid;
+            }
+        }
+        return failure;
+    } else while (true) {
         const result = posix.system.fork();
         switch (posix.errno(result)) {
             .SUCCESS => break @intCast(result),
@@ -251,40 +272,40 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
             else => return error.ChildForkFailed,
         }
     };
-    if (pid == 0) {
-        const error_fd = pipes[3][1];
-        // Only async-signal-safe syscalls below: no allocator, IO runtime,
-        // logging, or locks from the multithreaded parent may run after fork.
-        while (true) switch (posix.errno(posix.system.setpgid(0, 0))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => report(error_fd, .setup),
-        };
-        redirect(pipes[0][0], 0, error_fd);
-        redirect(pipes[1][1], 1, error_fd);
-        redirect(pipes[2][1], 2, error_fd);
-        for (pipes) |ends| for (ends) |fd| if (fd != error_fd) {
-            _ = posix.system.close(fd);
-        };
-        var failure: ExecFailure = .not_found;
-        for (paths.items) |path| {
-            while (true) switch (posix.errno(posix.system.execve(path.ptr, arguments.ptr, envp))) {
-                .NOENT, .NOTDIR => break,
-                .ACCES => {
-                    failure = .denied;
-                    break;
-                },
+    if (comptime builtin.os.tag != .macos) {
+        if (pid == 0) {
+            const error_fd = pipes[3][1];
+            // Only async-signal-safe syscalls below: no allocator, IO runtime,
+            // logging, or locks from the multithreaded parent may run after fork.
+            while (true) switch (posix.errno(posix.system.setpgid(0, 0))) {
+                .SUCCESS => break,
                 .INTR => continue,
-                .NOEXEC => report(error_fd, .invalid_executable),
                 else => report(error_fd, .setup),
             };
+            redirect(pipes[0][0], 0, error_fd);
+            redirect(pipes[1][1], 1, error_fd);
+            redirect(pipes[2][1], 2, error_fd);
+            if (!@import("child_descriptors.zig").closeExcept(error_fd)) report(error_fd, .setup);
+            var failure: ExecFailure = .not_found;
+            for (paths.items) |path| {
+                while (true) switch (posix.errno(posix.system.execve(path.ptr, arguments.ptr, envp))) {
+                    .NOENT, .NOTDIR => break,
+                    .ACCES => {
+                        failure = .denied;
+                        break;
+                    },
+                    .INTR => continue,
+                    .NOEXEC => report(error_fd, .invalid_executable),
+                    else => report(error_fd, .setup),
+                };
+            }
+            report(error_fd, failure);
         }
-        report(error_fd, failure);
     }
     close(pipes[0][0]);
     close(pipes[1][1]);
     close(pipes[2][1]);
-    close(pipes[3][1]);
+    if (comptime pipe_count == 4) close(pipes[3][1]);
     slot.* = pid;
     if (isStopping()) terminate(pid);
     return .{
@@ -296,7 +317,7 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
             .stderr = .{ .handle = pipes[2][0], .flags = .{ .nonblocking = false } },
             .request_resource_usage_statistics = false,
         },
-        .exec_status = .{ .handle = pipes[3][0], .flags = .{ .nonblocking = false } },
+        .exec_status = if (comptime pipe_count == 4) .{ .handle = pipes[3][0], .flags = .{ .nonblocking = false } } else null,
     };
 }
 

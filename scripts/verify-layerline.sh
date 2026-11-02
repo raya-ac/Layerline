@@ -775,6 +775,9 @@ python3 "$ROOT_DIR/scripts/verify-deadlines.py" "$SERVER_BINARY"
 log "verifying CGI and FastCGI version notices"
 python3 "$ROOT_DIR/scripts/verify-php-version.py" "$SERVER_BINARY"
 
+log "verifying child descriptor isolation"
+python3 "$ROOT_DIR/scripts/verify-child-descriptors.py" "$SERVER_BINARY"
+
 log "verifying child-process deadlines and cleanup"
 python3 "$ROOT_DIR/scripts/verify-child-processes.py" "$SERVER_BINARY"
 
