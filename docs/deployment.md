@@ -281,6 +281,12 @@ For a local release candidate before copying files onto the host, run the self-s
 ./scripts/verify-layerline.sh
 ```
 
+For a binary built elsewhere, also cross-build the native child fixture for the
+test host with `zig build test-tools -Dtarget=<target> -Doptimize=ReleaseFast`.
+Pass absolute paths through `LAYERLINE_VERIFY_BINARY` and
+`LAYERLINE_CHILD_WORKER` when running the verifier on that host. The helper is
+test-only and is not needed on production listeners.
+
 If HTTP/2 is enabled through native TLS or h2c testing, add:
 
 ```bash

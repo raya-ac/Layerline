@@ -89,8 +89,11 @@ if [[ -n ${LAYERLINE_VERIFY_BINARY:-} ]]; then
 else
   log "building Layerline release binary"
   "$ZIG" build -Doptimize=ReleaseFast
+  "$ZIG" build test-tools -Doptimize=ReleaseFast
 fi
 [[ -x $SERVER_BINARY ]] || die "Layerline binary is not executable: $SERVER_BINARY"
+export LAYERLINE_CHILD_WORKER=${LAYERLINE_CHILD_WORKER:-$(dirname "$SERVER_BINARY")/child-process-worker}
+[[ $LAYERLINE_CHILD_WORKER = /* && -x $LAYERLINE_CHILD_WORKER ]] || die "set LAYERLINE_CHILD_WORKER to an absolute native fixture path (zig build test-tools)"
 
 cat >"$CONFIG" <<CONF
 host = $HOST

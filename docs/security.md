@@ -627,6 +627,14 @@ error codes. Validated request trailers remain separate from routing/authenticat
 headers and are forwarded as their own chunked section on reverse-proxy requests;
 CGI/FastCGI environment mapping is not included.
 
+The child-process wire tests use a native Zig helper, built separately with
+`zig build test-tools`, so interpreter startup cannot consume the 350 ms CGI
+deadline before the intended child behavior starts. When testing an externally
+built server, set `LAYERLINE_CHILD_WORKER` to the helper for the test host (or
+place it beside the server binary). It is not part of the normal server install.
+The verifier still requires child PID records, bounded output, duplex body hash
+integrity, process-group termination and reaping; a missing helper fails the run.
+
 Proxy responses now share a bounded upstream reader. Fixed-length, chunked,
 HEAD, 204 and 304 replies finish at their message boundary without waiting for
 origin EOF. Close-delimited bodies still require EOF. Reader buffers live in

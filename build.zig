@@ -17,6 +17,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const child_worker = b.addExecutable(.{
+        .name = "child-process-worker",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/child_process_worker.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.step("test-tools", "Build native wire-test fixtures (not installed with the server)")
+        .dependOn(&b.addInstallArtifact(child_worker, .{}).step);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);

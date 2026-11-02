@@ -19,6 +19,9 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BINARY = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "zig-out/bin/layerline"
+WORKER = pathlib.Path(os.environ.get("LAYERLINE_CHILD_WORKER", BINARY.with_name("child-process-worker"))).resolve()
+if not WORKER.is_file() or not os.access(WORKER, os.X_OK):
+    raise RuntimeError(f"native child fixture missing: {WORKER}; build with 'zig build test-tools' or set LAYERLINE_CHILD_WORKER")
 
 
 def port():
@@ -144,8 +147,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
     (folder / "command-mode").write_text("okay")
     for name, mode in [("php-cgi", "--cgi"), ("certbot", "--command")]:
         wrapper = folder / name
-        worker = pathlib.Path(__file__).with_name("child-process-worker.py").resolve()
-        wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(worker))} {mode} {shlex.quote(str(folder))} \"$@\"\n")
+        wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(str(WORKER))} {mode} {shlex.quote(str(folder))} \"$@\"\n")
         wrapper.chmod(0o700)
     cert, key = folder / "cert.pem", folder / "key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=localhost"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -188,6 +190,10 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                     timings = {}
                     status, data, elapsed = request(number, tls, kind, body, path=path, timings=timings)
                     assert status == expected and elapsed < (3 if kind == "noinput" else 2), (kind, status, expected, elapsed)
+                    if kind in ["trickle", "closed"]:
+                        executed = [value for pid, value in records(folder).items() if value["kind"] == kind and previous.get(pid) != value]
+                        phase = "trickling" if kind == "trickle" else "closed"
+                        assert len(executed) == 1 and executed[0]["phase"] == phase, ("deadline expired before intended behavior", kind, executed)
                     if kind == "noinput":
                         assert elapsed >= .9, ("stdin pressure returned before its route budget", elapsed)
                         # Software TLS in Debug spends time decoding the large
