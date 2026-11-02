@@ -264,13 +264,14 @@ def transfer_failure_details(peer, started, total, secure):
                                        "complete_data_bytes": total, "last_frames": frames}, file=sys.stderr, flush=True)
 
 
-def slow_header_deadline(peer, initial, fragments, detail):
+def slow_header_deadline(peer, initial, fragments, detail, writer=None):
     started = time.monotonic()
-    peer.conn.sendall(initial)
+    connection = peer.conn if writer is None else writer
+    connection.sendall(initial)
     for fragment in fragments:
         time.sleep(.15)
         try:
-            peer.conn.sendall(fragment)
+            connection.sendall(fragment)
         except BrokenPipeError:
             # A scheduler pause can carry this write past the 500ms deadline.
             # The write failure alone proves nothing: still require GOAWAY.
@@ -505,14 +506,8 @@ with tempfile.TemporaryDirectory(prefix="layerline-deadline-") as tmp:
                 h2 = H2(server, wire=True)
                 try:
                     wire = h2.conn.encrypt(frame(1, 5, 1, fields()))
-                    started = time.monotonic()
-                    h2.conn.conn.sendall(wire[:2])
-                    for part in wire[2:5]:
-                        time.sleep(0.15)
-                        h2.conn.conn.sendall(bytes([part]))
-                    received = h2.until(lambda f: f[0] == 7)
-                    assert int.from_bytes(received[-1][3][4:], "big") == 11
-                    assert time.monotonic() - started < 0.9, "encrypted record bytes renewed the header budget"
+                    slow_header_deadline(h2, wire[:2], [bytes([part]) for part in wire[2:5]],
+                                         "encrypted record bytes renewed the header budget", writer=h2.conn.conn)
                 finally:
                     h2.conn.close()
                 print("ok: HTTP/2 stream expiry resumes partial TLS record headers and ciphertext without desynchronization")

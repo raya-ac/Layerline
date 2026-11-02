@@ -65,6 +65,17 @@ class DeadlineFixtureTests(unittest.TestCase):
         self.assertEqual(peer.sent, [b"initial", b"one", b"two", b"three"])
         self.assertEqual(peer.reads, 1)
 
+    def test_raw_ciphertext_writer_does_not_encrypt_fragments_again(self):
+        clock = Clock([.15, .15, .4])
+        peer = Peer(clock)
+        raw = Peer(clock, failure=BrokenPipeError())
+        namespace = {"time": clock}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), namespace)
+        namespace["slow_header_deadline"](peer, b"initial", [b"one", b"two", b"three"], "original deadline", writer=raw)
+        self.assertEqual(peer.sent, [])
+        self.assertEqual(raw.sent, [b"initial", b"one", b"two", b"three"])
+        self.assertEqual(peer.reads, 1)
+
     def test_late_broken_pipe_reads_goaway_instead_of_accepting_the_write_error(self):
         clock = Clock([.15, .15, .4])
         peer = Peer(clock, failure=BrokenPipeError())
