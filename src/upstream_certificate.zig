@@ -425,12 +425,18 @@ fn otherName(bytes: []const u8) !void {
     try fields.end();
 }
 
-pub fn verifyIdentity(san: []const u8, reference_input: []const u8) !void {
-    if (san.len == 0) return error.CertificateHostMismatch;
-    try validateNames(san);
+pub fn referenceName(reference_input: []const u8) ![]const u8 {
     const reference = if (std.mem.endsWith(u8, reference_input, ".")) reference_input[0 .. reference_input.len - 1] else reference_input;
     const address = std.Io.net.IpAddress.parse(reference, 0) catch null;
     if (address == null and !dnsValid(reference, false)) return error.CertificateHostMismatch;
+    return reference;
+}
+
+pub fn verifyIdentity(san: []const u8, reference_input: []const u8) !void {
+    if (san.len == 0) return error.CertificateHostMismatch;
+    try validateNames(san);
+    const reference = try referenceName(reference_input);
+    const address = std.Io.net.IpAddress.parse(reference, 0) catch null;
     var names: Cursor = .{ .bytes = san };
     while (!names.done()) {
         const item = try names.next(null);

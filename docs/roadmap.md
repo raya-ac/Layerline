@@ -53,11 +53,14 @@ The experimental HTTP/3 buffered encoder preserves the same section ordering and
 HEAD/304 length metadata, with codec and allocation-failure tests; this does not
 close its external interoperability, flow-control or live streaming gaps.
 
-Native HTTPS upstream work now has a bounded certificate-policy test bed, real
-disposable-chain tests and an offline pinned independent-corpus evaluator.
+Native HTTPS upstream work now has a bounded certificate-policy test bed, an
+owned authenticated TLS 1.2/1.3 channel, real disposable-chain/peer tests and an
+offline pinned independent-corpus evaluator.
 It is not wired into the runtime: HTTPS origins and health probes still fail
-closed. Trust loading, actual handshake authentication, encrypted pool/tunnel
-ownership and deadline integration remain required. The entire certificate
+closed. Immutable PEM trust loading and actual handshake authentication are tested
+in isolation. Config-snapshot trust ownership, the worker stack/reload boundary,
+encrypted pool/tunnel ownership and proxy deadline integration remain required.
+The entire certificate
 corpus is not passing; [the TLS work notes](upstream-tls.md) retain the scope,
 profile differences and implementation gates.
 

@@ -672,8 +672,8 @@ streaming guarantees.
 `scripts/verify-upstream-framing.py` checks these paths over plain and native TLS.
 
 HTTPS backend transport is still disabled. The separately tested
-[upstream certificate-policy foundation](upstream-tls.md) does not enable it or
-change production trust. Independent corpus mismatches remain visible; no full
+[upstream certificate policy and authenticated TLS channel](upstream-tls.md) do
+not enable it or change production trust. Independent corpus mismatches remain visible; no full
 PKIX, revocation, browser-policy or HTTPS-upstream acceptance is claimed.
 
 `scripts/verify-shutdown.py` starts isolated loopback instances with admin, QUIC,

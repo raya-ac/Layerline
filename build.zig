@@ -147,6 +147,26 @@ pub fn build(b: *std.Build) void {
     b.step("test-upstream-certificates", "Test native certificate policy with disposable OpenSSL chains")
         .dependOn(&certificate_checks.step);
     test_step.dependOn(&certificate_probe.step);
+    const upstream_tls_probe = b.addExecutable(.{
+        .name = "upstream-tls-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/upstream_tls_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    var previous_tls_check: *std.Build.Step = &upstream_tls_probe.step;
+    for ([_][]const u8{ "TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256" }) |suite| {
+        const checks = b.addSystemCommand(&.{"python3"});
+        checks.addFileArg(b.path("scripts/verify-upstream-tls.py"));
+        checks.addArtifactArg(upstream_tls_probe);
+        checks.addArgs(&.{ "--tls13-suite", suite });
+        checks.step.dependOn(previous_tls_check);
+        previous_tls_check = &checks.step;
+    }
+    b.step("test-upstream-tls", "Test the native origin TLS channel against disposable real TLS peers")
+        .dependOn(previous_tls_check);
+    test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);
     const protocol_tests = b.addTest(.{

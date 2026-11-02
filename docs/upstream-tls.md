@@ -4,9 +4,58 @@ HTTPS origins are **not enabled yet**. Both proxy paths and active health probes
 still reject them with `UnsupportedUpstreamScheme`; there is no insecure fallback
 to plaintext. TLS on the client-facing listener is a separate, existing feature.
 
-`src/upstream_certificate.zig` is a certificate-policy foundation, not a transport.
-It is exercised by unit tests and a test-only executable that is neither installed
-with Layerline nor exposed as a server command. The runtime does not import it.
+The certificate policy and owned TLS channel are exercised by unit tests and
+test-only executables. Neither probe is installed with Layerline or exposed as a
+server command. The runtime does not import the new transport yet.
+
+## channel implementation
+
+`src/upstream_tls_client.zig` is derived from Zig 0.16.0's
+`lib/std/crypto/tls/Client.zig`, under the unmodified license in
+`licenses/zig-stdlib-MIT.txt`. The original source SHA-256 is
+`1464bd0d53f799e7714fa073a0783cb94c68c10fb1ab4381246e01f9cb130c8a`.
+This is a maintained Zig standard-library derivative, not a claim that Layerline
+invented the underlying cryptography or has completed a TLS conformance audit.
+
+The local changes authenticate the actual handshake's certificate chain and leaf
+key with the bounded policy below. There is no insecure verification option,
+self-signed fallback, root download, or plaintext downgrade. Initialization
+rejects secret logging and the inherited truncation-bypass option.
+The HTTP origin channel offers only `http/1.1` through ALPN; an absent ALPN reply
+is allowed, a different selected protocol is not. TLS 1.2 requires the extended
+master secret extension and ECDHE with authenticated AEAD ciphers. TLS 1.3
+offers AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, not experimental AEGIS
+ciphers. Its handshakes do not depend on the optional compatibility
+ChangeCipherSpec record.
+They ignore early compatibility CCS and legacy record-version values as required
+by [RFC 8446 section 5](https://www.rfc-editor.org/rfc/rfc8446.html#section-5),
+without omitting those header bytes from encrypted-record authentication.
+
+Other patches bound certificate/handshake reassembly, validate negotiation and
+record lengths, retain fragmented post-handshake messages, prevent sequence
+wrap, and preserve writes larger than one output buffer. Requested key-update
+replies use the old write keys before rotation, sharing a write lock with tunnel
+traffic without serializing a blocked read against an ordinary write. Tickets
+are ignored rather than cached for resumption. Channel destruction wipes owned
+traffic state, and the handshake wipes its key-share and cipher scratch.
+
+`src/upstream_tls.zig` owns the encrypted and plaintext buffers, preserves raw
+I/O errors and the original deadline, and treats missing close-notify as
+truncation. Its socket belongs to the caller, not the channel. Both tunnel pumps
+must join before destroying it. Callers need a 1 MiB handshake stack floor:
+the real Debug probe exposed a stack overflow at the ordinary 256 KiB request
+worker size. Raising a setting on reload cannot repair already-running workers;
+runtime integration must enforce that boundary too.
+
+`src/upstream_trust.zig` loads immutable PEM stores, bounded to 8 MiB, 1024
+anchors and 128 KiB per certificate. An explicit store rejects unsupported or
+malformed certificates. System PEM loading records the number of unusable DER
+certificates skipped; malformed PEM framing still fails the entire load. This is
+not full OS keychain integration. Linux uses fixed
+distribution bundle paths and macOS uses `/etc/ssl/cert.pem`. No environment
+variable can replace trust material, and a corrupt first-found bundle does not
+silently select another source. Snapshot ownership and operator diagnostics are
+still required before using this loader in the server.
 
 ## what is covered
 
@@ -39,6 +88,8 @@ auditing an anchor's own AKI are not service-identity verification.
 zig build test
 zig build test-upstream-certificates -Doptimize=Debug
 zig build test-upstream-certificates -Doptimize=ReleaseSafe
+zig build test-upstream-tls -Doptimize=Debug
+zig build test-upstream-tls -Doptimize=ReleaseSafe
 ```
 
 The second target needs Python 3 and OpenSSL as developer tools. It generates
@@ -47,6 +98,30 @@ tests real valid/invalid chains, alternate paths, work-limit exhaustion and ever
 one-bit corruption of a generated leaf. Its signature-only negative control must
 accept a non-CA signer that the real policy rejects. Keys never become fixtures.
 These tools are not runtime dependencies.
+
+The TLS target uses Python's SSL MemoryBIO as a real independent peer, disposable
+OpenSSL certificates, and a probe on a 1 MiB worker stack. Its 59 cases cover
+TLS 1.2/1.3, RSA/ECDSA/Ed25519 leaf-key proof, DNS/IP identities, certificate and
+TCP fragmentation, AES-GCM/ChaCha20, P-256/P-384 exchange, ALPN and extended-master-
+secret negotiation, unauthenticated-origin refusal, malformed records, HTTP
+informational replies, close-notify/truncation and original handshake/body
+deadlines. It asserts that authentication failures send no HTTP request bytes.
+The build target repeats those cases under three forced TLS 1.3 cipher profiles
+(177 cases per build mode). A private temporary OpenSSL configuration in a child
+process works around Python's missing public TLS 1.3 ciphersuite setter; each
+positive case checks the actually negotiated cipher. No system configuration is
+changed. Optional `--output` receipts include binary/script hashes and SSL versions.
+Unit tests separately exercise fragmented key updates, correct reply-key order,
+sequence exhaustion, record/body bounds, large writes, and trust allocation
+failure cleanup. These are channel tests, not reverse-proxy, pool, concurrent
+tunnel, reload or full TLS conformance acceptance.
+
+Each traffic key is limited to 2^20 records in either direction. Exceeding that
+budget closes the channel, rather than relying only on sequence-number wrap;
+see the [AEAD usage limits in RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html#section-5.5).
+Peer key updates reset the corresponding counter. Proactive local key updates,
+HelloRetryRequest, session resumption and client-certificate authentication are
+not implemented in this channel.
 
 `scripts/verify-upstream-limbo.py` evaluates a separately obtained, pinned
 [x509-limbo corpus](https://github.com/C2SP/x509-limbo/tree/1080e565f26e544bbe9cf99953be8a57c08e7e20).
@@ -70,8 +145,9 @@ These counts are test-bed evidence, not approval to enable an HTTPS transport.
 
 1. Finish the certificate profile and compatibility audit, including the retained
    independent-corpus differences and unsupported algorithms.
-2. Authenticate the actual handshake's chain and leaf key with this policy. A
-   separate certificate-preflight connection would not authenticate proxy traffic.
+2. Integrate the tested channel, which authenticates the actual handshake's chain
+   and leaf key, into both proxy paths and health probes. A separate certificate-
+   preflight connection would not authenticate proxy traffic.
 3. Load bounded trust material into configuration snapshots, with explicit SNI
    and hostname policy and no peer-controlled trust mutation or root downloads.
 4. Carry the original backend deadline, cancellation and descriptor/heap ownership
