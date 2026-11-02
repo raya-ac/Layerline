@@ -133,6 +133,20 @@ pub fn build(b: *std.Build) void {
     const run_reactor_tests = b.addRunArtifact(reactor_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    const certificate_probe = b.addExecutable(.{
+        .name = "upstream-certificate-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/upstream_certificate_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const certificate_checks = b.addSystemCommand(&.{"python3"});
+    certificate_checks.addFileArg(b.path("scripts/verify-upstream-certificates.py"));
+    certificate_checks.addArtifactArg(certificate_probe);
+    b.step("test-upstream-certificates", "Test native certificate policy with disposable OpenSSL chains")
+        .dependOn(&certificate_checks.step);
+    test_step.dependOn(&certificate_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);
     const protocol_tests = b.addTest(.{

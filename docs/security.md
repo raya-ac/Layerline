@@ -245,7 +245,8 @@ Health checks acquire the current config each cycle and follow each pool's own
 interval, including checks enabled by reload. Certificate renewal also reads
 current policy, releases its lease before sleeping and reloads TLS material after
 renewal. Unrelated config reloads do not postpone scheduled renewal. External
-certificate-tool execution still lacks an independently enforced child deadline.
+certificate tools now use the owned child runner and
+`external_command_timeout_ms`; see the external-process limits below.
 
 ## Shutdown ownership
 
@@ -265,8 +266,9 @@ stuck at the deadline, a separate guard logs `server.shutdown_timeout`, removes
 the admin socket, and exits with status 1 without unwinding runtime destructors.
 The OS then reclaims process memory together instead of freeing config/caches
 while another thread might still access them. Outstanding requests can be lost
-at that deadline. This is a process boundary, not cancellation of external PHP
-or certificate-tool child processes; supervise and isolate those separately.
+at that deadline. Owned CGI and certificate-tool groups also receive shutdown
+cancellation and are killed/reaped by their runner. This does not sandbox PHP,
+contain a deliberately escaped child, or bound uninterruptible kernel operations.
 
 ## Read Deadlines
 
@@ -619,8 +621,9 @@ privacy, backend version notices, admin bootstrap/logout/origin behavior,
 symlink escapes, encrypted static responses, and config reload. The raw HTTP/2
 tests include padded/split trailers, refused-stream HPACK synchronization,
 compressed header budget bypass attempts, discarded DATA credit, and GOAWAY
-error codes. Request trailer forwarding is still not implemented; validated
-request trailers remain separate from routing/authentication headers.
+error codes. Validated request trailers remain separate from routing/authentication
+headers and are forwarded as their own chunked section on reverse-proxy requests;
+CGI/FastCGI environment mapping is not included.
 
 Proxy responses now share a bounded upstream reader. Fixed-length, chunked,
 HEAD, 204 and 304 replies finish at their message boundary without waiting for
@@ -667,6 +670,11 @@ encodes informational, final, DATA and trailer sections in order. These are
 codec/allocation checks, not external QUIC interoperability or live early-hint
 streaming guarantees.
 `scripts/verify-upstream-framing.py` checks these paths over plain and native TLS.
+
+HTTPS backend transport is still disabled. The separately tested
+[upstream certificate-policy foundation](upstream-tls.md) does not enable it or
+change production trust. Independent corpus mismatches remain visible; no full
+PKIX, revocation, browser-policy or HTTPS-upstream acceptance is claimed.
 
 `scripts/verify-shutdown.py` starts isolated loopback instances with admin, QUIC,
 health, and reload workers. It checks idle shutdown, in-flight HTTP/1 uploads,

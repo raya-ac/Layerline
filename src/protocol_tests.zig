@@ -43,6 +43,7 @@ test {
     _ = @import("backend_deadline.zig");
     _ = @import("upstream_runtime.zig");
     _ = @import("upstream_reader.zig");
+    _ = @import("upstream_certificate.zig");
     _ = @import("request_trailers.zig");
     _ = @import("proxy_request_body.zig");
     _ = @import("request_body.zig");
