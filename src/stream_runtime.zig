@@ -9,6 +9,7 @@ const backend_deadline = @import("backend_deadline.zig");
 const socket_timeout = @import("socket_timeout.zig");
 const socket_io = @import("socket_io.zig");
 const native_connect = @import("native_connect.zig");
+const upstream_tls = @import("upstream_tls.zig");
 
 const PhpFastcgiEndpoint = config_mod.PhpFastcgiEndpoint;
 const TlsChannel = native_tls.Channel;
@@ -97,6 +98,7 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
 
 pub fn streamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     if (read_deadline.forStream(stream)) |budget| _ = try budget.remaining();
+    if (upstream_tls.forStream(stream)) |channel| return channel.read(out);
     if (current_tls_channel) |channel| {
         if (stream.socket.handle == channel.stream.socket.handle) {
             const n = try native_tls.readApplicationData(channel, out);
@@ -172,6 +174,7 @@ pub fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
 }
 
 pub fn streamWriteAllCounted(stream: std.Io.net.Stream, bytes: []const u8, accepted: *usize) !void {
+    if (upstream_tls.forStream(stream)) |channel| return channel.write(bytes, accepted);
     if (current_tls_channel) |channel| {
         if (stream.socket.handle == channel.stream.socket.handle) {
             return native_tls.writeApplicationDataCounted(channel, bytes, accepted);

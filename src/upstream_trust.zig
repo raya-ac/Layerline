@@ -14,6 +14,46 @@ pub const Store = struct {
     }
 };
 
+pub const Snapshot = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    const Entry = struct { path: ?[]const u8, store: *Store };
+
+    pub fn create(allocator: std.mem.Allocator) !*Snapshot {
+        const self = try allocator.create(Snapshot);
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+
+    pub fn get(self: *Snapshot, io: std.Io, path: ?[]const u8) !*Store {
+        for (self.entries.items) |entry| {
+            if (path == null and entry.path == null) return entry.store;
+            if (path != null and entry.path != null and std.mem.eql(u8, path.?, entry.path.?)) return entry.store;
+        }
+        var store = if (path) |file| try load(io, self.allocator, file, false) else try loadSystem(io, self.allocator);
+        errdefer store.deinit();
+        const owned_path = if (path) |file| try self.allocator.dupe(u8, file) else null;
+        errdefer if (owned_path) |file| self.allocator.free(file);
+        const stable = try self.allocator.create(Store);
+        errdefer self.allocator.destroy(stable);
+        stable.* = store;
+        try self.entries.append(self.allocator, .{ .path = owned_path, .store = stable });
+        if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.upstream_trust_loaded\",\"system\":{},\"anchors\":{d},\"skipped\":{d}}}\n", .{ path == null, store.anchors.len, store.skipped });
+        return stable;
+    }
+
+    pub fn destroy(self: *Snapshot) void {
+        const allocator = self.allocator;
+        for (self.entries.items) |entry| {
+            entry.store.deinit();
+            allocator.destroy(entry.store);
+            if (entry.path) |path| allocator.free(path);
+        }
+        self.entries.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 pub fn fromPem(allocator: std.mem.Allocator, pem: []const u8, skip_unusable: bool) !Store {
     if (pem.len > max_file_bytes) return error.TrustFileTooLarge;
     const begin = "-----BEGIN CERTIFICATE-----";
@@ -59,6 +99,7 @@ pub fn fromPem(allocator: std.mem.Allocator, pem: []const u8, skip_unusable: boo
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, system: bool) !Store {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes));
     defer allocator.free(bytes);
+    defer std.crypto.secureZero(u8, bytes);
     return fromPem(allocator, bytes, system);
 }
 
@@ -121,4 +162,37 @@ test "trust owns decoded bytes and cleans up every allocation failure" {
     defer allocator.free(excess);
     for (0..policy.max_anchors + 1) |index| @memcpy(excess[index * pem.len ..][0..pem.len], pem);
     try std.testing.expectError(error.TooManyTrustAnchors, fromPem(allocator, excess, false));
+}
+
+test "trust snapshots deduplicate paths without moving borrowed stores" {
+    const allocator = std.testing.allocator;
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x58));
+    const der = try @import("tls13_native.zig").buildSelfSignedEd25519Certificate(allocator, pair, "localhost");
+    defer allocator.free(der);
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(der.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, der);
+    const pem = try std.fmt.allocPrint(allocator, "-----BEGIN CERTIFICATE-----\n{s}\n-----END CERTIFICATE-----\n", .{encoded});
+    defer allocator.free(pem);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "one.pem", .data = pem });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "two.pem", .data = pem });
+    const one = try temporary.dir.realPathFileAlloc(std.testing.io, "one.pem", allocator);
+    defer allocator.free(one);
+    const two = try temporary.dir.realPathFileAlloc(std.testing.io, "two.pem", allocator);
+    defer allocator.free(two);
+    const Check = struct {
+        fn load(failing: std.mem.Allocator, first: []const u8, second: []const u8) !void {
+            const snapshot = try Snapshot.create(failing);
+            defer snapshot.destroy();
+            const a = try snapshot.get(std.testing.io, first);
+            const b = try snapshot.get(std.testing.io, second);
+            try std.testing.expect(a != b);
+            try std.testing.expect(a == try snapshot.get(std.testing.io, first));
+            try std.testing.expectEqual(2, snapshot.entries.items.len);
+            try std.testing.expectEqualSlices(u8, a.anchors[0].parsed.certificate.buffer, b.anchors[0].parsed.certificate.buffer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.load, .{ one, two });
 }

@@ -28,7 +28,12 @@ pub const RsaPrivateKey = struct {
     public_exponent: []const u8,
     private_exponent: []const u8,
 
+    pub fn wipe(self: *RsaPrivateKey) void {
+        std.crypto.secureZero(u8, @constCast(self.private_exponent));
+    }
+
     pub fn deinit(self: *RsaPrivateKey, allocator: std.mem.Allocator) void {
+        self.wipe();
         allocator.free(self.modulus);
         allocator.free(self.public_exponent);
         allocator.free(self.private_exponent);
@@ -484,7 +489,7 @@ pub fn encryptTlsRecord(
     inner_content_type: u8,
     plaintext: []const u8,
 ) ![]u8 {
-    if (plaintext.len + 1 > 16 * 1024) return error.TlsPlaintextTooLarge;
+    if (plaintext.len > 16 * 1024) return error.TlsPlaintextTooLarge;
 
     var inner = std.ArrayListUnmanaged(u8).empty;
     defer inner.deinit(allocator);
@@ -515,12 +520,13 @@ pub fn decryptTlsRecord(
 ) !DecryptedRecord {
     if (record.len < 5) return error.TruncatedTlsRecord;
     if (record[0] != 0x17) return error.UnexpectedTlsRecordType;
-    if (record[1] != 0x03 or record[2] != 0x03) return error.UnsupportedTlsRecordVersion;
     const encrypted_len = (@as(usize, record[3]) << 8) | record[4];
+    if (encrypted_len > 16 * 1024 + 256) return error.TlsRecordOverflow;
     if (record.len != 5 + encrypted_len) return error.TruncatedTlsRecord;
     if (encrypted_len < Aes128Gcm.tag_length + 1) return error.BadTlsRecord;
 
     const ciphertext_len = encrypted_len - Aes128Gcm.tag_length;
+    if (ciphertext_len > 16 * 1024 + 1) return error.TlsRecordOverflow;
     const ciphertext = record[5 .. 5 + ciphertext_len];
     const tag: [Aes128Gcm.tag_length]u8 = record[5 + ciphertext_len ..][0..Aes128Gcm.tag_length].*;
     var inner = try allocator.alloc(u8, ciphertext.len);
@@ -547,6 +553,25 @@ pub fn finishedVerifyData(finished_key: [32]u8, transcript_hash_value: [32]u8) [
     var out: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&out, &transcript_hash_value, &finished_key);
     return out;
+}
+
+test "TLS13 record legacy versions are authenticated rather than used for negotiation" {
+    const allocator = std.testing.allocator;
+    const keys = deriveTlsRecordKeys(@splat(0x53));
+    const record = try encryptTlsRecord(allocator, keys, 0, 0x17, "hello");
+    defer allocator.free(record);
+    record[2] = 1;
+    Aes128Gcm.encrypt(record[5..11], record[11..][0..Aes128Gcm.tag_length], "hello\x17", record[0..5], tlsRecordNonce(keys.iv, 0), keys.key);
+    var clear = try decryptTlsRecord(allocator, keys, 0, record);
+    defer clear.deinit(allocator);
+    try std.testing.expectEqualStrings("hello", clear.payload);
+    record[2] = 3;
+    try std.testing.expectError(error.AuthenticationFailed, decryptTlsRecord(allocator, keys, 0, record));
+    const huge = try allocator.alloc(u8, 16385);
+    defer allocator.free(huge);
+    @memset(huge, 0);
+    try std.testing.expectError(error.TlsPlaintextTooLarge, encryptTlsRecord(allocator, keys, 0, 0x17, huge));
+    try std.testing.expectError(error.TlsRecordOverflow, decryptTlsRecord(allocator, keys, 0, "\x17\x03\x03\xff\xff"));
 }
 
 fn rsaPssSha256Sign(
@@ -592,7 +617,7 @@ fn rsaPssEncodeSha256(
     Sha256.hash(message, &message_hash, .{});
 
     var salt: [Sha256.digest_length]u8 = undefined;
-    io.random(&salt);
+    try io.randomSecure(&salt);
 
     var m_prime: [8 + Sha256.digest_length + Sha256.digest_length]u8 = undefined;
     @memset(m_prime[0..8], 0);

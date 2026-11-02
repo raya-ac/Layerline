@@ -350,10 +350,9 @@ pub fn upstreamAttemptIndex(pool: *const UpstreamPoolConfig, start_ticket: usize
 
 pub fn printUpstreamPool(policy: UpstreamPoolPolicy, pool: UpstreamPoolConfig) void {
     std.debug.print(" upstream={s}[", .{upstreamPoolPolicyName(policy)});
-    for (pool.targets.items, 0..) |up, i| {
+    for (pool.targets.items, 0..) |*up, i| {
         if (i > 0) std.debug.print(",", .{});
-        std.debug.print("{s}:{d}{s}", .{ up.host, up.port, up.base_path });
-        if (up.weight != 1) std.debug.print(" weight={d}", .{up.weight});
+        std.debug.print("{f}", .{up});
     }
     std.debug.print("]", .{});
 }

@@ -166,6 +166,11 @@ pub fn build(b: *std.Build) void {
     }
     b.step("test-upstream-tls", "Test the native origin TLS channel against disposable real TLS peers")
         .dependOn(previous_tls_check);
+    const https_checks = b.addSystemCommand(&.{"python3"});
+    https_checks.addFileArg(b.path("scripts/verify-https-upstreams.py"));
+    https_checks.addArtifactArg(exe);
+    b.step("test-https-upstreams", "Test authenticated HTTPS proxy traffic, pools, tunnels and reloads")
+        .dependOn(&https_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

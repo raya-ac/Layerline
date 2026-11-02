@@ -23,6 +23,7 @@ pub const RawReadFn = *const fn (std.Io.net.Stream, []u8) anyerror!usize;
 pub const RawWriteAllFn = *const fn (std.Io.net.Stream, []const u8) anyerror!void;
 
 pub const Channel = struct {
+    io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     client_application_keys: tls13_native.TlsRecordKeys,
@@ -37,6 +38,10 @@ pub const Channel = struct {
     record_header_used: usize = 0,
     record: ?[]u8 = null,
     record_used: usize = 0,
+    write_mutex: std.Io.Mutex = .init,
+    failed: std.atomic.Value(bool) = .init(false),
+    sent_close_notify: bool = false,
+    received_close_notify: bool = false,
 
     pub fn deinit(self: *Channel) void {
         if (self.pending_plaintext) |pending| self.allocator.free(pending);
@@ -46,6 +51,8 @@ pub const Channel = struct {
         self.record = null;
         self.record_header_used = 0;
         self.record_used = 0;
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.client_application_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.server_application_keys));
     }
 
     fn readRecord(self: *Channel) ![]u8 {
@@ -199,17 +206,35 @@ fn sendEncryptedRecord(
     payload: []const u8,
     raw_write_all: RawWriteAllFn,
 ) !void {
-    if (sequence.* == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
     const output_allocator = if (resource_budget.emergency_write) resource_budget.control.allocator() else allocator;
-    const record = try tls13_native.encryptTlsRecord(output_allocator, keys, sequence.*, inner_content_type, payload);
-    defer output_allocator.free(record);
-    try raw_write_all(stream, record);
-    sequence.* += 1;
+    var offset: usize = 0;
+    while (true) {
+        if (sequence.* == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
+        if (sequence.* >= @import("upstream_tls_client.zig").max_key_records) return error.TlsKeyLimit;
+        const part = payload[offset..][0..@min(payload.len - offset, MAX_INNER_PLAINTEXT_BYTES - 1)];
+        const record = try tls13_native.encryptTlsRecord(output_allocator, keys, sequence.*, inner_content_type, part);
+        defer output_allocator.free(record);
+        // A failed write may already have exposed ciphertext. Reserve the nonce
+        // before I/O so no later alert or retry can encrypt with it again.
+        sequence.* += 1;
+        try raw_write_all(stream, record);
+        offset += part.len;
+        if (offset == payload.len) break;
+    }
 }
 
-pub fn readApplicationData(channel: *Channel, out: []u8) !usize {
+pub fn readApplicationData(channel: *Channel, out: []u8) anyerror!usize {
     if (out.len == 0) return 0;
+    if (channel.failed.load(.acquire)) return error.TlsSessionFailed;
+    return readApplicationRecord(channel, out) catch |err| {
+        // H2 wakes a partially read connection when a backend job completes.
+        // Like a stream timeout, this is scheduling, not invalid TLS input.
+        if (err != error.RequestTimeout and err != error.DispatchReady) channel.failed.store(true, .release);
+        return err;
+    };
+}
 
+fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
     while (true) {
         if (channel.pending_plaintext) |pending| {
             const available = pending[channel.pending_offset..];
@@ -230,17 +255,20 @@ pub fn readApplicationData(channel: *Channel, out: []u8) !usize {
             channel.pending_offset = 0;
         }
 
-        const record = try channel.readRecord();
+        if (channel.received_close_notify) return 0;
+        const record = channel.readRecord() catch |err| switch (err) {
+            error.ConnectionClosed => return error.TlsConnectionTruncated,
+            else => return err,
+        };
         defer channel.allocator.free(record);
 
         switch (record[0]) {
-            CONTENT_TYPE_CHANGE_CIPHER_SPEC => continue,
-            CONTENT_TYPE_ALERT => return 0,
             CONTENT_TYPE_APPLICATION_DATA => {},
             else => return error.UnexpectedTlsRecordType,
         }
 
         if (channel.client_sequence == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
+        if (channel.client_sequence >= @import("upstream_tls_client.zig").max_key_records) return error.TlsKeyLimit;
         var decrypted = try tls13_native.decryptTlsRecord(
             channel.allocator,
             channel.client_application_keys,
@@ -259,12 +287,14 @@ pub fn readApplicationData(channel: *Channel, out: []u8) !usize {
                 channel.pending_offset = 0;
             },
             CONTENT_TYPE_ALERT => {
-                decrypted.deinit(channel.allocator);
+                defer decrypted.deinit(channel.allocator);
+                if (decrypted.payload.len != 2 or decrypted.payload[1] != 0) return error.TlsAlert;
+                channel.received_close_notify = true;
                 return 0;
             },
             CONTENT_TYPE_HANDSHAKE => {
                 decrypted.deinit(channel.allocator);
-                continue;
+                return error.UnexpectedTlsHandshake;
             },
             else => {
                 decrypted.deinit(channel.allocator);
@@ -280,6 +310,10 @@ pub fn writeApplicationData(channel: *Channel, bytes: []const u8) !void {
 }
 
 pub fn writeApplicationDataCounted(channel: *Channel, bytes: []const u8, accepted: *usize) !void {
+    channel.write_mutex.lockUncancelable(channel.io);
+    defer channel.write_mutex.unlock(channel.io);
+    if (channel.failed.load(.acquire) or channel.sent_close_notify) return error.TlsSessionFailed;
+    errdefer channel.failed.store(true, .release);
     var offset: usize = 0;
     while (offset < bytes.len) {
         const chunk_len = @min(bytes.len - offset, MAX_INNER_PLAINTEXT_BYTES - 1);
@@ -298,6 +332,16 @@ pub fn writeApplicationDataCounted(channel: *Channel, bytes: []const u8, accepte
     }
 }
 
+pub fn end(channel: *Channel) !void {
+    channel.write_mutex.lockUncancelable(channel.io);
+    defer channel.write_mutex.unlock(channel.io);
+    if (channel.failed.load(.acquire)) return error.TlsSessionFailed;
+    if (channel.sent_close_notify) return;
+    errdefer channel.failed.store(true, .release);
+    try sendEncryptedRecord(channel.stream, channel.allocator, channel.server_application_keys, &channel.server_sequence, CONTENT_TYPE_ALERT, &.{ 1, 0 }, channel.raw_write_all);
+    channel.sent_close_notify = true;
+}
+
 test "counted TLS writes include only complete application records" {
     const Fake = struct {
         var calls: usize = 0;
@@ -312,7 +356,7 @@ test "counted TLS writes include only complete application records" {
     for (0..3) |limit| {
         Fake.calls = 0;
         Fake.limit = limit;
-        var channel: Channel = .{ .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = partialRecordRead, .raw_write_all = Fake.write };
+        var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = partialRecordRead, .raw_write_all = Fake.write };
         defer channel.deinit();
         var bytes: usize = 7;
         if (limit == 2) {
@@ -321,7 +365,127 @@ test "counted TLS writes include only complete application records" {
         } else {
             try std.testing.expectError(error.ConnectionResetByPeer, writeApplicationDataCounted(&channel, &payload, &bytes));
             try std.testing.expectEqual(7 + limit * (MAX_INNER_PLAINTEXT_BYTES - 1), bytes);
+            try std.testing.expectEqual(limit + 1, channel.server_sequence);
+            try std.testing.expectError(error.TlsSessionFailed, end(&channel));
+            try std.testing.expectEqual(limit + 1, Fake.calls);
         }
+    }
+}
+
+test "large native handshake messages split into independently authenticated records" {
+    const Fake = struct {
+        var bytes: std.ArrayList(u8) = .empty;
+        fn write(_: std.Io.net.Stream, part: []const u8) !void {
+            try bytes.appendSlice(std.testing.allocator, part);
+        }
+    };
+    Fake.bytes = .empty;
+    defer Fake.bytes.deinit(std.testing.allocator);
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x48));
+    const payload = try std.testing.allocator.alloc(u8, 40000);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x62);
+    var sequence: u64 = 0;
+    try sendEncryptedRecord(undefined, std.testing.allocator, keys, &sequence, CONTENT_TYPE_HANDSHAKE, payload, Fake.write);
+    try std.testing.expectEqual(3, sequence);
+    var offset: usize = 0;
+    var received: usize = 0;
+    var record_number: u64 = 0;
+    while (offset < Fake.bytes.items.len) : (record_number += 1) {
+        const length = std.mem.readInt(u16, Fake.bytes.items[offset + 3 ..][0..2], .big);
+        try std.testing.expect(length + 5 <= MAX_RECORD_BYTES);
+        var clear = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, record_number, Fake.bytes.items[offset..][0 .. 5 + length]);
+        defer clear.deinit(std.testing.allocator);
+        try std.testing.expectEqual(CONTENT_TYPE_HANDSHAKE, clear.content_type);
+        try std.testing.expect(std.mem.allEqual(u8, clear.payload, 0x62));
+        received += clear.payload.len;
+        offset += 5 + length;
+    }
+    try std.testing.expectEqual(payload.len, received);
+}
+
+test "native TLS half-close sends one authenticated alert and disallows later writes" {
+    const Fake = struct {
+        var bytes: std.ArrayList(u8) = .empty;
+        fn write(_: std.Io.net.Stream, part: []const u8) !void {
+            try bytes.appendSlice(std.testing.allocator, part);
+        }
+    };
+    Fake.bytes = .empty;
+    defer Fake.bytes.deinit(std.testing.allocator);
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x73));
+    var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = partialRecordRead, .raw_write_all = Fake.write };
+    defer channel.deinit();
+    try end(&channel);
+    const length = Fake.bytes.items.len;
+    try end(&channel);
+    try std.testing.expectEqual(length, Fake.bytes.items.len);
+    try std.testing.expectEqual(1, channel.server_sequence);
+    var alert = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, 0, Fake.bytes.items);
+    defer alert.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CONTENT_TYPE_ALERT, alert.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, alert.payload);
+    var accepted: usize = 0;
+    try std.testing.expectError(error.TlsSessionFailed, writeApplicationDataCounted(&channel, "late", &accepted));
+    try std.testing.expectEqual(0, accepted);
+    try std.testing.expectEqual(length, Fake.bytes.items.len);
+}
+
+test "fatal TLS input poisons output but soft H2 read interruptions preserve partial records" {
+    const Fake = struct {
+        var input: []const u8 = "";
+        var offset: usize = 0;
+        var interrupt: ?anyerror = null;
+        var writes: usize = 0;
+        fn read(_: std.Io.net.Stream, out: []u8) !usize {
+            if (interrupt != null and offset > 0) {
+                const err = interrupt.?;
+                interrupt = null;
+                return err;
+            }
+            const n = @min(2, out.len, input.len - offset);
+            @memcpy(out[0..n], input[offset..][0..n]);
+            offset += n;
+            return n;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            writes += 1;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x45));
+    const corrupt = try tls13_native.encryptTlsRecord(allocator, keys, 0, CONTENT_TYPE_APPLICATION_DATA, "invalid authentication");
+    defer allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    const invalid_alert = try tls13_native.encryptTlsRecord(allocator, keys, 0, CONTENT_TYPE_ALERT, &.{0});
+    defer allocator.free(invalid_alert);
+    for ([_][]const u8{ "", "\x15\x03\x03\x00\x02\x01\x00", corrupt, invalid_alert }) |bytes| {
+        Fake.input = bytes;
+        Fake.offset = 0;
+        Fake.writes = 0;
+        var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = Fake.read, .raw_write_all = Fake.write };
+        defer channel.deinit();
+        var out: [32]u8 = undefined;
+        if (readApplicationData(&channel, &out)) |_| return error.InvalidTlsWasAccepted else |_| {}
+        try std.testing.expect(channel.failed.load(.acquire));
+        try std.testing.expectError(error.TlsSessionFailed, writeApplicationData(&channel, "late"));
+        try std.testing.expectError(error.TlsSessionFailed, end(&channel));
+        try std.testing.expectEqual(0, Fake.writes);
+    }
+    const valid = try tls13_native.encryptTlsRecord(allocator, keys, 0, CONTENT_TYPE_APPLICATION_DATA, "resumed");
+    defer allocator.free(valid);
+    for ([_]anyerror{ error.RequestTimeout, error.DispatchReady }) |pause| {
+        Fake.input = valid;
+        Fake.offset = 0;
+        Fake.interrupt = pause;
+        var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = allocator, .client_application_keys = keys, .server_application_keys = keys, .raw_read = Fake.read, .raw_write_all = Fake.write };
+        defer channel.deinit();
+        var out: [32]u8 = undefined;
+        try std.testing.expectError(pause, readApplicationData(&channel, &out));
+        try std.testing.expectEqual(2, channel.record_header_used);
+        try std.testing.expect(!channel.failed.load(.acquire));
+        const n = try readApplicationData(&channel, &out);
+        try std.testing.expectEqualStrings("resumed", out[0..n]);
     }
 }
 
@@ -349,7 +513,7 @@ fn noRecordWrite(_: std.Io.net.Stream, _: []const u8) !void {
 test "partial TLS records resume after read timeout and clean up on abandonment" {
     for ([_]bool{ false, true }) |abandon| {
         partial_record_step = 0;
-        var channel = Channel{ .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = undefined, .server_application_keys = undefined, .raw_read = partialRecordRead, .raw_write_all = noRecordWrite };
+        var channel = Channel{ .io = std.testing.io, .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = undefined, .server_application_keys = undefined, .raw_read = partialRecordRead, .raw_write_all = noRecordWrite };
         defer channel.deinit();
         try std.testing.expectError(error.RequestTimeout, channel.readRecord());
         try std.testing.expectEqual(2, channel.record_header_used);
@@ -377,6 +541,30 @@ fn verifyClientFinished(plain: tls13_native.DecryptedRecord, expected_verify_dat
     }
 }
 
+test "native TLS refuses missing secure entropy before emitting any handshake" {
+    const Fake = struct {
+        fn entropy(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+            return error.EntropyUnavailable;
+        }
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fake.entropy;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var cfg = config_mod.defaultServerConfig();
+    try std.testing.expectError(error.EntropyUnavailable, establishTls13(undefined, std.testing.allocator, &cfg, "", .{
+        .supports_tls13 = true,
+        .offers_aes_128_gcm_sha256 = true,
+        .offers_ecdsa_secp256r1_sha256 = true,
+        .x25519_key_share = @splat(0x13),
+    }, io, Fake.read, Fake.write));
+}
+
 pub fn establishTls13(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
@@ -396,10 +584,14 @@ pub fn establishTls13(
     const alpn = selectedAlpn(info);
     if (info.alpn != null and alpn == null) return error.NoApplicationProtocol;
 
-    var server_random: [32]u8 = undefined;
-    io.random(&server_random);
-    const server_key_pair = tls13_native.X25519.KeyPair.generate(io);
-    const shared_secret = try tls13_native.X25519.scalarmult(server_key_pair.secret_key, client_x25519);
+    var entropy: [96]u8 = undefined;
+    defer std.crypto.secureZero(u8, &entropy);
+    try io.randomSecure(&entropy);
+    const server_random = entropy[0..32].*;
+    var server_key_pair = try tls13_native.X25519.KeyPair.generateDeterministic(entropy[32..64].*);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key_pair));
+    var shared_secret = try tls13_native.X25519.scalarmult(server_key_pair.secret_key, client_x25519);
+    defer std.crypto.secureZero(u8, &shared_secret);
 
     const legacy_session_id = info.legacy_session_id orelse "";
     const server_hello = try tls13_native.buildServerHello(allocator, .{
@@ -411,7 +603,8 @@ pub fn establishTls13(
 
     const client_hello = try clientHelloHandshakeMessage(client_hello_record);
     const hello_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello });
-    const traffic = tls13_native.deriveTrafficSecrets(shared_secret, hello_hash);
+    var traffic = tls13_native.deriveTrafficSecrets(shared_secret, hello_hash);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&traffic));
     const client_handshake_keys = tls13_native.deriveTlsRecordKeys(traffic.client_handshake_traffic_secret);
     const server_handshake_keys = tls13_native.deriveTlsRecordKeys(traffic.server_handshake_traffic_secret);
 
@@ -430,14 +623,16 @@ pub fn establishTls13(
     else
         return error.UnsupportedTlsSignatureScheme;
 
-    const generated_ecdsa_key_pair = if (signing_key_kind == .generated_ecdsa)
-        tls13_native.EcdsaP256Sha256.KeyPair.generate(io)
+    var generated_ecdsa_key_pair = if (signing_key_kind == .generated_ecdsa)
+        try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(entropy[64..96].*)
     else
         null;
-    const generated_ed25519_key_pair = if (signing_key_kind == .generated_ed25519)
-        tls13_native.Ed25519.KeyPair.generate(io)
+    defer if (generated_ecdsa_key_pair) |*pair| std.crypto.secureZero(u8, std.mem.asBytes(pair));
+    var generated_ed25519_key_pair = if (signing_key_kind == .generated_ed25519)
+        try tls13_native.Ed25519.KeyPair.generateDeterministic(entropy[64..96].*)
     else
         null;
+    defer if (generated_ed25519_key_pair) |*pair| std.crypto.secureZero(u8, std.mem.asBytes(pair));
     var generated_cert_der: ?[]u8 = null;
     defer if (generated_cert_der) |cert| allocator.free(cert);
 
@@ -524,6 +719,7 @@ pub fn establishTls13(
     const app_secrets = tls13_native.deriveApplicationTrafficSecrets(traffic.master_secret, application_hash);
     return .{
         .channel = .{
+            .io = io,
             .stream = stream,
             .allocator = allocator,
             .client_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.client_application_traffic_secret),

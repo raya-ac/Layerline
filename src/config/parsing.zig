@@ -16,32 +16,74 @@ const UpstreamPoolConfig = types.UpstreamPoolConfig;
 const UpstreamPoolPolicy = types.UpstreamPoolPolicy;
 
 pub fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamConfig {
-    const scheme_https = std.mem.startsWith(u8, raw, "https://");
-    const scheme_http = std.mem.startsWith(u8, raw, "http://");
-    var rest = raw;
+    var parts = std.mem.tokenizeAny(u8, raw, " \t");
+    var target = try parseUpstreamEndpoint(allocator, parts.next() orelse return error.InvalidUpstream);
+    errdefer freeParsedUpstream(allocator, target);
+    while (parts.next()) |part| if (!try applyUpstreamOption(allocator, &target, part)) return error.InvalidUpstream;
+    return target;
+}
 
-    if (scheme_https) {
-        rest = raw["https://".len..];
-    } else if (scheme_http) {
-        rest = raw["http://".len..];
-    }
+fn freeParsedUpstream(allocator: std.mem.Allocator, target: UpstreamConfig) void {
+    allocator.free(target.host);
+    allocator.free(target.base_path);
+    if (target.tls_ca_file) |path| allocator.free(path);
+    if (target.tls_server_name) |name| allocator.free(name);
+}
 
-    const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
-    const host_port = if (slash_pos) |p| rest[0..p] else rest;
-    const base_path = if (slash_pos) |p| rest[p..] else "/";
-
-    const colon = std.mem.lastIndexOfScalar(u8, host_port, ':');
-    var host = host_port;
-    var port: u16 = if (scheme_https) 443 else 80;
-
-    if (colon) |col| {
-        host = host_port[0..col];
-        port = std.fmt.parseInt(u16, host_port[col + 1 ..], 10) catch if (scheme_https) 443 else 80;
-    }
-    if (host.len == 0) return error.InvalidUpstream;
+fn parseUpstreamEndpoint(allocator: std.mem.Allocator, value: []const u8) !UpstreamConfig {
+    if (value.len == 0) return error.InvalidUpstream;
+    for (value) |c| if (c <= 32 or c >= 127 or c == '\\') return error.InvalidUpstream;
+    const text = if (std.mem.indexOf(u8, value, "://") == null) try std.fmt.allocPrint(allocator, "http://{s}", .{value}) else try allocator.dupe(u8, value);
+    defer allocator.free(text);
+    const uri = std.Uri.parse(text) catch return error.InvalidUpstream;
+    const scheme_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!scheme_https and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidUpstream;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidUpstream;
+    const encoded_host = switch (uri.host orelse return error.InvalidUpstream) {
+        .raw, .percent_encoded => |bytes| bytes,
+    };
+    if (encoded_host.len == 0 or std.mem.indexOfScalar(u8, encoded_host, '%') != null) return error.InvalidUpstream;
+    const bracketed = encoded_host[0] == '[';
+    const host = if (bracketed) blk: {
+        if (!std.mem.endsWith(u8, encoded_host, "]")) return error.InvalidUpstream;
+        const name = encoded_host[1 .. encoded_host.len - 1];
+        const ip = std.Io.net.IpAddress.parse(name, 0) catch return error.InvalidUpstream;
+        if (ip != .ip6) return error.InvalidUpstream;
+        break :blk name;
+    } else blk: {
+        std.Io.net.HostName.validate(encoded_host) catch return error.InvalidUpstream;
+        break :blk encoded_host;
+    };
+    // Uri is deliberately permissive. Check that it consumed the complete
+    // authority, rather than discarding junk after a bracketed IPv6 literal.
+    const authority_start = uri.scheme.len + 3;
+    if (text.len < authority_start or !std.mem.eql(u8, text[uri.scheme.len..authority_start], "://")) return error.InvalidUpstream;
+    const authority_end = std.mem.indexOfScalarPos(u8, text, authority_start, '/') orelse text.len;
+    const authority = text[authority_start..authority_end];
+    if (!std.mem.startsWith(u8, authority, encoded_host)) return error.InvalidUpstream;
+    const suffix = authority[encoded_host.len..];
+    if (suffix.len != 0) {
+        if (suffix[0] != ':' or suffix.len == 1) return error.InvalidUpstream;
+        for (suffix[1..]) |c| if (!std.ascii.isDigit(c)) return error.InvalidUpstream;
+        if (uri.port == null) return error.InvalidUpstream;
+    } else if (uri.port != null) return error.InvalidUpstream;
+    const port = uri.port orelse if (scheme_https) @as(u16, 443) else @as(u16, 80);
+    if (port == 0) return error.InvalidUpstream;
+    if (scheme_https) _ = @import("../upstream_certificate.zig").referenceName(host) catch return error.InvalidUpstream;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |bytes| bytes,
+    };
+    const base_path = if (path.len == 0) "/" else path;
+    if (base_path[0] != '/') return error.InvalidUpstream;
+    var cursor: usize = 0;
+    while (cursor < base_path.len) : (cursor += 1) if (base_path[cursor] == '%') {
+        if (base_path.len - cursor < 3 or !std.ascii.isHex(base_path[cursor + 1]) or !std.ascii.isHex(base_path[cursor + 2])) return error.InvalidUpstream;
+        cursor += 2;
+    };
 
     const dupe_host = try allocator.dupe(u8, host);
-    const dupe_path = try allocator.dupe(u8, if (base_path.len == 0) "/" else base_path);
+    errdefer allocator.free(dupe_host);
+    const dupe_path = try allocator.dupe(u8, base_path);
 
     return UpstreamConfig{
         .host = dupe_host,
@@ -58,7 +100,7 @@ pub fn parseUpstream(allocator: std.mem.Allocator, raw: []const u8) !UpstreamCon
     };
 }
 
-pub fn applyUpstreamOption(upstream: *UpstreamConfig, raw: []const u8) !bool {
+pub fn applyUpstreamOption(allocator: std.mem.Allocator, upstream: *UpstreamConfig, raw: []const u8) !bool {
     const token = std.mem.trim(u8, raw, " \t\r\n;");
     const eq = std.mem.indexOfScalar(u8, token, '=') orelse return false;
     const key = token[0..eq];
@@ -71,8 +113,17 @@ pub fn applyUpstreamOption(upstream: *UpstreamConfig, raw: []const u8) !bool {
         return true;
     }
 
-    if (!std.mem.startsWith(u8, token, "http://") and !std.mem.startsWith(u8, token, "https://")) {
-        return error.InvalidUpstream;
+    if (std.ascii.eqlIgnoreCase(key, "tls_ca_file")) {
+        if (!upstream.https or upstream.tls_ca_file != null or value.len == 0) return error.InvalidUpstream;
+        for (value) |c| if (c < 32 or c == 127) return error.InvalidUpstream;
+        upstream.tls_ca_file = try allocator.dupe(u8, value);
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(key, "tls_server_name")) {
+        if (!upstream.https or upstream.tls_server_name != null) return error.InvalidUpstream;
+        _ = @import("../upstream_certificate.zig").referenceName(value) catch return error.InvalidUpstream;
+        upstream.tls_server_name = try allocator.dupe(u8, value);
+        return true;
     }
     return false;
 }
@@ -82,6 +133,10 @@ pub fn parseUpstreamPool(allocator: std.mem.Allocator, raw: []const u8) !Upstrea
         .targets = .empty,
         .policy = .round_robin,
     };
+    errdefer {
+        for (pool.targets.items) |target| freeParsedUpstream(allocator, target);
+        pool.targets.deinit(allocator);
+    }
 
     var parts = std.mem.tokenizeAny(u8, raw, " \t,");
     while (parts.next()) |part| {
@@ -89,19 +144,74 @@ pub fn parseUpstreamPool(allocator: std.mem.Allocator, raw: []const u8) !Upstrea
         if (value.len == 0) continue;
 
         if (pool.targets.items.len > 0) {
-            if (try applyUpstreamOption(&pool.targets.items[pool.targets.items.len - 1], value)) continue;
-        } else if (std.mem.indexOfScalar(u8, value, '=') != null and
-            !std.mem.startsWith(u8, value, "http://") and
-            !std.mem.startsWith(u8, value, "https://"))
-        {
-            return error.InvalidUpstream;
+            if (try applyUpstreamOption(allocator, &pool.targets.items[pool.targets.items.len - 1], value)) continue;
         }
 
-        try pool.targets.append(allocator, try parseUpstream(allocator, value));
+        const target = try parseUpstream(allocator, value);
+        pool.targets.append(allocator, target) catch |err| {
+            freeParsedUpstream(allocator, target);
+            return err;
+        };
     }
 
     if (pool.targets.items.len == 0) return error.InvalidUpstream;
     return pool;
+}
+
+test "upstream authorities ports schemes and base paths are unambiguous" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "localhost:8080/app", "HTTP://example.test/", "https://[::1]:8443/a%20b", "[2001:db8::1]:9000", "https://EXAMPLE.TEST./x=a" }) |value| {
+        const target = try parseUpstream(allocator, value);
+        defer freeParsedUpstream(allocator, target);
+        const text = try std.fmt.allocPrint(allocator, "{f}", .{&target});
+        defer allocator.free(text);
+        const copy = try parseUpstream(allocator, text);
+        defer freeParsedUpstream(allocator, copy);
+        try std.testing.expectEqualSlices(u8, target.host, copy.host);
+        try std.testing.expectEqualSlices(u8, target.base_path, copy.base_path);
+        try std.testing.expectEqual(target.port, copy.port);
+        try std.testing.expectEqual(target.https, copy.https);
+    }
+    for ([_][]const u8{
+        "",                                    "https://",                      "ftp://example.test",        "http://user:pass@example.test", "http://example.test:",
+        "http://example.test:wrong",           "http://example.test:0",         "http://example.test:65536", "http://example.test:+80",       "http://example.test:8_0",
+        "http://example.test?x=1",             "http://example.test/#fragment", "http://example.test/%xx",   "http://example.test/%0",        "http://ex%61mple.test",
+        "http://[::1]junk:80/",                "http://[::1]:4:80/",            "http://::1:80/",            "http://[127.0.0.1]:80/",        "http://example.test\\evil/",
+        "http://example.test/\r\nInjected: x",
+    }) |value| try std.testing.expectError(error.InvalidUpstream, parseUpstream(allocator, value));
+}
+
+test "upstream TLS options are owned and survive formatter round trips" {
+    const allocator = std.testing.allocator;
+    const target = try parseUpstream(allocator, "https://[::1]:8443/app weight=2 tls_ca_file=/tmp/roots.pem tls_server_name=origin.example.test");
+    defer freeParsedUpstream(allocator, target);
+    const text = try std.fmt.allocPrint(allocator, "{f}", .{&target});
+    defer allocator.free(text);
+    const copy = try parseUpstream(allocator, text);
+    defer freeParsedUpstream(allocator, copy);
+    try std.testing.expectEqual(2, copy.weight);
+    try std.testing.expectEqualStrings("/tmp/roots.pem", copy.tls_ca_file.?);
+    try std.testing.expectEqualStrings("origin.example.test", copy.tls_server_name.?);
+    for ([_][]const u8{
+        "http://localhost tls_ca_file=/tmp/ca.pem",                            "http://localhost tls_server_name=origin.test",
+        "https://localhost tls_server_name=bad_name",                          "https://localhost tls_server_name=*.example.test",
+        "https://localhost tls_server_name=one.test tls_server_name=two.test", "https://localhost tls_ca_file=a tls_ca_file=b",
+        "https://localhost tls_ca_file=",                                      "https://localhost typo=1",
+    }) |value| try std.testing.expectError(error.InvalidUpstream, parseUpstream(allocator, value));
+}
+
+test "upstream parsing cleans up every allocation failure" {
+    const Check = struct {
+        fn parse(allocator: std.mem.Allocator) !void {
+            var pool = try parseUpstreamPool(allocator, "https://[::1]:8443/app weight=2 tls_ca_file=/tmp/roots.pem tls_server_name=origin.test http://localhost:9000");
+            defer {
+                for (pool.targets.items) |target| freeParsedUpstream(allocator, target);
+                pool.targets.deinit(allocator);
+            }
+            try std.testing.expectEqual(2, pool.targets.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.parse, .{});
 }
 
 // Parse CLI/config booleans without crashing on odd values.

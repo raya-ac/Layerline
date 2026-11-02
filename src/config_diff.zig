@@ -52,10 +52,9 @@ fn appendIntChange(out: *std.ArrayList(u8), allocator: std.mem.Allocator, compti
 fn appendUpstreamSummary(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: ?UpstreamPoolConfig) !void {
     if (pool) |upstream| {
         try out.print(allocator, "{s}[", .{config_mod.upstreamPoolPolicyName(upstream.policy)});
-        for (upstream.targets.items, 0..) |target, index| {
+        for (upstream.targets.items, 0..) |*target, index| {
             if (index > 0) try out.appendSlice(allocator, ",");
-            try out.print(allocator, "{s}://{s}:{d}{s}", .{ if (target.https) "https" else "http", target.host, target.port, target.base_path });
-            if (target.weight != 1) try out.print(allocator, " weight={d}", .{target.weight});
+            try out.print(allocator, "{f}", .{target});
         }
         try out.append(allocator, ']');
     } else {
@@ -76,6 +75,10 @@ fn appendUpstreamChange(out: *std.ArrayList(u8), allocator: std.mem.Allocator, l
     const candidate_text = try upstreamSummary(allocator, candidate);
     defer allocator.free(candidate_text);
     return appendStringChange(out, allocator, label, active_text, candidate_text);
+}
+
+fn legacyUpstreamSummary(allocator: std.mem.Allocator, cfg: *const ServerConfig) ![]const u8 {
+    return if (cfg.h2_upstream) |*target| std.fmt.allocPrint(allocator, "{f}", .{target}) else allocator.dupe(u8, "<none>");
 }
 
 fn findRoute(routes: []const RouteConfig, name: []const u8) ?*const RouteConfig {
@@ -249,11 +252,17 @@ pub fn render(allocator: std.mem.Allocator, active: *const ServerConfig, candida
     changes += try appendIntChange(&out, allocator, usize, "global.descriptor_limit", active.descriptor_limit, candidate.descriptor_limit);
     changes += try appendIntChange(&out, allocator, usize, "global.io_thread_limit", active.io_thread_limit, candidate.io_thread_limit);
     changes += try appendIntChange(&out, allocator, usize, "global.io_stack_size", active.io_stack_size, candidate.io_stack_size);
+    changes += try appendIntChange(&out, allocator, usize, "global.worker_stack_size", active.worker_stack_size, candidate.worker_stack_size);
     changes += try appendOptionalStringChange(&out, allocator, "global.tls_cert", active.tls_cert, candidate.tls_cert);
     changes += try appendBoolChange(&out, allocator, "global.http_redirect", active.http_redirect_enabled, candidate.http_redirect_enabled);
     changes += try appendBoolChange(&out, allocator, "global.http3", active.http3_enabled, candidate.http3_enabled);
     changes += try appendBoolChange(&out, allocator, "global.admin_ui", active.admin_ui_enabled, candidate.admin_ui_enabled);
     changes += try appendUpstreamChange(&out, allocator, "global.proxy", active.upstream, candidate.upstream);
+    const old_h2 = try legacyUpstreamSummary(allocator, active);
+    defer allocator.free(old_h2);
+    const new_h2 = try legacyUpstreamSummary(allocator, candidate);
+    defer allocator.free(new_h2);
+    changes += try appendStringChange(&out, allocator, "global.h2_upstream", old_h2, new_h2);
     changes += try appendRoutesDiff(&out, allocator, "route", active.routes.items, candidate.routes.items);
     changes += try appendDomainsDiff(&out, allocator, active.domains.items, candidate.domains.items);
 

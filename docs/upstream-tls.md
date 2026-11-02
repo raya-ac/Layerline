@@ -1,12 +1,55 @@
 # upstream TLS work
 
-HTTPS origins are **not enabled yet**. Both proxy paths and active health probes
-still reject them with `UnsupportedUpstreamScheme`; there is no insecure fallback
-to plaintext. TLS on the client-facing listener is a separate, existing feature.
+HTTPS origins use authenticated TLS 1.2/1.3 in both reverse-proxy paths and active
+health probes. The backend HTTP protocol is still HTTP/1.1, including when the
+downstream client uses HTTP/2. There is no plaintext downgrade or insecure mode.
+TLS on the client-facing listener is configured separately.
 
-The certificate policy and owned TLS channel are exercised by unit tests and
-test-only executables. Neither probe is installed with Layerline or exposed as a
-server command. The runtime does not import the new transport yet.
+The certificate and channel probes remain developer-only executables, not server
+commands. Source support and passing local tests are not a production deployment
+receipt or a claim of complete TLS/PKIX conformance.
+
+## configuration and ownership
+
+```conf
+proxy = https://origin.example.test:443/app
+# Private CA and an explicit service identity when dialing an IP:
+#proxy = https://192.0.2.10:8443/app tls_ca_file=/etc/layerline/roots.pem tls_server_name=origin.example.test
+```
+
+The same per-target options work in global, route, domain and domain-route pools,
+alongside `weight`. Without `tls_ca_file`, the fixed system PEM bundle paths below
+are used. An explicit file replaces system trust for that target. File paths are
+relative to the process working directory unless absolute; paths cannot contain
+whitespace. `tls_server_name` sets both verification identity and DNS SNI, not the
+forwarded HTTP Host. Without it, the configured target host is verified. IP
+identities use IP SANs and do not send DNS SNI. Options on HTTP targets are rejected.
+The old `h2_upstream` setting is parsed for compatibility but does not route native
+HTTP/2 traffic; use `proxy` or a named proxy route instead.
+
+Startup, activation validation and reload preload immutable trust stores. A
+snapshot deduplicates stores by configured path and owns their decoded bytes until
+its last request/health lease and idle TLS pool are gone. Changing a CA file on
+disk does not mutate a running snapshot. Failed preflight leaves the working
+configuration intact. Trust-load events record system/explicit source, anchor
+count and unusable system certificates skipped, not private file contents.
+
+HTTPS targets raise the worker stack minimum to 1 MiB, including route/domain
+targets. Reload refuses any increase that existing workers cannot satisfy; restart
+instead. Set `worker_stack_size = 1048576` at startup if adding the first HTTPS
+target later must be reloadable. There are at most 32 simultaneous origin TLS
+handshakes process-wide. Capacity or secure-entropy failure is local overload,
+not evidence that an origin should be ejected.
+
+Dialing, handshake and HTTP I/O share the original attempt deadline and
+cancellation. HTTP/1 pools own the socket and TLS channel together; buffered input,
+pending protocol state or readable idle sockets prevent reuse. This conservative
+check may discard a connection with harmless pending session tickets too.
+Eviction, failed requests, retirement and shutdown release the channel before its
+socket. Upgraded tunnels bind the two independent TLS directions in both joined
+pump threads and send encrypted close-notify before a TCP write-half-close.
+The HTTP/2 proxy remains buffered and non-pooled; this work does not add backend
+HTTP/2 ALPN or streaming final response bodies.
 
 ## channel implementation
 
@@ -44,8 +87,7 @@ I/O errors and the original deadline, and treats missing close-notify as
 truncation. Its socket belongs to the caller, not the channel. Both tunnel pumps
 must join before destroying it. Callers need a 1 MiB handshake stack floor:
 the real Debug probe exposed a stack overflow at the ordinary 256 KiB request
-worker size. Raising a setting on reload cannot repair already-running workers;
-runtime integration must enforce that boundary too.
+worker size. The runtime enforces that floor and the restart-only growth boundary.
 
 `src/upstream_trust.zig` loads immutable PEM stores, bounded to 8 MiB, 1024
 anchors and 128 KiB per certificate. An explicit store rejects unsupported or
@@ -54,8 +96,8 @@ certificates skipped; malformed PEM framing still fails the entire load. This is
 not full OS keychain integration. Linux uses fixed
 distribution bundle paths and macOS uses `/etc/ssl/cert.pem`. No environment
 variable can replace trust material, and a corrupt first-found bundle does not
-silently select another source. Snapshot ownership and operator diagnostics are
-still required before using this loader in the server.
+silently select another source. Temporary PEM input is wiped after decoding;
+configured trust anchors themselves contain public certificates, not private keys.
 
 ## what is covered
 
@@ -90,6 +132,8 @@ zig build test-upstream-certificates -Doptimize=Debug
 zig build test-upstream-certificates -Doptimize=ReleaseSafe
 zig build test-upstream-tls -Doptimize=Debug
 zig build test-upstream-tls -Doptimize=ReleaseSafe
+zig build test-https-upstreams -Doptimize=Debug
+zig build test-https-upstreams -Doptimize=ReleaseSafe
 ```
 
 The second target needs Python 3 and OpenSSL as developer tools. It generates
@@ -116,6 +160,22 @@ sequence exhaustion, record/body bounds, large writes, and trust allocation
 failure cleanup. These are channel tests, not reverse-proxy, pool, concurrent
 tunnel, reload or full TLS conformance acceptance.
 
+The separate HTTPS integration target (also in `verify-layerline.sh`) runs the
+actual server against disposable TLS origins. It covers both origin versions,
+plain/native-TLS H1/H2 clients, certificate refusal before any HTTP bytes, framing,
+pool reuse/poisoning, health probes, original deadlines, scoped targets and the
+restart-only stack boundary. Real worker tests include RSA, P-384, Ed25519 and
+certificates larger than a record; the native listener also sends a fragmented
+large Certificate message. Tunnels exercise prefetched bytes, bidirectional
+traffic, TLS half-close and requested origin key rotations. OpenSSL's
+[documented K command](https://docs.openssl.org/3.5/man1/openssl-s_server/#connected-commands)
+requests rotation; its independent trace must show each authenticated reply.
+Reset/disconnect tests join stalled handshakes/body reads without peer ejection.
+Reload tests retain old H2 leases across root changes, delete an old CA file to
+prove immutable ownership, reject failed preflight and verify final reclamation.
+Optional JSON receipts hash the server, fixture and raw H2 helper. These selected
+wire cases are not a TLS or HTTP/2 conformance suite.
+
 Each traffic key is limited to 2^20 records in either direction. Exceeding that
 budget closes the channel, rather than relying only on sequence-number wrap;
 see the [AEAD usage limits in RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html#section-5.5).
@@ -139,23 +199,20 @@ cases, skips 93 with recorded reasons, and retains 16 raw mismatches: 13
 acceptances against public-CA issuance expectations and three conservative
 rejections. The latter are two generic CA targets without TLS signing usage and
 the non-critical name-constraints profile that conflicts with the RFC test.
-These counts are test-bed evidence, not approval to enable an HTTPS transport.
+The thirteen acceptances are public-CA issuance-lint differences, not a bypass of
+chain signatures or SAN identity. They are retained rather than reclassified as a
+green full-corpus result. Unsupported algorithms and the three conservative
+rejections remain interoperability gaps.
 
-## before enabling HTTPS origins
+## remaining boundaries
 
-1. Finish the certificate profile and compatibility audit, including the retained
-   independent-corpus differences and unsupported algorithms.
-2. Integrate the tested channel, which authenticates the actual handshake's chain
-   and leaf key, into both proxy paths and health probes. A separate certificate-
-   preflight connection would not authenticate proxy traffic.
-3. Load bounded trust material into configuration snapshots, with explicit SNI
-   and hostname policy and no peer-controlled trust mutation or root downloads.
-4. Carry the original backend deadline, cancellation and descriptor/heap ownership
-   through handshakes, reads, writes, health probes, pools, reload and shutdown.
-5. Cover TLS close-notify/truncation, session ownership, concurrent upgraded
-   tunnels and key updates before adding encrypted sockets to the existing pool.
-6. Exercise real adversarial HTTPS origins through both proxy paths on macOS and
-   Linux, then pass the existing runtime and production rollout gates.
+Wider independent certificate/TLS conformance, unsupported policy/algorithm
+coverage, revocation, resumption, mTLS, proactive key updates, backend HTTP/2/3
+and streaming H2 responses remain work. The native client-facing TLS server still
+has a narrower cipher/group profile and rejects post-handshake KeyUpdate; origin
+client support does not imply server support. Both channels fail closed at their
+per-key record cap. Runtime changes must pass native/Linux regression and the
+candidate, rollback and live-route gates before deployment.
 
 Identity and path checks follow the separate responsibilities described in
 [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html) and

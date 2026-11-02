@@ -218,7 +218,7 @@ upstream_timeout_ms = 350
 upstream_retries = 1
 upstream_keepalive = true
 fastcgi_keepalive = true
-read_body_timeout_ms = 3000
+read_body_timeout_ms = 30000
 write_timeout_ms = 3000
 max_body_bytes = 8388608
 graceful_shutdown_timeout_ms = 1000
@@ -248,7 +248,10 @@ route_upstream_health_check_interval_ms.probe = 30000
                     command += ["--verbose", "--data-binary", "@" + str(data)]
                 if path.startswith("upload/"):
                     backends[0].upload_started = None
-                    command += ["--max-time", "5", "-H", "Expect: 100-continue"]
+                    # Debug software TLS must receive/decode the 4 MiB upload
+                    # before this backend-write test begins. Its 350ms attempt
+                    # and the measured <1.2s backend ceiling stay independent.
+                    command += ["--max-time", "35", "-H", "Expect: 100-continue"]
                 if path.startswith("retry"):
                     command += ["-H", "Cookie: ll_upstream=0"]
                 command += [f"{scheme}://127.0.0.1:{port}/{path}"]

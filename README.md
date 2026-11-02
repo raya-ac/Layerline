@@ -9,7 +9,7 @@
 
 i'm building layerline to run sites directly, without needing caddy or nginx in front of it.
 
-it handles static files, php/fpm, reverse proxying and tls. there's native http/2, per-domain configs, caching, gzip, logs, metrics and an optional admin ui. http/3 is in the project too, but it's still experimental.
+it handles static files, php/fpm, http/https reverse proxying and tls. there's native http/2, per-domain configs, caching, gzip, logs, metrics and an optional admin ui. http/3 is in the project too, but it's still experimental.
 
 there's still work to do before i'd call it a drop-in caddy/nginx replacement. the [roadmap](docs/roadmap.md) and [security notes](docs/security.md) cover the gaps.
 

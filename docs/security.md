@@ -572,7 +572,9 @@ does not retain a second full request-handler frame. Once HTTP starts, bytes
 that resemble a TLS record are malformed HTTP, not another handshake. CGI
 environment encoding also avoids general-purpose formatting on that stack.
 Connection workers have a 256 KiB default and enforced minimum; compression
-requires at least 512 KiB. The previous 64 KiB stack could overflow baseline-x86
+requires at least 512 KiB and HTTPS origins require 1 MiB. Increasing the worker
+stack requires restart rather than silently retaining smaller existing workers.
+The previous 64 KiB stack could overflow baseline-x86
 software AES-GCM during a valid CGI response in Debug. Linux and macOS Debug wire
 tests request the old size and verify that the runtime enforces the larger floor
 before exercising CGI over RSA-2048/RSA-4096 TLS. Stacks remain outside the
@@ -671,10 +673,20 @@ codec/allocation checks, not external QUIC interoperability or live early-hint
 streaming guarantees.
 `scripts/verify-upstream-framing.py` checks these paths over plain and native TLS.
 
-HTTPS backend transport is still disabled. The separately tested
-[upstream certificate policy and authenticated TLS channel](upstream-tls.md) do
-not enable it or change production trust. Independent corpus mismatches remain visible; no full
-PKIX, revocation, browser-policy or HTTPS-upstream acceptance is claimed.
+HTTPS origins now authenticate the actual TLS handshake in H1/H2 proxy paths and
+health probes. [The origin TLS notes](upstream-tls.md) describe SAN-only identity,
+immutable snapshot-owned trust, original deadlines/cancellation, encrypted pools,
+joined tunnel/key-update tests, stack limits and unsupported features. There is
+no insecure option or plaintext fallback. The native downstream TLS path now
+reserves nonces before writes, poisons output after fatal input/partial-write
+failure, supports authenticated write-half-close and rejects unauthenticated EOF.
+Resumable read timeouts and H2 backend-completion wakeups retain partial records.
+Handshake key generation and
+RSA-PSS salt require secure entropy without the I/O API's weaker fallback.
+Temporary key PEM/DER buffers, retired configured private keys and traffic state
+are wiped. This is not a claim that every internal crypto-library scratch copy is
+erased. Independent certificate-corpus mismatches remain visible; no complete
+PKIX, revocation or browser-root-program acceptance is claimed.
 
 `scripts/verify-shutdown.py` starts isolated loopback instances with admin, QUIC,
 health, and reload workers. It checks idle shutdown, in-flight HTTP/1 uploads,

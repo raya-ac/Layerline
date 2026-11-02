@@ -244,12 +244,14 @@ route_proxy.dns = http://localhost:{backend.server_port}
                     assert head.request("HEAD", "/fast.txt", close=True)[0] == 503
                     head.close()
                     clients.remove(head)
+                    wait_for(lambda: metrics(admin)[NORMAL] < observed[NORMAL_LIMIT], "closed HEAD peer did not release its descriptor")
                     fill()
                     pids = set((folder / "pids").iterdir())
                     assert php_client.request("GET", "/index.php", close=True)[0] == 503
                     php_client.close()
                     clients.remove(php_client)
                     assert set((folder / "pids").iterdir()) == pids, "CGI launched despite full descriptor admission"
+                    wait_for(lambda: metrics(admin)[NORMAL] < observed[NORMAL_LIMIT], "closed CGI peer did not release its descriptor")
                     fill()
                     rejected = socket.create_connection(("127.0.0.1", number), timeout=3)
                     try:

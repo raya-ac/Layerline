@@ -424,6 +424,26 @@ test "activation config diff reports global and route changes" {
     try std.testing.expect(std.mem.indexOf(u8, diff, "+ route.api: prefix /api/ -> proxy") != null);
 }
 
+test "legacy origin trust and identity changes appear in activation diffs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var active = defaultServerConfig();
+    var candidate = defaultServerConfig();
+    try applyConfigLine(&active, allocator, "h2_upstream", "https://[::1]:8443/app tls_ca_file=old.pem tls_server_name=old.test");
+    try applyConfigLine(&candidate, allocator, "h2_upstream", "https://[::1]:8443/app tls_ca_file=new.pem tls_server_name=new.test");
+    const diff = try config_diff.render(std.testing.allocator, &active, &candidate);
+    defer std.testing.allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "~ global.h2_upstream: https://[::1]:8443/app tls_ca_file=old.pem tls_server_name=old.test -> https://[::1]:8443/app tls_ca_file=new.pem tls_server_name=new.test") != null);
+    const target = &candidate.h2_upstream.?;
+    const authority = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{target.authority()});
+    defer std.testing.allocator.free(authority);
+    try std.testing.expectEqualStrings("[::1]:8443", authority);
+    const url = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{target.url()});
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://[::1]:8443/app", url);
+}
+
 fn headersContainRule(headers: []const config_mod.ResponseHeaderRule, name: []const u8, value: []const u8) bool {
     for (headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name) and std.mem.eql(u8, header.value, value)) return true;

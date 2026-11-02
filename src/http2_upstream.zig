@@ -11,6 +11,8 @@ const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
 const backend_deadline = @import("backend_deadline.zig");
 const upstream_reader = @import("upstream_reader.zig");
+const upstream_tls = @import("upstream_tls.zig");
+const upstream_connection = @import("upstream_connection.zig");
 
 const H2BufferedResponse = h2_support.BufferedResponse;
 const ServerConfig = config_mod.ServerConfig;
@@ -42,7 +44,9 @@ fn appendForwardedRequestHeaders(
     cfg: *const ServerConfig,
     callbacks: Callbacks,
 ) !void {
-    const forwarded_host = http_headers.findHeaderValue(req.headers, "Host") orelse upstream.host;
+    var authority_buffer: [512]u8 = undefined;
+    const forwarded_host = http_headers.findHeaderValue(req.headers, "Host") orelse
+        try std.fmt.bufPrint(&authority_buffer, "{f}", .{upstream.authority()});
     const client_proto = if (proxy_utils.isConnectionField(req.headers, "X-Forwarded-Proto")) null else http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto");
     const forwarded_proto = if (client_proto) |proto|
         http_headers.trimValue(proto)
@@ -75,7 +79,6 @@ fn appendForwardedRequestHeaders(
 }
 
 fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
-    if (upstream.https) return error.UnsupportedUpstreamScheme;
     var phase: enum { connect, configure, request, response_head, response_body } = .connect;
     errdefer |err| if (!@import("builtin").is_test and err == error.Unexpected) {
         std.debug.print("{{\"event\":\"server.upstream_failure_detail\",\"protocol\":\"h2\",\"phase\":\"{s}\",\"error\":\"{s}\"}}\n", .{ @tagName(phase), @errorName(err) });
@@ -83,15 +86,14 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     const previous_backend = backend_deadline.push(callbacks.active_io(), runtime_policy.timeout_ms);
     defer backend_deadline.restore(previous_backend);
 
-    const upstream_label = try std.fmt.allocPrint(
-        allocator,
-        "{s}://{s}:{d}{s}",
-        .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
-    );
+    const upstream_label = try std.fmt.allocPrint(allocator, "{f}", .{upstream.url()});
     callbacks.access_log_set_upstream(upstream_label);
 
-    const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
-    defer callbacks.stream_close(upstream_conn);
+    const lease = try upstream_connection.open(allocator, upstream, runtime_policy.timeout_ms, callbacks);
+    defer lease.close(callbacks);
+    const upstream_conn = lease.stream;
+    const previous_tls = upstream_tls.bind(lease.tls_channel);
+    defer _ = upstream_tls.bind(previous_tls);
     phase = .configure;
     try backend_deadline.attach(upstream_conn);
     try callbacks.set_stream_timeouts(upstream_conn, runtime_policy.timeout_ms, runtime_policy.timeout_ms);
@@ -134,6 +136,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     while (try reader.nextData()) |data| try body.appendSlice(allocator, data);
+    lease.end();
     const content_type = if (!proxy_utils.isConnectionField(head.fields, "Content-Type"))
         if (http_headers.findHeaderValue(head.fields, "Content-Type")) |value| try allocator.dupe(u8, value) else "application/octet-stream"
     else
@@ -208,7 +211,6 @@ pub fn fetchPoolResponse(
     }
     if (last_error) |err| switch (err) {
         error.RequestTimeout => return callbacks.error_response(allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out."),
-        error.UnsupportedUpstreamScheme => return callbacks.error_response(allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this server path."),
         error.PayloadTooLarge => return callbacks.error_response(allocator, 502, "Bad Gateway", "Upstream response exceeds configured response buffer."),
         else => {},
     };

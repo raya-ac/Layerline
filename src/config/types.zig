@@ -46,6 +46,7 @@ pub const DEFAULT_ACCESS_LOG_PATH = "stderr";
 
 pub const UpstreamIdleConnection = struct {
     stream: std.Io.net.Stream,
+    tls_channel: ?*@import("../upstream_tls.zig").Channel = null,
     expires_at_ms: i64,
     requests_served: usize,
 };
@@ -87,6 +88,9 @@ pub const UpstreamConfig = struct {
     port: u16,
     base_path: []const u8,
     https: bool,
+    tls_ca_file: ?[]const u8 = null,
+    tls_server_name: ?[]const u8 = null,
+    tls_trust: ?*@import("../upstream_trust.zig").Store = null,
     weight: usize,
     keepalive_pool: UpstreamKeepAlivePool,
     active_requests: std.atomic.Value(usize),
@@ -94,6 +98,30 @@ pub const UpstreamConfig = struct {
     passive_failures: std.atomic.Value(usize),
     ejected_until_ms: std.atomic.Value(i64),
     recovered_at_ms: std.atomic.Value(i64),
+
+    pub fn format(self: *const UpstreamConfig, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.formatUrl(writer);
+        if (self.weight != 1) try writer.print(" weight={d}", .{self.weight});
+        if (self.tls_ca_file) |path| try writer.print(" tls_ca_file={s}", .{path});
+        if (self.tls_server_name) |name| try writer.print(" tls_server_name={s}", .{name});
+    }
+
+    pub fn formatAuthority(self: *const UpstreamConfig, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ipv6 = std.mem.indexOfScalar(u8, self.host, ':') != null;
+        try writer.print("{s}{s}{s}:{d}", .{ if (ipv6) "[" else "", self.host, if (ipv6) "]" else "", self.port });
+    }
+
+    pub fn formatUrl(self: *const UpstreamConfig, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{s}://{f}{s}", .{ if (self.https) "https" else "http", self.authority(), self.base_path });
+    }
+
+    pub fn authority(self: *const UpstreamConfig) std.fmt.Alt(*const UpstreamConfig, formatAuthority) {
+        return .{ .data = self };
+    }
+
+    pub fn url(self: *const UpstreamConfig) std.fmt.Alt(*const UpstreamConfig, formatUrl) {
+        return .{ .data = self };
+    }
 };
 
 pub const PhpFastcgiTcpEndpoint = struct {
@@ -351,6 +379,7 @@ pub const ServerConfig = struct {
     php_front_controller: bool,
     upstream: ?UpstreamPoolConfig,
     upstream_policy: UpstreamPoolPolicy,
+    upstream_trust_snapshot: ?*@import("../upstream_trust.zig").Snapshot = null,
     tls_enabled: bool,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,

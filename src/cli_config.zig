@@ -676,6 +676,8 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
         return err;
     };
 
+    if (validate_only or doctor) try @import("upstream_material.zig").loadAll(init.io, allocator, cfg);
+    defer if (validate_only or doctor) @import("upstream_material.zig").deinitAll(cfg);
     if (validate_only) {
         std.debug.print("Layerline config OK: {s}:{d}\n", .{ cfg.host, cfg.port });
     }

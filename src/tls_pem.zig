@@ -9,7 +9,15 @@ pub const ConfiguredPrivateKey = union(enum) {
     ecdsa_p256: tls13_native.EcdsaP256Sha256.KeyPair,
     rsa: tls13_native.RsaPrivateKey,
 
+    pub fn wipe(self: *ConfiguredPrivateKey) void {
+        switch (self.*) {
+            .ecdsa_p256 => |*key| std.crypto.secureZero(u8, std.mem.asBytes(key)),
+            .rsa => |*key| key.wipe(),
+        }
+    }
+
     pub fn deinit(self: *ConfiguredPrivateKey, allocator: std.mem.Allocator) void {
+        self.wipe();
         switch (self.*) {
             .ecdsa_p256 => {},
             .rsa => |*key| key.deinit(allocator),
@@ -34,6 +42,23 @@ const DerTlv = struct {
     tag: u8,
     value: []const u8,
 };
+
+test "owned TLS signing keys can be wiped before arena retirement" {
+    const allocator = std.testing.allocator;
+    var ec: ConfiguredPrivateKey = .{ .ecdsa_p256 = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x27)) };
+    ec.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&ec.ecdsa_p256), 0));
+    ec.deinit(allocator);
+    var rsa: ConfiguredPrivateKey = .{ .rsa = .{
+        .modulus = try allocator.dupe(u8, "public modulus"),
+        .public_exponent = try allocator.dupe(u8, "public exponent"),
+        .private_exponent = try allocator.dupe(u8, "private exponent"),
+    } };
+    defer rsa.deinit(allocator);
+    rsa.wipe();
+    try std.testing.expect(std.mem.allEqual(u8, rsa.rsa.private_exponent, 0));
+    try std.testing.expectEqualStrings("public modulus", rsa.rsa.modulus);
+}
 
 const DerReader = struct {
     bytes: []const u8,
@@ -105,16 +130,19 @@ pub fn decodePrivateKeyPem(
     if (findPemBlock(pem, "EC PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
         defer allocator.free(decoded);
+        defer std.crypto.secureZero(u8, decoded);
         return .{ .ecdsa_p256 = try parseSec1EcPrivateKey(decoded) };
     }
     if (findPemBlock(pem, "RSA PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
         defer allocator.free(decoded);
+        defer std.crypto.secureZero(u8, decoded);
         return .{ .rsa = try parsePkcs1RsaPrivateKey(allocator, decoded) };
     }
     if (findPemBlock(pem, "PRIVATE KEY", 0)) |block| {
         const decoded = try decodeBase64PemBody(allocator, block.body);
         defer allocator.free(decoded);
+        defer std.crypto.secureZero(u8, decoded);
         return parsePkcs8PrivateKey(allocator, decoded);
     }
     return error.MissingPrivateKeyPemBlock;

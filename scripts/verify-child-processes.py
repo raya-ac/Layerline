@@ -67,13 +67,15 @@ def open_connection(number, tls):
     return connection
 
 
-def request(number, tls, kind, body=None, path="/index.php"):
+def request(number, tls, kind, body=None, path="/index.php", timings=None):
     connection = open_connection(number, tls)
     try:
         start = time.monotonic()
         connection.request("POST" if body else "GET", path + "?" + kind, body=body)
         reply = connection.getresponse()
         data = reply.read()
+        if timings is not None:
+            timings["finished_ns"] = time.monotonic_ns()
         return reply.status, data, time.monotonic() - start
     finally:
         connection.close()
@@ -182,11 +184,19 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                     # Pipe pressure and output caps need time to reach the
                     # worker. Don't race those checks against the short
                     # deadline tested by hang/trickle/closed.
-                    path = "/extended/input" if kind in ["noinput", "overflow", "stderr"] else "/index.php"
-                    status, data, elapsed = request(number, tls, kind, body, path=path)
-                    assert status == expected and elapsed < 2, (kind, status, expected, elapsed)
+                    path = "/index.php" if kind in ["hang", "trickle", "closed"] else "/extended/input"
+                    timings = {}
+                    status, data, elapsed = request(number, tls, kind, body, path=path, timings=timings)
+                    assert status == expected and elapsed < (3 if kind == "noinput" else 2), (kind, status, expected, elapsed)
                     if kind == "noinput":
                         assert elapsed >= .9, ("stdin pressure returned before its route budget", elapsed)
+                        # Software TLS in Debug spends time decoding the large
+                        # upload before CGI starts. Keep a whole-wire ceiling,
+                        # then bound the child wait independently of that work.
+                        started = [value["started_ns"] for pid, value in records(folder).items() if value["kind"] == kind and previous.get(pid) != value]
+                        assert len(started) == 1, ("stdin pressure child did not start exactly once", started)
+                        child_elapsed = (timings["finished_ns"] - started[0]) / 1e9
+                        assert 0 <= child_elapsed < 1.5, ("stdin pressure outlived its original child budget", child_elapsed, elapsed)
                     if kind == "duplex":
                         assert data == b"x" * 65536 + hashlib.sha256(body).hexdigest().encode()
                     elif expected == 200:

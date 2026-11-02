@@ -8,6 +8,14 @@ pub const CheckProgress = *const fn (std.Io.net.Stream) anyerror!void;
 // Certificate verification and the vendored handshake use bounded stack scratch
 // in Debug too. Callers must provide this floor, including existing reload workers.
 pub const handshake_stack_bytes = 1024 * 1024;
+pub const max_handshakes = 32;
+var handshakes: std.atomic.Value(usize) = .init(0);
+
+fn reserveHandshake() !void {
+    var count = handshakes.load(.acquire);
+    while (count < max_handshakes) count = handshakes.cmpxchgWeak(count, count + 1, .acq_rel, .acquire) orelse return;
+    return error.BackendCapacity;
+}
 const ErrorCode = std.meta.Int(.unsigned, @bitSizeOf(anyerror));
 
 threadlocal var active: ?*Channel = null;
@@ -49,6 +57,8 @@ pub const Channel = struct {
 
     pub fn create(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, peer_name: []const u8, anchors: []const policy.Certificate, raw_read: RawRead, raw_write: RawWrite, check_progress: CheckProgress) !*Channel {
         const reference = try policy.referenceName(peer_name);
+        try reserveHandshake();
+        defer _ = handshakes.fetchSub(1, .acq_rel);
         const address = std.Io.net.IpAddress.parse(reference, 0) catch null;
         const self = try allocator.create(Channel);
         errdefer self.destroy();
@@ -56,8 +66,14 @@ pub const Channel = struct {
         self.reader = .{ .buffer = &self.input_buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = readRaw } };
         self.writer = .{ .buffer = &self.output_buffer, .vtable = &.{ .drain = writeRaw } };
         var entropy: [Client.Options.entropy_len]u8 = undefined;
-        try io.randomSecure(&entropy);
         defer std.crypto.secureZero(u8, &entropy);
+        io.randomSecure(&entropy) catch |err| switch (err) {
+            error.EntropyUnavailable => {
+                if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.tls_entropy_unavailable\"}}\n", .{});
+                return error.BackendCapacity;
+            },
+            else => return err,
+        };
         const handshake_buffer = try allocator.alloc(u8, Client.max_handshake_bytes);
         defer allocator.free(handshake_buffer);
         self.client = Client.init(&self.reader, &self.writer, .{
@@ -205,3 +221,36 @@ pub const Channel = struct {
         return n;
     }
 };
+
+test "origin handshake admission is bounded and rejection does not steal a slot" {
+    try std.testing.expectEqual(0, handshakes.load(.acquire));
+    defer handshakes.store(0, .release);
+    for (0..max_handshakes) |_| try reserveHandshake();
+    try std.testing.expectError(error.BackendCapacity, reserveHandshake());
+    try std.testing.expectEqual(max_handshakes, handshakes.load(.acquire));
+    _ = handshakes.fetchSub(1, .acq_rel);
+    try reserveHandshake();
+    try std.testing.expectEqual(max_handshakes, handshakes.load(.acquire));
+}
+
+test "missing secure entropy releases handshake admission without writing or falling back" {
+    const Fake = struct {
+        fn entropy(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+            return error.EntropyUnavailable;
+        }
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+        fn progress(_: std.Io.net.Stream) !void {
+            return error.UnexpectedProgress;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fake.entropy;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.BackendCapacity, Channel.create(std.testing.allocator, io, .{ .socket = .{ .handle = 123, .address = undefined } }, "example.test", &.{}, Fake.read, Fake.write, Fake.progress));
+    try std.testing.expectEqual(0, handshakes.load(.acquire));
+}

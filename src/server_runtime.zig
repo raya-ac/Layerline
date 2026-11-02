@@ -206,8 +206,7 @@ fn printStartupSummary(cfg: *const ServerConfig) void {
         );
     }
     if (cfg.h2_upstream != null) {
-        const hup = cfg.h2_upstream.?;
-        std.debug.print("HTTP/2 cleartext passthrough to: {s}:{d} (base {s})\n", .{ hup.host, hup.port, hup.base_path });
+        std.debug.print("Legacy h2_upstream does not route native HTTP/2 traffic; configure proxy instead.\n", .{});
     }
     std.debug.print(
         "Timeouts: header={d}ms body={d}ms idle={d}ms write={d}ms upstream={d}ms upstream_retries={d} graceful_shutdown={d}ms\n",

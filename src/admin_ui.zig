@@ -382,10 +382,9 @@ fn formatAdminUpstreamPoolValue(allocator: std.mem.Allocator, pool: ?UpstreamPoo
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     if (pool) |upstream| {
-        for (upstream.targets.items, 0..) |target, index| {
+        for (upstream.targets.items, 0..) |*target, index| {
             if (index > 0) try out.append(allocator, ' ');
-            try out.print(allocator, "{s}://{s}:{d}{s}", .{ if (target.https) "https" else "http", target.host, target.port, target.base_path });
-            if (target.weight != 1) try out.print(allocator, " weight={d}", .{target.weight});
+            try out.print(allocator, "{f}", .{target});
         }
     }
     return out.toOwnedSlice(allocator);

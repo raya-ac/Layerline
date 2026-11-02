@@ -13,6 +13,8 @@ const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const backend_deadline = @import("backend_deadline.zig");
 const upstream_reader = @import("upstream_reader.zig");
+const upstream_tls = @import("upstream_tls.zig");
+const upstream_connection = @import("upstream_connection.zig");
 
 const HttpRequest = request_mod.HttpRequest;
 const ServerConfig = config_mod.ServerConfig;
@@ -58,16 +60,14 @@ pub const HealthCheckContext = struct {
     callbacks: Callbacks,
 };
 
-const UpstreamConnectionLease = struct {
-    stream: std.Io.net.Stream,
-    requests_served: usize,
-};
+const UpstreamConnectionLease = upstream_connection.Lease;
 
 fn keepaliveConfigured(cfg: *const ServerConfig) bool {
     return cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0;
 }
 
 fn closeIdleConnection(conn: UpstreamIdleConnection, callbacks: Callbacks) void {
+    if (conn.tls_channel) |channel| channel.destroy();
     callbacks.stream_close(conn.stream);
     callbacks.metrics.upstreamConnectionDiscarded();
 }
@@ -78,6 +78,7 @@ pub fn deinitConfigPools(io: std.Io, cfg: *ServerConfig, metrics: *metrics_mod.S
             upstream.keepalive_pool.mutex.lockUncancelable(context);
             defer upstream.keepalive_pool.mutex.unlock(context);
             while (upstream.keepalive_pool.idle.pop()) |conn| {
+                if (conn.tls_channel) |channel| channel.destroy();
                 close_stream(conn.stream);
                 counters.upstreamConnectionDiscarded();
             }
@@ -131,14 +132,14 @@ test "retired global route domain and domain-route pools close all idle descript
     for (pools) |pool| try std.testing.expectEqual(0, pool.targets.items[0].keepalive_pool.idle.capacity);
 }
 
-fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, now_ms: i64, callbacks: Callbacks) !UpstreamConnectionLease {
-    if (keepaliveConfigured(cfg) and !upstream.https) {
+fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, timeout_ms: u32, now_ms: i64, callbacks: Callbacks) !UpstreamConnectionLease {
+    if (keepaliveConfigured(cfg)) {
         const io = callbacks.active_io();
         upstream.keepalive_pool.mutex.lockUncancelable(io);
         defer upstream.keepalive_pool.mutex.unlock(io);
 
         while (upstream.keepalive_pool.idle.pop()) |conn| {
-            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests or !upstream_idle.reusable(conn.stream)) {
+            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests or (if (conn.tls_channel) |channel| !channel.quiet() else upstream.https) or !upstream_idle.reusable(conn.stream)) {
                 closeIdleConnection(conn, callbacks);
                 continue;
             }
@@ -146,37 +147,32 @@ fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cf
             callbacks.metrics.upstreamConnectionReused();
             return .{
                 .stream = conn.stream,
+                .tls_channel = conn.tls_channel,
                 .requests_served = conn.requests_served,
             };
         }
     }
 
-    const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
-    errdefer callbacks.stream_close(upstream_conn);
-    try callbacks.set_stream_timeouts(upstream_conn, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms);
-    callbacks.metrics.upstreamConnectionOpened();
-    return .{
-        .stream = upstream_conn,
-        .requests_served = 0,
-    };
+    return upstream_connection.open(allocator, upstream, timeout_ms, callbacks);
 }
 
 fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease: UpstreamConnectionLease, reusable: bool, now_ms: i64, callbacks: Callbacks) void {
-    if (!reusable or !keepaliveConfigured(cfg) or upstream.https) {
-        callbacks.stream_close(lease.stream);
-        callbacks.metrics.upstreamConnectionDiscarded();
+    if (!reusable or !keepaliveConfigured(cfg) or (if (lease.tls_channel) |channel| !channel.quiet() else upstream.https)) {
+        lease.end();
+        lease.close(callbacks);
         return;
     }
 
     const served = lease.requests_served + 1;
     if (served >= cfg.upstream_keepalive_max_requests) {
-        callbacks.stream_close(lease.stream);
-        callbacks.metrics.upstreamConnectionDiscarded();
+        lease.end();
+        lease.close(callbacks);
         return;
     }
 
     const idle_conn = UpstreamIdleConnection{
         .stream = lease.stream,
+        .tls_channel = lease.tls_channel,
         .expires_at_ms = now_ms + @as(i64, @intCast(cfg.upstream_keepalive_idle_timeout_ms)),
         .requests_served = served,
     };
@@ -190,8 +186,7 @@ fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease:
     }
 
     upstream.keepalive_pool.idle.append(resource_budget.allocator(), idle_conn) catch {
-        callbacks.stream_close(idle_conn.stream);
-        callbacks.metrics.upstreamConnectionDiscarded();
+        lease.close(callbacks);
         return;
     };
     callbacks.metrics.upstreamConnectionPooled();
@@ -370,20 +365,17 @@ fn responseFailure(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
 }
 
 fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !void {
-    if (upstream.https) {
-        return error.UnsupportedUpstreamScheme;
-    }
-
     const upgrade_request = proxy_utils.isHttpUpgradeHeaders(req.headers);
     const keepalive_enabled = keepaliveConfigured(cfg) and !upgrade_request;
     const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
     defer backend_deadline.restore(previous_backend);
-    const lease = try acquireConnection(allocator, upstream, cfg, callbacks.upstream_now_ms(), callbacks);
+    const lease = try acquireConnection(allocator, upstream, cfg, timeout_ms, callbacks.upstream_now_ms(), callbacks);
     var lease_released = false;
     defer if (!lease_released) {
-        callbacks.stream_close(lease.stream);
-        callbacks.metrics.upstreamConnectionDiscarded();
+        lease.close(callbacks);
     };
+    const previous_tls = upstream_tls.bind(lease.tls_channel);
+    defer _ = upstream_tls.bind(previous_tls);
     try callbacks.set_stream_timeouts(lease.stream, timeout_ms, timeout_ms);
     try backend_deadline.attach(lease.stream);
 
@@ -393,10 +385,11 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
+    var authority_buffer: [512]u8 = undefined;
     const forwarded_host = if (http_headers.findHeaderValue(req.headers, "Host")) |host|
         http_headers.trimValue(host)
     else
-        upstream.host;
+        try std.fmt.bufPrint(&authority_buffer, "{f}", .{upstream.authority()});
     const client_proto = if (proxy_utils.isConnectionField(req.headers, "X-Forwarded-Proto")) null else http_headers.findHeaderValue(req.headers, "X-Forwarded-Proto");
     const forwarded_proto = if (client_proto) |proto|
         http_headers.trimValue(proto)
@@ -481,14 +474,13 @@ fn readHealthStatus(upstream_conn: std.Io.net.Stream, callbacks: Callbacks) !u16
 }
 
 fn checkHealth(allocator: std.mem.Allocator, upstream: *const UpstreamConfig, health_path: []const u8, timeout_ms: u32, callbacks: Callbacks) !bool {
-    if (upstream.https) return error.UnsupportedUpstreamScheme;
-
     const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
     defer backend_deadline.restore(previous_backend);
-    const upstream_conn = try callbacks.connect_tcp_host(allocator, upstream.host, upstream.port);
-    defer callbacks.stream_close(upstream_conn);
-    try backend_deadline.attach(upstream_conn);
-    try callbacks.set_stream_timeouts(upstream_conn, timeout_ms, timeout_ms);
+    const lease = try upstream_connection.open(allocator, upstream, timeout_ms, callbacks);
+    defer lease.close(callbacks);
+    const upstream_conn = lease.stream;
+    const previous_tls = upstream_tls.bind(lease.tls_channel);
+    defer _ = upstream_tls.bind(previous_tls);
 
     const probe_path = try proxy_utils.buildProxyPath(allocator, upstream.base_path, health_path, "");
     defer allocator.free(probe_path);
@@ -496,12 +488,13 @@ fn checkHealth(allocator: std.mem.Allocator, upstream: *const UpstreamConfig, he
     var request_buffer: [1024]u8 = undefined;
     const request = try std.fmt.bufPrint(
         &request_buffer,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: Layerline-healthcheck\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        .{ probe_path, upstream.host },
+        "GET {s} HTTP/1.1\r\nHost: {f}\r\nUser-Agent: Layerline-healthcheck\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        .{ probe_path, upstream.authority() },
     );
     try callbacks.stream_write_all(upstream_conn, request);
 
     const status_code = try readHealthStatus(upstream_conn, callbacks);
+    lease.end();
     return status_code >= 200 and status_code < 400;
 }
 
@@ -683,11 +676,7 @@ pub fn forwardToPool(
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
-        const upstream_label = try std.fmt.allocPrint(
-            allocator,
-            "{s}://{s}:{d}{s}",
-            .{ if (upstream.https) "https" else "http", upstream.host, upstream.port, upstream.base_path },
-        );
+        const upstream_label = try std.fmt.allocPrint(allocator, "{f}", .{upstream.url()});
         callbacks.access_log_set_upstream(upstream_label);
         const sticky_cookie = if (policy == .sticky_cookie)
             try upstream_mod.stickyCookieHeader(allocator, upstream_index)
@@ -736,10 +725,6 @@ pub fn forwardToPool(
     if (last_error) |err| switch (err) {
         error.RequestTimeout => {
             try callbacks.send_cool_error(stream, allocator, 504, "Gateway Timeout", "All configured upstream attempts timed out.", true, is_head, null);
-            return;
-        },
-        error.UnsupportedUpstreamScheme => {
-            try callbacks.send_cool_error(stream, allocator, 501, "Not Implemented", "HTTPS upstream is not yet supported in this single-file server path. Use HTTPS reverse proxy in front of this binary.", true, is_head, null);
             return;
         },
         else => {},

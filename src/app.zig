@@ -132,11 +132,14 @@ fn installProcessSignalHandlers() void {
 }
 
 fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
-    return tls_material.loadAll(io, allocator, cfg);
+    errdefer deinitConfiguredTlsMaterials(allocator, cfg);
+    try tls_material.loadAll(io, allocator, cfg);
+    try @import("upstream_material.zig").loadAll(io, allocator, cfg);
 }
 
 fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
     tls_material.deinitAll(allocator, cfg);
+    @import("upstream_material.zig").deinitAll(cfg);
 }
 
 fn upstreamNowMs() i64 {
@@ -145,6 +148,8 @@ fn upstreamNowMs() i64 {
 
 fn retireConfig(cfg: *ServerConfig) void {
     upstream_runtime.deinitConfigPools(activeIo(), cfg, &runtime_state.server_metrics, streamClose);
+    @import("upstream_material.zig").deinitAll(cfg);
+    tls_material.wipeAll(cfg);
 }
 
 fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
@@ -172,6 +177,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const ServerConfig) !void {
+    if (candidate.worker_stack_size > active.worker_stack_size) return error.ReloadRequiresRestart;
     if (active.memory_budget_bytes != candidate.memory_budget_bytes) return error.ReloadRequiresRestart;
     if (active.descriptor_limit != candidate.descriptor_limit) return error.ReloadRequiresRestart;
     if (active.io_thread_limit != candidate.io_thread_limit or active.io_stack_size != candidate.io_stack_size) return error.ReloadRequiresRestart;
@@ -895,10 +901,13 @@ pub fn main(init: std.process.Init) !void {
     };
 
     loadAllConfiguredTlsMaterials(init.io, resource_budget.allocator(), &cfg) catch |err| {
-        std.debug.print("Failed to load native TLS certificate/key: {}\n", .{err});
+        std.debug.print("Failed to load configured TLS material: {}\n", .{err});
         return err;
     };
-    try runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig);
+    runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig) catch |err| {
+        deinitConfiguredTlsMaterials(resource_budget.allocator(), &cfg);
+        return err;
+    };
     runtime_state.server_metrics.config_store = &runtime_state.config_store;
     defer runtime_state.config_store.deinit();
     defer {

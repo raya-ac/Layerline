@@ -83,8 +83,7 @@ proxy = off
 # Nginx-style per-domain files live outside this main runtime config.
 # Put .conf files in domains-enabled/ and enable this:
 #domain_config_dir = domains-enabled
-# optional h2 cleartext passthrough target; requests with HTTP/2 preface are tunneled raw
-#h2_upstream = http://127.0.0.1:9001
+# Use proxy or named proxy routes for native HTTP/1 and HTTP/2 clients.
 # Local admin socket: status, validate activation config, diff activation config, redacted config inspection, cache purge, restart, routes, upstreams, cert-renew, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
 # Browser admin UI is disabled by default and creates access on first launch.
@@ -180,7 +179,7 @@ Argument precedence (highest wins):
 - Request parsing enforces valid versions (`HTTP/1.0`/`HTTP/1.1`) and required headers.
 - Request bodies support fixed `Content-Length` and standards-style `Transfer-Encoding: chunked`; unsupported transfer codings are rejected.
 - `Expect: 100-continue` receives an interim `100 Continue` response before the body is read.
-- Incoming HTTP/2 preface payload is detected and can be tunneled to `--h2-upstream`.
+- Incoming HTTP/2 prefaces are handled by the native HTTP/2 implementation.
 - HTTP/3 traffic on TCP is rejected with an explicit guidance message; native HTTP/3 uses UDP.
 - Unsupported methods return `501 Method Not Implemented`.
 - Unknown paths can still be handled by reverse proxy mode if configured.
@@ -600,11 +599,32 @@ Passive health marks a target as unavailable after repeated failed attempts. Aft
 zig build run -- --proxy http://127.0.0.1:9000,http://127.0.0.1:9001 --upstream-max-failures 2 --upstream-fail-timeout-ms 10000 --upstream-circuit-half-open-max 1 --upstream-slow-start-ms 10000
 ```
 
-You can also run only HTTP/2 cleartext passthrough:
+HTTPS targets authenticate the actual TLS 1.2/1.3 peer, including health checks:
 
-```bash
-zig build run -- --h2-upstream http://127.0.0.1:9001
+```conf
+proxy = https://origin.example.test:443/service
+# Or dial an IP using a private CA and a fixed service identity:
+#proxy = https://192.0.2.10:8443/service tls_ca_file=/etc/layerline/roots.pem tls_server_name=origin.example.test
 ```
+
+Each target can set `tls_ca_file` and `tls_server_name`, including in route/domain
+pools. Without them, Layerline uses a fixed system PEM bundle and verifies the
+configured host. Explicit roots replace system trust for that target; the name
+override controls verification and DNS SNI, not the forwarded HTTP Host. There is
+no skip-verification option or plaintext fallback. HTTP targets reject TLS options.
+Endpoint URLs reject credentials, queries/fragments, malformed ports and invalid
+escapes; bracket IPv6 literals, for example `https://[::1]:8443/`.
+
+Trust files are loaded into immutable config snapshots before startup/reload
+publishes them. An unreadable or invalid explicit store rejects activation.
+Changing a file requires reload; old requests keep their original trust until
+they finish. HTTPS origins enforce a 1 MiB worker-stack minimum. Raising the
+effective stack requires restart, not reload; start with
+`worker_stack_size = 1048576` if the first HTTPS route must be added by reload.
+[Origin TLS details](upstream-tls.md) cover bounds, tests and compatibility gaps.
+Backend HTTP remains HTTP/1.1 even for H2 clients; final H2 responses are still
+buffered. The legacy `h2_upstream`/`--h2-upstream` setting no longer routes native
+H2 traffic: use `proxy` or a named proxy route.
 
 ## PHP support
 

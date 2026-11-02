@@ -62,15 +62,36 @@ pub fn normalizeConfig(cfg: *ServerConfig) void {
     if (configCanEnableCompression(cfg) and cfg.worker_stack_size < DEFAULT_COMPRESSION_WORKER_STACK_BYTES) {
         cfg.worker_stack_size = DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
     }
+    if (hasHttpsUpstreams(cfg)) cfg.worker_stack_size = @max(cfg.worker_stack_size, @import("../upstream_tls.zig").handshake_stack_bytes);
+}
+
+pub fn hasHttpsUpstreams(cfg: *const ServerConfig) bool {
+    if (cfg.h2_upstream) |target| if (target.https) return true;
+    if (cfg.upstream) |pool| if (httpsPool(pool)) return true;
+    for (cfg.routes.items) |route| if (route.upstream) |pool| if (httpsPool(pool)) return true;
+    for (cfg.domains.items) |domain| {
+        if (domain.upstream) |pool| if (httpsPool(pool)) return true;
+        for (domain.routes.items) |route| if (route.upstream) |pool| if (httpsPool(pool)) return true;
+    }
+    return false;
+}
+
+fn httpsPool(pool: UpstreamPoolConfig) bool {
+    for (pool.targets.items) |target| if (target.https) return true;
+    return false;
 }
 
 pub fn validateUpstreamPool(pool: UpstreamPoolConfig) !void {
     if (pool.targets.items.len == 0) return error.InvalidConfigValue;
     for (pool.targets.items) |target| {
-        if (target.host.len == 0) return error.InvalidConfigValue;
-        if (target.port == 0) return error.InvalidConfigValue;
-        if (target.base_path.len == 0 or target.base_path[0] != '/') return error.InvalidConfigValue;
+        try validateUpstreamTarget(target);
     }
+}
+
+fn validateUpstreamTarget(target: types.UpstreamConfig) !void {
+    if (target.host.len == 0 or target.port == 0 or target.base_path.len == 0 or target.base_path[0] != '/') return error.InvalidConfigValue;
+    if (!target.https and (target.tls_ca_file != null or target.tls_server_name != null)) return error.InvalidConfigValue;
+    if (target.https) _ = @import("../upstream_certificate.zig").referenceName(target.tls_server_name orelse target.host) catch return error.InvalidConfigValue;
 }
 
 pub fn isSafeRelativeScriptPath(path: []const u8) bool {
@@ -207,6 +228,8 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     try @import("../descriptor_budget.zig").validate(cfg.descriptor_limit);
     try @import("../runtime_io.zig").validate(cfg.io_thread_limit, cfg.io_stack_size);
     if (cfg.worker_stack_size < types.DEFAULT_WORKER_STACK_BYTES) return error.InvalidConfigValue;
+    if (hasHttpsUpstreams(cfg) and cfg.worker_stack_size < @import("../upstream_tls.zig").handshake_stack_bytes) return error.InvalidConfigValue;
+    if (cfg.h2_upstream) |target| try validateUpstreamTarget(target);
     if (cfg.read_header_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.read_body_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.idle_timeout_ms == 0) return error.InvalidConfigValue;

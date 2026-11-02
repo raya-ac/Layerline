@@ -53,16 +53,18 @@ The experimental HTTP/3 buffered encoder preserves the same section ordering and
 HEAD/304 length metadata, with codec and allocation-failure tests; this does not
 close its external interoperability, flow-control or live streaming gaps.
 
-Native HTTPS upstream work now has a bounded certificate-policy test bed, an
-owned authenticated TLS 1.2/1.3 channel, real disposable-chain/peer tests and an
-offline pinned independent-corpus evaluator.
-It is not wired into the runtime: HTTPS origins and health probes still fail
-closed. Immutable PEM trust loading and actual handshake authentication are tested
-in isolation. Config-snapshot trust ownership, the worker stack/reload boundary,
-encrypted pool/tunnel ownership and proxy deadline integration remain required.
-The entire certificate
-corpus is not passing; [the TLS work notes](upstream-tls.md) retain the scope,
-profile differences and implementation gates.
+Native HTTPS origins now use the authenticated TLS 1.2/1.3 channel in both proxy
+paths and active health probes, carrying original attempt deadlines and
+cancellation. Immutable snapshot-owned roots, strict endpoint/SNI options,
+encrypted H1 pools, joined tunnels and the 1 MiB worker/reload boundary are wired.
+Real wire fixtures cover nested RSA/P384/Ed25519/large-certificate handshakes,
+identity refusal, pooling, TLS half-close, requested origin key updates, H2
+reset/disconnect cleanup and root rotation with pinned old readers. H2 backend
+responses are still buffered and the backend HTTP protocol remains HTTP/1.1.
+The independent certificate corpus is not entirely passing; [the TLS work notes](upstream-tls.md)
+retain profile differences, unsupported algorithms and wider conformance/release
+gates. Native listener KeyUpdate, broader TLS profiles, mTLS/resumption, backend
+HTTP/2/3 and revocation are still gaps, not completed roadmap items.
 
 The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
 

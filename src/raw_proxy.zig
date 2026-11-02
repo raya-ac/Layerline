@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const native_tls = @import("native_tls_runtime.zig");
+const upstream_tls = @import("upstream_tls.zig");
 
 pub const Callbacks = struct {
     active_io: *const fn () std.Io,
@@ -17,6 +18,7 @@ const StreamContext = struct {
     src: std.Io.net.Stream,
     dst: std.Io.net.Stream,
     tls_channel: ?*native_tls.Channel = null,
+    upstream_channel: ?*upstream_tls.Channel = null,
     callbacks: Callbacks,
 };
 
@@ -24,12 +26,18 @@ fn proxyStream(ctx: StreamContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
     ctx.callbacks.set_tls_channel(ctx.tls_channel);
     defer ctx.callbacks.clear_tls_channel();
+    const previous_upstream = upstream_tls.bind(ctx.upstream_channel);
+    defer _ = upstream_tls.bind(previous_upstream);
 
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = ctx.callbacks.stream_read(ctx.src, &buf) catch break;
         if (n == 0) break;
         ctx.callbacks.stream_write_all(ctx.dst, buf[0..n]) catch break;
+    }
+    if (upstream_tls.forStream(ctx.dst)) |channel| channel.end() catch {};
+    if (ctx.tls_channel) |channel| {
+        if (channel.stream.socket.handle == ctx.dst.socket.handle) native_tls.end(channel) catch {};
     }
     ctx.dst.shutdown(ctx.callbacks.active_io(), .send) catch {};
 }
@@ -49,13 +57,14 @@ fn proxyWithSpawner(a: std.Io.net.Stream, b: std.Io.net.Stream, initial_payload:
 
     const io = callbacks.active_io();
     const tls_channel = callbacks.current_tls_channel();
-    const t1 = try spawn(.{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel, .callbacks = callbacks });
+    const upstream_channel = upstream_tls.current();
+    const t1 = try spawn(.{ .io = io, .src = a, .dst = b, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .callbacks = callbacks });
     errdefer {
         a.shutdown(io, .recv) catch {};
         b.shutdown(io, .send) catch {};
         t1.join();
     }
-    const t2 = try spawn(.{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel, .callbacks = callbacks });
+    const t2 = try spawn(.{ .io = io, .src = b, .dst = a, .tls_channel = tls_channel, .upstream_channel = upstream_channel, .callbacks = callbacks });
     t1.join();
     t2.join();
 }

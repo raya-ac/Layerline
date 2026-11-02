@@ -13,8 +13,10 @@ pub fn loadFromPaths(
 ) !tls_pem.ConfiguredTlsMaterial {
     const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cert_path, allocator, .limited(512 * 1024));
     defer allocator.free(cert_pem);
+    defer std.crypto.secureZero(u8, cert_pem);
     const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, key_path, allocator, .limited(128 * 1024));
     defer allocator.free(key_pem);
+    defer std.crypto.secureZero(u8, key_pem);
     return tls_pem.loadMaterialFromPem(allocator, cert_pem, key_pem);
 }
 
@@ -44,5 +46,14 @@ pub fn deinitAll(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
     for (cfg.domains.items) |*domain| {
         if (domain.tls_material) |*material| material.deinit(allocator);
         domain.tls_material = null;
+    }
+}
+
+// Retired reloads live in an arena. Erase secrets before that arena is released,
+// without guessing whether its individual allocations can be freed here.
+pub fn wipeAll(cfg: *ServerConfig) void {
+    if (cfg.tls_material) |*material| material.private_key.wipe();
+    for (cfg.domains.items) |*domain| {
+        if (domain.tls_material) |*material| material.private_key.wipe();
     }
 }
