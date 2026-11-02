@@ -1,5 +1,9 @@
 const std = @import("std");
 
+test {
+    _ = @import("systemd_notify.zig");
+}
+
 const acme_mod = @import("acme.zig");
 const admin_upstreams = @import("admin_upstreams.zig");
 const config_diff = @import("config_diff.zig");

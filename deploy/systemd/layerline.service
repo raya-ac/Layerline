@@ -5,7 +5,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=layerline
 Group=layerline
 EnvironmentFile=-/etc/layerline/layerline.env
@@ -14,6 +15,7 @@ ExecReload=/bin/sh -c '/usr/local/bin/layerline --validate-config --config /etc/
 Restart=always
 RestartSec=2s
 SuccessExitStatus=SIGTERM 143
+TimeoutStartSec=120s
 TimeoutStopSec=15s
 KillSignal=SIGTERM
 RuntimeDirectory=layerline

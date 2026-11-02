@@ -16,6 +16,7 @@ const metrics_mod = @import("metrics.zig");
 const native_connect = @import("native_connect.zig");
 const native_spawn = @import("native_spawn.zig");
 const static_cache = @import("static_cache.zig");
+const systemd_notify = @import("systemd_notify.zig");
 const stream_runtime = @import("stream_runtime.zig");
 const upstream_mod = @import("upstream.zig");
 const upstream_runtime = @import("upstream_runtime.zig");
@@ -41,6 +42,7 @@ pub const Context = struct {
     metrics: *ServerMetrics,
     response_cache: *static_cache.Store,
     shutdown_requested: *std.atomic.Value(bool),
+    supervisor: *systemd_notify.Notifier,
     default_admin_socket_path: []const u8,
     server_header: []const u8,
     callbacks: Callbacks,
@@ -90,6 +92,7 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     const start = std.Io.Timestamp.now(ctx.io, .awake);
+    ctx.supervisor.stopping(ctx.io);
     var children_stopped = false;
     while (!state.complete.load(.acquire)) {
         const elapsed = start.durationTo(std.Io.Timestamp.now(ctx.io, .awake)).toMilliseconds();
@@ -107,7 +110,8 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
     }
 }
 
-fn reloadSignalTask(ctx: Context) void {
+fn reloadSignalTask(ctx: Context, state: *listener_state.State) void {
+    if (!state.awaitReady(ctx.io)) return;
     ctx.callbacks.reload_signal(ctx.io);
 }
 
@@ -244,7 +248,7 @@ fn startRedirectListener(
 }
 
 fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State) !void {
-    try workers.start(reloadSignalTask, .{ctx});
+    try workers.start(reloadSignalTask, .{ ctx, state });
     {
         workers.start(upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
@@ -360,6 +364,7 @@ pub fn run(ctx: Context) !void {
     const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .workers_stopped = &workers_stopped, .connections = &concurrency, .admin = if (admin) |*value| value else null }});
     defer {
         ctx.shutdown_requested.store(true, .release);
+        ctx.supervisor.stopping(ctx.io);
         std.debug.print("Shutdown requested; draining workers for up to {d}ms.\n", .{ctx.cfg.graceful_shutdown_timeout_ms});
         concurrency.beginDrain(ctx.io);
         workers.join();
@@ -385,6 +390,7 @@ pub fn run(ctx: Context) !void {
         try listeners.result();
         return;
     }
+    try ctx.supervisor.ready(ctx.io, ctx.shutdown_requested);
     printStartupSummary(ctx.cfg);
     listeners.ready.store(true, .release);
     std.debug.print("{{\"event\":\"server.ready\"}}\n", .{});

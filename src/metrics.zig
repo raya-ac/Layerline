@@ -1,6 +1,7 @@
 const std = @import("std");
 const http_response = @import("http_response.zig");
 const resource_budget = @import("resource_budget.zig");
+const systemd_notify = @import("systemd_notify.zig");
 const config_store_mod = @import("config_store.zig");
 
 pub const StaticTransferMode = enum {
@@ -493,5 +494,6 @@ pub fn render(allocator: std.mem.Allocator, metrics: *const ServerMetrics) ![]co
         try heap.print(allocator, "layerline_heap_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_limit_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_peak_bytes{{pool=\"{s}\"}} {d}\nlayerline_heap_rejections_total{{pool=\"{s}\"}} {d}\n", .{ entry[0], entry[1].used.load(.acquire), entry[0], entry[1].limit, entry[0], entry[1].peak.load(.acquire), entry[0], entry[1].rejected.load(.acquire) });
     }
     try heap.print(allocator, "# HELP layerline_overload_responses_total Minimal HTTP/1 overload responses completed.\n# TYPE layerline_overload_responses_total counter\nlayerline_overload_responses_total {d}\n", .{resource_budget.overload_responses.load(.acquire)});
+    try heap.print(allocator, "# HELP layerline_supervisor_notification_failures_total Runtime supervisor notification send failures.\n# TYPE layerline_supervisor_notification_failures_total counter\nlayerline_supervisor_notification_failures_total {d}\n", .{systemd_notify.failures.load(.monotonic)});
     return std.mem.concat(allocator, u8, &.{ base_metrics, acme_metrics, response_cache_metrics, fastcgi_metrics, http2_resources, config_resources, heap.items });
 }

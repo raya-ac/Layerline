@@ -114,6 +114,15 @@ reclamation. HTTP/3 retained slots now age out instead of persisting forever.
 This does not yet cap stacks, Zig I/O internals, child RSS or kernel resources.
 Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
 the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
+Systemd startup now waits for Layerline's native readiness signal after all
+configured listeners and background workers are prepared. Reloads are serialized
+against the current snapshot, rejected reloads preserve the working config, and
+stopping cannot be undone by a late reload. CLI helpers stay silent and external
+commands inherit no notify/watchdog environment authority. Filesystem/abstract
+datagram tests include full queues and sender credentials; an optional real
+systemd gate checks activation, delayed certificate setup, reloads and listener
+failure. This is not backend-health verification, watchdog monitoring or socket
+activation support.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these
@@ -233,7 +242,7 @@ Sources:
 8. HTTP/3 full routing. Initial QUIC/TLS plus minimal QPACK request decoding can serve static routes, static root, configured redirects, `/static/*`, `/health`, metrics, FastCGI PHP, proxy routes, custom 404s, ordered and out-of-order DATA request bodies across stream frames, and the fallback protocol page; flow-control depth and broad client conformance remain.
 9. Cache and compression. Initial inherited Cache-Control policy shortcuts, static ETag/Last-Modified validators, `If-None-Match`, `If-Modified-Since`, HTTP/1 `If-Range`, stale directive shortcuts, static Cache-Status detail, opt-in shared memory static response cache with route/domain knobs, conservative HTTP/2/HTTP/3 buffered GET microcache, admin full/matching-key cache purge through socket, browser, and HTTP API, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; brotli/zstd, disk cache, and HTTP/1 microcache parity remain next.
 10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, activation diff, redacted config inspection, cache purge, in-memory reload, SIGHUP reload, managed restart, routes, upstream health/eject/recover, certs, cert-renew, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, live upstream controls, cache purge, certificate renewal, enabled domain files, activation preflight, activation diff, reload, managed restart, and new site-file creation. Richer write APIs and audit trails remain.
-11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
+11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented. Native systemd readiness, serialized reload status, terminal stopping notifications and child environment isolation are covered by Unix datagram tests and an optional real-manager gate; watchdog heartbeats, socket activation and package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers CLI doctor/certs, HTTP/1, parser hardening for malformed headers and conflicting content lengths, HEAD 404 framing, static files, static conditional validators, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, redacted config inspection, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin UI cache purge, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
 The next engineering milestone is the remaining audit gate above: wider HTTP/2 conformance, process-wide resource budgets, resolver cancellation and externally verified HTTP/3 interoperability. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.

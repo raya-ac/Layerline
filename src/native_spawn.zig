@@ -165,7 +165,10 @@ fn check(io: std.Io, deadline: Deadline, shutdown: ?*const std.atomic.Value(bool
 }
 
 fn environmentBlock(allocator: std.mem.Allocator, environment: *const std.process.Environ.Map) !std.process.Environ.PosixBlock {
-    const count = environment.count() - @intFromBool(environment.contains("ZIG_PROGRESS"));
+    var count: usize = 0;
+    for (environment.keys()) |key| {
+        if (!privateKey(key)) count += 1;
+    }
     const entries = try allocator.allocSentinel(?[*:0]u8, count, null);
     var used: usize = 0;
     errdefer {
@@ -173,7 +176,7 @@ fn environmentBlock(allocator: std.mem.Allocator, environment: *const std.proces
         allocator.free(entries);
     }
     for (environment.keys(), environment.values()) |key, value| {
-        if (std.mem.eql(u8, key, "ZIG_PROGRESS")) continue;
+        if (privateKey(key)) continue;
         if (key.len == 0 or std.mem.indexOfAny(u8, key, "=\x00") != null or std.mem.indexOfScalar(u8, value, 0) != null)
             return error.InvalidArgument;
         // POSIX needs literal key=value strings. Avoid the general formatter:
@@ -182,6 +185,10 @@ fn environmentBlock(allocator: std.mem.Allocator, environment: *const std.proces
         used += 1;
     }
     return .{ .slice = entries };
+}
+
+fn privateKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "ZIG_PROGRESS") or @import("systemd_notify.zig").privateEnvironmentKey(key);
 }
 
 pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, environment: ?*const std.process.Environ.Map, deadline: Deadline, shutdown: ?*const std.atomic.Value(bool)) !Spawned {
@@ -278,13 +285,16 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8,
     };
 }
 
-test "child environment encoding preserves values and excludes the inherited progress descriptor" {
+test "child environment encoding preserves values without progress or supervisor capabilities" {
     var environment: std.process.Environ.Map = .init(std.testing.allocator);
     defer environment.deinit();
     try environment.put("LANG", "C.UTF-8");
     try environment.put("EMPTY", "");
     try environment.put("VALUE", "a=b\nwith spaces");
     try environment.put("ZIG_PROGRESS", "42");
+    try environment.put("NOTIFY_SOCKET", "/run/systemd/notify");
+    try environment.put("WATCHDOG_PID", "123");
+    try environment.put("WATCHDOG_USEC", "1000000");
     const Case = struct {
         fn exercise(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !void {
             const block = try environmentBlock(allocator, env);

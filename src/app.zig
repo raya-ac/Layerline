@@ -34,6 +34,7 @@ const request_mod = @import("request.zig");
 const runtime_state = @import("runtime_state.zig");
 const resource_budget = @import("resource_budget.zig");
 const server_runtime = @import("server_runtime.zig");
+const systemd_notify = @import("systemd_notify.zig");
 const server_identity = @import("server_identity.zig");
 const static_cache = @import("static_cache.zig");
 const stream_runtime = @import("stream_runtime.zig");
@@ -78,6 +79,9 @@ const DEFAULT_ADMIN_SOCKET_PATH = server_identity.default_admin_socket_path;
 const SERVER_NAME = server_identity.name;
 const SERVER_TAGLINE = server_identity.tagline;
 const SERVER_HEADER = server_identity.header;
+
+var supervisor: systemd_notify.Notifier = .{};
+var reload_mutex: std.Io.Mutex = .init;
 
 const streamWriteRequestIdHeader = http1_response_bridge.streamWriteRequestIdHeader;
 const streamWriteConfiguredResponseHeaders = http1_response_bridge.streamWriteConfiguredResponseHeaders;
@@ -182,7 +186,17 @@ fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const Se
     if (!optionalStringEql(active.admin_socket_path, candidate.admin_socket_path)) return error.ReloadRequiresRestart;
 }
 
-fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerConfig) !void {
+fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, _: *const ServerConfig) !void {
+    reload_mutex.lockUncancelable(io);
+    defer reload_mutex.unlock(io);
+    try supervisor.beginReload(io, &runtime_state.shutdown_requested);
+    var success = false;
+    defer supervisor.endReload(io, &runtime_state.shutdown_requested, success);
+    // A second caller may have waited behind a successful reload. Compare
+    // against the current snapshot, not the lease it brought into the queue.
+    var lease = runtime_state.acquireConfig();
+    defer lease.deinit();
+    const active = lease.cfg;
     // A browser request arena is reset after the reply. Each publication owns
     // separate storage until its last connection/background reader exits.
     const allocator = resource_budget.allocator();
@@ -204,7 +218,9 @@ fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, active: *const ServerC
     try validateConfig(candidate);
     try validateReloadCompatibility(active, candidate);
     try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
+    if (runtime_state.shutdown_requested.load(.acquire)) return error.Canceled;
     try runtime_state.config_store.activateOwned(arena, candidate, active.cache_generation);
+    success = true;
 }
 
 fn renewCertificatesInMemory(io: std.Io, allocator: std.mem.Allocator, active: *const ServerConfig) !void {
@@ -856,6 +872,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (!(try cli_config.prepare(init, resource_budget.allocator(), &cfg, .{ .usage = usage, .dump_routes = dumpRoutes, .dump_certs = dumpCerts, .doctor = doctor, .admin_command = runAdminCommand }))) return;
     try resource_budget.configure(cfg.memory_budget_bytes);
+    supervisor = try systemd_notify.Notifier.init(init.environ_map);
+    try supervisor.starting();
+    defer supervisor.stopping(init.io);
 
     if (cfg.tls_auto) {
         ensureLetsEncryptSetup(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
@@ -891,6 +910,7 @@ pub fn main(init: std.process.Init) !void {
         .metrics = &runtime_state.server_metrics,
         .response_cache = &runtime_state.static_response_cache,
         .shutdown_requested = &runtime_state.shutdown_requested,
+        .supervisor = &supervisor,
         .default_admin_socket_path = DEFAULT_ADMIN_SOCKET_PATH,
         .server_header = SERVER_HEADER,
         .callbacks = .{
