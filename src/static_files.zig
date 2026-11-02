@@ -456,7 +456,7 @@ fn trySendfileRange(stream: std.Io.net.Stream, file: std.Io.File, start: usize, 
     defer if (budget) |state| state.restoreSocketTimeout(stream);
 
     while (remaining > 0) {
-        if (budget) |state| try state.preparePhase(stream, "sendfile");
+        if (budget) |state| _ = try state.preparePhase(stream, "sendfile");
         const chunk = @min(remaining, 64 * 1024);
         var len: std.c.off_t = @intCast(chunk);
         switch (std.c.errno(std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0))) {

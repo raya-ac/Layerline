@@ -25,16 +25,17 @@ pub const State = struct {
         std.debug.print("{{\"event\":\"server.write_timeout\",\"protocol\":\"{s}\",\"phase\":\"{s}\",\"stream_id\":{d}}}\n", .{ @tagName(self.protocol), phase, self.stream_id });
     }
 
-    pub fn prepare(self: State, stream: std.Io.net.Stream) !void {
-        try self.preparePhase(stream, "wire");
+    pub fn prepare(self: State, stream: std.Io.net.Stream) !?u32 {
+        return self.preparePhase(stream, "wire");
     }
 
-    pub fn preparePhase(self: State, stream: std.Io.net.Stream, phase: []const u8) !void {
+    pub fn preparePhase(self: State, stream: std.Io.net.Stream, phase: []const u8) !?u32 {
         const remaining_ms = self.remaining() catch |err| {
             self.logTimeoutPhase(phase);
             return err;
         };
         if (remaining_ms) |timeout_ms| try setSocketTimeout(stream, timeout_ms);
+        return remaining_ms;
     }
 
     pub fn restoreSocketTimeout(self: State, stream: std.Io.net.Stream) void {

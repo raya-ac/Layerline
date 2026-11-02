@@ -132,8 +132,9 @@ fn rawStreamWriteAllUsing(stream: std.Io.net.Stream, bytes: []const u8, accepted
     while (written < bytes.len) {
         var options = socket_io.Options{};
         if (budget) |state| {
-            try state.prepare(stream);
-            options.timeout_ms = try state.remaining();
+            // A second clock check here could expire without the timeout event.
+            // Socket I/O checks the same absolute deadline and reports its error below.
+            options.timeout_ms = try state.prepare(stream);
             options.deadline = state.deadline;
         }
         if (backend) |state| {
@@ -271,4 +272,40 @@ test "unexpected socket failures are not disguised as timeouts" {
     try std.testing.expectEqual(error.RequestTimeout, normalizeSocketIoError(error.TimedOut));
     try std.testing.expectEqual(error.Unexpected, normalizeSocketIoError(error.Unexpected));
     try std.testing.expectEqual(error.SocketClosed, normalizeSocketIoError(error.SocketClosed));
+}
+
+test "expiry after socket preparation reaches the logged write-error path" {
+    const Fake = struct {
+        var clocks: usize = 0;
+        var writes: usize = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const call = clocks;
+            clocks += 1;
+            return .fromNanoseconds(if (call == 0) 0 else std.time.ns_per_s);
+        }
+        fn write(io: std.Io, _: std.Io.net.Stream, _: []const u8, options: socket_io.Options) !usize {
+            writes += 1;
+            _ = try options.deadline.remaining(.now(io, .awake));
+            return error.DeadlineWasNotPreserved;
+        }
+    };
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{});
+    defer listener.deinit(std.testing.io);
+    const stream = std.Io.net.Stream{ .socket = listener.socket };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fake.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const previous_io = current_io;
+    defer current_io = previous_io;
+    bindThreadIo(io);
+    const previous = write_deadline.push(.{ .io = io, .handle = stream.socket.handle, .deadline = .after(.fromNanoseconds(0), 1), .restore_timeout_ms = 100, .protocol = .h1 });
+    defer write_deadline.restore(previous);
+    Fake.clocks = 0;
+    Fake.writes = 0;
+    var accepted: usize = 0;
+    try std.testing.expectError(error.WriteTimeout, rawStreamWriteAllUsing(stream, "body", &accepted, Fake.write));
+    try std.testing.expectEqual(0, accepted);
+    try std.testing.expectEqual(1, Fake.writes);
+    try std.testing.expectEqual(2, Fake.clocks);
 }
