@@ -134,6 +134,7 @@ def main():
         record_run("ci-tests", [sys.executable, "scripts/test-ci-tools.py", "-v"], output, checks)
         record_run("deadline-fixture-tests", [sys.executable, "scripts/test-deadline-fixture.py", "-v"], output, checks)
         record_run("https-fixture-tests", [sys.executable, "scripts/test-https-fixture.py", "-v"], output, checks)
+        record_run("memory-fixture-tests", [sys.executable, "scripts/test-memory-fixture.py", "-v"], output, checks)
         record_run("format", [paths["zig"], "fmt", "--check", "build.zig", "src"], output, checks)
         record_run("shell-syntax", ["bash", "-n", "scripts/verify-layerline.sh"], output, checks)
         record_run("units", [paths["zig"], "build", "test", "-Doptimize=" + args.mode, "--summary", "all", "-j2"], output, checks)

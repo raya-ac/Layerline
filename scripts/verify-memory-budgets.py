@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Saturate application allocations without losing Unix control or recovery."""
+import hashlib
 import http.client
 from pathlib import Path
 import signal
@@ -66,6 +67,10 @@ def response(conn, first=b""):
 
 
 def overloaded(output, head_only=False):
+    assert b"\r\n\r\n" in output, ("incomplete overload response", {
+        "bytes": len(output), "sha256": hashlib.sha256(output).hexdigest(),
+        "prefix_hex": output[:64].hex(), "head_only": head_only,
+    })
     head, body = output.split(b"\r\n\r\n", 1)
     assert head.startswith(b"HTTP/1.1 503 "), output[:200]
     assert b"Content-Length: 12" in head and b"Retry-After: 1" in head, head

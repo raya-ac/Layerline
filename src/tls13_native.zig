@@ -502,25 +502,23 @@ pub fn encryptTlsRecord(
 ) ![]u8 {
     if (plaintext.len > 16 * 1024) return error.TlsPlaintextTooLarge;
 
-    var inner = std.ArrayListUnmanaged(u8).empty;
-    defer inner.deinit(allocator);
-    try inner.appendSlice(allocator, plaintext);
-    try inner.append(allocator, inner_content_type);
+    const inner = try allocator.alloc(u8, plaintext.len + 1);
+    defer {
+        std.crypto.secureZero(u8, inner);
+        allocator.free(inner);
+    }
+    @memcpy(inner[0..plaintext.len], plaintext);
+    inner[plaintext.len] = inner_content_type;
 
-    const encrypted_len = inner.items.len + Aes128Gcm.tag_length;
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, 0x17);
-    try out.append(allocator, 0x03);
-    try out.append(allocator, 0x03);
-    try appendU16(allocator, &out, encrypted_len);
-    try out.resize(allocator, out.items.len + encrypted_len);
-
-    const ciphertext = out.items[5 .. 5 + inner.items.len];
-    const tag = out.items[5 + inner.items.len ..][0..Aes128Gcm.tag_length];
+    const encrypted_len = inner.len + Aes128Gcm.tag_length;
+    const out = try allocator.alloc(u8, 5 + encrypted_len);
+    out[0..5].* = .{ 0x17, 0x03, 0x03, 0, 0 };
+    std.mem.writeInt(u16, out[3..5], @intCast(encrypted_len), .big);
+    const ciphertext = out[5 .. 5 + inner.len];
+    const tag = out[5 + inner.len ..][0..Aes128Gcm.tag_length];
     const nonce = tlsRecordNonce(keys.iv, sequence_number);
-    Aes128Gcm.encrypt(ciphertext, tag, inner.items, out.items[0..5], nonce, keys.key);
-    return out.toOwnedSlice(allocator);
+    Aes128Gcm.encrypt(ciphertext, tag, inner, out[0..5], nonce, keys.key);
+    return out;
 }
 
 pub fn decryptTlsRecord(
@@ -558,6 +556,25 @@ pub fn decryptTlsRecord(
         .content_type = content_type,
         .payload = payload,
     };
+}
+
+test "TLS record encoding uses exact bounded allocations and cleans up allocation failures" {
+    const Check = struct {
+        fn encode(allocator: std.mem.Allocator, keys: TlsRecordKeys, payload: []const u8) !void {
+            const record = try encryptTlsRecord(allocator, keys, 7, 0x17, payload);
+            defer allocator.free(record);
+            try std.testing.expectEqual(5 + payload.len + 1 + Aes128Gcm.tag_length, record.len);
+            try std.testing.expectEqualSlices(u8, &.{ 0x17, 0x03, 0x03 }, record[0..3]);
+            try std.testing.expectEqual(record.len - 5, std.mem.readInt(u16, record[3..5], .big));
+        }
+    };
+    const keys = deriveTlsRecordKeys(@splat(0x75));
+    const payload: [16 * 1024]u8 = @splat(0x61);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.encode, .{ keys, &payload });
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try Check.encode(counting.allocator(), keys, &payload);
+    try std.testing.expectEqual(2, counting.allocations);
+    try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
 }
 
 pub fn finishedVerifyData(finished_key: [32]u8, transcript_hash_value: [32]u8) [32]u8 {

@@ -174,6 +174,12 @@ page-accounted limit and protected Unix-control/emergency-response capacity.
 Overload tests hold incomplete uploads until allocations fail, check plaintext
 and encrypted 503s plus admin access, then verify repeated recovery and cache
 reclamation. HTTP/3 retained slots now age out instead of persisting forever.
+Native TCP TLS also reserves bounded record workspaces before its handshake
+flight, so request-heap exhaustion cannot strand an established record reader
+before the protected overload writer runs. The extra per-connection storage is
+charged to the existing normal/shared heap, not taken from control capacity.
+Allocator-failure tests retain fatal authentication/write semantics; wire tests
+still require complete encrypted GET/HEAD overload responses and recovery.
 The owned Zig I/O runtime now shares the heap hierarchy for bootstrap and task
 allocations and has explicit restart-only worker/stack limits. DNS work uses
 rejectable concurrent admission rather than running inline when saturated.

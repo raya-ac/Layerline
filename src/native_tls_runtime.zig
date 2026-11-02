@@ -9,6 +9,7 @@ const tls_pem = @import("tls_pem.zig");
 const write_deadline = @import("write_deadline.zig");
 const read_deadline = @import("read_deadline.zig");
 const development_tls = @import("development_tls.zig");
+const RecordWorkspace = @import("tls_record_workspace.zig").Workspace;
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -33,6 +34,8 @@ pub const Channel = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
+    read_workspace: ?RecordWorkspace = null,
+    write_workspace: ?RecordWorkspace = null,
     client_application_keys: tls13_native.TlsRecordKeys,
     server_application_keys: tls13_native.TlsRecordKeys,
     client_application_secret: ?[32]u8 = null,
@@ -56,9 +59,30 @@ pub const Channel = struct {
     pending_key_updates: std.atomic.Value(u8) = .init(0),
     read_update_requested: bool = false,
 
+    pub fn reserveRecordWorkspaces(self: *Channel) !void {
+        if (self.read_workspace != null or self.write_workspace != null) return error.TlsWorkspacesAlreadyReserved;
+        if (self.pending_plaintext != null or self.record != null or self.record_header_used != 0 or
+            self.client_sequence != 0 or self.server_sequence != 0 or self.post_handshake_used != 0 or
+            self.sent_close_notify or self.received_close_notify or self.failed.load(.acquire)) return error.TlsWorkspacesRequireFreshChannel;
+        var input = try RecordWorkspace.init(self.allocator, 3 * MAX_RECORD_BYTES);
+        errdefer input.deinit();
+        const output = try RecordWorkspace.init(self.allocator, 2 * MAX_RECORD_BYTES);
+        self.read_workspace = input;
+        self.write_workspace = output;
+    }
+
+    fn readAllocator(self: *Channel) std.mem.Allocator {
+        return if (self.read_workspace) |*workspace| workspace.allocator() else self.allocator;
+    }
+
+    fn writeAllocator(self: *Channel) std.mem.Allocator {
+        return if (self.write_workspace) |*workspace| workspace.allocator() else self.allocator;
+    }
+
     pub fn deinit(self: *Channel) void {
-        if (self.pending_plaintext) |pending| self.allocator.free(pending);
-        if (self.record) |record| self.allocator.free(record);
+        const input = self.readAllocator();
+        if (self.pending_plaintext) |pending| input.free(pending);
+        if (self.record) |record| input.free(record);
         self.pending_plaintext = null;
         self.pending_offset = 0;
         self.record = null;
@@ -71,6 +95,10 @@ pub const Channel = struct {
         self.client_application_secret = null;
         self.server_application_secret = null;
         self.post_handshake_used = 0;
+        if (self.read_workspace) |*workspace| workspace.deinit();
+        if (self.write_workspace) |*workspace| workspace.deinit();
+        self.read_workspace = null;
+        self.write_workspace = null;
     }
 
     fn readRecord(self: *Channel) ![]u8 {
@@ -84,7 +112,7 @@ pub const Channel = struct {
         if (self.record == null) {
             const len = std.mem.readInt(u16, self.record_header[3..5], .big);
             if (len > MAX_RECORD_BYTES - 5) return error.RequestTooLarge;
-            const record = try self.allocator.alloc(u8, 5 + @as(usize, len));
+            const record = try self.readAllocator().alloc(u8, 5 + @as(usize, len));
             @memcpy(record[0..5], &self.record_header);
             self.record = record;
             self.record_used = 5;
@@ -275,6 +303,7 @@ pub fn readApplicationData(channel: *Channel, out: []u8) anyerror!usize {
 }
 
 fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
+    const input = channel.readAllocator();
     while (true) {
         if (channel.pending_plaintext) |pending| {
             const available = pending[channel.pending_offset..];
@@ -283,14 +312,14 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
                 @memcpy(out[0..copied], available[0..copied]);
                 channel.pending_offset += copied;
                 if (channel.pending_offset >= pending.len) {
-                    channel.allocator.free(pending);
+                    input.free(pending);
                     channel.pending_plaintext = null;
                     channel.pending_offset = 0;
                 }
                 return copied;
             }
 
-            channel.allocator.free(pending);
+            input.free(pending);
             channel.pending_plaintext = null;
             channel.pending_offset = 0;
         }
@@ -300,7 +329,7 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
             error.ConnectionClosed => return error.TlsConnectionTruncated,
             else => return err,
         };
-        defer channel.allocator.free(record);
+        defer input.free(record);
 
         switch (record[0]) {
             CONTENT_TYPE_APPLICATION_DATA => {},
@@ -310,7 +339,7 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
         if (channel.client_sequence == std.math.maxInt(u64)) return error.TlsSequenceOverflow;
         if (channel.client_sequence >= @import("upstream_tls_client.zig").max_key_records) return error.TlsKeyLimit;
         var decrypted = try tls13_native.decryptTlsRecord(
-            channel.allocator,
+            input,
             channel.client_application_keys,
             channel.client_sequence,
             record,
@@ -320,37 +349,37 @@ fn readApplicationRecord(channel: *Channel, out: []u8) anyerror!usize {
         switch (decrypted.content_type) {
             CONTENT_TYPE_APPLICATION_DATA => {
                 if (channel.post_handshake_used != 0) {
-                    decrypted.deinit(channel.allocator);
+                    decrypted.deinit(input);
                     return error.TlsHandshakeInterleaved;
                 }
                 if (!channel.read_update_requested and channel.client_sequence >= MAX_KEY_RECORDS - PEER_UPDATE_MARGIN) {
                     channel.read_update_requested = true;
                     _ = channel.pending_key_updates.fetchOr(UPDATE_REQUEST, .acq_rel);
                     drainKeyUpdates(channel) catch |err| {
-                        decrypted.deinit(channel.allocator);
+                        decrypted.deinit(input);
                         return err;
                     };
                 }
                 if (decrypted.payload.len == 0) {
-                    decrypted.deinit(channel.allocator);
+                    decrypted.deinit(input);
                     continue;
                 }
                 channel.pending_plaintext = decrypted.payload;
                 channel.pending_offset = 0;
             },
             CONTENT_TYPE_ALERT => {
-                defer decrypted.deinit(channel.allocator);
+                defer decrypted.deinit(input);
                 if (channel.post_handshake_used != 0) return error.TlsHandshakeInterleaved;
                 if (decrypted.payload.len != 2 or decrypted.payload[1] != 0) return error.TlsAlert;
                 channel.received_close_notify = true;
                 return 0;
             },
             CONTENT_TYPE_HANDSHAKE => {
-                defer decrypted.deinit(channel.allocator);
+                defer decrypted.deinit(input);
                 try receiveKeyUpdate(channel, decrypted.payload);
             },
             else => {
-                decrypted.deinit(channel.allocator);
+                decrypted.deinit(input);
                 return error.UnexpectedTlsInnerContentType;
             },
         }
@@ -379,7 +408,7 @@ fn sendControlRecord(channel: *Channel, content_type: u8, payload: []const u8) !
         _ = write_deadline.push(control);
     }
     defer if (unstarted) write_deadline.restore(previous);
-    try sendEncryptedRecord(channel.stream, channel.allocator, channel.server_application_keys, &channel.server_sequence, content_type, payload, channel.raw_write_all);
+    try sendEncryptedRecord(channel.stream, channel.writeAllocator(), channel.server_application_keys, &channel.server_sequence, content_type, payload, channel.raw_write_all);
 }
 
 fn sendKeyUpdateLocked(channel: *Channel, request_peer: bool) !void {
@@ -463,7 +492,7 @@ fn writeApplicationDataLocked(channel: *Channel, bytes: []const u8, accepted: *u
         const chunk_len = @min(bytes.len - offset, MAX_INNER_PLAINTEXT_BYTES - 1);
         try sendEncryptedRecord(
             channel.stream,
-            channel.allocator,
+            channel.writeAllocator(),
             channel.server_application_keys,
             &channel.server_sequence,
             CONTENT_TYPE_APPLICATION_DATA,
@@ -490,7 +519,7 @@ fn endLocked(channel: *Channel) !void {
     errdefer channel.failed.store(true, .release);
     try flushKeyUpdatesLocked(channel);
     if (channel.server_sequence >= MAX_KEY_RECORDS - 1) try sendKeyUpdateLocked(channel, false);
-    try sendEncryptedRecord(channel.stream, channel.allocator, channel.server_application_keys, &channel.server_sequence, CONTENT_TYPE_ALERT, &.{ 1, 0 }, channel.raw_write_all);
+    try sendEncryptedRecord(channel.stream, channel.writeAllocator(), channel.server_application_keys, &channel.server_sequence, CONTENT_TYPE_ALERT, &.{ 1, 0 }, channel.raw_write_all);
     channel.sent_close_notify = true;
 }
 
@@ -641,6 +670,223 @@ test "fatal TLS input poisons output but soft H2 read interruptions preserve par
     }
 }
 
+test "TLS record workspace admission rolls back partial reservations" {
+    const Fake = struct {
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+    };
+    for (0..2) |fail_at| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = failing.allocator(), .client_application_keys = undefined, .server_application_keys = undefined, .raw_read = Fake.read, .raw_write_all = Fake.write };
+        try std.testing.expectError(error.OutOfMemory, channel.reserveRecordWorkspaces());
+        try std.testing.expect(channel.read_workspace == null and channel.write_workspace == null);
+        channel.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    var active: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = std.testing.allocator, .client_application_keys = undefined, .server_application_keys = undefined, .raw_read = Fake.read, .raw_write_all = Fake.write, .client_sequence = 1 };
+    defer active.deinit();
+    try std.testing.expectError(error.TlsWorkspacesRequireFreshChannel, active.reserveRecordWorkspaces());
+}
+
+test "admitted TLS records survive request heap exhaustion and soft read interruptions" {
+    const Fake = struct {
+        var input: []const u8 = "";
+        var offset: usize = 0;
+        var interrupt: ?anyerror = null;
+        var output: std.ArrayList(u8) = .empty;
+        fn read(_: std.Io.net.Stream, bytes: []u8) !usize {
+            if (offset >= 7) if (interrupt) |err| {
+                interrupt = null;
+                return err;
+            };
+            const count = @min(2, bytes.len, input.len - offset);
+            @memcpy(bytes[0..count], input[offset..][0..count]);
+            offset += count;
+            return count;
+        }
+        fn write(_: std.Io.net.Stream, bytes: []const u8) !void {
+            try output.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    Fake.output = .empty;
+    defer Fake.output.deinit(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x73));
+    var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = failing.allocator(), .client_application_keys = keys, .server_application_keys = keys, .raw_read = Fake.read, .raw_write_all = Fake.write };
+    defer channel.deinit();
+    try channel.reserveRecordWorkspaces();
+    try std.testing.expectError(error.TlsWorkspacesAlreadyReserved, channel.reserveRecordWorkspaces());
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
+    const payload: [MAX_INNER_PLAINTEXT_BYTES - 1]u8 = @splat(0x61);
+    for (0..4) |number| {
+        const record = try tls13_native.encryptTlsRecord(std.testing.allocator, keys, number, CONTENT_TYPE_APPLICATION_DATA, &payload);
+        defer std.testing.allocator.free(record);
+        Fake.input = record;
+        Fake.offset = 0;
+        Fake.interrupt = switch (number) {
+            0 => error.RequestTimeout,
+            1 => error.DispatchReady,
+            else => null,
+        };
+        var buffer: [64]u8 = undefined;
+        if (Fake.interrupt) |pause| {
+            try std.testing.expectError(pause, readApplicationData(&channel, &buffer));
+            try std.testing.expect(channel.record != null);
+            try std.testing.expectEqual(1, channel.read_workspace.?.live);
+        }
+        var received: usize = 0;
+        while (received < payload.len) {
+            const count = try readApplicationData(&channel, &buffer);
+            try std.testing.expect(count > 0);
+            try std.testing.expect(std.mem.allEqual(u8, buffer[0..count], 0x61));
+            received += count;
+        }
+        try std.testing.expectEqual(payload.len, received);
+        try std.testing.expectEqual(0, channel.read_workspace.?.live);
+        try std.testing.expect(std.mem.allEqual(u8, channel.read_workspace.?.fixed.buffer[0 .. record.len + 2 * payload.len + 1], 0));
+        Fake.output.clearRetainingCapacity();
+        const sequence = channel.server_sequence;
+        try writeApplicationData(&channel, &payload);
+        var clear = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, sequence, Fake.output.items);
+        defer clear.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, &payload, clear.payload);
+        try std.testing.expectEqual(0, channel.write_workspace.?.live);
+        try std.testing.expect(std.mem.allEqual(u8, channel.write_workspace.?.fixed.buffer[0 .. 2 * payload.len + 23], 0));
+        try std.testing.expect(!channel.failed.load(.acquire));
+    }
+    Fake.output.clearRetainingCapacity();
+    const bulk = payload ++ payload;
+    const first_sequence = channel.server_sequence;
+    try writeApplicationData(&channel, &bulk);
+    var offset: usize = 0;
+    var records: usize = 0;
+    while (offset < Fake.output.items.len) {
+        const length = 5 + @as(usize, std.mem.readInt(u16, Fake.output.items[offset + 3 ..][0..2], .big));
+        var clear = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, first_sequence + records, Fake.output.items[offset..][0..length]);
+        defer clear.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, &payload, clear.payload);
+        offset += length;
+        records += 1;
+    }
+    try std.testing.expectEqual(2, records);
+    try std.testing.expectEqual(0, channel.write_workspace.?.live);
+    Fake.output.clearRetainingCapacity();
+    const maximum: [MAX_INNER_PLAINTEXT_BYTES]u8 = @splat(0x62);
+    const full_record = try tls13_native.encryptTlsRecord(std.testing.allocator, keys, channel.client_sequence, CONTENT_TYPE_APPLICATION_DATA, &maximum);
+    defer std.testing.allocator.free(full_record);
+    Fake.input = full_record;
+    Fake.offset = 0;
+    Fake.interrupt = null;
+    var full_output: [MAX_INNER_PLAINTEXT_BYTES]u8 = undefined;
+    try std.testing.expectEqual(maximum.len, try readApplicationData(&channel, &full_output));
+    try std.testing.expectEqualSlices(u8, &maximum, &full_output);
+    try std.testing.expectEqual(0, channel.read_workspace.?.live);
+    const sequence = channel.server_sequence;
+    try end(&channel);
+    var alert = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, sequence, Fake.output.items);
+    defer alert.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CONTENT_TYPE_ALERT, alert.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, alert.payload);
+    try std.testing.expectEqual(2, failing.allocations);
+}
+
+test "reserved TLS input storage does not excuse authentication failures under pressure" {
+    const Fake = struct {
+        var input: []const u8 = "";
+        var offset: usize = 0;
+        var writes: usize = 0;
+        fn read(_: std.Io.net.Stream, bytes: []u8) !usize {
+            const count = @min(bytes.len, input.len - offset);
+            @memcpy(bytes[0..count], input[offset..][0..count]);
+            offset += count;
+            return count;
+        }
+        fn write(_: std.Io.net.Stream, _: []const u8) !void {
+            writes += 1;
+        }
+    };
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x74));
+    const corrupt = try tls13_native.encryptTlsRecord(std.testing.allocator, keys, 0, CONTENT_TYPE_APPLICATION_DATA, "not authenticated");
+    defer std.testing.allocator.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    Fake.input = corrupt;
+    Fake.offset = 0;
+    Fake.writes = 0;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = failing.allocator(), .client_application_keys = keys, .server_application_keys = keys, .raw_read = Fake.read, .raw_write_all = Fake.write };
+    defer channel.deinit();
+    try channel.reserveRecordWorkspaces();
+    failing.fail_index = failing.alloc_index;
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectError(error.AuthenticationFailed, readApplicationData(&channel, &buffer));
+    const previous = resource_budget.emergency_write;
+    resource_budget.emergency_write = true;
+    defer resource_budget.emergency_write = previous;
+    try std.testing.expectError(error.TlsSessionFailed, writeApplicationData(&channel, "not a 503"));
+    try std.testing.expectError(error.TlsSessionFailed, end(&channel));
+    try std.testing.expectEqual(0, Fake.writes);
+}
+
+test "TLS admission workspaces avoid poisoning protected overload writes when the request heap is full" {
+    const Fake = struct {
+        var input: []const u8 = "";
+        var offset: usize = 0;
+        var output: std.ArrayList(u8) = .empty;
+        fn read(_: std.Io.net.Stream, bytes: []u8) !usize {
+            const count = @min(bytes.len, input.len - offset);
+            @memcpy(bytes[0..count], input[offset..][0..count]);
+            offset += count;
+            return count;
+        }
+        fn write(_: std.Io.net.Stream, bytes: []const u8) !void {
+            try output.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    const keys = tls13_native.deriveTlsRecordKeys(@splat(0x76));
+    const request = "HEAD /health HTTP/1.1\r\nHost: local\r\n\r\n";
+    const record = try tls13_native.encryptTlsRecord(std.testing.allocator, keys, 0, CONTENT_TYPE_APPLICATION_DATA, request);
+    defer std.testing.allocator.free(record);
+    Fake.output = .empty;
+    defer Fake.output.deinit(std.testing.allocator);
+    for (0..4) |mode| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var channel: Channel = .{ .io = std.testing.io, .stream = undefined, .allocator = failing.allocator(), .client_application_keys = keys, .server_application_keys = keys, .raw_read = Fake.read, .raw_write_all = Fake.write };
+        defer channel.deinit();
+        const admitted = mode == 3;
+        if (admitted) try channel.reserveRecordWorkspaces();
+        failing.fail_index = if (admitted) failing.alloc_index else mode;
+        if (admitted) try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
+        Fake.input = record;
+        Fake.offset = 0;
+        Fake.output.clearRetainingCapacity();
+        var buffer: [64]u8 = undefined;
+        if (admitted) {
+            const count = try readApplicationData(&channel, &buffer);
+            try std.testing.expectEqualStrings(request, buffer[0..count]);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, readApplicationData(&channel, &buffer));
+        }
+        const previous = resource_budget.emergency_write;
+        resource_budget.emergency_write = true;
+        defer resource_budget.emergency_write = previous;
+        const overload = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 12\r\nConnection: close\r\n\r\n";
+        if (admitted) {
+            try writeApplicationData(&channel, overload);
+            var clear = try tls13_native.decryptTlsRecord(std.testing.allocator, keys, 0, Fake.output.items);
+            defer clear.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(overload, clear.payload);
+        } else {
+            try std.testing.expectError(error.TlsSessionFailed, writeApplicationData(&channel, overload));
+            try std.testing.expectEqual(0, Fake.output.items.len);
+        }
+    }
+}
+
 threadlocal var partial_record_step: usize = 0;
 
 fn partialRecordRead(_: std.Io.net.Stream, out: []u8) !usize {
@@ -756,6 +1002,21 @@ pub fn establishTls13(
     defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key_pair));
     var shared_secret = try tls13_native.X25519.scalarmult(server_key_pair.secret_key, client_x25519);
     defer std.crypto.secureZero(u8, &shared_secret);
+    try checkHandshakePreparation(stream);
+
+    var application_channel: Channel = .{
+        .io = io,
+        .stream = stream,
+        .allocator = allocator,
+        .client_application_keys = undefined,
+        .server_application_keys = undefined,
+        .raw_read = raw_read,
+        .raw_write_all = raw_write_all,
+    };
+    // Admit record storage before any handshake flight promises a usable TLS
+    // connection. Request-heap pressure must not disable an established reader.
+    try application_channel.reserveRecordWorkspaces();
+    errdefer application_channel.deinit();
     try checkHandshakePreparation(stream);
 
     const legacy_session_id = info.legacy_session_id orelse "";
@@ -887,20 +1148,11 @@ pub fn establishTls13(
         break;
     }
 
-    return .{
-        .channel = .{
-            .io = io,
-            .stream = stream,
-            .allocator = allocator,
-            .client_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.client_application_traffic_secret),
-            .server_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.server_application_traffic_secret),
-            .client_application_secret = app_secrets.client_application_traffic_secret,
-            .server_application_secret = app_secrets.server_application_traffic_secret,
-            .raw_read = raw_read,
-            .raw_write_all = raw_write_all,
-        },
-        .alpn = alpn,
-    };
+    application_channel.client_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.client_application_traffic_secret);
+    application_channel.server_application_keys = tls13_native.deriveTlsRecordKeys(app_secrets.server_application_traffic_secret);
+    application_channel.client_application_secret = app_secrets.client_application_traffic_secret;
+    application_channel.server_application_secret = app_secrets.server_application_traffic_secret;
+    return .{ .channel = application_channel, .alpn = alpn };
 }
 
 test "failed TLS flight writes never append a plaintext alert or another record" {

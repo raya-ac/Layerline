@@ -196,6 +196,17 @@ pools overlap: do not sum their gauges. Zig startup/I/O internals, thread stacks
 foreign libraries, subprocesses, socket buffers and kernel allocations are not
 covered. This is an application heap budget, not an RSS or host-sandbox promise.
 
+The native TCP TLS listener reserves separate bounded read/write record
+workspaces before sending ServerHello. They use 83,225 bytes per connection
+before page rounding, charged to the normal/shared heap rather than control
+capacity. Record encryption uses exact-sized buffers; established application
+records, key updates and close alerts do not need new request-heap allocations.
+The reader retains partial ciphertext across soft interruptions, and each
+workspace erases its used bytes once the last borrowed slice is freed. Admission
+failure releases partial reservations and does not complete a handshake.
+Authentication failures, malformed TLS and failed wire writes still poison the
+session; reserved storage does not make a failed TLS session writable again.
+
 One eighth of the budget, capped at 16 MiB, is unavailable to request allocations
 and reserved for serialized Unix admin commands and emergency TLS output. A
 failed config reload leaves the active snapshot intact. Budget changes require
