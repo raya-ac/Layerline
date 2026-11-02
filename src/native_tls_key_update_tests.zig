@@ -137,22 +137,54 @@ test "partial key-update messages survive both soft read interruptions" {
 }
 
 test "bad key updates fail closed with an authenticated alert" {
-    const malformed = [_][]const u8{ "", "\x18\x00\x00\x01\x02", "\x18\x00\x00\x02\x00", "\x04\x00\x00\x01\x00", "\x18\x00\x00\x01\x00\x18\x00\x00\x01\x00" };
-    for (malformed) |payload| {
+    const malformed = [_]struct { payload: []const u8, alert: u8 }{
+        .{ .payload = "", .alert = 10 },
+        .{ .payload = "\x18\x00\x00\x01\x02", .alert = 47 },
+        .{ .payload = "\x18\x00\x00\x01\xff", .alert = 47 },
+        .{ .payload = "\x18\x00\x00\x02\x00", .alert = 50 },
+        .{ .payload = "\x04\x00\x00\x01\x00", .alert = 10 },
+        .{ .payload = "\x18\x00\x00\x01\x00\x18\x00\x00\x01\x00", .alert = 10 },
+    };
+    for (malformed) |case| {
         var peer: Peer = .{};
         defer peer.deinit();
         var channel = peer.channel();
         defer channel.deinit();
-        try peer.record(@splat(0x43), 0, 0x16, payload);
+        try peer.record(@splat(0x43), 0, 0x16, case.payload);
         var data: [16]u8 = undefined;
         if (runtime.readApplicationData(&channel, &data)) |_| return error.BadUpdateAccepted else |_| {}
         try std.testing.expect(channel.failed.load(.acquire));
         var offset: usize = 0;
-        const description: u8 = if (payload.len == 5 and payload[0] == 0x18) 47 else 10;
-        try peer.expectRecord(&offset, @splat(0x53), 0, 0x15, &.{ 2, description });
+        try peer.expectRecord(&offset, @splat(0x53), 0, 0x15, &.{ 2, case.alert });
         try std.testing.expectEqual(offset, peer.output.items.len);
         try std.testing.expectError(error.TlsSessionFailed, runtime.writeApplicationData(&channel, "late"));
         try std.testing.expectError(error.TlsSessionFailed, runtime.end(&channel));
+    }
+}
+
+test "invalid key-update lengths produce decode_error before any rotation" {
+    for ([_]u24{ 0, 2, 255, 256, 0xffffff }) |length| {
+        for (4..7) |size| {
+            for (0..4) |split| {
+                var peer: Peer = .{};
+                defer peer.deinit();
+                var channel = peer.channel();
+                defer channel.deinit();
+                var message = [_]u8{ 0x18, 0, 0, 0, 0, 0 };
+                std.mem.writeInt(u24, message[1..4], length, .big);
+                if (split != 0) try peer.record(@splat(0x43), 0, 0x16, message[0..split]);
+                try peer.record(@splat(0x43), @intFromBool(split != 0), 0x16, message[split..size]);
+                var data: [16]u8 = undefined;
+                try std.testing.expectError(error.MalformedTlsKeyUpdate, runtime.readApplicationData(&channel, &data));
+                try std.testing.expect(channel.failed.load(.acquire));
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x43)), &channel.client_application_secret.?);
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0x53)), &channel.server_application_secret.?);
+                var offset: usize = 0;
+                try peer.expectRecord(&offset, @splat(0x53), 0, 0x15, &.{ 2, 50 });
+                try std.testing.expectEqual(offset, peer.output.items.len);
+                try std.testing.expectError(error.TlsSessionFailed, runtime.writeApplicationData(&channel, "late"));
+            }
+        }
     }
 }
 

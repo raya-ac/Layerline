@@ -247,6 +247,7 @@ pub fn readApplicationData(channel: *Channel, out: []u8) anyerror!usize {
         // Like a stream timeout, this is scheduling, not invalid TLS input.
         if (err != error.RequestTimeout and err != error.DispatchReady) {
             const alert: ?u8 = switch (err) {
+                error.MalformedTlsKeyUpdate => 50,
                 error.InvalidTlsKeyUpdate => 47,
                 error.UnexpectedTlsHandshake, error.TlsHandshakeInterleaved => 10,
                 else => null,
@@ -394,11 +395,14 @@ fn drainKeyUpdates(channel: *Channel) !void {
 }
 
 fn receiveKeyUpdate(channel: *Channel, payload: []const u8) !void {
-    if (payload.len == 0 or payload.len > channel.post_handshake.len - channel.post_handshake_used) return error.UnexpectedTlsHandshake;
-    @memcpy(channel.post_handshake[channel.post_handshake_used..][0..payload.len], payload);
-    channel.post_handshake_used += payload.len;
+    if (payload.len == 0) return error.UnexpectedTlsHandshake;
+    const copied = @min(payload.len, channel.post_handshake.len - channel.post_handshake_used);
+    @memcpy(channel.post_handshake[channel.post_handshake_used..][0..copied], payload[0..copied]);
+    channel.post_handshake_used += copied;
     if (channel.post_handshake[0] != 0x18) return error.UnexpectedTlsHandshake;
-    if (channel.post_handshake_used >= 4 and !std.mem.eql(u8, channel.post_handshake[1..4], &.{ 0, 0, 1 })) return error.InvalidTlsKeyUpdate;
+    // A bad length is a decoding failure even when its body exceeds our buffer.
+    if (channel.post_handshake_used >= 4 and !std.mem.eql(u8, channel.post_handshake[1..4], &.{ 0, 0, 1 })) return error.MalformedTlsKeyUpdate;
+    if (payload.len != copied) return error.UnexpectedTlsHandshake;
     if (channel.post_handshake_used < channel.post_handshake.len) return;
     const request = channel.post_handshake[4];
     if (request > 1) return error.InvalidTlsKeyUpdate;

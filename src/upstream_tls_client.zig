@@ -1286,12 +1286,12 @@ fn processPostHandshake(c: *Client, cleartext: []const u8) Reader.Error!void {
             position += n;
             if (c.post_header_used != c.post_header.len) continue;
             c.post_remaining = mem.readInt(u24, c.post_header[1..4], .big);
-            if (c.post_remaining > max_handshake_bytes) return failRead(c, error.TlsRecordOverflow);
             switch (@as(tls.HandshakeType, @enumFromInt(c.post_header[0]))) {
-                .key_update => if (c.post_remaining != 1) return failRead(c, error.TlsIllegalParameter),
+                .key_update => if (c.post_remaining != 1) return failRead(c, error.TlsDecodeError),
                 .new_session_ticket => {},
                 else => return failRead(c, error.TlsUnexpectedMessage),
             }
+            if (c.post_remaining > max_handshake_bytes) return failRead(c, error.TlsRecordOverflow);
             if (c.post_remaining == 0) {
                 c.post_header_used = 0;
                 continue;
@@ -1753,6 +1753,7 @@ test "authenticated malformed TLS records fail rather than indexing missing byte
         try std.testing.expectEqual(@as(?ReadError, switch (index) {
             0 => error.TlsUnexpectedMessage,
             1 => error.TlsUnexpectedMessage,
+            2 => error.TlsDecodeError,
             else => error.TlsIllegalParameter,
         }), client.read_err);
     }
@@ -1787,6 +1788,39 @@ test "requested key update replies with old write keys before rotating both dire
     try std.testing.expectEqualSlices(u8, &next_server, &client.application_cipher.AES_128_GCM_SHA256.tls_1_3.server_secret);
     try std.testing.expectEqual(0, client.write_seq);
     try std.testing.expectEqual(0, client.read_seq);
+}
+
+test "origin key-update lengths fail decoding without rotating or replying" {
+    var wire: [256]u8 = undefined;
+    var plaintext: [min_buffer_len]u8 = undefined;
+    var reply: [min_buffer_len]u8 = undefined;
+    for ([_]u24{ 0, 2, 255, 256, 0xffffff }) |length| {
+        for (0..4) |split| {
+            var input = Reader.fixed(&.{});
+            var output = Writer.fixed(&reply);
+            var client = fixtureClient(&input, &output, &plaintext);
+            const old = client.application_cipher.AES_128_GCM_SHA256.tls_1_3;
+            var message = [_]u8{ 0x18, 0, 0, 0, 0, 0 };
+            mem.writeInt(u24, message[1..4], length, .big);
+            var inner: [7]u8 = undefined;
+            if (split != 0) {
+                @memcpy(inner[0..split], message[0..split]);
+                inner[split] = 0x16;
+                input = .fixed(fixtureRecord(&client, inner[0 .. split + 1], &wire));
+                try std.testing.expectEqual(0, try readIndirect(&client));
+                try std.testing.expectEqual(split, client.post_header_used);
+            }
+            const remaining = message.len - split;
+            @memcpy(inner[0..remaining], message[split..]);
+            inner[remaining] = 0x16;
+            input = .fixed(fixtureRecord(&client, inner[0 .. remaining + 1], &wire));
+            try std.testing.expectError(error.ReadFailed, readIndirect(&client));
+            try std.testing.expectEqual(error.TlsDecodeError, client.read_err.?);
+            try std.testing.expectEqualSlices(u8, mem.asBytes(&old), mem.asBytes(&client.application_cipher.AES_128_GCM_SHA256.tls_1_3));
+            try std.testing.expectEqual(0, output.end);
+            try std.testing.expectEqual(0, client.reader.bufferedLen());
+        }
+    }
 }
 
 test "fragmented key updates retain their header and requested replies remain aligned" {

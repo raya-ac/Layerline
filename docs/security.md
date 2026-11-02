@@ -707,6 +707,12 @@ Resumable read timeouts and H2 backend-completion wakeups retain partial records
 The listener retains partial TLS 1.3 KeyUpdate messages across those interruptions,
 rejects malformed/interleaved updates, and resets record counters only after an
 authenticated update. Replies finish under the old outgoing key before rotation.
+Malformed KeyUpdate lengths produce `decode_error` (50); invalid request values
+retain `illegal_parameter` (47), as specified by
+[RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html#section-6).
+Fragmented/header-only and oversized declarations are rejected without rotating
+keys. Origin TLS parsing makes the same length/value distinction; the listener
+tests also decrypt and check its fatal alert.
 It rotates output before the per-key cap and requests fresh peer keys with bounded
 headroom; an unresponsive peer still reaches the hard cap and is disconnected.
 Tunnel readers queue replies without waiting behind a blocked writer, which

@@ -159,7 +159,10 @@ positive case checks the actually negotiated cipher. No system configuration is
 changed. Optional `--output` receipts include binary/script hashes and SSL versions.
 Unit tests separately exercise fragmented key updates, correct reply-key order,
 sequence exhaustion, record/body bounds, large writes, and trust allocation
-failure cleanup. These are channel tests, not reverse-proxy, pool, concurrent
+failure cleanup. Invalid KeyUpdate lengths fail with `TlsDecodeError` before
+rotation or a reply, including split headers and declarations above the general
+handshake limit. Invalid request values remain `TlsIllegalParameter`. These are
+channel tests, not reverse-proxy, pool, concurrent
 tunnel, reload or full TLS conformance acceptance.
 
 The separate HTTPS integration target (also in `verify-layerline.sh`) runs the
