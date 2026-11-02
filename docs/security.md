@@ -699,7 +699,13 @@ conformance suite.
 Handshake key generation and
 RSA-PSS salt require secure entropy without the I/O API's weaker fallback.
 Temporary key PEM/DER buffers, retired configured private keys and traffic state
-are wiped. This is not a claim that every internal crypto-library scratch copy is
+are wiped. Temporary activation/reload candidates own their signing keys and
+origin trust until successful publication transfers that ownership to the config
+store. Validation, late cancellation and rejected publication erase loaded keys
+before releasing the candidate arena. Tests inspect arena storage before its
+backing allocator frees it, exercise failed allocations and the real generation
+limit, and retain keys/trust while old readers still hold a published snapshot.
+This is not a claim that every internal crypto-library scratch copy is
 erased. Independent certificate-corpus mismatches remain visible; no complete
 PKIX, revocation or browser-root-program acceptance is claimed.
 

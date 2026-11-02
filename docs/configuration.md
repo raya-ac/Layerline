@@ -241,6 +241,10 @@ Upstream target scopes are `global <index>`, `route <route-name> <index>`, `doma
 
 `reload` validates the activation config, loads TLS material into an owned snapshot, and atomically moves new connections to that snapshot while existing requests keep the config they started with. Listener-bound changes still require `restart`: host, port, TLS enablement, redirect listener ports, HTTP/3 listener settings, and admin socket path. Heap and I/O pool limits also require a restart. `restart` validates the activation config and TLS material, then asks the process to drain so a supervisor such as systemd can replace it.
 
+Discarded validation and reload candidates erase loaded signing keys before
+their arenas are released. A published snapshot keeps its keys and origin trust
+until its last reader exits; a failed publication does not transfer ownership.
+
 `SIGHUP` follows the same in-memory reload path as the admin `reload` command. If the candidate config changes listener-bound settings, Layerline logs `SIGHUP reload blocked` and keeps serving the current snapshot.
 
 Old connections retain their original routing and TLS config until they close;

@@ -59,6 +59,7 @@ test {
     _ = @import("admin_runtime.zig");
     _ = @import("admin_reply.zig");
     _ = @import("config_store.zig");
+    _ = @import("config_candidate_tests.zig");
     _ = @import("request_guard.zig");
     _ = @import("php_version.zig");
     _ = @import("php_runtime.zig");

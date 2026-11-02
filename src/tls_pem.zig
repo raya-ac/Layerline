@@ -18,6 +18,13 @@ pub const ConfiguredPrivateKey = union(enum) {
 
     pub fn deinit(self: *ConfiguredPrivateKey, allocator: std.mem.Allocator) void {
         self.wipe();
+        if (@import("builtin").is_test) {
+            const erased = switch (self.*) {
+                .ecdsa_p256 => |*key| std.mem.allEqual(u8, std.mem.asBytes(key), 0),
+                .rsa => |*key| std.mem.allEqual(u8, key.private_exponent, 0),
+            };
+            if (!erased) @panic("configured signing key was not erased before deinit");
+        }
         switch (self.*) {
             .ecdsa_p256 => {},
             .rsa => |*key| key.deinit(allocator),

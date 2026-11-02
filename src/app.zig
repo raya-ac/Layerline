@@ -9,6 +9,7 @@ const cli_config = @import("cli_config.zig");
 const cli_output = @import("cli_output.zig");
 const config_loader = @import("config_loader.zig");
 const config_diff = @import("config_diff.zig");
+const config_candidate = @import("config_candidate.zig");
 const config_mod = @import("config.zig");
 const custom_errors = @import("custom_errors.zig");
 const h2_server = @import("http2_server.zig");
@@ -72,6 +73,8 @@ const loadConfig = config_loader.loadConfig;
 const loadConfiguredDomainConfigs = config_loader.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const validateConfig = config_mod.validateConfig;
+const loadAllConfiguredTlsMaterials = config_candidate.loadMaterials;
+const deinitConfiguredTlsMaterials = config_candidate.deinitMaterials;
 
 const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = server_identity.max_php_fastcgi_stderr_bytes;
 const DEFAULT_COMPRESSION_WORK_BUFFER_BYTES = http1_response_bridge.compression_work_buffer_bytes;
@@ -131,17 +134,6 @@ fn installProcessSignalHandlers() void {
     std.posix.sigaction(.HUP, &reload_action, null);
 }
 
-fn loadAllConfiguredTlsMaterials(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig) !void {
-    errdefer deinitConfiguredTlsMaterials(allocator, cfg);
-    try tls_material.loadAll(io, allocator, cfg);
-    try @import("upstream_material.zig").loadAll(io, allocator, cfg);
-}
-
-fn deinitConfiguredTlsMaterials(allocator: std.mem.Allocator, cfg: *ServerConfig) void {
-    tls_material.deinitAll(allocator, cfg);
-    @import("upstream_material.zig").deinitAll(cfg);
-}
-
 fn upstreamNowMs() i64 {
     return std.Io.Timestamp.now(activeIo(), .awake).toMilliseconds();
 }
@@ -153,45 +145,8 @@ fn retireConfig(cfg: *ServerConfig) void {
 }
 
 fn validateConfigFileForActivation(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const candidate_allocator = arena.allocator();
-
-    var candidate = defaultServerConfig();
-    candidate.config_path = cfg.config_path;
-    try loadConfig(io, candidate_allocator, &candidate, candidate.config_path);
-    try loadConfiguredDomainConfigs(io, candidate_allocator, &candidate);
-    normalizeConfig(&candidate);
-    try applyLetsEncryptDefaultCertPaths(candidate_allocator, &candidate);
-    try validateConfig(&candidate);
-
-    // Catch bad certificate paths before an operator asks a supervisor to
-    // restart into them. The arena drops the temporary material afterwards.
-    try loadAllConfiguredTlsMaterials(io, candidate_allocator, &candidate);
-}
-
-fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
-
-fn validateReloadCompatibility(active: *const ServerConfig, candidate: *const ServerConfig) !void {
-    if (candidate.worker_stack_size > active.worker_stack_size) return error.ReloadRequiresRestart;
-    if (active.memory_budget_bytes != candidate.memory_budget_bytes) return error.ReloadRequiresRestart;
-    if (active.descriptor_limit != candidate.descriptor_limit) return error.ReloadRequiresRestart;
-    if (active.io_thread_limit != candidate.io_thread_limit or active.io_stack_size != candidate.io_stack_size) return error.ReloadRequiresRestart;
-    if (!std.mem.eql(u8, active.host, candidate.host)) return error.ReloadRequiresRestart;
-    if (active.port != candidate.port) return error.ReloadRequiresRestart;
-    if (active.tls_enabled != candidate.tls_enabled) return error.ReloadRequiresRestart;
-    if (active.tls_auto != candidate.tls_auto) return error.ReloadRequiresRestart;
-    if (active.http_redirect_enabled != candidate.http_redirect_enabled) return error.ReloadRequiresRestart;
-    if (active.http_redirect_port != candidate.http_redirect_port) return error.ReloadRequiresRestart;
-    if (active.http_redirect_https_port != candidate.http_redirect_https_port) return error.ReloadRequiresRestart;
-    if (active.http3_enabled != candidate.http3_enabled) return error.ReloadRequiresRestart;
-    if (active.http3_port != candidate.http3_port) return error.ReloadRequiresRestart;
-    if (active.admin_enabled != candidate.admin_enabled) return error.ReloadRequiresRestart;
-    if (!optionalStringEql(active.admin_socket_path, candidate.admin_socket_path)) return error.ReloadRequiresRestart;
+    var candidate = try config_candidate.Candidate.load(io, allocator, cfg.config_path, null);
+    defer candidate.deinit();
 }
 
 fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, _: *const ServerConfig) !void {
@@ -207,27 +162,9 @@ fn reloadConfigInMemory(io: std.Io, _: std.mem.Allocator, _: *const ServerConfig
     const active = lease.cfg;
     // A browser request arena is reset after the reply. Each publication owns
     // separate storage until its last connection/background reader exits.
-    const allocator = resource_budget.allocator();
-    const arena = try allocator.create(std.heap.ArenaAllocator);
-    arena.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer {
-        arena.deinit();
-        allocator.destroy(arena);
-    }
-
-    const candidate_allocator = arena.allocator();
-    const candidate = try candidate_allocator.create(ServerConfig);
-    candidate.* = defaultServerConfig();
-    candidate.config_path = try candidate_allocator.dupe(u8, active.config_path);
-    try loadConfig(io, candidate_allocator, candidate, candidate.config_path);
-    try loadConfiguredDomainConfigs(io, candidate_allocator, candidate);
-    normalizeConfig(candidate);
-    try applyLetsEncryptDefaultCertPaths(candidate_allocator, candidate);
-    try validateConfig(candidate);
-    try validateReloadCompatibility(active, candidate);
-    try loadAllConfiguredTlsMaterials(io, candidate_allocator, candidate);
-    if (runtime_state.shutdown_requested.load(.acquire)) return error.Canceled;
-    try runtime_state.config_store.activateOwned(arena, candidate, active.cache_generation);
+    var candidate = try config_candidate.Candidate.load(io, resource_budget.allocator(), active.config_path, active);
+    defer candidate.deinit();
+    try candidate.publish(&runtime_state.config_store, active.cache_generation, &runtime_state.shutdown_requested);
     success = true;
 }
 
