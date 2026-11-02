@@ -212,6 +212,12 @@ proxy = https://127.0.0.1:{origin.server_port} tls_ca_file={ca} tls_server_name=
             if details is not None:
                 details.update(port=port, config=config, process=process, log=log_path)
             yield port
+        except BaseException:
+            with contextlib.suppress(OSError):
+                with log_path.open("rb") as failure_log:
+                    failure_log.seek(max(0, log_path.stat().st_size - 32768))
+                    print("HTTPS fixture server log:", repr(failure_log.read(32768)), file=sys.stderr, flush=True)
+            raise
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -564,7 +570,12 @@ def reload_trust(folder, first, second, first_ca, second_ca, secure):
                 assert len(origin.requests) > before, "new connection did not use published origin"
                 stream = 3 + number * 2
                 old.request(stream, b"/fixed")
-                assert old.response(stream) == (200, body), "retired trust did not survive its old H2 reader"
+                reply = old.response(stream)
+                assert reply == (200, body), ("retired trust did not survive its old H2 reader", {
+                    "downstream_tls": secure, "replacement": number, "stream": stream,
+                    "status": reply[0], "body_bytes": len(reply[1]),
+                    "body_sha256": hashlib.sha256(reply[1]).hexdigest(),
+                })
                 old.connection.sendall(frame(8, 0, 0, len(body).to_bytes(4, "big")))
             # Publish the second trust source so only the old H2 lease owns the
             # first. Remove that file: old requests must use immutable bytes.
@@ -574,7 +585,11 @@ def reload_trust(folder, first, second, first_ca, second_ca, secure):
             first_ca.unlink()
             try:
                 old.request(21, b"/fixed")
-                assert old.response(21) == (200, body), "trust was loaded lazily or freed before its last reader"
+                reply = old.response(21)
+                assert reply == (200, body), ("trust was loaded lazily or freed before its last reader", {
+                    "downstream_tls": secure, "stream": 21, "status": reply[0],
+                    "body_bytes": len(reply[1]), "body_sha256": hashlib.sha256(reply[1]).hexdigest(),
+                })
                 good_config = details["config"].read_text()
                 details["config"].write_text(good_config.replace(str(second_ca), str(folder / "missing-ca.pem")))
                 assert control(folder, b"reload").startswith(b"ERROR ")
