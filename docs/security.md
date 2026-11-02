@@ -613,6 +613,15 @@ request paths, query strings, headers, bodies, or credentials.
 
 ## Verification scope
 
+Startup loads immutable origin trust before invoking certificate helpers, creating
+ACME challenge directories or calling the DNS API. Missing/malformed roots abort
+at that point, including domain and route overrides. Listener keys load after
+the certificate helper so it can create them. Startup cleanup retains
+trust and signing material until config readers and idle pools have retired.
+`zig build test-startup-materials` exercises both ordering and successful
+provisioning with disposable certificate/DNS fixtures; it uses no real provider.
+These fixtures do not verify first-boot HTTP-01 reachability.
+
 TCP TLS and experimental QUIC connection diagnostics quote and escape unauthenticated SNI and ALPN bytes,
 including terminal controls and non-ASCII bytes. Each field is capped at 256 input
 bytes before escaping, with explicit truncation. TCP wire tests cover forged lines,

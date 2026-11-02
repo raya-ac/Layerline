@@ -73,7 +73,7 @@ const loadConfig = config_loader.loadConfig;
 const loadConfiguredDomainConfigs = config_loader.loadConfiguredDomainConfigs;
 const normalizeConfig = config_mod.normalizeConfig;
 const validateConfig = config_mod.validateConfig;
-const loadAllConfiguredTlsMaterials = config_candidate.loadMaterials;
+const loadAllConfiguredTlsMaterials = tls_material.loadAll;
 const deinitConfiguredTlsMaterials = config_candidate.deinitMaterials;
 
 const DEFAULT_MAX_PHP_FASTCGI_STDERR_BYTES = server_identity.max_php_fastcgi_stderr_bytes;
@@ -826,6 +826,14 @@ pub fn main(init: std.process.Init) !void {
     try supervisor.starting();
     defer supervisor.stopping(init.io);
 
+    // Trust files are read-only inputs. Reject them before any ACME or DNS
+    // changes, but load listener keys later because ACME may create them.
+    defer deinitConfiguredTlsMaterials(resource_budget.allocator(), &cfg);
+    @import("upstream_material.zig").loadAll(init.io, resource_budget.allocator(), &cfg) catch |err| {
+        std.debug.print("Failed to load configured origin trust: {}\n", .{err});
+        return err;
+    };
+
     if (cfg.tls_auto) {
         ensureLetsEncryptSetup(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
             std.debug.print("Let's Encrypt automation failed: {}\n", .{err});
@@ -842,17 +850,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Failed to load configured TLS material: {}\n", .{err});
         return err;
     };
-    runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig) catch |err| {
-        deinitConfiguredTlsMaterials(resource_budget.allocator(), &cfg);
-        return err;
-    };
+    try runtime_state.config_store.installInitial(resource_budget.allocator(), &cfg, retireConfig);
     runtime_state.server_metrics.config_store = &runtime_state.config_store;
     defer runtime_state.config_store.deinit();
     defer {
         runtime_state.buffered_response_cache.deinit();
         runtime_state.static_response_cache.deinit();
         php_runtime.deinitKeepalivePool(phpCallbacks());
-        deinitConfiguredTlsMaterials(resource_budget.allocator(), &cfg);
     }
 
     try server_runtime.run(.{

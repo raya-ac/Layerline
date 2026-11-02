@@ -28,6 +28,8 @@ The old `h2_upstream` setting is parsed for compatibility but does not route nat
 HTTP/2 traffic; use `proxy` or a named proxy route instead.
 
 Startup, activation validation and reload preload immutable trust stores. A
+startup trust failure happens before certificate helpers, ACME directory creation
+or DNS API requests. Listener keys load after ACME can provision them. A
 snapshot deduplicates stores by configured path and owns their decoded bytes until
 its last request/health lease and idle TLS pool are gone. Changing a CA file on
 disk does not mutate a running snapshot. Failed preflight leaves the working

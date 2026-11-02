@@ -845,4 +845,7 @@ python3 "$ROOT_DIR/scripts/verify-native-tls.py" "$SERVER_BINARY"
 log "verifying bounded TLS diagnostic fields"
 python3 "$ROOT_DIR/scripts/verify-tls-diagnostics.py" "$SERVER_BINARY"
 
+log "verifying origin trust before startup side effects"
+python3 "$ROOT_DIR/scripts/verify-startup-materials.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

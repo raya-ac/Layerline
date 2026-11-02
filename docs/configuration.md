@@ -434,6 +434,11 @@ The configured certificate path supports ECDSA P-256 private keys in SEC1 (`BEGI
 
 The server can run `certbot` in webroot mode automatically on startup when both `--tls-auto true` and `--letsencrypt-domains` are provided. With `letsencrypt_renew = true`, Layerline also starts a background `certbot renew` loop; the default interval is 12 hours.
 
+The startup helper runs before Layerline binds its normal listeners. First-time
+webroot issuance therefore needs an already reachable challenge endpoint;
+`http_redirect = true` serves challenges after normal startup, not during that
+first helper call. A pre-certificate challenge listener remains separate work.
+
 ```bash
 zig build run -- \
   --tls-auto true \
@@ -621,6 +626,8 @@ escapes; bracket IPv6 literals, for example `https://[::1]:8443/`.
 
 Trust files are loaded into immutable config snapshots before startup/reload
 publishes them. An unreadable or invalid explicit store rejects activation.
+At startup this check precedes certificate helpers and DNS automation; listener
+keys still load after ACME provisioning.
 Changing a file requires reload; old requests keep their original trust until
 they finish. HTTPS origins enforce a 1 MiB worker-stack minimum. Raising the
 effective stack requires restart, not reload; start with
