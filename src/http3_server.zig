@@ -45,9 +45,9 @@ const Http3InitialAssembly = struct {
     original_dcid: quic_native.ConnectionId = .{},
     has_server_cid: bool = false,
     server_cid: quic_native.ConnectionId = .{},
-    crypto: std.ArrayListUnmanaged(u8) = .empty,
+    crypto: quic_native.CryptoBuffer = .{},
     server_flight_sent: bool = false,
-    client_handshake_crypto: std.ArrayListUnmanaged(u8) = .empty,
+    client_handshake_crypto: quic_native.CryptoBuffer = .{},
     has_handshake_keys: bool = false,
     client_handshake_keys: quic_native.PacketKeys = undefined,
     server_handshake_keys: quic_native.PacketKeys = undefined,
@@ -213,7 +213,7 @@ test "HTTP3 resource aging reclaims half-open and idle allocations" {
     const base = budget.used.load(.acquire);
     const half_open = try table.acquire();
     half_open.touch(0);
-    try half_open.crypto.appendNTimes(a, 1, 200);
+    try half_open.crypto.insert(a, 0, &@as([200]u8, @splat(1)));
     half_open.touch(9_999);
     const established = try table.acquire();
     established.touch(0);
@@ -228,7 +228,7 @@ test "HTTP3 resource aging reclaims half-open and idle allocations" {
     try std.testing.expectEqual(1, table.expire(59_999));
     try std.testing.expectEqual(base, budget.used.load(.acquire));
     const failed_reset = try table.acquire();
-    try failed_reset.crypto.appendNTimes(a, 1, 200);
+    try failed_reset.crypto.insert(a, 0, &@as([200]u8, @splat(1)));
     try std.testing.expectEqual(1, table.expire(60_000));
     try std.testing.expectEqual(base, budget.used.load(.acquire));
     _ = try table.acquire();
@@ -291,6 +291,13 @@ const Http3Request = struct {
     headers: []const u8 = "",
     body: []const u8 = "",
     body_available: bool = false,
+    decoded_headers: ?[]h3_native.Header = null,
+
+    fn deinit(self: *const Http3Request, allocator: std.mem.Allocator) void {
+        if (self.decoded_headers) |headers| h3_native.freeDecodedHeaders(allocator, headers);
+        if (self.headers.len != 0) allocator.free(self.headers);
+        if (self.body.len != 0) allocator.free(self.body);
+    }
 };
 
 fn http3PathOnly(path: []const u8) []const u8 {
@@ -306,11 +313,12 @@ fn http3QueryOnly(path: []const u8) []const u8 {
 fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, payload: []const u8) !?Http3Request {
     var offset: usize = 0;
     var request = Http3Request{ .stream_id = stream_id };
+    errdefer request.deinit(allocator);
     var saw_headers = false;
     var raw_headers = std.ArrayList(u8).empty;
-    errdefer raw_headers.deinit(allocator);
+    defer raw_headers.deinit(allocator);
     var body = std.ArrayList(u8).empty;
-    errdefer body.deinit(allocator);
+    defer body.deinit(allocator);
 
     while (offset < payload.len) {
         const frame_header = try h3_native.decodeFrameHeader(payload[offset..]);
@@ -324,7 +332,7 @@ fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, 
         if (frame_header.frame_type == @intFromEnum(h3_native.FrameType.headers)) {
             if (saw_headers) continue;
             const headers = try h3_native.decodeHeaderBlock(allocator, frame_payload);
-            defer allocator.free(headers);
+            request.decoded_headers = headers;
             try http2_support.validateRequestFields(headers);
 
             for (headers) |header| {
@@ -352,13 +360,9 @@ fn parseHttp3RequestStreamPayload(allocator: std.mem.Allocator, stream_id: u64, 
     if (!saw_headers) return null;
     if (raw_headers.items.len > 0) {
         request.headers = try raw_headers.toOwnedSlice(allocator);
-    } else {
-        raw_headers.deinit(allocator);
     }
     if (request.body_available) {
         request.body = try body.toOwnedSlice(allocator);
-    } else {
-        body.deinit(allocator);
     }
     return request;
 }
@@ -666,7 +670,7 @@ test "HTTP3 HEAD and 304 carry no DATA frames" {
         const frame = try h3_native.decodeFrameHeader(wire);
         try std.testing.expectEqual(wire.len, frame.len + frame.length);
         const fields = try h3_native.decodeHeaderBlock(std.testing.allocator, wire[frame.len..]);
-        defer std.testing.allocator.free(fields);
+        defer h3_native.freeDecodedHeaders(std.testing.allocator, fields);
         var length: ?[]const u8 = null;
         for (fields) |field| {
             if (std.mem.eql(u8, field.name, "content-length")) length = field.value;
@@ -686,7 +690,7 @@ test "HTTP3 preserves known HEAD and 304 lengths without inventing unknown metad
         const frame = try h3_native.decodeFrameHeader(wire);
         try std.testing.expectEqual(wire.len, frame.len + frame.length);
         const fields = try h3_native.decodeHeaderBlock(std.testing.allocator, wire[frame.len..]);
-        defer std.testing.allocator.free(fields);
+        defer h3_native.freeDecodedHeaders(std.testing.allocator, fields);
         var length: ?[]const u8 = null;
         for (fields) |field| if (std.mem.eql(u8, field.name, "content-length")) {
             length = field.value;
@@ -714,7 +718,7 @@ fn h3MetadataAllocationCheck(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqualStrings("okay", payload);
         } else {
             const fields = try h3_native.decodeHeaderBlock(allocator, payload);
-            defer allocator.free(fields);
+            defer h3_native.freeDecodedHeaders(allocator, fields);
             if (i == 0) {
                 try std.testing.expectEqualStrings("103", fields[0].value);
                 try std.testing.expectEqualStrings("link", fields[1].name);
@@ -971,6 +975,7 @@ test "extracts HTTP/3 request path from a request stream" {
     var assembly = Http3InitialAssembly{};
     defer assembly.deinit(std.testing.allocator);
     const request = (try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, stream_frame)).?;
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 0), request.stream_id);
     try std.testing.expectEqualStrings("GET", request.method);
     try std.testing.expectEqualStrings("/health", request.path);
@@ -981,6 +986,18 @@ test "HTTP/3 path helpers split query strings" {
     try std.testing.expectEqualStrings("v=1", http3QueryOnly("/assets/app.css?v=1"));
     try std.testing.expectEqualStrings("/health", http3PathOnly("/health"));
     try std.testing.expectEqualStrings("", http3QueryOnly("/health"));
+}
+
+test "HTTP3 retains Huffman pseudo-header storage through request dispatch" {
+    const block = "\x00\x00\xd1\xd7\x50\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff\x51\x07/health";
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(std.testing.allocator);
+    try h3_native.appendFrame(std.testing.allocator, &payload, .headers, block);
+    const request = (try parseHttp3RequestStreamPayload(std.testing.allocator, 0, payload.items)).?;
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("GET", request.method);
+    try std.testing.expectEqualStrings("/health", request.path);
+    try std.testing.expectEqualStrings("www.example.com", request.authority.?);
 }
 
 test "HTTP/3 request conversion carries host and query into common router shape" {
@@ -1035,10 +1052,7 @@ test "extracts HTTP/3 DATA frames from a request stream" {
     try h3_native.appendFrame(std.testing.allocator, &h3_payload, .data, "hello");
 
     const request = (try parseHttp3RequestStreamPayload(std.testing.allocator, 0, h3_payload.items)).?;
-    defer {
-        std.testing.allocator.free(request.headers);
-        std.testing.allocator.free(request.body);
-    }
+    defer request.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("POST", request.method);
     try std.testing.expectEqualStrings("/api/echo", request.path);
@@ -1128,10 +1142,7 @@ test "reassembles out-of-order HTTP/3 request stream data" {
 
     try std.testing.expect((try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, tail_stream)) == null);
     const request = (try findHttp3Request(std.testing.allocator, std.testing.allocator, &assembly, head_stream)).?;
-    defer {
-        std.testing.allocator.free(request.headers);
-        std.testing.allocator.free(request.body);
-    }
+    defer request.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("POST", request.method);
     try std.testing.expectEqualStrings("/api/echo", request.path);
@@ -1342,11 +1353,11 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                     continue;
                 }
 
-                const finished = findTlsFinishedVerifyData(assembly.client_handshake_crypto.items) catch |err| {
+                const finished = findTlsFinishedVerifyData(assembly.client_handshake_crypto.prefix()) catch |err| {
                     std.debug.print("HTTP/3 client Finished parse failed from {f}: {}\n", .{ msg.from, err });
                     continue;
                 } orelse {
-                    std.debug.print("HTTP/3 waiting for client Finished from {f}: crypto_bytes={d}\n", .{ msg.from, assembly.client_handshake_crypto.items.len });
+                    std.debug.print("HTTP/3 waiting for client Finished from {f}: crypto_bytes={d}\n", .{ msg.from, assembly.client_handshake_crypto.prefix().len });
                     continue;
                 };
                 const expected_finished = tls13_native.finishedVerifyData(assembly.traffic.client_finished_key, assembly.application_transcript_hash);
@@ -1425,6 +1436,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                         continue;
                     };
                     if (request_opt) |request| {
+                        defer request.deinit(request_arena.allocator());
                         var lease = acquire_config();
                         defer lease.deinit();
                         const packet_count = sendHttp3ResponsePacket(io, socket, &msg.from, assembly, short.packet_number, request, lease.cfg, process_env, server_header, callbacks) catch |err| {
@@ -1469,6 +1481,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 continue;
             };
             if (request_opt) |request| {
+                defer request.deinit(request_arena.allocator());
                 if (!assembly.h3_response_sent) {
                     var lease = acquire_config();
                     defer lease.deinit();
@@ -1586,17 +1599,17 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
 
         if (assembly.server_flight_sent) continue;
 
-        const hello = quic_native.parseClientHello(assembly.crypto.items) catch |err| {
+        const hello = quic_native.parseClientHello(assembly.crypto.prefix()) catch |err| {
             if (err == error.Truncated) {
                 std.debug.print(
                     "HTTP/3 waiting for complete ClientHello from {f}: packet_number={d}, crypto_bytes={d}\n",
-                    .{ msg.from, decrypted.packet_number, assembly.crypto.items.len },
+                    .{ msg.from, decrypted.packet_number, assembly.crypto.prefix().len },
                 );
                 continue;
             }
             std.debug.print(
                 "HTTP/3 QUIC Initial from {f}: packet_number={d}, crypto_bytes={d}; ClientHello parse failed: {}\n",
-                .{ msg.from, decrypted.packet_number, assembly.crypto.items.len, err },
+                .{ msg.from, decrypted.packet_number, assembly.crypto.prefix().len, err },
             );
             continue;
         };
@@ -1639,7 +1652,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
                 std.debug.print("HTTP/3 TLS X25519 shared-secret failed for {f}: {}\n", .{ msg.from, err });
                 continue;
             };
-            const transcript_hash = tls13_native.transcriptHash(&.{ assembly.crypto.items, server_hello });
+            const transcript_hash = tls13_native.transcriptHash(&.{ assembly.crypto.prefix(), server_hello });
             const traffic = tls13_native.deriveTrafficSecrets(shared, transcript_hash);
             const client_handshake_keys = packetKeysFromTls(tls13_native.deriveQuicPacketKeys(traffic.client_handshake_traffic_secret));
             const server_handshake_keys = packetKeysFromTls(tls13_native.deriveQuicPacketKeys(traffic.server_handshake_traffic_secret));
@@ -1719,7 +1732,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             defer resource_budget.http3.allocator().free(certificate_msg);
 
             const cert_verify_hash = tls13_native.transcriptHash(&.{
-                assembly.crypto.items,
+                assembly.crypto.prefix(),
                 server_hello,
                 encrypted_extensions,
                 certificate_msg,
@@ -1735,7 +1748,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             defer resource_budget.http3.allocator().free(certificate_verify_msg);
 
             const finished_hash = tls13_native.transcriptHash(&.{
-                assembly.crypto.items,
+                assembly.crypto.prefix(),
                 server_hello,
                 encrypted_extensions,
                 certificate_msg,
@@ -1754,7 +1767,7 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
             assembly.client_handshake_keys = client_handshake_keys;
             assembly.server_handshake_keys = server_handshake_keys;
             assembly.application_transcript_hash = tls13_native.transcriptHash(&.{
-                assembly.crypto.items,
+                assembly.crypto.prefix(),
                 server_hello,
                 encrypted_extensions,
                 certificate_msg,

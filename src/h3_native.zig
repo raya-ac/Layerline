@@ -8,7 +8,7 @@ pub const Error = error{
     InvalidVarInt,
     InvalidFrame,
     InvalidHeaderBlock,
-    HuffmanUnsupported,
+    HeaderBlockTooLarge,
     DynamicTableUnsupported,
     UnknownStaticTableIndex,
 };
@@ -121,7 +121,17 @@ pub fn appendFrame(
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+    owned_name: bool = false,
+    owned_value: bool = false,
 };
+
+pub fn freeDecodedHeaders(allocator: std.mem.Allocator, headers: []Header) void {
+    for (headers) |header| {
+        if (header.owned_name) allocator.free(header.name);
+        if (header.owned_value) allocator.free(header.value);
+    }
+    allocator.free(headers);
+}
 
 const PrefixedInteger = struct {
     value: u64,
@@ -153,19 +163,25 @@ fn decodePrefixedInteger(input: []const u8, prefix_bits: u4) Error!PrefixedInteg
 const StringLiteral = struct {
     value: []const u8,
     len: usize,
+    owned: bool,
 };
 
-fn decodeStringLiteral(input: []const u8, prefix_bits: u4) Error!StringLiteral {
+fn decodeStringLiteral(allocator: std.mem.Allocator, input: []const u8, prefix_bits: u4) !StringLiteral {
     if (input.len == 0) return error.Truncated;
     const huffman_bit = @as(u8, 1) << @as(u3, @intCast(prefix_bits));
-    if ((input[0] & huffman_bit) != 0) return error.HuffmanUnsupported;
+    const is_huffman = (input[0] & huffman_bit) != 0;
     const len_vi = try decodePrefixedInteger(input, prefix_bits);
     if (len_vi.value > std.math.maxInt(usize)) return error.VarIntTooLarge;
     const value_len: usize = @intCast(len_vi.value);
     if (value_len > input.len - len_vi.len) return error.Truncated;
     return .{
-        .value = input[len_vi.len .. len_vi.len + value_len],
+        // QPACK uses the same Huffman alphabet and padding rules as HPACK.
+        .value = if (is_huffman)
+            try hpack.decodeHuffmanString(allocator, input[len_vi.len .. len_vi.len + value_len])
+        else
+            input[len_vi.len .. len_vi.len + value_len],
         .len = len_vi.len + value_len,
+        .owned = is_huffman,
     };
 }
 
@@ -190,21 +206,45 @@ fn staticHeader(index: u64) Error!Header {
     };
 }
 
-fn appendDecodedHeader(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(Header), name: []const u8, value: []const u8) !void {
-    try out.append(allocator, .{ .name = name, .value = value });
+pub const max_header_bytes = 64 * 1024;
+const max_header_fields = @import("http_headers.zig").MAX_HTTP1_HEADER_FIELDS;
+
+fn appendDecodedHeader(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(Header), header: Header) !void {
+    if (out.items.len >= max_header_fields) return error.HeaderBlockTooLarge;
+    var remaining: usize = max_header_bytes;
+    for (out.items) |field| {
+        remaining -= field.name.len + field.value.len + 32;
+    }
+    for ([_]usize{ header.name.len, header.value.len, 32 }) |size| {
+        if (size > remaining) return error.HeaderBlockTooLarge;
+        remaining -= size;
+    }
+    try out.append(allocator, header);
 }
 
+// Literal/static strings borrow block storage; Huffman strings are owned. Keep
+// both alive until freeDecodedHeaders, including any borrowed pseudo-headers.
 pub fn decodeHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]Header {
+    if (block.len > max_header_bytes) return error.HeaderBlockTooLarge;
     var offset: usize = 0;
     const required_insert_count = try decodePrefixedInteger(block[offset..], 8);
     offset += required_insert_count.len;
     if (required_insert_count.value != 0) return error.DynamicTableUnsupported;
 
     const delta_base = try decodePrefixedInteger(block[offset..], 7);
+    // With no dynamic references a positive Base is harmless; a negative one
+    // is still invalid (RFC 9204 section 4.5.1.2).
+    if (block[offset] & 0x80 != 0) return error.InvalidHeaderBlock;
     offset += delta_base.len;
 
     var out = std.ArrayListUnmanaged(Header).empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        for (out.items) |header| {
+            if (header.owned_name) allocator.free(header.name);
+            if (header.owned_value) allocator.free(header.value);
+        }
+        out.deinit(allocator);
+    }
 
     while (offset < block.len) {
         const first = block[offset];
@@ -214,7 +254,7 @@ pub fn decodeHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]Hea
             offset += index.len;
             if (!uses_static) return error.DynamicTableUnsupported;
             const header = try staticHeader(index.value);
-            try appendDecodedHeader(allocator, &out, header.name, header.value);
+            try appendDecodedHeader(allocator, &out, header);
             continue;
         }
 
@@ -224,18 +264,21 @@ pub fn decodeHeaderBlock(allocator: std.mem.Allocator, block: []const u8) ![]Hea
             offset += index.len;
             if (!uses_static) return error.DynamicTableUnsupported;
             const name = (try staticHeader(index.value)).name;
-            const value = try decodeStringLiteral(block[offset..], 7);
+            const value = try decodeStringLiteral(allocator, block[offset..], 7);
+            errdefer if (value.owned) allocator.free(value.value);
             offset += value.len;
-            try appendDecodedHeader(allocator, &out, name, value.value);
+            try appendDecodedHeader(allocator, &out, .{ .name = name, .value = value.value, .owned_value = value.owned });
             continue;
         }
 
         if ((first & 0x20) != 0) {
-            const name = try decodeStringLiteral(block[offset..], 3);
+            const name = try decodeStringLiteral(allocator, block[offset..], 3);
+            errdefer if (name.owned) allocator.free(name.value);
             offset += name.len;
-            const value = try decodeStringLiteral(block[offset..], 7);
+            const value = try decodeStringLiteral(allocator, block[offset..], 7);
+            errdefer if (value.owned) allocator.free(value.value);
             offset += value.len;
-            try appendDecodedHeader(allocator, &out, name.value, value.value);
+            try appendDecodedHeader(allocator, &out, .{ .name = name.value, .value = value.value, .owned_name = name.owned, .owned_value = value.owned });
             continue;
         }
 
@@ -364,7 +407,7 @@ test "QPACK literal lengths cross prefix boundaries without QUIC varints" {
         const encoded = try encodeLiteralHeaders(std.testing.allocator, &.{.{ .name = "x-test", .value = value }});
         defer std.testing.allocator.free(encoded);
         const decoded = try decodeHeaderBlock(std.testing.allocator, encoded);
-        defer std.testing.allocator.free(decoded);
+        defer freeDecodedHeaders(std.testing.allocator, decoded);
         try std.testing.expectEqualStrings("x-test", decoded[0].name);
         try std.testing.expectEqualStrings(value, decoded[0].value);
         if (len == 127) try std.testing.expectEqualSlices(u8, "\x7f\x00", encoded[9..11]);
@@ -380,11 +423,74 @@ test "minimal QPACK decoder reads static and literal request headers" {
     const block = "\x00\x00\xd1\x51\x07/health";
 
     const headers = try decodeHeaderBlock(std.testing.allocator, block);
-    defer std.testing.allocator.free(headers);
+    defer freeDecodedHeaders(std.testing.allocator, headers);
 
     try std.testing.expectEqual(@as(usize, 2), headers.len);
     try std.testing.expectEqualStrings(":method", headers[0].name);
     try std.testing.expectEqualStrings("GET", headers[0].value);
     try std.testing.expectEqualStrings(":path", headers[1].name);
     try std.testing.expectEqualStrings("/health", headers[1].value);
+}
+
+test "QPACK decodes Huffman string literals using the HPACK alphabet" {
+    const block = "\x00\x00\x50\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff";
+    const headers = try decodeHeaderBlock(std.testing.allocator, block);
+    defer freeDecodedHeaders(std.testing.allocator, headers);
+    try std.testing.expectEqualStrings(":authority", headers[0].name);
+    try std.testing.expectEqualStrings("www.example.com", headers[0].value);
+}
+
+const huffman_example = "\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff";
+const huffman_literal_pair = "\x00\x00\x2f\x05" ++ huffman_example ++ "\x8c" ++ huffman_example;
+
+fn qpackHuffmanAllocationCheck(allocator: std.mem.Allocator) !void {
+    const headers = try decodeHeaderBlock(allocator, huffman_literal_pair);
+    defer freeDecodedHeaders(allocator, headers);
+    try std.testing.expectEqualStrings("www.example.com", headers[0].name);
+    try std.testing.expectEqualStrings("www.example.com", headers[0].value);
+}
+
+test "QPACK owns Huffman names and values across all failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, qpackHuffmanAllocationCheck, .{});
+}
+
+test "QPACK rejects bad Huffman padding EOS and late truncated fields without leaks" {
+    for ([_][]const u8{
+        "\x00\x00\x50\x81\x00",
+        "\x00\x00\x50\x81\xff",
+        "\x00\x00\x50\x84\xff\xff\xff\xff",
+        "\x00\x00\x29\xff\x00",
+    }) |block| {
+        try std.testing.expectError(error.BadHeaderBlock, decodeHeaderBlock(std.testing.allocator, block));
+    }
+    for ([_][]const u8{
+        huffman_literal_pair ++ "\x50\x03a",
+        "\x00\x00\x2f\x05" ++ huffman_example ++ "\x03a",
+        huffman_literal_pair ++ "\x2f\x05short",
+    }) |block| {
+        try std.testing.expectError(error.Truncated, decodeHeaderBlock(std.testing.allocator, block));
+    }
+    try std.testing.expectError(error.InvalidHeaderBlock, decodeHeaderBlock(std.testing.allocator, "\x00\x80"));
+    const positive_base = try decodeHeaderBlock(std.testing.allocator, "\x00\x01\xd1");
+    defer freeDecodedHeaders(std.testing.allocator, positive_base);
+    try std.testing.expectEqualStrings("GET", positive_base[0].value);
+}
+
+test "QPACK bounds encoded decoded and indexed header expansion" {
+    const allocator = std.testing.allocator;
+    const oversized = try allocator.alloc(u8, max_header_bytes + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 0);
+    try std.testing.expectError(error.HeaderBlockTooLarge, decodeHeaderBlock(allocator, oversized));
+    const value = try allocator.alloc(u8, max_header_bytes - 11);
+    defer allocator.free(value);
+    @memset(value, 'a');
+    const block = try encodeLiteralHeaders(allocator, &.{.{ .name = "x", .value = value }});
+    defer allocator.free(block);
+    try std.testing.expect(block.len <= max_header_bytes);
+    try std.testing.expectError(error.HeaderBlockTooLarge, decodeHeaderBlock(allocator, block));
+    var indexed = [_]u8{0xd1} ** (max_header_fields + 3);
+    indexed[0] = 0;
+    indexed[1] = 0;
+    try std.testing.expectError(error.HeaderBlockTooLarge, decodeHeaderBlock(allocator, &indexed));
 }

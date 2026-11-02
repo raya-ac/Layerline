@@ -518,21 +518,78 @@ fn applyPacketNumberToNonce(nonce: *[12]u8, packet_number: u64) void {
     }
 }
 
+// Initial keys are public, so a peer must not turn one sparse offset into an
+// unbounded allocation. Each encryption level has its own bounded byte stream.
+pub const CryptoBuffer = struct {
+    pub const max_bytes = 64 * 1024;
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    received: std.ArrayListUnmanaged(u8) = .empty,
+    contiguous_len: usize = 0,
+
+    pub fn deinit(self: *CryptoBuffer, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+        self.received.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn clearRetainingCapacity(self: *CryptoBuffer) void {
+        self.bytes.clearRetainingCapacity();
+        self.received.clearRetainingCapacity();
+        self.contiguous_len = 0;
+    }
+
+    pub fn prefix(self: *const CryptoBuffer) []const u8 {
+        return self.bytes.items[0..self.contiguous_len];
+    }
+
+    pub fn insert(self: *CryptoBuffer, allocator: std.mem.Allocator, stream_offset: u64, data: []const u8) !void {
+        if (stream_offset > max_bytes or data.len > max_bytes - stream_offset) return error.CryptoBufferExceeded;
+        if (data.len == 0) return;
+        const start: usize = @intCast(stream_offset);
+        const end = start + data.len;
+        const overlap_end = @min(end, self.bytes.items.len);
+        // Check the whole overlap before changing anything. Retransmissions may
+        // fill gaps, but they cannot rewrite bytes already used by the transcript.
+        for (start..@max(start, overlap_end)) |i| {
+            if (self.received.items[i] != 0 and self.bytes.items[i] != data[i - start]) return error.ConflictingCryptoData;
+        }
+        if (end > self.bytes.items.len) {
+            const capacity = if (self.bytes.capacity >= end)
+                self.bytes.capacity
+            else
+                @min(max_bytes, @max(end, @max(64, self.bytes.capacity * 2)));
+            try self.bytes.ensureTotalCapacityPrecise(allocator, capacity);
+            try self.received.ensureTotalCapacityPrecise(allocator, capacity);
+            const previous_len = self.bytes.items.len;
+            self.bytes.items.len = end;
+            self.received.items.len = end;
+            @memset(self.bytes.items[previous_len..end], 0);
+            @memset(self.received.items[previous_len..end], 0);
+        }
+        @memcpy(self.bytes.items[start..end], data);
+        @memset(self.received.items[start..end], 1);
+        while (self.contiguous_len < self.received.items.len and self.received.items[self.contiguous_len] != 0) {
+            self.contiguous_len += 1;
+        }
+    }
+};
+
 pub fn extractCryptoData(
     allocator: std.mem.Allocator,
     plaintext: []const u8,
 ) ![]u8 {
-    var crypto = std.ArrayListUnmanaged(u8).empty;
-    errdefer crypto.deinit(allocator);
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
 
     try appendCryptoData(allocator, plaintext, &crypto);
-    return crypto.toOwnedSlice(allocator);
+    if (crypto.contiguous_len != crypto.bytes.items.len) return error.CryptoGap;
+    return allocator.dupe(u8, crypto.prefix());
 }
 
 pub fn appendCryptoData(
     allocator: std.mem.Allocator,
     plaintext: []const u8,
-    crypto: *std.ArrayListUnmanaged(u8),
+    crypto: *CryptoBuffer,
 ) !void {
     var offset: usize = 0;
     while (offset < plaintext.len) {
@@ -573,15 +630,9 @@ pub fn appendCryptoData(
                 offset += crypto_offset.len;
                 const len = try h3.decodeVarInt(plaintext[offset..]);
                 offset += len.len;
+                if (len.value > plaintext.len - offset) return error.Truncated;
                 const end = offset + @as(usize, @intCast(len.value));
-                if (plaintext.len < end) return error.Truncated;
-                const crypto_start = @as(usize, @intCast(crypto_offset.value));
-                if (crypto_start > crypto.items.len) return error.CryptoGap;
-                const overlap = crypto.items.len - crypto_start;
-                if (overlap < len.value) {
-                    const append_start = offset + overlap;
-                    try crypto.appendSlice(allocator, plaintext[append_start..end]);
-                }
+                try crypto.insert(allocator, crypto_offset.value, plaintext[offset..end]);
                 offset = end;
             },
             0x08...0x0f => {
@@ -746,7 +797,8 @@ fn appendBytesTransportParameter(
 }
 
 pub fn parseClientHello(crypto_data: []const u8) !ClientHelloInfo {
-    if (crypto_data.len < 4 or crypto_data[0] != 0x01) return error.NotClientHello;
+    if (crypto_data.len < 4) return error.Truncated;
+    if (crypto_data[0] != 0x01) return error.NotClientHello;
     const handshake_len = (@as(usize, crypto_data[1]) << 16) |
         (@as(usize, crypto_data[2]) << 8) |
         @as(usize, crypto_data[3]);
@@ -995,6 +1047,19 @@ test "parse h3 ClientHello capabilities" {
     try std.testing.expect(parsed.has_quic_transport_parameters);
 }
 
+test "extracts CRYPTO fragments shuffled within a packet" {
+    const allocator = std.testing.allocator;
+    const head = try buildCryptoFrame(allocator, 0, "hello ");
+    defer allocator.free(head);
+    const tail = try buildCryptoFrame(allocator, 6, "world");
+    defer allocator.free(tail);
+    const packet = try std.mem.concat(allocator, u8, &.{ tail, &.{0}, head });
+    defer allocator.free(packet);
+    const extracted = try extractCryptoData(allocator, packet);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualStrings("hello world", extracted);
+}
+
 test "reassembles CRYPTO frames across packets" {
     const allocator = std.testing.allocator;
     const first = try buildCryptoFrame(allocator, 0, "hello ");
@@ -1002,13 +1067,101 @@ test "reassembles CRYPTO frames across packets" {
     const second = try buildCryptoFrame(allocator, 6, "world");
     defer allocator.free(second);
 
-    var crypto = std.ArrayListUnmanaged(u8).empty;
+    var crypto: CryptoBuffer = .{};
     defer crypto.deinit(allocator);
     try appendCryptoData(allocator, first, &crypto);
     try appendCryptoData(allocator, first, &crypto);
     try appendCryptoData(allocator, second, &crypto);
 
-    try std.testing.expectEqualStrings("hello world", crypto.items);
+    try std.testing.expectEqualStrings("hello world", crypto.prefix());
+}
+
+test "CRYPTO gaps stay private until shuffled fragments fill them" {
+    const allocator = std.testing.allocator;
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
+    try crypto.insert(allocator, 8, "rld");
+    try std.testing.expectEqualStrings("", crypto.prefix());
+    try crypto.insert(allocator, 0, "hel");
+    try std.testing.expectEqualStrings("hel", crypto.prefix());
+    try crypto.insert(allocator, 6, "wo");
+    try std.testing.expectEqualStrings("hel", crypto.prefix());
+    try crypto.insert(allocator, 2, "llo ");
+    try std.testing.expectEqualStrings("hello world", crypto.prefix());
+    try crypto.insert(allocator, 4, "o world");
+    try std.testing.expectError(error.ConflictingCryptoData, crypto.insert(allocator, 3, "lo wOrld!"));
+    try std.testing.expectEqualStrings("hello world", crypto.prefix());
+    try std.testing.expectEqual(11, crypto.bytes.items.len);
+    crypto.clearRetainingCapacity();
+    try crypto.insert(allocator, 2, "new");
+    try std.testing.expectEqualStrings("", crypto.prefix());
+    try crypto.insert(allocator, 0, "a ");
+    try std.testing.expectEqualStrings("a new", crypto.prefix());
+}
+
+test "CRYPTO offset and size limits precede any allocation" {
+    const allocator = std.testing.allocator;
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
+    try std.testing.expectError(error.CryptoBufferExceeded, crypto.insert(allocator, std.math.maxInt(u64), "x"));
+    try std.testing.expectError(error.CryptoBufferExceeded, crypto.insert(allocator, CryptoBuffer.max_bytes, "x"));
+    try std.testing.expectError(error.CryptoBufferExceeded, crypto.insert(allocator, CryptoBuffer.max_bytes - 1, "xx"));
+    try crypto.insert(allocator, CryptoBuffer.max_bytes, "");
+    try std.testing.expectEqual(0, crypto.bytes.capacity);
+    try std.testing.expectEqual(0, crypto.received.capacity);
+    try crypto.insert(allocator, CryptoBuffer.max_bytes - 1, "x");
+    try std.testing.expect(crypto.bytes.capacity <= CryptoBuffer.max_bytes);
+    try std.testing.expect(crypto.received.capacity <= CryptoBuffer.max_bytes);
+    try std.testing.expectEqualStrings("", crypto.prefix());
+}
+
+fn cryptoAllocationFailures(allocator: std.mem.Allocator) !void {
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
+    try crypto.insert(allocator, 4, "ef");
+    try crypto.insert(allocator, 0, "abcd");
+    try std.testing.expectEqualStrings("abcdef", crypto.prefix());
+}
+
+test "CRYPTO allocation failures clean up both sparse buffers" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cryptoAllocationFailures, .{});
+}
+
+test "CRYPTO growth can retry after its second allocation fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
+    try std.testing.expectError(error.OutOfMemory, crypto.insert(allocator, 3, "def"));
+    try std.testing.expectEqual(0, crypto.bytes.items.len);
+    try std.testing.expectEqual(0, crypto.received.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    try crypto.insert(allocator, 3, "def");
+    try crypto.insert(allocator, 0, "abc");
+    try std.testing.expectEqualStrings("abcdef", crypto.prefix());
+}
+
+test "small CRYPTO fragments grow geometrically within their hard cap" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 32 });
+    const allocator = failing.allocator();
+    var crypto: CryptoBuffer = .{};
+    defer crypto.deinit(allocator);
+    for (0..4096) |i| {
+        try crypto.insert(allocator, i, "x");
+        try std.testing.expect(crypto.bytes.capacity >= 64);
+        try std.testing.expect(crypto.bytes.capacity <= CryptoBuffer.max_bytes);
+    }
+    try std.testing.expectEqual(4096, crypto.prefix().len);
+}
+
+test "standalone CRYPTO extraction rejects missing and truncated data" {
+    const allocator = std.testing.allocator;
+    const gap = try buildCryptoFrame(allocator, 1, "x");
+    defer allocator.free(gap);
+    try std.testing.expectError(error.CryptoGap, extractCryptoData(allocator, gap));
+    try std.testing.expectError(error.Truncated, extractCryptoData(allocator, gap[0 .. gap.len - 1]));
+    try std.testing.expectError(error.Truncated, parseClientHello(""));
+    try std.testing.expectError(error.Truncated, parseClientHello(&.{1}));
 }
 
 test "version negotiation swaps connection IDs" {

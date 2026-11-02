@@ -392,6 +392,9 @@ if curl_supports_http3; then
   H3_HEALTH_BODY="$TMP_DIR/h3-health.body"
   curl -fsSk --http3-only --max-time 5 "https://$HOST:$H3_PORT/health" -o "$H3_HEALTH_BODY"
   grep -Fq 'ok' "$H3_HEALTH_BODY" || die "HTTP/3 external curl smoke did not receive health body"
+  H3_ROOT_BODY="$TMP_DIR/h3-root.body"
+  curl -fsSk --http3-only --max-time 5 "https://$HOST:$H3_PORT/" -o "$H3_ROOT_BODY"
+  cmp -s "$ROOT_DIR/public/index.html" "$H3_ROOT_BODY" || die "HTTP/3 root did not match the published website"
   ok "HTTP/3 external curl smoke"
 else
   ok "HTTP/3 external curl smoke skipped; curl lacks HTTP3 feature"

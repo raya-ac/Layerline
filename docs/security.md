@@ -638,11 +638,19 @@ doctor check present files without provisioning; missing ACME inputs may defer
 until issuance. Startup loads listener material before DNS changes.
 `zig build test-listener-materials` checks global/SNI scopes, rejected activation
 and reload, retained connections, and verified EC/RSA/RSA-PSS-chain rotation.
+Private key admission requires complete two-prime PKCS1 RSA tuples and checks
+`n = p*q`, both private-exponent congruences, the CRT exponents and coefficient.
+Positive integers and DER lengths must be canonical. PKCS8 accepts version zero,
+an exact supported algorithm identifier and no attributes; RSA parameters may be
+absent or an empty NULL. Private PEM and decoded DER are capped at 32 KiB and
+16 KiB respectively. The listener fixture covers 136 startup/reload groups and
+seven valid rotation profiles per global/SNI scope, including RSA-4096.
+These algebraic checks do not establish factor primality or key-generation
+quality. SEC1 EC metadata validation remains separate unfinished work.
 The listener parser does not impose origin trust policy: unknown extension
 contents and signature profiles remain for the client to interpret. This is not
-issuer/path, hostname, expiry or revocation validation, nor a proof of RSA
-private-parameter consistency. A material load alone does not prove that every
-client trusts or can use the chain. The original finding concerned configured
+issuer/path, hostname, expiry or revocation validation. A material load alone
+does not prove that every client trusts or can use the chain. The original finding concerned configured
 input/readiness, not a proven remote authentication bypass.
 
 TCP TLS and experimental QUIC connection diagnostics quote and escape unauthenticated SNI and ALPN bytes,
@@ -824,3 +832,14 @@ cleanup, deadline scoping, and the method retry gate.
 HTTP/3 uses the shared request guard, but its external interoperability, QUIC
 recovery/flow control, and configured certificate integration remain open. Do
 not treat the shared guard or codec tests as production HTTP/3 acceptance.
+
+QUIC CRYPTO reassembly accepts shuffled fragments within and across packets,
+exposes only contiguous bytes to TLS, and rejects conflicting retransmissions.
+Initial and Handshake levels have separate 64 KiB stream limits; sparse offsets
+cannot request unbounded storage. Allocations use the existing HTTP/3 resource
+budget and expire with their connection. QPACK literal names and values reuse
+the HPACK Huffman decoder, including its EOS/padding checks. Encoded and decoded
+field sections are capped at 64 KiB and 100 fields; decoded accounting includes
+32 bytes per field. The static-only decoder still rejects dynamic references.
+Huffman allocations remain owned until the decoded fields/request are released.
+These bounds and codec checks do not replace QUIC recovery or client conformance.
