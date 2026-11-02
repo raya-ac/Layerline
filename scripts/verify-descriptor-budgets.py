@@ -31,6 +31,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "--limited":
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "zig-out/bin/layerline"
 NORMAL = 'layerline_descriptor_owned_by_pool{pool="normal"}'
+RESERVATIONS = 'layerline_descriptor_reservations{pool="normal"}'
 NORMAL_LIMIT = 'layerline_descriptor_limit{pool="normal"}'
 DATA = b"descriptor capacity recovered"
 
@@ -222,7 +223,9 @@ route_proxy.dns = http://localhost:{backend.server_port}
                     wait_for(lambda: metrics(admin)[NORMAL] == base + 2, "warm backend descriptor did not close")
 
                     def fill():
-                        current = metrics(admin)
+                        # Close unregisters the handle before releasing its slot.
+                        # Refill only after both parts of that ownership change finish.
+                        current = wait_for(lambda: (m if (m := metrics(admin))[NORMAL] == m[RESERVATIONS] else None), "descriptor reservations did not settle before refill")
                         needed = current[NORMAL_LIMIT] - current[NORMAL]
                         for _ in range(needed):
                             idle.append(socket.create_connection(("127.0.0.1", number), timeout=3))
