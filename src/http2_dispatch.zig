@@ -8,6 +8,7 @@ const read_interrupt = @import("read_interrupt.zig");
 const resource_budget = @import("resource_budget.zig");
 const h2 = @import("h2_native.zig");
 const write_deadline = @import("write_deadline.zig");
+const request_cancel = @import("request_cancel.zig");
 
 pub const Result = struct {
     response: support.BufferedResponse,
@@ -105,6 +106,9 @@ pub const Dispatcher = struct {
     }
 
     fn run(self: *Dispatcher, job: *Job) void {
+        const previous_cancel = request_cancel.active;
+        request_cancel.active = &job.canceled;
+        defer request_cancel.active = previous_cancel;
         var sink = ProgressContext{ .dispatcher = self, .job = job };
         const previous = support.informational_sink;
         support.informational_sink = .{ .context = &sink, .emit = publishInformational };

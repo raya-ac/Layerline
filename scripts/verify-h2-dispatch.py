@@ -241,8 +241,9 @@ graceful_shutdown_timeout_ms = 1200
                 # A PING proves the resets were parsed, not that jobs finished.
                 client.send(6, 0, 0, b"canceled")
                 client.until(lambda items: (6, 1, 0, b"canceled") in items)
-                backend.release.set()
                 quiescent()
+                assert not backend.release.is_set(), "reset cleanup waited for the backend to reply"
+                backend.release.set()
                 client.request(19, b"/health")
                 client.window(19, 16)
                 client.until(lambda _: client.ended(19))

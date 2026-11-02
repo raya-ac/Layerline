@@ -57,6 +57,7 @@ pub const Prepared = struct {
 };
 
 test "Darwin spawn flags match the kernel descriptor allowlist and group ABI" {
+    if (comptime @import("builtin").os.tag != .macos) return error.SkipZigTest;
     const flags: std.c.POSIX_SPAWN = .{ .SETPGROUP = true, .CLOEXEC_DEFAULT = true };
     try std.testing.expectEqual(@as(c_short, 0x4002), @as(c_short, @bitCast(flags)));
     try std.testing.expectEqual(error.FileNotFound, failure(@intFromEnum(posix.E.NOENT)));

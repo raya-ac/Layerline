@@ -179,7 +179,15 @@ recovery on plaintext/TLS H1/H2. It does not pressure the production process.
 The heap cap is still not RSS or virtual-address-space accounting. Stack guards,
 TLS/runtime overhead, kernel buffers and child memory need the OS boundary above.
 Standalone/non-systemd deployments must provide equivalent OS limits themselves.
-Stronger Darwin resolver cancellation guarantees remain separate work.
+macOS hostname dialing now resolves through an owned mode of the same executable
+so backend deadlines, canceled HTTP/2 work and shutdown can kill/reap a stalled
+libc lookup. Keep that executable available at its absolute, trusted path during
+operation (prefer immutable release paths). Helpers receive no inherited
+environment and never load server configuration. They share command admission
+and descriptor limits. The system resolver policy is retained, with an explicit
+128-address reply cap and no DNS cache added. Linux keeps its existing in-process
+cancellable resolver; no additional executable or resolver dependency is needed.
+Blocking kernel/filesystem/spawn operations remain outside a hard time guarantee.
 
 CGI and helper execs now inherit only their owned standard I/O pipes. Linux 5.9+
 uses `close_range`; older kernels or restricted syscall policies need a trusted,

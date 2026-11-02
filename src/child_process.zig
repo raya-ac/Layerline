@@ -126,6 +126,7 @@ fn read(io: std.Io, allocator: std.mem.Allocator, pipe: *?std.Io.File, output: *
 
 fn check(io: std.Io, options: Options, deadline: Deadline) !void {
     try io.checkCancel();
+    try @import("request_cancel.zig").check();
     if (native_spawn.isStopping()) return error.Canceled;
     if (options.shutdown) |requested| if (requested.load(.acquire)) return error.Canceled;
     _ = try deadline.remaining(.now(io, .awake));

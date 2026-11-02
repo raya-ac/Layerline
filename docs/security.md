@@ -345,7 +345,13 @@ pauses while work remains and starts afresh when the connection becomes idle;
 partial-frame, upload, and response deadlines do not pause.
 
 Reset streams suppress late replies but cannot undo backend side effects already
-performed. Connection teardown cancels and joins routing tasks before releasing
+performed. Their routing flag is now checked by native socket waits, child
+launch/capture and the existing backend dial timer. A reset therefore unwinds
+blocked work without joining it on the frame-reader thread or allocating another
+watcher task. Held-backend tests require routing admission to recover before the
+backend is released, and cancellation is not counted as an upstream failure.
+This is cooperative cancellation at I/O boundaries, not CPU/kernel preemption.
+Connection teardown cancels and joins routing tasks before releasing
 their arenas, wake descriptors, or borrowed config/TLS state. Local cancellation
 and allocation failure release upstream attempt leases without retrying or
 ejecting a healthy target. This is not a fully evented socket scheduler:
@@ -362,9 +368,26 @@ timeout policies must be positive; zero is rejected by configuration validation.
 
 Dialing races an owned IO task against the deadline and cancels/joins it before
 returning; even a successful late connection is closed. Linux uses Zig's
-cancellable resolver. Darwin's libc resolver can delay cancellation while inside
-`getaddrinfo`, so a hard DNS deadline there is not yet guaranteed. This is not a
-full end-to-end application execution deadline on every platform/path.
+cancellable resolver. On macOS, the same executable runs libc `getaddrinfo` in
+an owned helper, preserving the system resolver's hosts/VPN/search policy. Its
+private entry point runs before config loading and cannot start listeners. The
+parent accepts only a versioned, bounded binary reply (at most 128 addresses),
+preserves IPv6 scope/flow and races the returned candidates as before. Excess
+answers fail rather than silently dropping candidates; there is no invented DNS
+cache TTL. No config, authorization, or inherited environment is sent to it.
+
+The helper shares the 64-child admission limit and managed pipe reservations.
+The original backend timer cancels its owner, which kills the group and reaps
+the leader before returning; lookup does not start a fresh timeout. HTTP/2
+reset/disconnect and shutdown use the same joined cleanup. A test-only Darwin
+interposer stalls actual `getaddrinfo`, checks timeout/recovery over plain/TLS
+HTTP, and observes that canceled helpers are gone rather than zombies.
+`python3 scripts/verify-resolver-deadlines.py /absolute/path/to/layerline` requires
+Apple's command-line C compiler; it is explicitly skipped on other systems.
+The fixture is never linked into the server. This adds a process launch per
+macOS lookup, not per request reusing an upstream connection. It does not bound
+uninterruptible kernel/filesystem/spawn operations or constitute a full
+end-to-end application execution deadline on every platform/path.
 
 ## Child Processes
 

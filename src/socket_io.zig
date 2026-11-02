@@ -74,6 +74,7 @@ const Wait = struct {
 
     fn check(self: Wait) !void {
         try self.io.checkCancel();
+        try @import("request_cancel.zig").check();
         _ = try self.deadline.remaining(.now(self.io, .awake));
     }
 

@@ -5,6 +5,8 @@ test {
     _ = @import("descriptor_io.zig");
     _ = @import("child_descriptors.zig");
     _ = @import("native_spawn_darwin.zig");
+    _ = @import("darwin_resolver.zig");
+    _ = @import("request_cancel.zig");
 }
 
 const acme_mod = @import("acme.zig");

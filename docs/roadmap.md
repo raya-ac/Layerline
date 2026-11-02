@@ -103,8 +103,7 @@ RSA signing is isolated on bounded joined worker stacks, rather than overflowing
 the default small connection stack in Debug. Initial protocol selection no longer
 retains a duplicate HTTP request handler during TLS, and CGI environment encoding
 avoids general formatting on that stack. These controls do not sandbox child
-code or cover uninterruptible kernel operations. Darwin resolver cancellation
-still needs stronger deadline guarantees. Listener startup now prepares every
+code or cover uninterruptible kernel operations. Listener startup now prepares every
 configured endpoint before accepting traffic, propagates fatal listener failures
 through joined shutdown, and protects Unix control socket ownership with a lock,
 kernel peer credentials and crash-recovery checks. Tests cover occupied ports,
@@ -132,8 +131,16 @@ but standard I/O and its temporary status pipe with `close_range` or a fail-clos
 raw `/proc` fallback; macOS uses native `CLOEXEC_DEFAULT` spawn actions. Tests
 exercise inherited high handles above soft nofile, CGI/certificate helpers,
 concurrent HTTP/2 churn and forced Linux fallback. Parent handles stay intact;
-child credentials/environment/filesystem access are not sandboxed. Darwin
-resolver cancellation and wider protocol conformance remain open.
+child credentials/environment/filesystem access are not sandboxed. macOS DNS
+now uses the same binary's private resolver mode before configuration bootstrap,
+with no inherited environment and a bounded versioned address reply. The owned
+runner kills/reaps stalled libc lookups on the original backend deadline,
+HTTP/2 cancellation or shutdown. Injected real-libc stalls verify plain/TLS
+deadlines, shared lookup/response budgets, cleanup and recovery; Linux retains
+its in-process resolver. HTTP/2 reset flags also reach native socket waits,
+child launch/capture and the existing dial timer, releasing held backend jobs
+before the backend responds without another watcher task. Kernel/filesystem/spawn stalls and wider protocol
+conformance remain outside this acceptance claim.
 Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
 the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
 Systemd startup now waits for Layerline's native readiness signal after all
@@ -267,4 +274,4 @@ Sources:
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented. Native systemd readiness, serialized reload status, terminal stopping notifications and child environment isolation are covered by Unix datagram tests and an optional real-manager gate; watchdog heartbeats, socket activation and package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers CLI doctor/certs, HTTP/1, parser hardening for malformed headers and conflicting content lengths, HEAD 404 framing, static files, static conditional validators, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, redacted config inspection, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin UI cache purge, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone is the remaining audit gate above: wider HTTP/2 conformance, process-wide resource budgets, resolver cancellation and externally verified HTTP/3 interoperability. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.
+The next engineering milestone is the remaining audit gate above: wider HTTP/2 conformance, resource-boundary verification and externally verified HTTP/3 interoperability. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Deadline = @import("read_deadline.zig").Deadline;
+const request_cancel = @import("request_cancel.zig");
 
 pub const State = struct {
     io: std.Io,
@@ -8,6 +9,7 @@ pub const State = struct {
     handle: ?std.Io.net.Socket.Handle = null,
 
     pub fn remaining(self: State) !?u32 {
+        try request_cancel.check();
         return self.deadline.remaining(.now(self.io, .awake));
     }
 };
@@ -48,10 +50,40 @@ pub fn logTimeout(phase: []const u8) void {
 pub fn checkReadCompletion(stream: std.Io.net.Stream) !void {
     if (forStream(stream)) |state| {
         _ = state.remaining() catch |err| {
-            logTimeout("read");
+            if (err == error.RequestTimeout) logTimeout("read");
             return err;
         };
     }
+}
+
+test "stream reset cancels an in-flight dial without waiting for its deadline" {
+    const Fake = struct {
+        var entered: std.Io.Event = .unset;
+        var stopped = std.atomic.Value(bool).init(false);
+        fn dial(io: std.Io) !std.Io.net.Stream {
+            defer stopped.store(true, .release);
+            entered.set(io);
+            try io.sleep(.fromSeconds(30), .awake);
+            return error.UnexpectedDialCompletion;
+        }
+        fn run(io: std.Io, canceled: *const std.atomic.Value(bool)) !std.Io.net.Stream {
+            const previous_cancel = request_cancel.active;
+            request_cancel.active = canceled;
+            defer request_cancel.active = previous_cancel;
+            const previous = push(io, 5000);
+            defer restore(previous);
+            return connect(io, dial, .{io});
+        }
+    };
+    Fake.entered = .unset;
+    Fake.stopped.store(false, .release);
+    var canceled = std.atomic.Value(bool).init(false);
+    var task = try std.testing.io.concurrent(Fake.run, .{ std.testing.io, &canceled });
+    defer _ = task.cancel(std.testing.io) catch {};
+    try Fake.entered.wait(std.testing.io);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, task.await(std.testing.io));
+    try std.testing.expect(Fake.stopped.load(.acquire));
 }
 
 // ConnectOptions.timeout is not implemented by Zig's threaded IO yet. Race the
@@ -94,8 +126,18 @@ fn connectUntil(io: std.Io, at: std.Io.Timestamp, comptime dial: anytype, args: 
             };
         }
     };
+    const Timer = struct {
+        fn wait(task_io: std.Io, end: std.Io.Timestamp, canceled: ?*const std.atomic.Value(bool)) std.Io.Cancelable!void {
+            const flag = canceled orelse return (std.Io.Clock.Timestamp{ .raw = end, .clock = .awake }).wait(task_io);
+            while (true) {
+                if (flag.load(.acquire)) return error.Canceled;
+                const remaining = (Deadline{ .at = end }).remaining(.now(task_io, .awake)) catch return;
+                try task_io.sleep(.fromMilliseconds(@min(remaining orelse 25, 25)), .awake);
+            }
+        }
+    };
     select.concurrent(.connected, Dial.run, .{args}) catch return error.BackendCapacity;
-    select.concurrent(.timer, std.Io.Clock.Timestamp.wait, .{ std.Io.Clock.Timestamp{ .raw = at, .clock = .awake }, io }) catch return error.BackendCapacity;
+    select.concurrent(.timer, Timer.wait, .{ io, at, request_cancel.active }) catch return error.BackendCapacity;
     switch (try select.await()) {
         .timer => |result| {
             try result;
@@ -104,6 +146,7 @@ fn connectUntil(io: std.Io, at: std.Io.Timestamp, comptime dial: anytype, args: 
         .connected => |result| {
             const stream = try result;
             errdefer stream.close(io);
+            try request_cancel.check();
             _ = try (Deadline{ .at = at }).remaining(.now(io, .awake));
             return stream;
         },

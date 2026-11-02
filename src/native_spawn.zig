@@ -172,6 +172,7 @@ fn redirect(source: posix.fd_t, target: posix.fd_t, error_fd: posix.fd_t) void {
 
 fn check(io: std.Io, deadline: Deadline, shutdown: ?*const std.atomic.Value(bool)) !void {
     try io.checkCancel();
+    try @import("request_cancel.zig").check();
     if (isStopping()) return error.Canceled;
     if (shutdown) |requested| if (requested.load(.acquire)) return error.Canceled;
     _ = try deadline.remaining(.now(io, .awake));

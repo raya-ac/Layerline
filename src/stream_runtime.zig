@@ -67,7 +67,7 @@ pub fn rawStreamRead(stream: std.Io.net.Stream, out: []u8) !usize {
     if (backend_deadline.forStream(stream)) |budget| {
         limit = .earliest(limit, budget.deadline);
         const remaining = budget.remaining() catch |err| {
-            backend_deadline.logTimeout("read");
+            if (err == error.RequestTimeout) backend_deadline.logTimeout("read");
             return err;
         };
         if (remaining) |ms| timeout = @min(timeout orelse ms, ms);
@@ -136,7 +136,7 @@ fn rawStreamWriteAllUsing(stream: std.Io.net.Stream, bytes: []const u8, accepted
         }
         if (backend) |state| {
             const remaining = state.remaining() catch |err| {
-                backend_deadline.logTimeout("write");
+                if (err == error.RequestTimeout) backend_deadline.logTimeout("write");
                 return err;
             };
             if (remaining) |ms| try setStreamWriteTimeout(stream, ms);
@@ -159,7 +159,7 @@ fn rawStreamWriteAllUsing(stream: std.Io.net.Stream, bytes: []const u8, accepted
         accepted.* +|= n;
         if (backend) |state| {
             _ = state.remaining() catch |err| {
-                backend_deadline.logTimeout("write");
+                if (err == error.RequestTimeout) backend_deadline.logTimeout("write");
                 return err;
             };
         }

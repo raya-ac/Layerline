@@ -781,6 +781,9 @@ python3 "$ROOT_DIR/scripts/verify-child-descriptors.py" "$SERVER_BINARY"
 log "verifying child-process deadlines and cleanup"
 python3 "$ROOT_DIR/scripts/verify-child-processes.py" "$SERVER_BINARY"
 
+log "verifying Darwin resolver deadlines and cleanup"
+python3 "$ROOT_DIR/scripts/verify-resolver-deadlines.py" "$SERVER_BINARY"
+
 log "verifying structured Cloudflare DNS API handling"
 python3 "$ROOT_DIR/scripts/verify-cloudflare.py" "$SERVER_BINARY"
 

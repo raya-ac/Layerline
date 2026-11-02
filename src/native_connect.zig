@@ -156,7 +156,13 @@ fn connectMany(host: HostName, io: std.Io, port: u16, results: *ResultQueue) !vo
     defer results.close(io);
     var buffer: [32]HostName.LookupResult = undefined;
     var resolved: std.Io.Queue(HostName.LookupResult) = .init(&buffer);
-    var lookup = io.concurrent(HostName.lookup, .{ host, io, &resolved, HostName.LookupOptions{ .port = port } }) catch return error.BackendCapacity;
+    const Resolver = struct {
+        fn run(name: HostName, task_io: std.Io, queue: *std.Io.Queue(HostName.LookupResult), number: u16) !void {
+            if (comptime builtin.os.tag == .macos) return @import("darwin_resolver.zig").lookup(name, task_io, queue, number);
+            return name.lookup(task_io, queue, .{ .port = number });
+        }
+    };
+    var lookup = io.concurrent(Resolver.run, .{ host, io, &resolved, port }) catch return error.BackendCapacity;
     defer lookup.cancel(io) catch {};
     var group: std.Io.Group = .init;
     defer group.cancel(io);
