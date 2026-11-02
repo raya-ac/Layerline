@@ -848,6 +848,9 @@ python3 "$ROOT_DIR/scripts/verify-native-tls.py" "$SERVER_BINARY"
 log "verifying TLS handshake alert protection"
 python3 "$ROOT_DIR/scripts/verify-tls-handshake-alerts.py" "$SERVER_BINARY"
 
+log "verifying bounded development TLS identities"
+python3 "$ROOT_DIR/scripts/verify-development-tls.py" "$SERVER_BINARY"
+
 log "verifying bounded TLS diagnostic fields"
 python3 "$ROOT_DIR/scripts/verify-tls-diagnostics.py" "$SERVER_BINARY"
 

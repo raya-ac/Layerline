@@ -201,7 +201,7 @@ and reserved for serialized Unix admin commands and emergency TLS output. A
 failed config reload leaves the active snapshot intact. Budget changes require
 a restart. Before any final HTTP/1 output, allocation failure can return a small
 503 with `Retry-After: 1`; after output starts, the connection closes without
-appending another response. TLS handshake failures close without sending plaintext.
+appending another response. TLS handshake failures never send a plaintext HTTP response.
 The reserved pool is itself bounded, so a failed emergency allocation can still
 close a connection. Public HTTP admin/metrics routes do not bypass the request
 budget. `layerline_heap_{bytes,limit_bytes,peak_bytes,rejections_total}` expose
@@ -778,6 +778,24 @@ appending an alert to a possibly partial record. The OpenSSL MemoryBIO peer in
 sends an unexpected record across both ALPN choices, checking encrypted alerts
 and the separate pre-ServerHello refusal path. These tests do not establish wider
 TLS profile or timing acceptance.
+
+Development TCP TLS has a process-owned cache of at most 64 hostname/signature
+algorithm pairs. Names longer than 253 bytes and full-cache misses keep the
+uncached fallback; these are cache bounds, not new SNI rejection rules. Configured
+global/SNI certificates always take precedence. Identities are generated outside
+the registry lock and never move or evict while borrowed. Duplicates, uncached
+identities and process teardown erase signing keys before freeing storage;
+teardown happens after connection workers stop. Localhost identities are prepared
+before readiness when TLS has no configured global material. Reloads retain this
+development cache; process restart discards it. This is not trusted issuance,
+session resumption, a bound on cold-host CPU work, or an HTTP/3 identity cache.
+`scripts/verify-development-tls.py` covers concurrency, algorithm separation,
+configured precedence, held readers across reload and cache exhaustion.
+
+Handshake preparation checks cancellation and the original header deadline
+between crypto stages and before sending ServerHello. An expired preparation
+cannot publish a late server flight. These checks do not preempt a single
+cryptographic operation or claim a hard CPU scheduling deadline.
 
 To exercise an already-built release on its target OS without installing Zig,
 run `LAYERLINE_VERIFY_BINARY=/absolute/path/to/layerline bash scripts/verify-layerline.sh`.

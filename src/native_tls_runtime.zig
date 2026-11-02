@@ -7,6 +7,8 @@ const tls13_native = @import("tls13_native.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
 const tls_pem = @import("tls_pem.zig");
 const write_deadline = @import("write_deadline.zig");
+const read_deadline = @import("read_deadline.zig");
+const development_tls = @import("development_tls.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -691,6 +693,11 @@ fn verifyClientFinished(plain: tls13_native.DecryptedRecord, expected_verify_dat
     }
 }
 
+fn checkHandshakePreparation(stream: std.Io.net.Stream) !void {
+    try @import("request_cancel.zig").check();
+    if (read_deadline.forStream(stream)) |budget| _ = try budget.remaining();
+}
+
 test "native TLS refuses missing secure entropy before emitting any handshake" {
     const Fake = struct {
         fn entropy(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
@@ -712,7 +719,7 @@ test "native TLS refuses missing secure entropy before emitting any handshake" {
         .offers_aes_128_gcm_sha256 = true,
         .offers_ecdsa_secp256r1_sha256 = true,
         .x25519_key_share = @splat(0x13),
-    }, io, Fake.read, Fake.write));
+    }, io, Fake.read, Fake.write, null));
 }
 
 pub fn establishTls13(
@@ -724,11 +731,13 @@ pub fn establishTls13(
     io: std.Io,
     raw_read: RawReadFn,
     raw_write_all: RawWriteAllFn,
+    development_materials: ?*development_tls.Store,
 ) !Result {
     var clear_alert_allowed = true;
     errdefer |err| if (clear_alert_allowed) {
         sendFatalAlert(stream, handshakeAlertDescription(err), raw_write_all) catch {};
     };
+    try checkHandshakePreparation(stream);
     if (!info.supports_tls13) return error.UnsupportedTlsVersion;
     if (!info.offers_aes_128_gcm_sha256) return error.UnsupportedTlsCipherSuite;
     if (!info.offers_ecdsa_secp256r1_sha256 and !info.offers_rsa_pss_rsae_sha256 and !info.offers_ed25519) {
@@ -738,14 +747,16 @@ pub fn establishTls13(
     const alpn = selectedAlpn(info);
     if (info.alpn != null and alpn == null) return error.NoApplicationProtocol;
 
-    var entropy: [96]u8 = undefined;
+    var entropy: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &entropy);
     try io.randomSecure(&entropy);
+    try checkHandshakePreparation(stream);
     const server_random = entropy[0..32].*;
     var server_key_pair = try tls13_native.X25519.KeyPair.generateDeterministic(entropy[32..64].*);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key_pair));
     var shared_secret = try tls13_native.X25519.scalarmult(server_key_pair.secret_key, client_x25519);
     defer std.crypto.secureZero(u8, &shared_secret);
+    try checkHandshakePreparation(stream);
 
     const legacy_session_id = info.legacy_session_id orelse "";
     const server_hello = try tls13_native.buildServerHello(allocator, .{
@@ -777,31 +788,22 @@ pub fn establishTls13(
     else
         return error.UnsupportedTlsSignatureScheme;
 
-    var generated_ecdsa_key_pair = if (signing_key_kind == .generated_ecdsa)
-        try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(entropy[64..96].*)
-    else
-        null;
-    defer if (generated_ecdsa_key_pair) |*pair| std.crypto.secureZero(u8, std.mem.asBytes(pair));
-    var generated_ed25519_key_pair = if (signing_key_kind == .generated_ed25519)
-        try tls13_native.Ed25519.KeyPair.generateDeterministic(entropy[64..96].*)
-    else
-        null;
-    defer if (generated_ed25519_key_pair) |*pair| std.crypto.secureZero(u8, std.mem.asBytes(pair));
-    var generated_cert_der: ?[]u8 = null;
-    defer if (generated_cert_der) |cert| allocator.free(cert);
+    var development: ?development_tls.Reference = if (signing_key_kind == .generated_ecdsa or signing_key_kind == .generated_ed25519) blk: {
+        const algorithm: development_tls.Algorithm = if (signing_key_kind == .generated_ecdsa) .ecdsa else .ed25519;
+        break :blk if (development_materials) |store|
+            try store.acquire(io, allocator, cert_name, algorithm)
+        else
+            .{ .identity = try development_tls.Identity.create(io, allocator, cert_name, algorithm), .owner = allocator };
+    } else null;
+    defer if (development) |*identity| identity.deinit();
+    try checkHandshakePreparation(stream);
 
     const certificate = switch (signing_key_kind) {
         .configured_ecdsa, .configured_rsa => try tls13_native.buildCertificate(allocator, selected_material.?.certificate_chain),
-        .generated_ecdsa => blk: {
-            generated_cert_der = try tls13_native.buildSelfSignedEcdsaP256Sha256Certificate(allocator, generated_ecdsa_key_pair.?, cert_name);
-            break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
-        },
-        .generated_ed25519 => blk: {
-            generated_cert_der = try tls13_native.buildSelfSignedEd25519Certificate(allocator, generated_ed25519_key_pair.?, cert_name);
-            break :blk try tls13_native.buildCertificate(allocator, &.{generated_cert_der.?});
-        },
+        .generated_ecdsa, .generated_ed25519 => try tls13_native.buildCertificate(allocator, &.{development.?.identity.certificate}),
     };
     defer allocator.free(certificate);
+    try checkHandshakePreparation(stream);
 
     const cert_verify_hash = tls13_native.transcriptHash(&.{ client_hello, server_hello, encrypted_extensions, certificate });
     const cert_signature = switch (signing_key_kind) {
@@ -813,13 +815,14 @@ pub fn establishTls13(
             const key = selected_material.?.private_key.rsa;
             break :blk try tls13_native.signCertificateVerifyRsaPssSha256(io, allocator, key, cert_verify_hash);
         },
-        .generated_ecdsa => try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, generated_ecdsa_key_pair.?, cert_verify_hash),
+        .generated_ecdsa => try tls13_native.signCertificateVerifyEcdsaP256Sha256(allocator, development.?.identity.key.ecdsa, cert_verify_hash),
         .generated_ed25519 => blk: {
-            const signature = try tls13_native.signCertificateVerifyEd25519(generated_ed25519_key_pair.?, cert_verify_hash);
+            const signature = try tls13_native.signCertificateVerifyEd25519(development.?.identity.key.ed25519, cert_verify_hash);
             break :blk try allocator.dupe(u8, &signature);
         },
     };
     defer allocator.free(cert_signature);
+    try checkHandshakePreparation(stream);
     const signature_scheme: tls13_native.SignatureScheme = switch (signing_key_kind) {
         .configured_ecdsa, .generated_ecdsa => .ecdsa_secp256r1_sha256,
         .configured_rsa => .rsa_pss_rsae_sha256,
@@ -850,6 +853,7 @@ pub fn establishTls13(
 
     // A failed flight write may have exposed part of a record. Close it instead
     // of appending an alert to a record boundary we can no longer trust.
+    try checkHandshakePreparation(stream);
     clear_alert_allowed = false;
     try sendPlainRecord(stream, CONTENT_TYPE_HANDSHAKE, server_hello, raw_write_all);
     var server_handshake_sequence: u64 = 0;
@@ -922,7 +926,51 @@ test "failed TLS flight writes never append a plaintext alert or another record"
             .offers_aes_128_gcm_sha256 = true,
             .offers_ecdsa_secp256r1_sha256 = true,
             .x25519_key_share = client.public_key,
-        }, std.testing.io, Fake.read, Fake.write));
+        }, std.testing.io, Fake.read, Fake.write, null));
         try std.testing.expectEqual(failure + 1, Fake.writes);
+    }
+}
+
+test "expired handshake preparation never publishes a late server flight" {
+    const Fake = struct {
+        var checks: usize = 0;
+        var expire_at: usize = 0;
+        var writes: usize = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            checks += 1;
+            return .fromNanoseconds(if (checks >= expire_at) 500 * std.time.ns_per_ms else 0);
+        }
+        fn entropy(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            @memset(bytes, 0x37);
+        }
+        fn read(_: std.Io.net.Stream, _: []u8) !usize {
+            return error.UnexpectedRead;
+        }
+        fn write(_: std.Io.net.Stream, bytes: []const u8) !void {
+            try std.testing.expectEqualSlices(u8, "\x15\x03\x03\x00\x02\x02\x28", bytes);
+            writes += 1;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fake.now;
+    vtable.randomSecure = Fake.entropy;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    const previous = read_deadline.push(.{ .io = io, .handle = 123, .deadline = .after(.fromNanoseconds(0), 500), .restore_timeout_ms = 500 });
+    defer read_deadline.restore(previous);
+    const client = try tls13_native.X25519.KeyPair.generateDeterministic(@splat(0x13));
+    var cfg = config_mod.defaultServerConfig();
+    for (1..8) |checkpoint| {
+        Fake.checks = 0;
+        Fake.writes = 0;
+        Fake.expire_at = checkpoint;
+        try std.testing.expectError(error.RequestTimeout, establishTls13(stream, std.testing.allocator, &cfg, "\x16\x03\x03\x00\x01\x00", .{
+            .supports_tls13 = true,
+            .offers_aes_128_gcm_sha256 = true,
+            .offers_ecdsa_secp256r1_sha256 = true,
+            .x25519_key_share = client.public_key,
+        }, io, Fake.read, Fake.write, null));
+        try std.testing.expectEqual(checkpoint, Fake.checks);
+        try std.testing.expectEqual(1, Fake.writes);
     }
 }

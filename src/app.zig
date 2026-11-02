@@ -423,6 +423,7 @@ fn handleHttp1ConnectionFromTls(
 
 fn tlsAcceptCallbacks() tls_accept.Callbacks {
     return .{
+        .development_materials = &runtime_state.development_tls_materials,
         .active_io = activeIo,
         .clear_tls_channel = clearTlsChannel,
         .handle_http1_connection = handleHttp1ConnectionFromTls,
@@ -845,6 +846,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Failed to load configured TLS material: {}\n", .{err});
         return err;
     };
+    runtime_state.development_tls_materials = .{ .allocator = resource_budget.allocator() };
+    defer runtime_state.development_tls_materials.deinit();
+    if (cfg.tls_enabled and cfg.tls_material == null) try runtime_state.development_tls_materials.warm(init.io);
     ensureCloudflareDeployment(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
         std.debug.print("Cloudflare deployment failed: {}\n", .{err});
         return err;

@@ -29,6 +29,7 @@ pub var server_metrics = metrics_mod.ServerMetrics.init();
 pub var fastcgi_keepalive_pool = config_mod.FastcgiKeepAlivePool.init();
 pub var static_response_cache = static_cache_mod.Store{};
 pub var buffered_response_cache = buffered_cache_mod.Store{};
+pub var development_tls_materials = @import("development_tls.zig").Store{};
 
 pub fn currentRequestId() []const u8 {
     return current_request_id;

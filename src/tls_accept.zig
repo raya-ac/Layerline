@@ -15,6 +15,7 @@ pub const Callbacks = struct {
     raw_stream_read: *const fn (std.Io.net.Stream, []u8) anyerror!usize,
     raw_stream_write_all: *const fn (std.Io.net.Stream, []const u8) anyerror!void,
     set_tls_channel: *const fn (?*native_tls.Channel) void,
+    development_materials: ?*@import("development_tls.zig").Store = null,
 };
 
 pub fn handleClientHelloProbe(
@@ -51,7 +52,7 @@ pub fn handleClientHelloProbe(
         },
     );
 
-    var established = native_tls.establishTls13(stream, allocator, cfg, record, info, callbacks.active_io(), callbacks.raw_stream_read, callbacks.raw_stream_write_all) catch |err| {
+    var established = native_tls.establishTls13(stream, allocator, cfg, record, info, callbacks.active_io(), callbacks.raw_stream_read, callbacks.raw_stream_write_all, callbacks.development_materials) catch |err| {
         std.debug.print("Native TLS 1.3 handshake failed: {}\n", .{err});
         return;
     };

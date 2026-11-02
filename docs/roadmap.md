@@ -72,6 +72,12 @@ Handshake failures now preserve their write epoch: after server Finished, alerts
 use application keys rather than plaintext. Failed flight writes close without
 appending another record. An independent OpenSSL peer covers held/corrupt client
 Finished and wrong-record failures across H1/H2 ALPN, plus early ALPN refusal.
+Development TCP TLS identities now use a process-owned cache of at most 64
+host/algorithm pairs, avoiding repeated key and certificate creation for common
+hosts. Configured certificates take precedence, and full caches keep the uncached
+fallback instead of rejecting hosts or evicting borrowed identities. Preparation
+checks cancellation and the original header deadline between crypto stages and
+before publishing ServerHello; it does not preempt an individual crypto operation.
 Configured listener material now has bounded DER envelope/SPKI admission,
 P-256 point and RSA modulus/exponent matching, key-strength limits and read-only
 CLI checks. Global/SNI tests cover bad material before DNS, rejected reloads and
