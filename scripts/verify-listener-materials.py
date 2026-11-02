@@ -244,23 +244,76 @@ with tempfile.TemporaryDirectory(prefix="layerline-listener-materials-", dir="/t
     fields = pkcs8.copy()
     fields[1] = (0x30, der(*algorithm[0]))
     absent_rsa_parameters = pkcs8_pem(fields)
-    fields = parts(parts(unpem("PRIVATE KEY", ec_key.read_bytes()))[0][1])
+    ec_pkcs8 = parts(parts(unpem("PRIVATE KEY", ec_key.read_bytes()))[0][1])
+    fields = ec_pkcs8.copy()
     ec_algorithm = parts(fields[1][1])
     fields[1] = (0x30, b"".join(der(tag, value) for tag, value in ec_algorithm + ec_algorithm[1:]))
     cases["PKCS8 duplicate named curve"] = (ec.read_bytes(), pkcs8_pem(fields))
     cases["oversized private PEM"] = (rsa.read_bytes(), traditional + b" " * (32 * 1024))
     cases["oversized private DER"] = (rsa.read_bytes(), pem("RSA PRIVATE KEY", bytes(16 * 1024 + 1)))
+    ec_fields = parts(parts(run("openssl", "ec", "-in", str(ec_key), "-outform", "DER"))[0][1])
+    assert [tag for tag, _ in ec_fields] == [2, 4, 0xa0, 0xa1]
+
+    def ec_private_der(fields):
+        return der(0x30, b"".join(der(tag, value) for tag, value in fields))
+
+    def ec_pem(fields):
+        return pem("EC PRIVATE KEY", ec_private_der(fields))
+
+    compressed_point = bytes([2 | (public_ec[-1] & 1)]) + public_ec[1:33]
+    compressed_ec = ec_fields[:3] + [(0xa1, der(3, b"\0" + compressed_point))]
+    minimal_ec = ec_fields[:2]
+    bad_version = [(2, b"\0")] + ec_fields[1:]
+    bad_curve = ec_fields[:2] + [(0xa0, der(6, b"\x2b\x81\x04\x00\x22"))] + ec_fields[3:]
+    bad_public = ec_fields[:3] + [(0xa1, der(3, b"\0" + other_public_ec))]
+    bad_compressed = bytes([2 | (other_public_ec[-1] & 1)]) + other_public_ec[1:33]
+    for name, fields in [
+        ("unsupported version", bad_version),
+        ("wrong inner curve", bad_curve),
+        ("duplicate parameters", ec_fields[:3] + ec_fields[2:]),
+        ("duplicate public key", ec_fields + ec_fields[3:]),
+        ("public before parameters", ec_fields[:2] + ec_fields[3:] + ec_fields[2:3]),
+        ("nonzero public unused bits", ec_fields[:3] + [(0xa1, der(3, b"\1" + public_ec))]),
+        ("public key mismatch", bad_public),
+        ("compressed public key mismatch", ec_fields[:3] + [(0xa1, der(3, b"\0" + bad_compressed))]),
+        ("unknown optional field", ec_fields + [(0x80, b"")]),
+    ]:
+        cases[f"SEC1 {name}"] = (ec.read_bytes(), ec_pem(fields))
+    for name, inner in [("unsupported inner version", bad_version), ("wrong inner curve", bad_curve), ("inner public key mismatch", bad_public)]:
+        fields = ec_pkcs8.copy()
+        fields[2] = (4, ec_private_der(inner))
+        cases[f"PKCS8 EC {name}"] = (ec.read_bytes(), pkcs8_pem(fields))
+    # n+1 derives the same public point as 1, but is not a valid signing scalar.
+    # A matching certificate keeps this from passing only because SPKI differs.
+    order = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+    one_fields = [(2, b"\1"), (4, (1).to_bytes(32, "big")), ec_fields[2]]
+    scalar_key, scalar_cert = root / "scalar-one-key.pem", root / "scalar-one.pem"
+    scalar_key.write_bytes(ec_pem(one_fields))
+    run("openssl", "req", "-x509", "-key", str(scalar_key), "-days", "1", "-subj", "/CN=localhost",
+        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,digitalSignature,keyCertSign,cRLSign", "-out", str(scalar_cert))
+    for name, scalar in [("zero scalar", 0), ("scalar equal to order", order), ("noncanonical scalar", order + 1)]:
+        inner = [(2, b"\1"), (4, scalar.to_bytes(32, "big")), ec_fields[2]]
+        cases[f"SEC1 {name}"] = (scalar_cert.read_bytes(), ec_pem(inner))
+    fields = ec_pkcs8.copy()
+    fields[2] = (4, ec_private_der([(2, b"\1"), (4, (order + 1).to_bytes(32, "big")), ec_fields[2]]))
+    cases["PKCS8 EC noncanonical scalar"] = (scalar_cert.read_bytes(), pkcs8_pem(fields))
+    assert len(cases) == 49
     csr, signed = root / "leaf.csr", root / "pss-leaf.pem"
     run("openssl", "req", "-new", "-key", str(ec_key), "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-out", str(csr))
     run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(rsa), "-CAkey", str(rsa_key), "-set_serial", "7", "-days", "1", "-copy_extensions", "copy", "-sigopt", "rsa_padding_mode:pss", "-out", str(signed))
     rsa4096, rsa4096_key = certificate("rsa4096", "rsa:4096")
     positives = [(ec.read_bytes(), ec_key.read_bytes(), ec, ec_der),
+                 (ec.read_bytes(), ec_pem(compressed_ec), ec, ec_der),
+                 (ec.read_bytes(), ec_pem(minimal_ec), ec, ec_der),
+                 (scalar_cert.read_bytes(), scalar_key.read_bytes(), scalar_cert, unpem("CERTIFICATE", scalar_cert.read_bytes())),
                  (rsa.read_bytes(), traditional, rsa, unpem("CERTIFICATE", rsa.read_bytes())),
                  (rsa.read_bytes(), rsa_key.read_bytes(), rsa, unpem("CERTIFICATE", rsa.read_bytes())),
                  (rsa.read_bytes(), absent_rsa_parameters, rsa, unpem("CERTIFICATE", rsa.read_bytes())),
                  (rsa4096.read_bytes(), rsa4096_key.read_bytes(), rsa4096, unpem("CERTIFICATE", rsa4096.read_bytes())),
                  (signed.read_bytes() + rsa.read_bytes(), ec_key.read_bytes(), rsa, unpem("CERTIFICATE", signed.read_bytes())),
                  (other_ec.read_bytes(), other_ec_key.read_bytes(), other_ec, other_ec_der)]
+    assert len(positives) == 10
     api = http.server.ThreadingHTTPServer(("127.0.0.1", 0), API)
     api.daemon_threads = True
     api.calls = []

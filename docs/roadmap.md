@@ -83,8 +83,10 @@ P-256 point and RSA modulus/exponent matching, key-strength limits and read-only
 CLI checks. Global/SNI tests cover bad material before DNS, rejected reloads and
 verified certificate rotation. Private RSA admission now checks the complete
 two-prime tuple and CRT consistency, with canonical DER and bounded input sizes.
-This is not full PKIX, factor-primality or key-generation-quality validation;
-SEC1 metadata checks remain open.
+SEC1 also checks its version, canonical nonzero scalar, optional P-256 curve and
+matching compressed/uncompressed public point, including PKCS8 wrappers.
+Legacy parameter-free P-256 inputs remain supported. This is not full PKIX,
+factor-primality or key-generation-quality validation.
 Startup certbot webroot issuance runs before normal listeners and still needs
 an already reachable challenge endpoint; native first-boot HTTP-01 bootstrap is
 not complete. Origin trust preflight and fake-helper tests do not close that gap.

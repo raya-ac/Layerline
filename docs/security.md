@@ -643,10 +643,16 @@ Private key admission requires complete two-prime PKCS1 RSA tuples and checks
 Positive integers and DER lengths must be canonical. PKCS8 accepts version zero,
 an exact supported algorithm identifier and no attributes; RSA parameters may be
 absent or an empty NULL. Private PEM and decoded DER are capped at 32 KiB and
-16 KiB respectively. The listener fixture covers 136 startup/reload groups and
-seven valid rotation profiles per global/SNI scope, including RSA-4096.
+16 KiB respectively. SEC1 requires version one and a nonzero canonical P-256
+scalar. Supplied curve parameters must name P-256; supplied compressed or
+uncompressed public points must match the derived key. Duplicate, reordered,
+unknown or malformed optional fields are rejected, including inside PKCS8.
+Legacy parameter-free P-256 keys remain supported; this is not a claim that
+their encoding meets every [RFC 5915](https://www.rfc-editor.org/rfc/rfc5915.html)
+producer requirement. The listener fixture covers 200 startup/reload groups and
+ten valid rotation profiles per global/SNI scope, including RSA-4096.
 These algebraic checks do not establish factor primality or key-generation
-quality. SEC1 EC metadata validation remains separate unfinished work.
+quality.
 The listener parser does not impose origin trust policy: unknown extension
 contents and signature profiles remain for the client to interpret. This is not
 issuer/path, hostname, expiry or revocation validation. A material load alone

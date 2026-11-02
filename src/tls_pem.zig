@@ -246,14 +246,47 @@ fn parseSec1EcPrivateKey(der: []const u8) !tls13_native.EcdsaP256Sha256.KeyPair 
     var seq = DerReader{ .bytes = try reader.readExpected(0x30) };
     if (!reader.done()) return error.TrailingDerData;
 
-    _ = try seq.readExpected(0x02);
+    if (!std.mem.eql(u8, try seq.readExpected(0x02), "\x01")) return error.UnsupportedEcPrivateKeyVersion;
     const private_key = try seq.readExpected(0x04);
     if (private_key.len != tls13_native.EcdsaP256Sha256.SecretKey.encoded_length) {
         return error.UnsupportedEcPrivateKeyLength;
     }
 
-    const secret = try tls13_native.EcdsaP256Sha256.SecretKey.fromBytes(private_key[0..32].*);
-    return tls13_native.EcdsaP256Sha256.KeyPair.fromSecretKey(secret);
+    var parameters_seen = false;
+    var public_bytes: ?[]const u8 = null;
+    while (!seq.done()) {
+        const field = try seq.readTlv();
+        var explicit = DerReader{ .bytes = field.value };
+        switch (field.tag) {
+            0xa0 => {
+                if (parameters_seen or public_bytes != null) return error.InvalidEcPrivateKeyFields;
+                parameters_seen = true;
+                if (!std.mem.eql(u8, try explicit.readExpected(0x06), PRIME256V1_OID)) return error.UnsupportedPrivateKeyCurve;
+            },
+            0xa1 => {
+                if (public_bytes != null) return error.InvalidEcPrivateKeyFields;
+                const bits = try explicit.readExpected(0x03);
+                if ((bits.len != 34 and bits.len != 66) or bits[0] != 0) return error.InvalidEcPrivateKeyPublicKey;
+                public_bytes = bits[1..];
+            },
+            else => return error.InvalidEcPrivateKeyFields,
+        }
+        if (!explicit.done()) return error.InvalidEcPrivateKeyFields;
+    }
+
+    var secret = try tls13_native.EcdsaP256Sha256.SecretKey.fromBytes(private_key[0..32].*);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
+    // KeyPair.fromSecretKey multiplies the point but does not require a
+    // canonical scalar. A reducible scalar can derive a key that cannot sign.
+    try std.crypto.ecc.P256.scalar.rejectNonCanonical(secret.bytes, .big);
+    if (std.mem.allEqual(u8, &secret.bytes, 0)) return error.InvalidEcPrivateKeyScalar;
+    var pair = try tls13_native.EcdsaP256Sha256.KeyPair.fromSecretKey(secret);
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(&pair));
+    if (public_bytes) |bytes| {
+        const provided = tls13_native.EcdsaP256Sha256.PublicKey.fromSec1(bytes) catch return error.InvalidEcPrivateKeyPublicKey;
+        if (!std.mem.eql(u8, &provided.toUncompressedSec1(), &pair.public_key.toUncompressedSec1())) return error.InvalidEcPrivateKeyPublicKey;
+    }
+    return pair;
 }
 
 fn parsePkcs1RsaPrivateKey(allocator: std.mem.Allocator, der: []const u8) !tls13_native.RsaPrivateKey {
@@ -511,6 +544,93 @@ test "parses SEC1 ECDSA P-256 private keys" {
 
     const parsed = try parseSec1EcPrivateKey(der.items);
     try std.testing.expectEqualSlices(u8, &kp.public_key.toUncompressedSec1(), &parsed.public_key.toUncompressedSec1());
+}
+
+fn testEcPrivateDer(allocator: std.mem.Allocator, secret: []const u8, version: []const u8, fields: []const u8) ![]u8 {
+    var body = std.ArrayList(u8).empty;
+    defer {
+        std.crypto.secureZero(u8, body.items);
+        body.deinit(allocator);
+    }
+    try appendTlv(allocator, &body, 0x02, version);
+    try appendTlv(allocator, &body, 0x04, secret);
+    try body.appendSlice(allocator, fields);
+    var der = std.ArrayList(u8).empty;
+    errdefer {
+        std.crypto.secureZero(u8, der.items);
+        der.deinit(allocator);
+    }
+    try appendTlv(allocator, &der, 0x30, body.items);
+    return der.toOwnedSlice(allocator);
+}
+
+test "SEC1 metadata accepts matching optional compressed and uncompressed public keys" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x24));
+    const parameters = "\xa0\x0a\x06\x08" ++ PRIME256V1_OID;
+    const compressed = "\xa1\x24\x03\x22\x00" ++ pair.public_key.toCompressedSec1();
+    const uncompressed = "\xa1\x44\x03\x42\x00" ++ pair.public_key.toUncompressedSec1();
+    for ([_][]const u8{ "", parameters, compressed, uncompressed, parameters ++ compressed, parameters ++ uncompressed }) |fields| {
+        const der = try testEcPrivateDer(allocator, &pair.secret_key.toBytes(), "\x01", fields);
+        defer freeSecret(allocator, der);
+        const parsed = try parseSec1EcPrivateKey(der);
+        try std.testing.expectEqualSlices(u8, &pair.public_key.toUncompressedSec1(), &parsed.public_key.toUncompressedSec1());
+    }
+}
+
+test "SEC1 metadata rejects unsupported versions" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x24));
+    for ([_][]const u8{ "", "\x00", "\x02", "\xff", "\x00\x01" }) |version| {
+        const der = try testEcPrivateDer(allocator, &pair.secret_key.toBytes(), version, "");
+        defer freeSecret(allocator, der);
+        if (parseSec1EcPrivateKey(der)) |_| return error.InvalidEcVersionAccepted else |_| {}
+    }
+}
+
+test "SEC1 metadata rejects wrong curves duplicates and public key mismatches" {
+    const allocator = std.testing.allocator;
+    const pair = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x24));
+    const other = try tls13_native.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(0x25));
+    const parameters = "\xa0\x0a\x06\x08" ++ PRIME256V1_OID;
+    const public = "\xa1\x44\x03\x42\x00" ++ pair.public_key.toUncompressedSec1();
+    const wrong_public = "\xa1\x44\x03\x42\x00" ++ other.public_key.toUncompressedSec1();
+    const wrong_compressed = "\xa1\x24\x03\x22\x00" ++ other.public_key.toCompressedSec1();
+    for ([_][]const u8{
+        "\xa0\x00", // Empty explicit parameters.
+        "\xa0\x07\x06\x05\x2b\x81\x04\x00\x22", // P-384, not P-256.
+        "\x06\x08" ++ PRIME256V1_OID, // Missing explicit tag.
+        parameters ++ parameters,
+        public ++ parameters,
+        public ++ public,
+        "\xa0\x0c\x06\x08" ++ PRIME256V1_OID ++ "\x05\x00",
+        "\xa1\x00",
+        "\xa1\x02\x03\x00",
+        "\xa1\x03\x03\x01\x00",
+        "\xa1\x04\x03\x02\x00\x00", // Point at infinity.
+        "\xa1\x44\x03\x42\x01" ++ pair.public_key.toUncompressedSec1(),
+        "\xa1\x46\x03\x42\x00" ++ pair.public_key.toUncompressedSec1() ++ "\x05\x00",
+        wrong_public,
+        wrong_compressed,
+        "\x80\x00",
+    }) |fields| {
+        const der = try testEcPrivateDer(allocator, &pair.secret_key.toBytes(), "\x01", fields);
+        defer freeSecret(allocator, der);
+        if (parseSec1EcPrivateKey(der)) |_| return error.InvalidEcMetadataAccepted else |_| {}
+    }
+}
+
+test "SEC1 metadata rejects zero and noncanonical private scalars" {
+    const allocator = std.testing.allocator;
+    var order: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&order, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+    var above = order;
+    above[31] += 1;
+    for ([_][32]u8{ @splat(0), order, above, @splat(0xff) }) |secret| {
+        const der = try testEcPrivateDer(allocator, &secret, "\x01", "");
+        defer freeSecret(allocator, der);
+        if (parseSec1EcPrivateKey(der)) |_| return error.InvalidEcScalarAccepted else |_| {}
+    }
 }
 
 // Public field primes give this disposable parser fixture consistent parameters.

@@ -45,7 +45,8 @@ helper call. Native first-boot HTTP-01 bootstrap remains open. Configured listen
 loading now validates bounded DER envelopes, matches parsed SPKI public keys and
 enforces listener key-strength limits. RSA private admission checks two-prime/CRT
 algebraic consistency and canonical DER, not factor primality or generation
-quality. Its admission/rotation tests do not prove full PKIX; SEC1 metadata
-validation also remains open.
+quality. SEC1 checks version one, canonical nonzero scalars and matching optional
+curve/public-key metadata, while retaining legacy parameter-free P-256 inputs.
+Its admission/rotation tests do not prove full PKIX.
 
 Layerline should not be described as a general Caddy/nginx replacement while the audit blockers remain. Existing deployments need an explicit risk assessment and tested rollback; successful small HTTP requests alone do not establish HTTP/2 flow-control correctness, safe admin exposure, or resource bounds. HTTP/3 remains experimental until the configured-certificate and external-client gates pass.
