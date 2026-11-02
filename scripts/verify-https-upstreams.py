@@ -325,12 +325,40 @@ def exact(connection, count):
 def wait_bytes(path, marker, count=1):
     until = time.monotonic() + 4
     while True:
-        data = path.read_bytes() if path.exists() else b""
+        data = b""
+        if path.exists():
+            with path.open("rb") as source:
+                data = source.read(4 * 1024 * 1024 + 1)
         assert len(data) < 4 * 1024 * 1024, "unbounded OpenSSL fixture output"
         if data.count(marker) >= count:
             return
-        assert time.monotonic() < until, f"OpenSSL fixture did not produce {marker!r} x {count}"
+        assert time.monotonic() < until, ("OpenSSL fixture marker missing", {
+            "file": path.name, "marker_bytes": len(marker), "marker_sha256": hashlib.sha256(marker).hexdigest(),
+            "expected_count": count, "observed_count": data.count(marker), "output_bytes": len(data),
+            # Diagnostic only: s_server can mix console messages into stdout.
+            # This must never be used to accept corrupted application bytes.
+            "count_without_console_read_block": data.replace(b"Read BLOCK\n", b"").count(marker),
+        })
         time.sleep(.01)
+
+
+def openssl_failure_details(folder, process):
+    print("OpenSSL fixture process:", process.poll(), file=sys.stderr, flush=True)
+    for name in ["openssl.stdout", "openssl.stderr", "openssl.trace"]:
+        with contextlib.suppress(OSError):
+            path = folder / name
+            with path.open("rb") as source:
+                size = source.seek(0, 2)
+                source.seek(max(0, size - 65536))
+                tail = source.read(65536)
+            # Summaries preserve record/console boundaries without dumping large
+            # fake payloads or interpreting terminal control bytes as text.
+            lines = tail.splitlines(keepends=True)
+            details = {"file": name, "file_bytes": size, "tail_bytes": len(tail), "tail_sha256": hashlib.sha256(tail).hexdigest(),
+                       "line_count": len(lines), "last_lines": [
+                           {"bytes": len(line), "sha256": hashlib.sha256(line).hexdigest(), "prefix_hex": line[:32].hex(), "suffix_hex": line[-32:].hex()}
+                           for line in lines[-32:]]}
+            print("OpenSSL fixture output:", json.dumps(details), file=sys.stderr, flush=True)
 
 
 def key_updates(folder, ca, leaf, key, secure):
@@ -374,6 +402,9 @@ def key_updates(folder, ca, leaf, key, secure):
                     assert len(lines) == 8 and sum(line.startswith("<<<") for line in lines) == 4 and sum(line.startswith(">>>") for line in lines) == 4, lines
                 finally:
                     client.close()
+        except BaseException:
+            openssl_failure_details(folder, process)
+            raise
         finally:
             process.stdin.close()
             if process.poll() is None:
