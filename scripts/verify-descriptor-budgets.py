@@ -30,6 +30,9 @@ if len(sys.argv) > 1 and sys.argv[1] == "--limited":
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "zig-out/bin/layerline"
+WORKER = Path(os.environ.get("LAYERLINE_CHILD_WORKER", BINARY.with_name("child-process-worker"))).resolve()
+if not WORKER.is_file() or not os.access(WORKER, os.X_OK):
+    raise RuntimeError(f"native child fixture missing: {WORKER}; build with 'zig build test-tools' or set LAYERLINE_CHILD_WORKER")
 NORMAL = 'layerline_descriptor_owned_by_pool{pool="normal"}'
 RESERVATIONS = 'layerline_descriptor_reservations{pool="normal"}'
 NORMAL_LIMIT = 'layerline_descriptor_limit{pool="normal"}'
@@ -161,7 +164,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-fds-", dir="/tmp") as tempora
             (folder / "fast.txt").write_bytes(DATA)
             (folder / "index.php").write_text("<?php // Only the harmless fixture process executes this path.\n")
             php = folder / "php-cgi"
-            php.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(ROOT / 'scripts/child-process-worker.py'))} --cgi {shlex.quote(str(folder))}\n")
+            php.write_text(f"#!/bin/sh\nexec {shlex.quote(str(WORKER))} --cgi {shlex.quote(str(folder))}\n")
             php.chmod(0o700)
             number = port()
             admin, config, log = folder / "admin.sock", folder / "server.conf", folder / "server.log"
