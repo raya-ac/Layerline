@@ -178,6 +178,7 @@ fn startShutdownWatcher(
 fn printStartupSummary(cfg: *const ServerConfig) void {
     std.debug.print("Serving on {s}://{s}:{d}\n", .{ if (cfg.tls_enabled) "https" else "http", cfg.host, cfg.port });
     std.debug.print("Concurrency limit: {d} concurrent connection handlers\n", .{cfg.max_concurrent_connections});
+    std.debug.print("Worker stack: {d} bytes\n", .{cfg.worker_stack_size});
     if (cfg.upstream != null) {
         const pool = cfg.upstream.?;
         std.debug.print(

@@ -382,14 +382,18 @@ has not been accepted.
 
 RSA TLS signing uses joined, separately sized worker stacks instead of the small
 connection stack. At most eight signers run at once, each with a 512 KiB stack;
-excess handshakes fail admission. This bounds the extra signing workspace without
-enlarging every connection stack. It is not a full TLS/process memory budget.
+excess handshakes fail admission. The extra signing workspace is not retained on
+connection stacks. It is not a full TLS/process memory budget.
 Initial protocol detection is separate from the HTTP/1 request loop, so TLS
 does not retain a second full request-handler frame. Once HTTP starts, bytes
 that resemble a TLS record are malformed HTTP, not another handshake. CGI
 environment encoding also avoids general-purpose formatting on that stack.
-Linux and macOS Debug wire tests exercise CGI over RSA TLS with the default
-64 KiB connection stack.
+Connection workers have a 256 KiB default and enforced minimum; compression
+requires at least 512 KiB. The previous 64 KiB stack could overflow baseline-x86
+software AES-GCM during a valid CGI response in Debug. Linux and macOS Debug wire
+tests request the old size and verify that the runtime enforces the larger floor
+before exercising CGI over RSA-2048/RSA-4096 TLS. Stacks remain outside the
+application-heap accounting.
 
 ## Backend Failures
 

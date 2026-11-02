@@ -161,12 +161,15 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                     assert process.poll() is None, log_path.read_text()
                     try:
                         with socket.create_connection(("127.0.0.1", number), timeout=.1):
-                            break
+                            if '"event":"server.ready"' in log_path.read_text():
+                                break
                     except OSError:
-                        time.sleep(.02)
+                        pass
+                    time.sleep(.02)
                 else:
                     raise AssertionError("server never listened")
                 previous = records(folder)
+                assert "Worker stack: 262144 bytes" in log_path.read_text(), log_path.read_text()
                 status, data, elapsed = request(number, tls, "okay", path="/extended/warm")
                 assert status == 200 and data == b"ok", ("initial CGI launch", status, elapsed)
                 stopped(folder, previous, "initial CGI launch")

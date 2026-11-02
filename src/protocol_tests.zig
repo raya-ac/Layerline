@@ -5,6 +5,20 @@ const h2_support = @import("http2_support.zig");
 const cache = @import("buffered_cache.zig");
 const static_files = @import("static_files.zig");
 
+test "request stacks enforce the software TLS floor and preserve larger settings" {
+    const config = @import("config.zig");
+    var cfg = config.defaultServerConfig();
+    try std.testing.expectEqual(@as(usize, 256 * 1024), cfg.worker_stack_size);
+    cfg.worker_stack_size = 64 * 1024;
+    try std.testing.expectError(error.InvalidConfigValue, config.validateConfig(&cfg));
+    config.normalizeConfig(&cfg);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), cfg.worker_stack_size);
+    try config.validateConfig(&cfg);
+    cfg.worker_stack_size = 1024 * 1024;
+    config.normalizeConfig(&cfg);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.worker_stack_size);
+}
+
 test "application heap budget has a positive default and rejects undersized config" {
     const config = @import("config.zig");
     var cfg = config.defaultServerConfig();

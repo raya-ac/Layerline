@@ -112,6 +112,8 @@ Overload tests hold incomplete uploads until allocations fail, check plaintext
 and encrypted 503s plus admin access, then verify repeated recovery and cache
 reclamation. HTTP/3 retained slots now age out instead of persisting forever.
 This does not yet cap stacks, Zig I/O internals, child RSS or kernel resources.
+Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
+the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these

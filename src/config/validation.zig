@@ -53,8 +53,10 @@ pub fn normalizeConfig(cfg: *ServerConfig) void {
     if (cfg.fastcgi_keepalive_idle_timeout_ms == 0) {
         cfg.fastcgi_keepalive_idle_timeout_ms = DEFAULT_FASTCGI_KEEPALIVE_IDLE_TIMEOUT_MS;
     }
-    if (cfg.worker_stack_size < 16 * 1024) {
-        cfg.worker_stack_size = 16 * 1024;
+    // Fixed stacks must also fit baseline-CPU software TLS and deep CGI paths
+    // in Debug. The old 64 KiB value could reach its guard during AES-GCM.
+    if (cfg.worker_stack_size < types.DEFAULT_WORKER_STACK_BYTES) {
+        cfg.worker_stack_size = types.DEFAULT_WORKER_STACK_BYTES;
     }
     if (configCanEnableCompression(cfg) and cfg.worker_stack_size < DEFAULT_COMPRESSION_WORKER_STACK_BYTES) {
         cfg.worker_stack_size = DEFAULT_COMPRESSION_WORKER_STACK_BYTES;
@@ -201,7 +203,7 @@ pub fn validateConfig(cfg: *const ServerConfig) !void {
     if (cfg.max_static_file_bytes == 0) return error.InvalidConfigValue;
     if (cfg.max_concurrent_connections == 0) return error.InvalidConfigValue;
     if (cfg.memory_budget_bytes < @import("../resource_budget.zig").minimum_limit) return error.InvalidConfigValue;
-    if (cfg.worker_stack_size < 16 * 1024) return error.InvalidConfigValue;
+    if (cfg.worker_stack_size < types.DEFAULT_WORKER_STACK_BYTES) return error.InvalidConfigValue;
     if (cfg.read_header_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.read_body_timeout_ms == 0) return error.InvalidConfigValue;
     if (cfg.idle_timeout_ms == 0) return error.InvalidConfigValue;

@@ -131,7 +131,7 @@ tls = false
 #cf_record_proxied = false
 #cf_record_comment = managed by Layerline
 #max_requests_per_connection = 256
-#worker_stack_size = 65536
+#worker_stack_size = 262144
 #max_php_output_bytes = 2097152
 #read_header_timeout_ms = 10000
 #read_body_timeout_ms = 30000
@@ -477,7 +477,7 @@ Start with a measured per-host connection budget and tune under realistic load:
 zig build run -- \
   --max-concurrent-connections 1024 \
   --max-requests-per-connection 256 \
-  --worker-stack-size 65536 \
+  --worker-stack-size 262144 \
   --max-php-output-bytes 2097152 \
   --read-header-timeout-ms 10000 \
   --read-body-timeout-ms 30000 \
