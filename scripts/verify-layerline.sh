@@ -842,4 +842,7 @@ python3 "$ROOT_DIR/scripts/verify-proxy-accounting.py" "$SERVER_BINARY"
 python3 "$ROOT_DIR/scripts/verify-https-upstreams.py" "$SERVER_BINARY"
 python3 "$ROOT_DIR/scripts/verify-native-tls.py" "$SERVER_BINARY"
 
+log "verifying bounded TLS diagnostic fields"
+python3 "$ROOT_DIR/scripts/verify-tls-diagnostics.py" "$SERVER_BINARY"
+
 log "Layerline verification passed"

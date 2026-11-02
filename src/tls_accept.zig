@@ -3,6 +3,7 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const native_tls = @import("native_tls_runtime.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
+const diagnosticField = @import("tls_log_field.zig").field;
 
 const ServerConfig = config_mod.ServerConfig;
 
@@ -35,10 +36,10 @@ pub fn handleClientHelloProbe(
     defer info.deinit(allocator);
 
     std.debug.print(
-        "TLS ClientHello sni={s} alpn={s} tls13={} aes128gcm={} ecdsa_p256={} rsa_pss={} ed25519={} h2={} http11={} tls_configured={}\n",
+        "TLS ClientHello sni={f} alpn={f} tls13={} aes128gcm={} ecdsa_p256={} rsa_pss={} ed25519={} h2={} http11={} tls_configured={}\n",
         .{
-            info.sni orelse "(none)",
-            info.alpn orelse "(none)",
+            diagnosticField(info.sni orelse "(none)"),
+            diagnosticField(info.alpn orelse "(none)"),
             info.supports_tls13,
             info.offers_aes_128_gcm_sha256,
             info.offers_ecdsa_secp256r1_sha256,
@@ -66,8 +67,8 @@ pub fn handleClientHelloProbe(
     defer native_tls.end(&established.channel) catch {};
 
     std.debug.print(
-        "TLS 1.3 native connection accepted sni={s} alpn={s}\n",
-        .{ info.sni orelse "(none)", established.alpn orelse "(none)" },
+        "TLS 1.3 native connection accepted sni={f} alpn={f}\n",
+        .{ diagnosticField(info.sni orelse "(none)"), diagnosticField(established.alpn orelse "(none)") },
     );
 
     if (established.alpn) |alpn| {

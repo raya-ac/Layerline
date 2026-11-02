@@ -197,6 +197,11 @@ pub fn build(b: *std.Build) void {
     native_tls_checks.addArtifactArg(exe);
     b.step("test-native-tls", "Test native TLS key updates and closure with independent OpenSSL clients")
         .dependOn(&native_tls_checks.step);
+    const tls_diagnostic_checks = b.addSystemCommand(&.{"python3"});
+    tls_diagnostic_checks.addFileArg(b.path("scripts/verify-tls-diagnostics.py"));
+    tls_diagnostic_checks.addArtifactArg(exe);
+    b.step("test-tls-diagnostics", "Test bounded single-line TLS diagnostics with hostile ClientHellos")
+        .dependOn(&tls_diagnostic_checks.step);
     test_step.dependOn(&upstream_tls_probe.step);
     // Unit roots do not analyze every runtime function in Zig.
     test_step.dependOn(&exe.step);

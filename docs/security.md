@@ -613,6 +613,12 @@ request paths, query strings, headers, bodies, or credentials.
 
 ## Verification scope
 
+TCP TLS and experimental QUIC connection diagnostics quote and escape unauthenticated SNI and ALPN bytes,
+including terminal controls and non-ASCII bytes. Each field is capped at 256 input
+bytes before escaping, with explicit truncation. TCP wire tests cover forged lines,
+binary names and oversized protocol lists before authentication and after normal
+TLS requests. This is log containment, not stricter DNS-name validation.
+
 `zig build test` includes the native guard, session lifecycle, cache accounting,
 reload cap, and exposed-version checks. Allocation-failure injection covers
 HPACK table insertion and pending request cloning, including cleanup after every

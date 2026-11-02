@@ -15,6 +15,7 @@ const request_mod = @import("request.zig");
 const routing_mod = @import("routing.zig");
 const server_identity = @import("server_identity.zig");
 const tls13_native = @import("tls13_native.zig");
+const diagnosticField = @import("tls_log_field.zig").field;
 
 const DomainConfig = config_mod.DomainConfig;
 const H2BufferedResponse = http2_support.BufferedResponse;
@@ -1601,12 +1602,12 @@ pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig,
         };
 
         std.debug.print(
-            "HTTP/3 ClientHello from {f}: packet_number={d}, alpn={s}, sni={s}, tls13={}, aes128gcm={}, ed25519={}, x25519={}, quic_transport_params={}\n",
+            "HTTP/3 ClientHello from {f}: packet_number={d}, alpn={f}, sni={f}, tls13={}, aes128gcm={}, ed25519={}, x25519={}, quic_transport_params={}\n",
             .{
                 msg.from,
                 decrypted.packet_number,
-                hello.alpn orelse "(none)",
-                hello.server_name orelse "(none)",
+                diagnosticField(hello.alpn orelse "(none)"),
+                diagnosticField(hello.server_name orelse "(none)"),
                 hello.supports_tls13,
                 hello.supports_aes_128_gcm_sha256,
                 hello.supports_ed25519,
