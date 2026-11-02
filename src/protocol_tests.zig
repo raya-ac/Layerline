@@ -41,6 +41,9 @@ test {
     _ = @import("socket_io.zig");
     _ = @import("native_connect.zig");
     _ = @import("child_process.zig");
+    _ = @import("listener_state.zig");
+    _ = @import("native_accept.zig");
+    _ = @import("admin_listener.zig");
 }
 
 test "HTTP2 trailers stay separate from routing and authentication fields" {

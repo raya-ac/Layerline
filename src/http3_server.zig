@@ -1156,33 +1156,41 @@ test "HTTP/3 routed responses accept parsed DATA bodies" {
     try std.testing.expect(std.mem.indexOf(u8, data, "hello") != null);
 }
 
-pub fn serveProbeTask(io: std.Io, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, acquire_config: *const fn () config_store.Lease, shutdown_requested: *std.atomic.Value(bool), callbacks: Callbacks) void {
-    var address = std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port) catch |err| {
-        std.debug.print("HTTP/3 bind address error: {}\n", .{err});
-        return;
-    };
-    const socket = address.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
-        std.debug.print("HTTP/3 UDP bind failed on {s}:{d}: {}\n", .{ cfg.host, cfg.http3_port, err });
-        return;
-    };
-    defer socket.close(io);
+pub const Listener = struct {
+    socket: std.Io.net.Socket,
+    connections: Http3ConnectionTable,
+
+    pub fn init(io: std.Io, cfg: *const ServerConfig) !Listener {
+        var address = try std.Io.net.IpAddress.parse(cfg.host, cfg.http3_port);
+        const socket = try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        errdefer socket.close(io);
+        return .{ .socket = socket, .connections = try Http3ConnectionTable.init(std.heap.page_allocator, HTTP3_CONNECTION_TABLE_CAPACITY) };
+    }
+
+    pub fn deinit(self: *Listener, io: std.Io) void {
+        self.connections.deinit();
+        self.socket.close(io);
+    }
+};
+
+pub fn serveProbeTask(io: std.Io, listener: *Listener, cfg: *const ServerConfig, process_env: *const std.process.Environ.Map, metrics: *ServerMetrics, server_header: []const u8, acquire_config: *const fn () config_store.Lease, shutdown_requested: *std.atomic.Value(bool), callbacks: Callbacks) !void {
+    const socket = listener.socket;
+    const connections = &listener.connections;
 
     std.debug.print("HTTP/3 native UDP listener on udp://{s}:{d}\n", .{ cfg.host, cfg.http3_port });
     std.debug.print("HTTP/3 status: native QUIC/TLS handshake and buffered route response path active.\n", .{});
-
-    var connections = Http3ConnectionTable.init(std.heap.page_allocator, HTTP3_CONNECTION_TABLE_CAPACITY) catch |err| {
-        std.debug.print("HTTP/3 connection table allocation failed: {}\n", .{err});
-        return;
-    };
-    defer connections.deinit();
 
     var recv_buf: [4096]u8 = undefined;
 
     while (!shutdown_requested.load(.acquire)) {
         const msg = socket.receiveTimeout(io, &recv_buf, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| {
-            if (err == error.Timeout or shutdown_requested.load(.acquire)) continue;
-            std.debug.print("HTTP/3 UDP receive error: {}\n", .{err});
-            continue;
+            if (shutdown_requested.load(.acquire)) break;
+            if (err == error.Timeout or err == error.MessageOversize or err == error.PortUnreachable or err == error.ConnectionResetByPeer) continue;
+            if (err == error.SystemResources or err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded) {
+                try io.sleep(.fromMilliseconds(100), .awake);
+                continue;
+            }
+            return err;
         };
 
         if (shutdown_requested.load(.acquire)) break;

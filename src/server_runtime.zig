@@ -1,7 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const acme_renewal = @import("acme_renewal.zig");
 const admin_runtime = @import("admin_runtime.zig");
+const admin_listener = @import("admin_listener.zig");
+const listener_state = @import("listener_state.zig");
+const native_accept = @import("native_accept.zig");
 const concurrency_mod = @import("concurrency.zig");
 const config_mod = @import("config.zig");
 const config_store = @import("config_store.zig");
@@ -65,14 +69,13 @@ const ShutdownDeadlineContext = struct {
     ctx: Context,
     complete: *std.atomic.Value(bool),
     connections: *concurrency_mod.State,
+    admin: ?*admin_listener.Listener,
 };
 
-fn forceShutdown(ctx: Context, connections: *concurrency_mod.State) noreturn {
+fn forceShutdown(ctx: Context, connections: *concurrency_mod.State, admin: ?*admin_listener.Listener) noreturn {
     _ = native_spawn.tryStopAll(ctx.io);
     std.debug.print("{{\"event\":\"server.shutdown_timeout\",\"active_connections\":{d},\"timeout_ms\":{d}}}\n", .{ connections.active(), ctx.cfg.graceful_shutdown_timeout_ms });
-    if (ctx.cfg.admin_enabled) {
-        admin_runtime.unlinkUnixSocket(ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path, ctx.callbacks.admin);
-    }
+    if (admin) |listener| listener.removePath(ctx.io);
     // A worker may still borrow config, caches, or stack-owned state.
     // Let the OS reclaim them together; unwinding would free live memory.
     std.process.exit(1);
@@ -94,26 +97,22 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
             children_stopped = native_spawn.tryStopAll(ctx.io);
         }
         if (elapsed >= ctx.cfg.graceful_shutdown_timeout_ms) {
-            forceShutdown(ctx, state.connections);
+            forceShutdown(ctx, state.connections, state.admin);
         }
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-}
-
-fn wakeAdminListener(ctx: Context) void {
-    if (!ctx.cfg.admin_enabled) return;
-    const address = std.Io.net.UnixAddress.init(ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path) catch return;
-    const conn = native_connect.connectUnix(&address, ctx.io) catch return;
-    conn.close(ctx.io);
 }
 
 fn reloadSignalTask(ctx: Context) void {
     ctx.callbacks.reload_signal(ctx.io);
 }
 
-fn http3Task(ctx: Context) void {
+fn http3Task(ctx: Context, listener: *http3_server.Listener, state: *listener_state.State) void {
     ctx.callbacks.bind_thread_io(ctx.io);
-    http3_server.serveProbeTask(ctx.io, ctx.cfg, ctx.process_env, ctx.metrics, ctx.server_header, ctx.callbacks.acquire_config, ctx.shutdown_requested, ctx.callbacks.http3);
+    if (!state.awaitReady(ctx.io)) return;
+    http3_server.serveProbeTask(ctx.io, listener, ctx.cfg, ctx.process_env, ctx.metrics, ctx.server_header, ctx.callbacks.acquire_config, ctx.shutdown_requested, ctx.callbacks.http3) catch |err| {
+        if (!ctx.shutdown_requested.load(.acquire)) state.fail("http3", err);
+    };
 }
 
 const ShutdownWatcherContext = struct {
@@ -153,6 +152,9 @@ fn startShutdownWatcher(
     shutdown_requested: *std.atomic.Value(bool),
     label: []const u8,
 ) !void {
+    // POSIX listeners poll owned nonblocking descriptors; no other thread
+    // closes them underneath accept. Windows retains its existing wake path.
+    if (builtin.os.tag != .windows) return;
     workers.start(
         shutdownWatcherTask,
         .{ShutdownWatcherContext{
@@ -214,6 +216,7 @@ fn startRedirectListener(
     redirect_server: *std.Io.net.Server,
     concurrency: *concurrency_mod.State,
     redirect_closed: *std.atomic.Value(bool),
+    state: *listener_state.State,
 ) !void {
     try startShutdownWatcher(workers, ctx.io, redirect_server, redirect_closed, ctx.cfg, ctx.cfg.http_redirect_port, ctx.shutdown_requested, "HTTP redirect");
 
@@ -225,6 +228,7 @@ fn startRedirectListener(
             .cfg = ctx.cfg,
             .allocator = ctx.allocator,
             .state = concurrency,
+            .listeners = state,
             .callbacks = ctx.callbacks.http1,
         }},
     ) catch |err| {
@@ -234,7 +238,7 @@ fn startRedirectListener(
     std.debug.print("HTTP redirect listener on http://{s}:{d} -> https port {d} status {d}\n", .{ ctx.cfg.host, ctx.cfg.http_redirect_port, ctx.cfg.http_redirect_https_port, ctx.cfg.http_redirect_status });
 }
 
-fn startBackgroundWorkers(ctx: Context, workers: *Workers) !void {
+fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State) !void {
     try workers.start(reloadSignalTask, .{ctx});
     {
         workers.start(upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
@@ -243,15 +247,15 @@ fn startBackgroundWorkers(ctx: Context, workers: *Workers) !void {
         };
         if (config_mod.configCanRunHealthChecks(ctx.cfg)) std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
     }
-    if (ctx.cfg.http3_enabled) {
-        workers.start(http3Task, .{ctx}) catch |err| {
+    if (h3) |listener| {
+        workers.start(http3Task, .{ ctx, listener, state }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
             return err;
         };
     }
-    if (ctx.cfg.admin_enabled) {
+    if (admin) |listener| {
         const admin_socket_path = ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path;
-        workers.start(admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = ctx.io, .cfg = ctx.cfg, .socket_path = admin_socket_path, .callbacks = ctx.callbacks.admin }}) catch |err| {
+        workers.start(admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = ctx.io, .cfg = ctx.cfg, .socket_path = admin_socket_path, .listener = listener, .state = state, .callbacks = ctx.callbacks.admin }}) catch |err| {
             std.debug.print("Failed to start admin socket: {}\n", .{err});
             return err;
         };
@@ -270,18 +274,9 @@ fn startBackgroundWorkers(ctx: Context, workers: *Workers) !void {
     }
 }
 
-fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *concurrency_mod.State) void {
+fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *concurrency_mod.State) !void {
     while (!ctx.shutdown_requested.load(.acquire)) {
-        const conn = server.accept(ctx.io) catch |err| {
-            if (ctx.shutdown_requested.load(.acquire)) break;
-            std.debug.print("Accept failed: {}. Continuing to accept.\n", .{err});
-            ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
-            continue;
-        };
-        if (ctx.shutdown_requested.load(.acquire)) {
-            stream_runtime.streamClose(conn);
-            break;
-        }
+        const conn = (try native_accept.next(ctx.io, server, ctx.shutdown_requested)) orelse break;
 
         var lease = ctx.callbacks.acquire_config();
         const active_cfg = lease.cfg;
@@ -338,6 +333,7 @@ pub fn run(ctx: Context) !void {
             server.deinit(ctx.io);
         }
     }
+    try native_accept.prepare(&server);
     defer {
         if (redirect_server) |*http_server| {
             if (!redirect_listener_closed_by_shutdown.load(.acquire)) {
@@ -348,22 +344,28 @@ pub fn run(ctx: Context) !void {
     if (ctx.cfg.http_redirect_enabled) {
         const redirect_address = try std.Io.net.IpAddress.parse(ctx.cfg.host, ctx.cfg.http_redirect_port);
         redirect_server = try redirect_address.listen(ctx.io, .{ .reuse_address = true });
+        try native_accept.prepare(&redirect_server.?);
     }
+
+    var h3: ?http3_server.Listener = if (ctx.cfg.http3_enabled) try .init(ctx.io, ctx.cfg) else null;
+    defer if (h3) |*listener| listener.deinit(ctx.io);
+    var admin: ?admin_listener.Listener = if (ctx.cfg.admin_enabled) try .init(ctx.io, ctx.allocator, ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path) else null;
+    defer if (admin) |*listener| listener.deinit(ctx.io);
+    var listeners: listener_state.State = .{ .shutdown = ctx.shutdown_requested };
 
     var workers = Workers{};
     var shutdown_complete = std.atomic.Value(bool).init(false);
-    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .connections = &concurrency }});
+    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .connections = &concurrency, .admin = if (admin) |*value| value else null }});
     defer {
         ctx.shutdown_requested.store(true, .release);
         std.debug.print("Shutdown requested; draining workers for up to {d}ms.\n", .{ctx.cfg.graceful_shutdown_timeout_ms});
         concurrency.beginDrain(ctx.io);
-        wakeAdminListener(ctx);
         workers.join();
         concurrency_mod.waitForDrain(ctx.io, &concurrency, ctx.cfg.graceful_shutdown_timeout_ms);
         if (concurrency.active() != 0) {
             // The independent deadline guard exits before this wait can overrun.
             // Do not return through stack/config destructors with live readers.
-            forceShutdown(ctx, &concurrency);
+            forceShutdown(ctx, &concurrency, if (admin) |*value| value else null);
         }
         shutdown_complete.store(true, .release);
         deadline_worker.join();
@@ -372,12 +374,21 @@ pub fn run(ctx: Context) !void {
 
     try startShutdownWatcher(&workers, ctx.io, &server, &listener_closed_by_shutdown, ctx.cfg, ctx.cfg.port, ctx.shutdown_requested, "primary");
     if (redirect_server) |*http_server| {
-        try startRedirectListener(ctx, &workers, http_server, &concurrency, &redirect_listener_closed_by_shutdown);
+        try startRedirectListener(ctx, &workers, http_server, &concurrency, &redirect_listener_closed_by_shutdown, &listeners);
     }
 
+    try startBackgroundWorkers(ctx, &workers, if (h3) |*value| value else null, if (admin) |*value| value else null, &listeners);
+    if (ctx.shutdown_requested.load(.acquire)) {
+        try listeners.result();
+        return;
+    }
     printStartupSummary(ctx.cfg);
-    try startBackgroundWorkers(ctx, &workers);
-    acceptConnections(ctx, &server, &concurrency);
+    listeners.ready.store(true, .release);
+    std.debug.print("{{\"event\":\"server.ready\"}}\n", .{});
+    acceptConnections(ctx, &server, &concurrency) catch |err| {
+        if (!ctx.shutdown_requested.load(.acquire)) listeners.fail("primary", err);
+    };
+    try listeners.result();
 }
 
 fn testWorker(counter: *std.atomic.Value(usize)) void {

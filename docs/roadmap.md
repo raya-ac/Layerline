@@ -99,8 +99,12 @@ the default small connection stack in Debug. Initial protocol selection no longe
 retains a duplicate HTTP request handler during TLS, and CGI environment encoding
 avoids general formatting on that stack. These controls do not sandbox child
 code or cover uninterruptible kernel operations. Darwin resolver cancellation
-still needs stronger deadline guarantees. The next work also includes wider HTTP/2 frame/stream
-conformance, listener readiness and full process resource budgets.
+still needs stronger deadline guarantees. Listener startup now prepares every
+configured endpoint before accepting traffic, propagates fatal listener failures
+through joined shutdown, and protects Unix control socket ownership with a lock,
+kernel peer credentials and crash-recovery checks. Tests cover occupied ports,
+path collisions, malformed datagrams, restart and cross-UID access. Full process
+resource budgets and wider HTTP/2 frame/stream conformance remain open.
 HTTP/3 remains experimental: configured
 certificate integration, Huffman decoding, flow control, and external client
 acceptance are incomplete. Disk caching and broad feature expansion follow these
@@ -223,4 +227,4 @@ Sources:
 11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented; package-manager installers remain future work.
 12. Conformance harness. Initial self-starting verifier covers CLI doctor/certs, HTTP/1, parser hardening for malformed headers and conflicting content lengths, HEAD 404 framing, static files, static conditional validators, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, redacted config inspection, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin UI cache purge, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
 
-The next engineering milestone is the September audit gate above, beginning with HTTP/2 outbound flow control. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.
+The next engineering milestone is the remaining audit gate above: wider HTTP/2 conformance, process-wide resource budgets, resolver cancellation and externally verified HTTP/3 interoperability. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.

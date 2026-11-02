@@ -12,6 +12,8 @@ const request_mod = @import("request.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const tls_client_hello = @import("tls_client_hello.zig");
+const native_accept = @import("native_accept.zig");
+const listener_state = @import("listener_state.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const ConcurrencyState = concurrency_mod.State;
@@ -259,23 +261,19 @@ pub const HttpRedirectListenerContext = struct {
     cfg: *ServerConfig,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
+    listeners: *listener_state.State,
     callbacks: Callbacks,
 };
 
 pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
+    if (!ctx.listeners.awaitReady(ctx.io)) return;
 
     while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
-        const conn = ctx.server.accept(ctx.io) catch |err| {
-            if (ctx.callbacks.shutdown_requested.load(.acquire)) break;
-            std.debug.print("HTTP redirect accept failed: {}. Continuing to accept.\n", .{err});
-            ctx.io.sleep(.fromMilliseconds(25), .awake) catch {};
-            continue;
-        };
-        if (ctx.callbacks.shutdown_requested.load(.acquire)) {
-            ctx.callbacks.stream_close(conn);
-            break;
-        }
+        const conn = (native_accept.next(ctx.io, ctx.server, ctx.callbacks.shutdown_requested) catch |err| {
+            if (!ctx.callbacks.shutdown_requested.load(.acquire)) ctx.listeners.fail("redirect", err);
+            return;
+        }) orelse break;
 
         var lease = ctx.callbacks.acquire_config();
         const active_cfg = lease.cfg;

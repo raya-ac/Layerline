@@ -1,6 +1,9 @@
 const std = @import("std");
 const read_deadline = @import("read_deadline.zig");
 const builtin = @import("builtin");
+const admin_listener = @import("admin_listener.zig");
+const native_accept = @import("native_accept.zig");
+const listener_state = @import("listener_state.zig");
 const admin_pages = @import("admin_pages.zig");
 const admin_reply = @import("admin_reply.zig");
 const admin_support = @import("admin_support.zig");
@@ -60,6 +63,8 @@ pub const SocketContext = struct {
     io: std.Io,
     cfg: *ServerConfig,
     socket_path: []const u8,
+    listener: *admin_listener.Listener,
+    state: *listener_state.State,
     callbacks: Callbacks,
 };
 
@@ -952,39 +957,19 @@ test "admin command framing waits for a newline across arbitrary reads" {
     try std.testing.expectError(error.AdminCommandTooLong, readSocketCommand(stream, &buffer, fixture.read));
 }
 
-pub fn unlinkUnixSocket(path: []const u8, callbacks: Callbacks) void {
-    if (builtin.os.tag == .windows) return;
-    std.Io.Dir.deleteFileAbsolute(callbacks.active_io(), path) catch {};
-}
-
 pub fn serveSocketTask(ctx: SocketContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
-    unlinkUnixSocket(ctx.socket_path, ctx.callbacks);
-
-    const address = std.Io.net.UnixAddress.init(ctx.socket_path) catch |err| {
-        std.debug.print("Admin socket path invalid: {s}: {}\n", .{ ctx.socket_path, err });
-        return;
-    };
-    var server = address.listen(ctx.io, .{ .kernel_backlog = 16 }) catch |err| {
-        std.debug.print("Admin socket listen failed: {s}: {}\n", .{ ctx.socket_path, err });
-        return;
-    };
-    defer {
-        server.deinit(ctx.io);
-        unlinkUnixSocket(ctx.socket_path, ctx.callbacks);
-    }
-
+    if (!ctx.state.awaitReady(ctx.io)) return;
     std.debug.print("Admin socket: {s}\n", .{ctx.socket_path});
     while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
-        const conn = server.accept(ctx.io) catch |err| {
-            if (ctx.callbacks.shutdown_requested.load(.acquire)) break;
-            std.debug.print("Admin socket accept failed: {}\n", .{err});
-            ctx.io.sleep(.fromMilliseconds(50), .awake) catch {};
-            continue;
-        };
-        if (ctx.callbacks.shutdown_requested.load(.acquire)) {
+        const conn = (native_accept.next(ctx.io, &ctx.listener.server, ctx.callbacks.shutdown_requested) catch |err| {
+            if (!ctx.callbacks.shutdown_requested.load(.acquire)) ctx.state.fail("admin", err);
+            return;
+        }) orelse break;
+        if (!(admin_listener.authorized(conn) catch false)) {
+            std.debug.print("{{\"event\":\"server.admin_peer_rejected\"}}\n", .{});
             ctx.callbacks.close_stream(conn);
-            break;
+            continue;
         }
         handleConnection(conn, std.heap.page_allocator, ctx.cfg, ctx.callbacks) catch |err| {
             std.debug.print("Admin command failed: {}\n", .{err});

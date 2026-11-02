@@ -96,6 +96,29 @@ fragmented commands. Extra lines are not executed. The CLI sends each command
 with its newline in the same write buffer; command framing does not depend on
 socket read boundaries.
 
+Primary, redirect, HTTP/3 and Unix control listeners are prepared before any
+listener worker accepts traffic. Failure to prepare a configured endpoint exits
+nonzero without announcing readiness; `server.ready` is emitted only after their
+workers have started. Fatal listener errors request joined shutdown of the whole
+runtime and retain a nonzero exit status. Resource-pressure accept failures back
+off instead; malformed datagrams and peer ICMP errors remain packet-local.
+On Linux and macOS, nonblocking accept with bounded poll waits keeps descriptor
+closure on its owning thread after workers join, not on a racing shutdown thread.
+
+The Unix control socket is mode 0600 regardless of umask. Kernel peer credentials
+must identify the server's effective UID or root before a command is read, even
+if an operator later relaxes filesystem permissions. Canonical parent directories
+must belong to that UID or root and must not allow unprotected group/other writes;
+sticky temporary directories are supported. Prefer a private runtime directory.
+A private, single-link, no-symlink `.lock` file serializes ownership and stays in
+place across restarts. Existing files, symlinks, and live sockets are not removed.
+An owned stale socket is removed only under that lock after an immediate,
+nonblocking connection-refused probe. Cleanup checks the socket's recorded
+device/inode/owner and never intentionally removes a replacement path. This is
+not isolation from root or another process running as the server UID; keep the
+runtime directory and its ancestors under trusted ownership. These Unix control
+ownership checks are currently supported on Linux and macOS, not Windows.
+
 ## Files and memory
 
 Static assets, precompressed sidecars, custom error documents, and ACME tokens
