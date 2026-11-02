@@ -178,10 +178,10 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-processes-") as tempora
                 for kind, expected in cases:
                     previous = records(folder)
                     body = b"upload" * 87381 if kind in ["noinput", "duplex", "earlyinput"] else None
-                    # The stdin-pressure case must reach the worker before its
-                    # pipe fills. Keep cold interpreter startup out of that
-                    # assertion; hang/trickle still use the 350 ms route.
-                    path = "/extended/input" if kind == "noinput" else "/index.php"
+                    # Pipe pressure and output caps need time to reach the
+                    # worker. Don't race those checks against the short
+                    # deadline tested by hang/trickle/closed.
+                    path = "/extended/input" if kind in ["noinput", "overflow", "stderr"] else "/index.php"
                     status, data, elapsed = request(number, tls, kind, body, path=path)
                     assert status == expected and elapsed < 2, (kind, status, expected, elapsed)
                     if kind == "noinput":
