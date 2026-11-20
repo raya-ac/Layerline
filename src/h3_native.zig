@@ -1,5 +1,6 @@
 const std = @import("std");
 const hpack = @import("h2_native.zig");
+const qpack_static = @import("qpack_static.zig").entries;
 
 pub const Error = error{
     BufferTooSmall,
@@ -186,24 +187,9 @@ fn decodeStringLiteral(allocator: std.mem.Allocator, input: []const u8, prefix_b
 }
 
 fn staticHeader(index: u64) Error!Header {
-    return switch (index) {
-        0 => .{ .name = ":authority", .value = "" },
-        1 => .{ .name = ":path", .value = "/" },
-        15 => .{ .name = ":method", .value = "CONNECT" },
-        16 => .{ .name = ":method", .value = "DELETE" },
-        17 => .{ .name = ":method", .value = "GET" },
-        18 => .{ .name = ":method", .value = "HEAD" },
-        19 => .{ .name = ":method", .value = "OPTIONS" },
-        20 => .{ .name = ":method", .value = "POST" },
-        21 => .{ .name = ":method", .value = "PUT" },
-        22 => .{ .name = ":scheme", .value = "http" },
-        23 => .{ .name = ":scheme", .value = "https" },
-        29 => .{ .name = "accept", .value = "*/*" },
-        31 => .{ .name = "accept-encoding", .value = "gzip, deflate, br" },
-        84 => .{ .name = "authorization", .value = "" },
-        95 => .{ .name = "user-agent", .value = "" },
-        else => error.UnknownStaticTableIndex,
-    };
+    if (index >= qpack_static.len) return error.UnknownStaticTableIndex;
+    const entry = qpack_static[@intCast(index)];
+    return .{ .name = entry.name, .value = entry.value };
 }
 
 pub const max_header_bytes = 64 * 1024;
@@ -430,6 +416,45 @@ test "minimal QPACK decoder reads static and literal request headers" {
     try std.testing.expectEqualStrings("GET", headers[0].value);
     try std.testing.expectEqualStrings(":path", headers[1].name);
     try std.testing.expectEqualStrings("/health", headers[1].value);
+}
+
+test "QPACK decodes all 99 static entries in RFC order" {
+    const allocator = std.testing.allocator;
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(allocator);
+    try block.appendSlice(allocator, &.{ 0, 0 });
+    for (0..99) |index| {
+        if (index < 63) {
+            try block.append(allocator, 0xc0 | @as(u8, @intCast(index)));
+        } else {
+            try block.appendSlice(allocator, &.{ 0xff, @intCast(index - 63) });
+        }
+    }
+    const fields = try decodeHeaderBlock(allocator, block.items);
+    defer freeDecodedHeaders(allocator, fields);
+    try std.testing.expectEqual(99, fields.len);
+    // Hash the Appendix A rows as "name: value\n", in index order.
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (fields) |field| {
+        try std.testing.expect(!field.owned_name and !field.owned_value);
+        hash.update(field.name);
+        hash.update(": ");
+        hash.update(field.value);
+        hash.update("\n");
+    }
+    try std.testing.expectEqualStrings("f778de50d45b042ede99d0781252e2d318286eb3b71e0271c0228ff02051b5c2", &std.fmt.bytesToHex(hash.finalResult(), .lower));
+}
+
+test "QPACK decodes a literal using a multi-byte static name index" {
+    const allocator = std.testing.allocator;
+    const fields = try decodeHeaderBlock(allocator, "\x00\x00\x5f\x4b\x03web");
+    defer freeDecodedHeaders(allocator, fields);
+    try std.testing.expectEqual(1, fields.len);
+    try std.testing.expectEqualStrings("origin", fields[0].name);
+    try std.testing.expectEqualStrings("web", fields[0].value);
+    try std.testing.expectError(error.UnknownStaticTableIndex, decodeHeaderBlock(allocator, "\x00\x00\xff\x24"));
+    try std.testing.expectError(error.UnknownStaticTableIndex, decodeHeaderBlock(allocator, "\x00\x00\x5f\x54\x00"));
+    try std.testing.expectError(error.DynamicTableUnsupported, decodeHeaderBlock(allocator, "\x00\x00\x81"));
 }
 
 test "QPACK decodes Huffman string literals using the HPACK alphabet" {
