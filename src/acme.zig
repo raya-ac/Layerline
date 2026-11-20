@@ -368,7 +368,7 @@ pub fn ensureCloudflareDeployment(io: std.Io, allocator: std.mem.Allocator, cfg:
     std.debug.print("{{\"event\":\"server.cloudflare_dns\",\"action\":\"{s}\"}}\n", .{action});
 }
 
-pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *ServerConfig, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {
+pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *const ServerConfig, shutdown: ?*const std.atomic.Value(bool), environment: ?*const std.process.Environ.Map) !void {
     if (!cfg.tls_auto) return;
     if (cfg.letsencrypt_domains == null or cfg.letsencrypt_domains.?.len == 0) {
         std.debug.print("Skipping Let's Encrypt setup because letsencrypt_domains is empty.\n", .{});
@@ -381,8 +381,6 @@ pub fn ensureLetsEncryptSetup(io: std.Io, allocator: std.mem.Allocator, cfg: *Se
     std.Io.Dir.cwd().createDirPath(io, challenge_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
-
-    try applyLetsEncryptDefaultCertPaths(allocator, cfg);
 
     var domains = std.ArrayList([]const u8).empty;
     defer {

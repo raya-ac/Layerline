@@ -244,6 +244,10 @@ def slow_start_config(folder):
     helper.chmod(0o700)
     number = port()
     original = configuration(folder, number, f"tls = true\ntls_auto = true\nletsencrypt_renew = false\nletsencrypt_domains = fixture.invalid\nletsencrypt_webroot = {folder}\nletsencrypt_certbot = {helper}\ntls_cert = {cert}\ntls_key = {key}\n")
+    redirect = port()
+    while redirect == number:
+        redirect = port()
+    original += f"http_redirect = true\nhttp_redirect_port = {redirect}\n"
     config = folder / "slow.conf"
     config.write_text(original)
     return config, snapshot, original

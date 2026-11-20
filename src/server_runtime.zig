@@ -2,6 +2,7 @@ const std = @import("std");
 const resource_budget = @import("resource_budget.zig");
 const builtin = @import("builtin");
 
+const acme = @import("acme.zig");
 const acme_renewal = @import("acme_renewal.zig");
 const admin_runtime = @import("admin_runtime.zig");
 const admin_listener = @import("admin_listener.zig");
@@ -264,6 +265,64 @@ fn printStartupSummary(cfg: *const ServerConfig) void {
     );
 }
 
+fn bindRedirect(io: std.Io, cfg: *const ServerConfig) !std.Io.net.Server {
+    const address = try std.Io.net.IpAddress.parse(cfg.host, cfg.http_redirect_port);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    errdefer server.deinit(io);
+    try native_accept.prepare(&server);
+    return server;
+}
+
+pub fn issueStartupCertificates(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cfg: *const ServerConfig,
+    environment: *const std.process.Environ.Map,
+    callbacks: http1_runtime.Callbacks,
+) !?std.Io.net.Server {
+    const shutdown = callbacks.shutdown_requested;
+    if (!cfg.http_redirect_enabled or cfg.letsencrypt_webroot.len == 0 or builtin.os.tag == .windows) {
+        try acme.ensureLetsEncryptSetup(io, allocator, cfg, shutdown, environment);
+        return null;
+    }
+
+    var listener = try bindRedirect(io, cfg);
+    errdefer listener.deinit(io);
+    var connections = concurrency_mod.State.init(callbacks.metrics);
+    var stop_accept = std.atomic.Value(bool).init(false);
+    var listeners: listener_state.State = .{ .shutdown = shutdown, .ready = .init(true) };
+    const worker = try std.Thread.spawn(.{}, http1_runtime.serveHttpRedirectListenerTask, .{http1_runtime.HttpRedirectListenerContext{
+        .io = io,
+        .server = &listener,
+        .cfg = cfg,
+        .allocator = allocator,
+        .state = &connections,
+        .listeners = &listeners,
+        .startup_stop = &stop_accept,
+        .callbacks = callbacks,
+    }});
+    std.debug.print("{{\"event\":\"server.acme_http01_listening\",\"port\":{d}}}\n", .{cfg.http_redirect_port});
+    const issued = acme.ensureLetsEncryptSetup(io, allocator, cfg, shutdown, environment);
+    stop_accept.store(true, .release);
+    worker.join();
+
+    // Stop incomplete HTTP requests before handing this socket to the live
+    // redirect worker. They still borrow startup config and connection state.
+    const start = std.Io.Timestamp.now(io, .awake);
+    while (connections.active() > 0) {
+        _ = connections.tryCancelAll(io);
+        if (start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() >= cfg.graceful_shutdown_timeout_ms) {
+            std.debug.print("{{\"event\":\"server.acme_http01_drain_timeout\"}}\n", .{});
+            std.process.exit(1);
+        }
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try listeners.result();
+    try issued;
+    if (shutdown.load(.acquire)) return error.Canceled;
+    return listener;
+}
+
 fn startRedirectListener(
     ctx: Context,
     workers: *Workers,
@@ -378,20 +437,10 @@ fn acceptConnections(ctx: Context, server: *std.Io.net.Server, concurrency: *con
     }
 }
 
-pub fn run(ctx: Context) !void {
+pub fn run(ctx: Context, startup_redirect: ?std.Io.net.Server) !void {
     var concurrency = concurrency_mod.State.init(ctx.metrics);
-
-    var address = try std.Io.net.IpAddress.parse(ctx.cfg.host, ctx.cfg.port);
-    var server = try address.listen(ctx.io, .{ .reuse_address = true });
-    var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
+    var redirect_server = startup_redirect;
     var redirect_listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
-    var redirect_server: ?std.Io.net.Server = null;
-    defer {
-        if (!listener_closed_by_shutdown.load(.acquire)) {
-            server.deinit(ctx.io);
-        }
-    }
-    try native_accept.prepare(&server);
     defer {
         if (redirect_server) |*http_server| {
             if (!redirect_listener_closed_by_shutdown.load(.acquire)) {
@@ -399,11 +448,18 @@ pub fn run(ctx: Context) !void {
             }
         }
     }
-    if (ctx.cfg.http_redirect_enabled) {
-        const redirect_address = try std.Io.net.IpAddress.parse(ctx.cfg.host, ctx.cfg.http_redirect_port);
-        redirect_server = try redirect_address.listen(ctx.io, .{ .reuse_address = true });
-        try native_accept.prepare(&redirect_server.?);
+
+    var address = try std.Io.net.IpAddress.parse(ctx.cfg.host, ctx.cfg.port);
+    var server = try address.listen(ctx.io, .{ .reuse_address = true });
+    var listener_closed_by_shutdown = std.atomic.Value(bool).init(false);
+    defer {
+        if (!listener_closed_by_shutdown.load(.acquire)) {
+            server.deinit(ctx.io);
+        }
     }
+    try native_accept.prepare(&server);
+    if (ctx.cfg.http_redirect_enabled and redirect_server == null)
+        redirect_server = try bindRedirect(ctx.io, ctx.cfg);
 
     var h3: ?http3_server.Listener = if (ctx.cfg.http3_enabled) try .init(ctx.io, ctx.cfg) else null;
     defer if (h3) |*listener| listener.deinit(ctx.io);

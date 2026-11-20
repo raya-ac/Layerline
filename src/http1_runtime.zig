@@ -114,8 +114,9 @@ fn routeHttpRedirectRequest(
     io: std.Io,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
-    cfg: *ServerConfig,
+    cfg: *const ServerConfig,
     req: HttpRequest,
+    challenge_only: bool,
     callbacks: Callbacks,
 ) !void {
     const is_head = std.mem.eql(u8, req.method, "HEAD");
@@ -135,6 +136,12 @@ fn routeHttpRedirectRequest(
         return;
     }
 
+    if (challenge_only) {
+        callbacks.access_log_set_handler("acme_startup");
+        try callbacks.send_cool_error_with_connection(stream, allocator, 503, "Service Unavailable", "HTTPS is not ready yet.", close_connection, is_head, null);
+        return;
+    }
+
     callbacks.access_log_set_handler("http_to_https_redirect");
     callbacks.send_https_redirect(stream, allocator, cfg, req, close_connection, is_head) catch |err| switch (err) {
         error.MissingHostHeader => try callbacks.send_bad_request_for_method(allocator, stream, "Missing Host header.", close_connection, is_head),
@@ -147,8 +154,9 @@ fn routeHttpRedirectRequest(
 fn handleHttpRedirectConnection(
     io: std.Io,
     stream: std.Io.net.Stream,
-    cfg: *ServerConfig,
+    cfg: *const ServerConfig,
     allocator: std.mem.Allocator,
+    challenge_only: bool,
     callbacks: Callbacks,
 ) anyerror!void {
     const previous_write = write_deadline.pushHttp1(io, stream, cfg.write_timeout_ms);
@@ -277,7 +285,7 @@ fn handleHttpRedirectConnection(
     callbacks.set_access_context(&access_ctx, request_id);
     defer callbacks.clear_access_context();
 
-    routeHttpRedirectRequest(io, stream, req_alloc, cfg, req, callbacks) catch |err| {
+    routeHttpRedirectRequest(io, stream, req_alloc, cfg, req, challenge_only, callbacks) catch |err| {
         callbacks.access_log_set_error(@errorName(err));
         callbacks.emit_access_log(0, 0);
         callbacks.metrics.routeError();
@@ -289,14 +297,15 @@ fn handleHttpRedirectConnection(
 fn serveHttpRedirectConnectionTask(
     io: std.Io,
     stream: std.Io.net.Stream,
-    config_lease: config_store.Lease,
+    cfg: *const ServerConfig,
+    config_lease: ?config_store.Lease,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
+    challenge_only: bool,
     callbacks: Callbacks,
 ) void {
     callbacks.bind_thread_io(io);
     var lease = config_lease;
-    const cfg = lease.cfg;
     callbacks.set_response_config(cfg);
     var registration = concurrency_mod.Connection{ .state = state, .stream = stream };
     const previous_cancel = request_cancel.active;
@@ -307,11 +316,11 @@ fn serveHttpRedirectConnectionTask(
         state.unregister(io, &registration);
         callbacks.stream_close(stream);
         callbacks.set_response_config(null);
-        lease.deinit();
+        if (lease) |*active| active.deinit();
         state.release();
     }
 
-    handleHttpRedirectConnection(io, stream, cfg, allocator, callbacks) catch |err| {
+    handleHttpRedirectConnection(io, stream, cfg, allocator, challenge_only, callbacks) catch |err| {
         std.debug.print("HTTP redirect handler error: {}\n", .{err});
     };
 }
@@ -319,41 +328,48 @@ fn serveHttpRedirectConnectionTask(
 pub const HttpRedirectListenerContext = struct {
     io: std.Io,
     server: *std.Io.net.Server,
-    cfg: *ServerConfig,
+    cfg: *const ServerConfig,
     allocator: std.mem.Allocator,
     state: *ConcurrencyState,
     listeners: *listener_state.State,
+    startup_stop: ?*const std.atomic.Value(bool) = null,
     callbacks: Callbacks,
 };
 
 pub fn serveHttpRedirectListenerTask(ctx: HttpRedirectListenerContext) void {
     ctx.callbacks.bind_thread_io(ctx.io);
     if (!ctx.listeners.awaitReady(ctx.io)) return;
+    const stop = ctx.startup_stop orelse ctx.callbacks.shutdown_requested;
+    const challenge_only = ctx.startup_stop != null;
+    const previous_cancel = request_cancel.active;
+    request_cancel.active = stop;
+    defer request_cancel.active = previous_cancel;
 
-    while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
-        const conn = (native_accept.next(ctx.io, ctx.server, ctx.callbacks.shutdown_requested) catch |err| {
-            if (!ctx.callbacks.shutdown_requested.load(.acquire)) ctx.listeners.fail("redirect", err);
+    while (!stop.load(.acquire) and !ctx.callbacks.shutdown_requested.load(.acquire)) {
+        const conn = (native_accept.next(ctx.io, ctx.server, stop) catch |err| {
+            if (!stop.load(.acquire)) ctx.listeners.fail("redirect", err);
             return;
         }) orelse break;
 
-        var lease = ctx.callbacks.acquire_config();
-        const active_cfg = lease.cfg;
-        if (@import("descriptor_budget.zig").emergency(conn.socket.handle) or !ctx.state.tryAcquire(active_cfg.max_concurrent_connections)) {
+        var lease: ?config_store.Lease = if (challenge_only) null else ctx.callbacks.acquire_config();
+        const active_cfg: *const ServerConfig = if (lease) |active| active.cfg else ctx.cfg;
+        const limit = if (challenge_only) @min(16, active_cfg.max_concurrent_connections) else active_cfg.max_concurrent_connections;
+        if (@import("descriptor_budget.zig").emergency(conn.socket.handle) or !ctx.state.tryAcquire(limit)) {
             ctx.callbacks.metrics.connectionRejected();
             sendOverload(ctx.io, conn, false, ctx.callbacks) catch {};
             ctx.callbacks.stream_close(conn);
-            lease.deinit();
+            if (lease) |*active| active.deinit();
             continue;
         }
 
         const worker = std.Thread.spawn(
             .{ .stack_size = active_cfg.worker_stack_size },
             serveHttpRedirectConnectionTask,
-            .{ ctx.io, conn, lease, ctx.allocator, ctx.state, ctx.callbacks },
+            .{ ctx.io, conn, active_cfg, lease, ctx.allocator, ctx.state, challenge_only, ctx.callbacks },
         ) catch |err| {
             std.debug.print("Failed to start HTTP redirect worker: {}\n", .{err});
             ctx.callbacks.stream_close(conn);
-            lease.deinit();
+            if (lease) |*active| active.deinit();
             ctx.state.release();
             continue;
         };

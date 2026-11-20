@@ -15,8 +15,8 @@ without checking what their sites actually need.
   both client protocols can reuse HTTP/1.1 origin connections. HTTPS backends
   use TLS 1.2 or 1.3 with certificate checks.
 - the TCP listener speaks TLS 1.3 and picks configured certificates by hostname.
-  certbot can issue and renew certs. first-time webroot issuance still needs the
-  challenge path to be reachable before Layerline starts.
+  certbot can issue and renew certs. Layerline can serve first-boot HTTP-01
+  challenges before opening HTTPS when it owns the HTTP port.
 - compatible config changes reload while old requests finish on the previous
   config. listener changes need a restart. the optional admin UI can add sites,
   stage edits, show diffs and run the same validation and reload as the local
@@ -43,9 +43,10 @@ including what doesn't pass.
    2 MiB replies at 4 KiB of stream credit, checks memory and health, then
    finishes all four. it doesn't measure a long run on the live workload.
    expand the RFC 9113 checks too; h2spec alone doesn't cover the current spec.
-4. close the TLS gaps: first-boot HTTP-01, unattended renewal checks, more TCP
-   listener profiles and absolute handshake write budgets. The origin
-   certificate corpus still has mismatches and skips.
+4. close the TLS gaps: check first-boot issuance against a real ACME staging
+   server and test unattended renewal. add more TCP listener profiles and
+   absolute handshake write budgets. the origin certificate corpus still has
+   mismatches and skips.
 5. finish the QUIC transport before calling HTTP/3 ready: configured certs, flow
    control, loss recovery, connection and stream lifetimes, and an independent
    client matrix for more than a small GET. Keep dynamic QPACK off until its

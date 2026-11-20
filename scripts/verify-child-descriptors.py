@@ -141,6 +141,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-child-fds-", dir="/tmp") as t
             probe.write_text(f"#!{sys.executable}\n" + worker)
             probe.chmod(0o700)
         number = free_port()
+        redirect = free_port()
+        while redirect == number:
+            redirect = free_port()
         (folder / "server.conf").write_text(f"""host = 127.0.0.1
 port = {number}
 dir = {folder}
@@ -154,6 +157,8 @@ admin_ui = false
 admin_socket = {folder / 'admin.sock'}
 tls = {str(tls).lower()}
 tls_auto = {str(tls).lower()}
+http_redirect = {str(tls).lower()}
+http_redirect_port = {redirect}
 tls_cert = {seed_cert}
 tls_key = {seed_key}
 letsencrypt_certbot = {folder / 'certbot'}

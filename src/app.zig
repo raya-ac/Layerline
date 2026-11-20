@@ -45,7 +45,6 @@ const upstream_runtime = @import("upstream_runtime.zig");
 
 const AdminCredentials = admin_support.AdminCredentials;
 const ensureCloudflareDeployment = acme_mod.ensureCloudflareDeployment;
-const ensureLetsEncryptSetup = acme_mod.ensureLetsEncryptSetup;
 const HttpRequest = request_mod.HttpRequest;
 const applyLetsEncryptDefaultCertPaths = acme_mod.applyLetsEncryptDefaultCertPaths;
 const activeIo = stream_runtime.activeIo;
@@ -850,8 +849,11 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
+    var redirect: ?std.Io.net.Server = null;
+    defer if (redirect) |*listener| listener.deinit(init.io);
     if (cfg.tls_auto) {
-        ensureLetsEncryptSetup(init.io, resource_budget.allocator(), &cfg, &runtime_state.shutdown_requested, init.environ_map) catch |err| {
+        try applyLetsEncryptDefaultCertPaths(resource_budget.allocator(), &cfg);
+        redirect = server_runtime.issueStartupCertificates(init.io, resource_budget.allocator(), &cfg, init.environ_map, http1RuntimeCallbacks()) catch |err| {
             std.debug.print("Let's Encrypt automation failed: {}\n", .{err});
             return err;
         };
@@ -877,6 +879,8 @@ pub fn main(init: std.process.Init) !void {
         php_runtime.deinitKeepalivePool(phpCallbacks());
     }
 
+    const startup_redirect = redirect;
+    redirect = null;
     try server_runtime.run(.{
         .io = init.io,
         .allocator = resource_budget.allocator(),
@@ -897,5 +901,5 @@ pub fn main(init: std.process.Init) !void {
             .reload_signal = reloadSignalWatcherTask,
             .upstream = upstreamRuntimeCallbacks(),
         },
-    });
+    }, startup_redirect);
 }

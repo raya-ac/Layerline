@@ -24,8 +24,9 @@ setup. it doesn't tell me it can replace every Caddyfile or nginx config.
 ## where i'd still keep caddy
 
 if the site needs something Layerline can't do yet, don't replace its proxy.
-in particular, first-boot HTTP-01 isn't self-contained, the TCP listener has a
-narrower TLS profile than a general-purpose server, and HTTP/3 is experimental.
+in particular, first-boot HTTP-01 still uses certbot and needs public port 80.
+the TCP listener has a narrower TLS profile than a general-purpose server, and
+HTTP/3 is experimental.
 a good curl result against `/health` says nothing about a long upload or a busy
 upstream.
 

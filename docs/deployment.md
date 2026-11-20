@@ -243,6 +243,14 @@ When replacing an existing reverse proxy, you can usually issue the first cert w
 
 Once Layerline owns the edge, enable the plaintext redirect listener. It binds `http_redirect_port`, serves ACME HTTP-01 challenges from `letsencrypt_webroot`, and redirects every other request to HTTPS while preserving host, path, and query.
 
+on a fresh host, `tls_auto = true` with `http_redirect = true` lets Layerline
+serve the challenge before the certificate exists. point the names in
+`letsencrypt_domains` at the host first, and make the redirect socket reachable
+on public TCP port 80. the process needs permission to run certbot and read the
+resulting cert and key. it won't signal readiness or open HTTPS before it can
+load them. try `letsencrypt_staging = true` first; staging certs aren't trusted
+by browsers.
+
 ```conf
 letsencrypt_webroot = /var/www/layerline/public
 letsencrypt_renew = true

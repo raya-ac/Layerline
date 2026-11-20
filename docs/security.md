@@ -635,9 +635,10 @@ ACME challenge directories or calling the DNS API. Missing/malformed roots abort
 at that point, including domain and route overrides. Listener keys load after
 the certificate helper so it can create them. Startup cleanup retains
 trust and signing material until config readers and idle pools have retired.
-`zig build test-startup-materials` exercises both ordering and successful
-provisioning with disposable certificate/DNS fixtures; it uses no real provider.
-These fixtures do not verify first-boot HTTP-01 reachability.
+`zig build test-startup-materials` checks this order with disposable helpers.
+it fetches the first-boot HTTP-01 token on loopback, checks the HTTP-to-HTTPS
+handoff, and checks failure and cancellation before readiness. these fixtures
+don't verify public reachability or talk to a real ACME provider.
 
 Configured listener PEM loading now reads bounded DER certificate envelopes and
 matches the leaf's SubjectPublicKeyInfo, not a byte string anywhere in the file.

@@ -70,6 +70,16 @@ def stop(process):
             raise AssertionError("startup material fixture did not shut down cleanly")
 
 
+def reply(number, path, method="GET"):
+    client = http.client.HTTPConnection("127.0.0.1", number, timeout=2)
+    try:
+        client.request(method, path, headers={"Host": "fixture.invalid", "Connection": "close"})
+        response = client.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        client.close()
+
+
 with tempfile.TemporaryDirectory(prefix="layerline-startup-materials-") as temporary:
     root = Path(temporary)
     ca, ca_key = root / "origin-ca.pem", root / "origin-ca-key.pem"
@@ -86,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix="layerline-startup-materials-") as tempo
     thread.start()
     try:
         cases = [(scope, kind) for scope in ["proxy", "h2_upstream", "route", "domain", "domain route"] for kind in ["missing", "malformed"]]
-        cases.append(("proxy", "valid"))
+        cases.extend(("proxy", kind) for kind in ["valid", "failed issuance", "canceled issuance"])
         for index, (scope, kind) in enumerate(cases):
             folder = root / str(index)
             folder.mkdir()
@@ -94,13 +104,25 @@ with tempfile.TemporaryDirectory(prefix="layerline-startup-materials-") as tempo
             (folder / "command-mode").write_text("okay")
             generated_cert, generated_key = folder / "generated.pem", folder / "generated-key.pem"
             certbot = folder / "certbot"
-            certbot.write_text("#!/bin/sh\nset -eu\n" +
-                              f"cp {shlex.quote(str(cert))} {shlex.quote(str(generated_cert))}\n" +
-                              f"cp {shlex.quote(str(key))} {shlex.quote(str(generated_key))}\n" +
-                              f"exec {shlex.quote(str(WORKER))} --command {shlex.quote(str(folder))} \"$@\"\n")
+            token_dir = folder / "webroot/.well-known/acme-challenge"
+            token_body = b"local-http01-fixture"
+            release = folder / "validation-finished"
+            redirection, number = port(), port()
+            while redirection == number:
+                number = port()
+            certbot.write_text(
+                "#!/bin/sh\nset -eu\n"
+                f"test \"$1\" = certonly\n"
+                f"printf %s {shlex.quote(token_body.decode())} > {shlex.quote(str(token_dir / 'token-fixture'))}\n"
+                f"ln -s {shlex.quote(str(key))} {shlex.quote(str(token_dir / 'link-fixture'))}\n"
+                f"while [ ! -e {shlex.quote(str(release))} ]; do sleep .02; done\n"
+                + ("exit 23\n" if kind == "failed issuance" else
+                   f"cp {shlex.quote(str(cert))} {shlex.quote(str(generated_cert))}\n"
+                   f"cp {shlex.quote(str(key))} {shlex.quote(str(generated_key))}\n"
+                   f"exec {shlex.quote(str(WORKER))} --command {shlex.quote(str(folder))} \"$@\"\n")
+            )
             certbot.chmod(0o700)
-            selected_ca = ca if kind == "valid" else malformed if kind == "malformed" else folder / "missing-ca.pem"
-            number = port()
+            selected_ca = malformed if kind == "malformed" else folder / "missing-ca.pem" if kind == "missing" else ca
             config, log = folder / "server.conf", folder / "server.log"
             config.write_text(f"""host = 127.0.0.1
 port = {number}
@@ -111,12 +133,15 @@ http3 = false
 tls = true
 tls_cert = {generated_cert}
 tls_key = {generated_key}
+http_redirect = true
+http_redirect_port = {redirection}
+http_redirect_https_port = {number}
 tls_auto = true
 letsencrypt_domains = fixture.invalid
 letsencrypt_certbot = {certbot}
 letsencrypt_webroot = {folder / 'webroot'}
 letsencrypt_renew = false
-external_command_timeout_ms = 3000
+external_command_timeout_ms = 6000
 cf_auto_deploy = true
 cf_api_base = http://127.0.0.1:{api.server_port}
 cf_token = {TOKEN}
@@ -128,7 +153,7 @@ cf_record_proxied = false
 graceful_shutdown_timeout_ms = 1200
 """ + scope_config(scope, selected_ca))
             api.calls = []
-            if kind != "valid":
+            if kind in {"missing", "malformed"}:
                 result = subprocess.run([str(BINARY), "--config", str(config)], cwd=ROOT, capture_output=True, timeout=10)
                 assert result.returncode != 0, (scope, kind, result.stdout)
                 assert not api.calls, ("DNS API reached before trust validation", scope, kind, api.calls)
@@ -136,6 +161,7 @@ graceful_shutdown_timeout_ms = 1200
                 assert not (folder / "webroot").exists(), ("challenge directory created", scope, kind)
                 assert not generated_cert.exists() and not generated_key.exists()
                 assert b"Failed to load configured origin trust" in result.stderr, result.stderr
+                assert b"server.acme_http01_listening" not in result.stderr
                 assert TOKEN.encode() not in result.stderr and b"private-child-marker" not in result.stderr
                 print(f"ok: {scope} {kind} trust rejected before certificate/DNS work", flush=True)
                 continue
@@ -143,7 +169,45 @@ graceful_shutdown_timeout_ms = 1200
             with log.open("wb") as output:
                 process = subprocess.Popen([str(BINARY), "--config", str(config)], cwd=ROOT, stdout=output, stderr=output, start_new_session=True)
                 try:
-                    until = time.monotonic() + 6
+                    until = time.monotonic() + 4
+                    while not (token_dir / "link-fixture").is_symlink():
+                        assert process.poll() is None and time.monotonic() < until, log.read_bytes()
+                        time.sleep(.02)
+                    path = "/.well-known/acme-challenge/token-fixture"
+                    status, _, body = reply(redirection, path)
+                    assert status == 200 and body == token_body, (status, body)
+                    status, headers, body = reply(redirection, path, "HEAD")
+                    assert status == 200 and not body and int(headers["Content-Length"]) == len(token_body)
+                    assert reply(redirection, "/.well-known/acme-challenge/link-fixture")[0] == 404
+                    status, headers, _ = reply(redirection, "/")
+                    assert status == 503 and "Location" not in headers
+                    assert reply(redirection, path, "POST")[0] == 503
+                    assert not api.calls and not generated_cert.exists() and not generated_key.exists()
+                    assert b'"event":"server.ready"' not in log.read_bytes(), log.read_bytes()
+                    with socket.socket() as probe:
+                        assert probe.connect_ex(("127.0.0.1", number)) != 0, "TLS opened before issuance"
+
+                    with socket.create_connection(("127.0.0.1", redirection), 2) as incomplete:
+                        incomplete.sendall(b"GET / HTTP/1.1\r\nHost:")
+                        if kind == "canceled issuance":
+                            process.send_signal(signal.SIGTERM)
+                        else:
+                            release.touch()
+                        try:
+                            assert incomplete.recv(1) == b"", "bootstrap connection survived the handoff"
+                        except ConnectionResetError:
+                            pass
+
+                    if kind != "valid":
+                        assert process.wait(timeout=3) != 0
+                        assert b'"event":"server.ready"' not in log.read_bytes()
+                        assert not api.calls and not generated_cert.exists()
+                        with socket.socket() as probe:
+                            assert probe.connect_ex(("127.0.0.1", redirection)) != 0, "bootstrap socket left open"
+                        print(f"ok: {kind} stops HTTP-01 with no HTTPS, readiness or DNS changes", flush=True)
+                        continue
+
+                    until = time.monotonic() + 4
                     while b'"event":"server.ready"' not in log.read_bytes():
                         assert process.poll() is None and time.monotonic() < until, log.read_bytes()
                         time.sleep(.02)
@@ -151,11 +215,14 @@ graceful_shutdown_timeout_ms = 1200
                     client = http.client.HTTPSConnection("127.0.0.1", number, context=context, timeout=5)
                     try:
                         client.request("GET", "/health", headers={"Connection": "close"})
-                        reply = client.getresponse()
-                        assert reply.status == 200, reply.status
-                        reply.read()
+                        response = client.getresponse()
+                        assert response.status == 200, response.status
+                        response.read()
                     finally:
                         client.close()
+                    status, headers, _ = reply(redirection, "/after?ready=1")
+                    assert status == 308 and headers["Location"] == f"https://fixture.invalid:{number}/after?ready=1"
+                    assert reply(redirection, path)[2] == token_body
                     assert api.calls == ["GET", "POST"], api.calls
                     assert any(path.name.isdecimal() for path in (folder / "pids").iterdir())
                     assert generated_cert.exists() and generated_key.exists()

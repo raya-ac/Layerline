@@ -473,10 +473,11 @@ preserves the published certificate, even if its files on disk have changed.
 
 The server can run `certbot` in webroot mode automatically on startup when both `--tls-auto true` and `--letsencrypt-domains` are provided. With `letsencrypt_renew = true`, Layerline also starts a background `certbot renew` loop; the default interval is 12 hours.
 
-The startup helper runs before Layerline binds its normal listeners. First-time
-webroot issuance therefore needs an already reachable challenge endpoint;
-`http_redirect = true` serves challenges after normal startup, not during that
-first helper call. A pre-certificate challenge listener remains separate work.
+with `tls_auto = true` and `http_redirect = true`, Layerline opens the HTTP
+redirect socket before running certbot. it serves HTTP-01 challenges and returns
+503 for other valid HTTP requests until HTTPS is ready. if issuance fails,
+startup fails too. when Layerline doesn't own the HTTP port, the existing edge
+must serve the same challenge directory.
 
 ```bash
 zig build run -- \
