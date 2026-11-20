@@ -2,10 +2,12 @@
 """Real HTTPS origins through Layerline's HTTP/1 and HTTP/2 proxy paths."""
 import argparse
 import contextlib
+import errno
 import hashlib
 import http.client
 import http.server
 import json
+import os
 from pathlib import Path
 import signal
 import socket
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import tty
 
 from wire_h2 import H2, frame
 
@@ -382,6 +385,53 @@ def openssl_failure_details(folder, process):
             print("OpenSSL fixture output:", json.dumps(details), file=sys.stderr, flush=True)
 
 
+@contextlib.contextmanager
+def openssl_console(command, log, errors):
+    # s_server prints status through stdio and writes application bytes directly.
+    # a raw tty flushes each status line without changing the bytes on the wire.
+    master, terminal = os.openpty()
+    try:
+        try:
+            tty.setraw(terminal)
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=terminal, stderr=errors)
+        finally:
+            os.close(terminal)
+
+        def drain():
+            left = 4 * 1024 * 1024
+            while left:
+                try:
+                    data = os.read(master, min(left, 65536))
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break  # Linux reports tty EOF as EIO.
+                    raise
+                if not data:
+                    break
+                log.write(data)
+                left -= len(data)
+
+        reader = threading.Thread(target=drain)
+        reader.start()
+        try:
+            yield process
+        finally:
+            process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(4)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise AssertionError("OpenSSL origin did not join")
+            finally:
+                reader.join(4)
+                assert not reader.is_alive(), "OpenSSL console did not close"
+    finally:
+        os.close(master)
+
+
 def key_updates(folder, ca, leaf, key, secure):
     # s_server's documented K command sends KeyUpdate(requested). Its message
     # trace must also show the actual authenticated reply; data alone is not proof.
@@ -389,8 +439,13 @@ def key_updates(folder, ca, leaf, key, secure):
         reserved.bind(("127.0.0.1", 0))
         port = reserved.getsockname()[1]
     output, trace = folder / "openssl.stdout", folder / "openssl.trace"
-    with output.open("wb") as log, (folder / "openssl.stderr").open("wb") as errors:
-        process = subprocess.Popen(["openssl", "s_server", "-accept", f"127.0.0.1:{port}", "-cert", str(leaf), "-key", str(key), "-tls1_3", "-alpn", "http/1.1", "-num_tickets", "0", "-msg", "-msgfile", str(trace), "-naccept", "1"], stdin=subprocess.PIPE, stdout=log, stderr=errors)
+    trace.unlink(missing_ok=True)
+    command = ["openssl", "s_server", "-accept", f"127.0.0.1:{port}", "-cert", str(leaf), "-key", str(key), "-tls1_3", "-alpn", "http/1.1", "-num_tickets", "0", "-msg", "-msgfile", str(trace), "-naccept", "1"]
+    with (
+        output.open("wb", buffering=0) as log,
+        (folder / "openssl.stderr").open("wb") as errors,
+        openssl_console(command, log, errors) as process,
+    ):
         try:
             wait_bytes(output, b"ACCEPT")
             origin = type("CommandOrigin", (), {"server_port": port})()
@@ -410,6 +465,7 @@ def key_updates(folder, ca, leaf, key, secure):
                         process.stdin.write(b"K\n")
                         process.stdin.flush()
                         wait_bytes(trace, b"KeyUpdate", number * 2 + 1)
+                        wait_bytes(output, b"SSL_do_handshake -> 1\n", number + 1)
                         upload = b"client after update " + str(number).encode() + b":" + b"x" * 32768 + b"\n"
                         client.sendall(upload)
                         download = b"origin after update " + str(number).encode() + b":" + b"y" * 32768 + b"\n"
@@ -426,16 +482,6 @@ def key_updates(folder, ca, leaf, key, secure):
         except BaseException:
             openssl_failure_details(folder, process)
             raise
-        finally:
-            process.stdin.close()
-            if process.poll() is None:
-                process.terminate()
-            try:
-                process.wait(4)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                raise AssertionError("OpenSSL origin did not join")
     results.append({"case": "four requested TLS key rotations during bidirectional upgraded traffic", "downstream_tls": secure})
     print(f"ok: downstream_tls={secure} actual origin KeyUpdate replies and tunnel traffic", flush=True)
 
