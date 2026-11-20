@@ -39,10 +39,10 @@ including what doesn't pass.
    host, compare site behavior, then prove rollback with the real systemd unit.
    Test memory and descriptor pressure there too. A green CI run doesn't do
    those things. See the [replacement checklist](caddy-replacement-plan.md).
-3. run a longer HTTP/2 proxy soak with slow clients and large bodies.
-   loopback tests already cover early bytes, window credit, trailers, resets
-   and no retry after final headers. expand the RFC 9113 checks too; h2spec
-   alone doesn't cover the current spec.
+3. soak HTTP/2 proxying on the target host. the local pressure test holds four
+   2 MiB replies at 4 KiB of stream credit, checks memory and health, then
+   finishes all four. it doesn't measure a long run on the live workload.
+   expand the RFC 9113 checks too; h2spec alone doesn't cover the current spec.
 4. close the TLS gaps: first-boot HTTP-01, unattended renewal checks, more TCP
    listener profiles and absolute handshake write budgets. The origin
    certificate corpus still has mismatches and skips.

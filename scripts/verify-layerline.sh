@@ -820,6 +820,9 @@ python3 "$ROOT_DIR/scripts/verify-admin-http2.py" "$SERVER_BINARY"
 log "verifying HTTP/2 backend isolation and resource cleanup"
 python3 "$ROOT_DIR/scripts/verify-h2-dispatch.py" "$SERVER_BINARY"
 
+log "verifying HTTP/2 proxying under stalled stream windows"
+python3 "$ROOT_DIR/scripts/verify-h2-proxy-pressure.py" "$SERVER_BINARY"
+
 log "verifying HTTP/2 stream lifecycle and error delivery"
 python3 "$ROOT_DIR/scripts/verify-h2-state.py" "$SERVER_BINARY"
 

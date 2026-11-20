@@ -78,6 +78,16 @@ fail the run if HTTP/3 is required but doesn't work:
 LAYERLINE_H3_REQUIRED=1 ./scripts/benchmark-layerline.sh --verify-only
 ```
 
+## slow HTTP/2 clients
+
+this check starts its own loopback server and origin. it holds four 2 MiB replies
+at 4 KiB of stream credit, checks memory and health, then lets the replies finish.
+run more rounds on a candidate without pointing it at live traffic:
+
+```bash
+python3 scripts/verify-h2-proxy-pressure.py ./zig-out/bin/layerline --rounds 20
+```
+
 ## reading results
 
 keep the machine, config and tool the same when comparing builds. look at
