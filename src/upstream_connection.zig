@@ -34,6 +34,24 @@ fn fromIdle(conn: config.UpstreamIdleConnection) Lease {
     return .{ .stream = conn.stream, .tls_channel = conn.tls_channel, .requests_served = conn.requests_served };
 }
 
+pub fn expireIdle(target: *config.UpstreamConfig, now_ms: i64, callbacks: anytype) void {
+    const pool = &target.keepalive_pool;
+    // let an active checkout finish rather than holding up the rest of the sweep.
+    if (!pool.mutex.tryLock()) return;
+    defer pool.mutex.unlock(callbacks.active_io());
+
+    var retained: usize = 0;
+    for (pool.idle.items) |entry| {
+        if (entry.expires_at_ms <= now_ms) {
+            fromIdle(entry).close(callbacks);
+        } else {
+            pool.idle.items[retained] = entry;
+            retained += 1;
+        }
+    }
+    pool.idle.shrinkRetainingCapacity(retained);
+}
+
 pub fn acquire(allocator: std.mem.Allocator, target: *config.UpstreamConfig, cfg: *const config.ServerConfig, timeout_ms: u32, callbacks: anytype) !Lease {
     if (keepaliveConfigured(cfg)) {
         const io = callbacks.active_io();
@@ -104,4 +122,38 @@ pub fn open(allocator: std.mem.Allocator, target: *const config.UpstreamConfig, 
         };
     } else null;
     return .{ .stream = stream, .tls_channel = channel };
+}
+
+test "expiry skips a busy pool and keeps reusable entries in order" {
+    const Fake = struct {
+        fn io() std.Io {
+            return std.testing.io;
+        }
+        fn close(stream: std.Io.net.Stream) void {
+            std.debug.assert(stream.socket.handle == 42 or stream.socket.handle == 44);
+        }
+    };
+    var counters = @import("metrics.zig").ServerMetrics.init();
+    const callbacks = .{ .active_io = Fake.io, .stream_close = Fake.close, .metrics = &counters };
+    var target: config.UpstreamConfig = undefined;
+    target.keepalive_pool = .init();
+    const pool = &target.keepalive_pool;
+    defer pool.idle.deinit(std.testing.allocator);
+    for ([_]i64{ 150, 100, 200, 130 }, 41..) |at, handle| {
+        try pool.idle.append(std.testing.allocator, .{
+            .stream = .{ .socket = .{ .handle = @intCast(handle), .address = undefined } },
+            .expires_at_ms = at,
+            .requests_served = 1,
+        });
+    }
+    {
+        pool.mutex.lockUncancelable(std.testing.io);
+        defer pool.mutex.unlock(std.testing.io);
+        expireIdle(&target, 130, callbacks);
+        try std.testing.expectEqual(4, pool.idle.items.len);
+    }
+    expireIdle(&target, 130, callbacks);
+    try std.testing.expectEqual(2, pool.idle.items.len);
+    try std.testing.expectEqual(41, pool.idle.items[0].stream.socket.handle);
+    try std.testing.expectEqual(43, pool.idle.items[1].stream.socket.handle);
 }

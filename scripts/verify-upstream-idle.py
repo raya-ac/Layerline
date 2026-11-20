@@ -29,6 +29,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with self.server.lock:
+                self.server.closed.add(self.connection)
+
     def answer(self):
         length = int(self.headers.get("Content-Length", "0"))
         payload = self.rfile.read(length)
@@ -71,9 +78,63 @@ def request(port, secure, path, method="GET", body=None, h2=False):
         connection.close()
 
 
+def check_expiry(origin, folder, secure):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    config = folder / "expiry.conf"
+    config.write_text(f"""host = 127.0.0.1
+port = {port}
+tls = {str(secure).lower()}
+admin_socket = off
+upstream_keepalive = true
+upstream_keepalive_idle_timeout_ms = 1500
+route = pool /pool/* proxy
+route_proxy.pool = http://127.0.0.1:{origin.server_port}
+""")
+    log_path = folder / "expiry.log"
+    with log_path.open("wb") as log:
+        process = subprocess.Popen([str(BINARY), "--config", str(config)], cwd=ROOT, stdout=log, stderr=log)
+        try:
+            until = time.monotonic() + 5
+            while True:
+                assert process.poll() is None and time.monotonic() < until, log_path.read_text()
+                try:
+                    request(port, secure, "expiry-first", "HEAD")
+                    break
+                except OSError:
+                    time.sleep(.02)
+            with origin.lock:
+                old = origin.seen[-1][2]
+            request(port, secure, "expiry-reuse", "HEAD", h2=True)
+            with origin.lock:
+                assert origin.seen[-1][2] is old and old not in origin.closed
+
+            # no client request checks out this socket to make it close.
+            until = time.monotonic() + 5
+            while True:
+                with origin.lock:
+                    if old in origin.closed:
+                        break
+                assert process.poll() is None and time.monotonic() < until, "idle socket never closed"
+                time.sleep(.02)
+            request(port, secure, "after-expiry", h2=True)
+            with origin.lock:
+                assert origin.seen[-1][2] is not old
+            print(f"ok: {'TLS' if secure else 'plain'} origin socket expires without another checkout", flush=True)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+
 with tempfile.TemporaryDirectory(prefix="ll-idle-", dir="/tmp") as temporary:
     origin = Origin(("127.0.0.1", 0), Handler)
     origin.lock, origin.seen = threading.Lock(), []
+    origin.closed = set()
     thread = threading.Thread(target=origin.serve_forever)
     thread.start()
     try:
@@ -149,6 +210,7 @@ route_proxy.pool = http://127.0.0.1:{origin.server_port}
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=3)
+            check_expiry(origin, folder, secure)
     finally:
         origin.shutdown()
         origin.server_close()

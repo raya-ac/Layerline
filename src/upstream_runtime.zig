@@ -53,36 +53,70 @@ pub const HealthTransition = enum {
     recovered,
 };
 
-pub const HealthCheckContext = struct {
+pub const MaintenanceContext = struct {
     io: std.Io,
     acquire_config: *const fn () config_store.Lease,
     callbacks: Callbacks,
     maintenance_wake: *std.Io.Event,
 };
 
+fn visitPool(pool: *UpstreamPoolConfig, state: anytype, comptime visit: anytype) void {
+    for (pool.targets.items) |*target| visit(state, target);
+}
+
+fn visitConfiguredTargets(cfg: *ServerConfig, state: anytype, comptime visit: anytype) void {
+    if (cfg.h2_upstream) |*target| visit(state, target);
+    if (cfg.upstream) |*pool| visitPool(pool, state, visit);
+    for (cfg.routes.items) |*route| if (route.upstream) |*pool| visitPool(pool, state, visit);
+    for (cfg.domains.items) |*domain| {
+        if (domain.upstream) |*pool| visitPool(pool, state, visit);
+        for (domain.routes.items) |*route| if (route.upstream) |*pool| visitPool(pool, state, visit);
+    }
+}
+
 pub fn deinitConfigPools(io: std.Io, cfg: *ServerConfig, metrics: *metrics_mod.ServerMetrics, close: *const fn (std.Io.net.Stream) void) void {
     const Cleanup = struct {
-        fn target(context: std.Io, upstream: *UpstreamConfig, counters: *metrics_mod.ServerMetrics, close_stream: *const fn (std.Io.net.Stream) void) void {
-            upstream.keepalive_pool.mutex.lockUncancelable(context);
-            defer upstream.keepalive_pool.mutex.unlock(context);
+        io: std.Io,
+        metrics: *metrics_mod.ServerMetrics,
+        close_stream: *const fn (std.Io.net.Stream) void,
+
+        fn target(self: @This(), upstream: *UpstreamConfig) void {
+            upstream.keepalive_pool.mutex.lockUncancelable(self.io);
+            defer upstream.keepalive_pool.mutex.unlock(self.io);
             while (upstream.keepalive_pool.idle.pop()) |conn| {
                 if (conn.tls_channel) |channel| channel.destroy();
-                close_stream(conn.stream);
-                counters.upstreamConnectionDiscarded();
+                self.close_stream(conn.stream);
+                self.metrics.upstreamConnectionDiscarded();
             }
             upstream.keepalive_pool.idle.deinit(resource_budget.allocator());
             upstream.keepalive_pool.idle = .empty;
         }
-        fn pool(context: std.Io, targets: *UpstreamPoolConfig, counters: *metrics_mod.ServerMetrics, close_stream: *const fn (std.Io.net.Stream) void) void {
-            for (targets.targets.items) |*upstream| target(context, upstream, counters, close_stream);
+    };
+    visitConfiguredTargets(cfg, Cleanup{ .io = io, .metrics = metrics, .close_stream = close }, Cleanup.target);
+}
+
+fn expireConfigPools(cfg: *ServerConfig, now_ms: i64, callbacks: Callbacks) void {
+    const Expiry = struct {
+        now_ms: i64,
+        callbacks: Callbacks,
+
+        fn target(self: @This(), upstream: *UpstreamConfig) void {
+            @import("upstream_connection.zig").expireIdle(upstream, self.now_ms, self.callbacks);
         }
     };
-    if (cfg.h2_upstream) |*upstream| Cleanup.target(io, upstream, metrics, close);
-    if (cfg.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
-    for (cfg.routes.items) |*route| if (route.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
-    for (cfg.domains.items) |*domain| {
-        if (domain.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
-        for (domain.routes.items) |*route| if (route.upstream) |*pool| Cleanup.pool(io, pool, metrics, close);
+    visitConfiguredTargets(cfg, Expiry{ .now_ms = now_ms, .callbacks = callbacks }, Expiry.target);
+}
+
+pub fn idlePoolTask(ctx: MaintenanceContext) void {
+    ctx.callbacks.bind_thread_io(ctx.io);
+    while (!ctx.callbacks.shutdown_requested.load(.acquire)) {
+        {
+            var lease = ctx.acquire_config();
+            defer lease.deinit();
+            if (@import("upstream_connection.zig").keepaliveConfigured(lease.cfg))
+                expireConfigPools(lease.cfg, ctx.callbacks.upstream_now_ms(), ctx.callbacks);
+        }
+        @import("shutdown_wait.zig").sleepUntilShutdown(ctx.io, ctx.maintenance_wake, 250);
     }
 }
 
@@ -529,7 +563,7 @@ fn runHealthCheckCycle(schedule: *HealthSchedule, allocator: std.mem.Allocator, 
     return schedule.delay(callbacks.upstream_now_ms());
 }
 
-pub fn healthCheckTask(ctx: HealthCheckContext) void {
+pub fn healthCheckTask(ctx: MaintenanceContext) void {
     const previous_cancel = request_cancel.active;
     request_cancel.active = ctx.callbacks.shutdown_requested;
     defer request_cancel.active = previous_cancel;

@@ -50,16 +50,20 @@ pub const Context = struct {
 };
 
 const Workers = struct {
-    const Kind = enum(u8) { none, accept_wake, redirect, reload, health, http3, admin, acme };
+    const Kind = enum(u8) { none, accept_wake, redirect, reload, health, idle_pool, http3, admin, acme };
 
-    threads: [8]?std.Thread = @splat(null),
-    kinds: [8]Kind = @splat(.none),
+    threads: [9]?std.Thread = @splat(null),
+    kinds: [9]Kind = @splat(.none),
     count: usize = 0,
     joining: std.atomic.Value(Kind) = .init(.none),
 
     fn start(self: *Workers, kind: Kind, comptime task: anytype, args: anytype) !void {
         if (self.count == self.threads.len) return error.TooManyBackgroundWorkers;
-        self.threads[self.count] = try std.Thread.spawn(.{}, task, args);
+        self.threads[self.count] = try std.Thread.spawn(
+            if (kind == .idle_pool) .{ .stack_size = 256 * 1024 } else .{},
+            task,
+            args,
+        );
         self.kinds[self.count] = kind;
         self.count += 1;
     }
@@ -291,13 +295,15 @@ fn startRedirectListener(
 
 fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State, maintenance_wake: *std.Io.Event) !void {
     try workers.start(.reload, reloadSignalTask, .{ ctx, state, maintenance_wake });
+    const upstream_context: upstream_runtime.MaintenanceContext = .{
+        .io = ctx.io,
+        .acquire_config = ctx.callbacks.acquire_config,
+        .callbacks = ctx.callbacks.upstream,
+        .maintenance_wake = maintenance_wake,
+    };
+    try workers.start(.idle_pool, upstream_runtime.idlePoolTask, .{upstream_context});
     {
-        workers.start(.health, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{
-            .io = ctx.io,
-            .acquire_config = ctx.callbacks.acquire_config,
-            .callbacks = ctx.callbacks.upstream,
-            .maintenance_wake = maintenance_wake,
-        }}) catch |err| {
+        workers.start(.health, upstream_runtime.healthCheckTask, .{upstream_context}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return err;
         };
