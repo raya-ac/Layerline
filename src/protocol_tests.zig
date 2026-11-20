@@ -65,6 +65,7 @@ test {
     _ = @import("php_version.zig");
     _ = @import("php_runtime.zig");
     _ = @import("server_runtime.zig");
+    _ = @import("shutdown_wait.zig");
     _ = @import("concurrency.zig");
     _ = @import("read_deadline.zig");
     _ = @import("write_deadline.zig");

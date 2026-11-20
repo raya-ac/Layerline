@@ -194,7 +194,7 @@ fn renderActivationConfigDiff(io: std.Io, allocator: std.mem.Allocator, active: 
     return config_diff.render(allocator, active, candidate);
 }
 
-fn reloadSignalWatcherTask(io: std.Io) void {
+fn reloadSignalWatcherTask(io: std.Io, maintenance_wake: *std.Io.Event) void {
     bindThreadIo(io);
     while (!runtime_state.shutdown_requested.load(.acquire)) {
         if (resource_budget.pressure.swap(false, .acq_rel)) {
@@ -214,7 +214,7 @@ fn reloadSignalWatcherTask(io: std.Io) void {
             };
             std.debug.print("SIGHUP config reload completed for new connections.\n", .{});
         }
-        io.sleep(.fromMilliseconds(100), .awake) catch {};
+        @import("shutdown_wait.zig").sleepUntilShutdown(io, maintenance_wake, 100);
     }
 }
 

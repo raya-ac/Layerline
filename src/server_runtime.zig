@@ -31,7 +31,7 @@ pub const Callbacks = struct {
     bind_thread_io: *const fn (std.Io) void,
     http1: http1_runtime.Callbacks,
     http3: http3_server.Callbacks,
-    reload_signal: *const fn (std.Io) void,
+    reload_signal: *const fn (std.Io, *std.Io.Event) void,
     upstream: upstream_runtime.Callbacks,
 };
 
@@ -81,6 +81,7 @@ const ShutdownDeadlineContext = struct {
     workers_stopped: *std.atomic.Value(bool),
     connections: *concurrency_mod.State,
     workers: *Workers,
+    maintenance_wake: *std.Io.Event,
     admin: ?*admin_listener.Listener,
 };
 
@@ -121,6 +122,8 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     const start = std.Io.Timestamp.now(ctx.io, .awake);
+    // The signal handler only sets the flag. Wake sleepers from normal thread context.
+    state.maintenance_wake.set(ctx.io);
     ctx.supervisor.stopping(ctx.io);
     var cleanup_started = false;
     while (!state.complete.load(.acquire)) {
@@ -145,9 +148,9 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
     }
 }
 
-fn reloadSignalTask(ctx: Context, state: *listener_state.State) void {
+fn reloadSignalTask(ctx: Context, state: *listener_state.State, maintenance_wake: *std.Io.Event) void {
     if (!state.awaitReady(ctx.io)) return;
-    ctx.callbacks.reload_signal(ctx.io);
+    ctx.callbacks.reload_signal(ctx.io, maintenance_wake);
 }
 
 fn http3Task(ctx: Context, listener: *http3_server.Listener, state: *listener_state.State) void {
@@ -286,10 +289,15 @@ fn startRedirectListener(
     std.debug.print("HTTP redirect listener on http://{s}:{d} -> https port {d} status {d}\n", .{ ctx.cfg.host, ctx.cfg.http_redirect_port, ctx.cfg.http_redirect_https_port, ctx.cfg.http_redirect_status });
 }
 
-fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State) !void {
-    try workers.start(.reload, reloadSignalTask, .{ ctx, state });
+fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State, maintenance_wake: *std.Io.Event) !void {
+    try workers.start(.reload, reloadSignalTask, .{ ctx, state, maintenance_wake });
     {
-        workers.start(.health, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
+        workers.start(.health, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{
+            .io = ctx.io,
+            .acquire_config = ctx.callbacks.acquire_config,
+            .callbacks = ctx.callbacks.upstream,
+            .maintenance_wake = maintenance_wake,
+        }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return err;
         };
@@ -313,6 +321,7 @@ fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Li
             .io = ctx.io,
             .acquire_config = ctx.callbacks.acquire_config,
             .shutdown_requested = ctx.shutdown_requested,
+            .maintenance_wake = maintenance_wake,
             .bind_thread_io = ctx.callbacks.bind_thread_io,
             .renew_certs = ctx.callbacks.admin.renew_certs,
         }}) catch |err| {
@@ -399,9 +408,19 @@ pub fn run(ctx: Context) !void {
     var workers = Workers{};
     var shutdown_complete = std.atomic.Value(bool).init(false);
     var workers_stopped = std.atomic.Value(bool).init(false);
-    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .workers_stopped = &workers_stopped, .connections = &concurrency, .workers = &workers, .admin = if (admin) |*value| value else null }});
+    var maintenance_wake: std.Io.Event = .unset;
+    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{
+        .ctx = ctx,
+        .complete = &shutdown_complete,
+        .workers_stopped = &workers_stopped,
+        .connections = &concurrency,
+        .workers = &workers,
+        .maintenance_wake = &maintenance_wake,
+        .admin = if (admin) |*value| value else null,
+    }});
     defer {
         ctx.shutdown_requested.store(true, .release);
+        maintenance_wake.set(ctx.io);
         ctx.supervisor.stopping(ctx.io);
         std.debug.print("Shutdown requested; draining workers for up to {d}ms.\n", .{ctx.cfg.graceful_shutdown_timeout_ms});
         concurrency.beginDrain(ctx.io);
@@ -423,7 +442,7 @@ pub fn run(ctx: Context) !void {
         try startRedirectListener(ctx, &workers, http_server, &concurrency, &redirect_listener_closed_by_shutdown, &listeners);
     }
 
-    try startBackgroundWorkers(ctx, &workers, if (h3) |*value| value else null, if (admin) |*value| value else null, &listeners);
+    try startBackgroundWorkers(ctx, &workers, if (h3) |*value| value else null, if (admin) |*value| value else null, &listeners, &maintenance_wake);
     if (ctx.shutdown_requested.load(.acquire)) {
         try listeners.result();
         return;

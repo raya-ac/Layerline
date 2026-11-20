@@ -59,6 +59,7 @@ pub const HealthCheckContext = struct {
     io: std.Io,
     acquire_config: *const fn () config_store.Lease,
     callbacks: Callbacks,
+    maintenance_wake: *std.Io.Event,
 };
 
 const UpstreamConnectionLease = upstream_connection.Lease;
@@ -602,15 +603,6 @@ fn runHealthCheckCycle(schedule: *HealthSchedule, allocator: std.mem.Allocator, 
     return schedule.delay(callbacks.upstream_now_ms());
 }
 
-fn sleepHealthInterval(io: std.Io, interval_ms: u32, callbacks: Callbacks) void {
-    var remaining = interval_ms;
-    while (remaining > 0 and !callbacks.shutdown_requested.load(.acquire)) {
-        const chunk = @min(remaining, 250);
-        io.sleep(.fromMilliseconds(chunk), .awake) catch {};
-        remaining -= chunk;
-    }
-}
-
 pub fn healthCheckTask(ctx: HealthCheckContext) void {
     const previous_cancel = request_cancel.active;
     request_cancel.active = ctx.callbacks.shutdown_requested;
@@ -624,7 +616,7 @@ pub fn healthCheckTask(ctx: HealthCheckContext) void {
             defer lease.deinit();
             break :cycle runHealthCheckCycle(&schedule, resource_budget.allocator(), lease.cfg, ctx.callbacks) catch 250;
         };
-        sleepHealthInterval(ctx.io, delay, ctx.callbacks);
+        @import("shutdown_wait.zig").sleepUntilShutdown(ctx.io, ctx.maintenance_wake, delay);
     }
 }
 

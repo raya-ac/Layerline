@@ -263,9 +263,11 @@ certificate tools now use the owned child runner and
 
 The server retains and joins background threads before freeing runtime state,
 including the reload watcher, health checker, admin socket, QUIC listener, and
-optional redirect and renewal workers. QUIC's receive loop checks for shutdown
-between bounded receive waits. A locked connection registry interrupts idle
-HTTP/1 and HTTP/2 reads without shutting down active uploads or response writes.
+optional redirect and renewal workers. Shutdown wakes sleeping reload, health
+and renewal workers without waiting out their polling intervals. QUIC's receive
+loop checks for shutdown between bounded receive waits. A locked connection
+registry interrupts idle HTTP/1 and HTTP/2 reads without shutting down active
+uploads or response writes.
 Workers unlink before closing sockets, so shutdown cannot target a reused file
 descriptor. Connection workers close their stream and finish
 metrics updates before publishing their final concurrency release.

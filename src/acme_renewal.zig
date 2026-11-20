@@ -7,6 +7,7 @@ pub const Context = struct {
     io: std.Io,
     acquire_config: *const fn () config_store.Lease,
     shutdown_requested: *std.atomic.Value(bool),
+    maintenance_wake: *std.Io.Event,
     bind_thread_io: *const fn (std.Io) void,
     renew_certs: *const fn (std.Io, std.mem.Allocator, *const config_mod.ServerConfig) anyerror!void,
 };
@@ -55,7 +56,7 @@ pub fn renewalTask(ctx: Context) void {
             }
         }
         // Only numeric schedule state survives sleep, never a config pointer.
-        ctx.io.sleep(.fromMilliseconds(250), .awake) catch {};
+        @import("shutdown_wait.zig").sleepUntilShutdown(ctx.io, ctx.maintenance_wake, 250);
     }
 }
 
