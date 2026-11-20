@@ -49,8 +49,10 @@ check may discard a connection with harmless pending session tickets too.
 Eviction, failed requests, retirement and shutdown release the channel before its
 socket. Upgraded tunnels bind the two independent TLS directions in both joined
 pump threads and send encrypted close-notify before a TCP write-half-close.
-The HTTP/2 proxy remains buffered and non-pooled; this work does not add backend
-HTTP/2 ALPN or streaming final response bodies.
+
+HTTP/2 clients can receive streamed proxy bodies. Layerline still opens a new
+HTTP/1.1 origin connection for each of those requests; there's no origin
+pooling or HTTP/2 ALPN on that path.
 
 ## channel implementation
 
