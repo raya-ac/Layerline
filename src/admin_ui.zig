@@ -104,7 +104,7 @@ pub fn appendAdminShellStart(out: *std.ArrayList(u8), allocator: std.mem.Allocat
         \\<header>
         \\  <a class="brand" href="{s}">
         \\    <img src="/favicon.svg" alt="">
-        \\    <span><strong>Layerline Admin</strong><span>disabled unless explicitly enabled</span></span>
+        \\    <strong>Layerline admin</strong>
         \\  </a>
         \\  <nav>
         \\    <a class="navlink" href="/">Site</a>
@@ -144,7 +144,7 @@ pub fn renderAdminSetupPage(allocator: std.mem.Allocator, cfg: *const ServerConf
     try appendAdminShellStart(&out, allocator, cfg, "First Launch Setup");
     try out.appendSlice(allocator,
         \\<h1>First launch setup</h1>
-        \\<p class="lede">Create the first admin account with the setup token from the server.</p>
+        \\<p class="lede">Read the setup token beside the credentials file on the server.</p>
         \\<div class="panel"><div class="panel-inner">
         \\
     );
@@ -156,7 +156,7 @@ pub fn renderAdminSetupPage(allocator: std.mem.Allocator, cfg: *const ServerConf
         \\  <label>Username<input name="username" autocomplete="username" required minlength="2" maxlength="64"></label>
         \\  <label>Password<input type="password" name="password" autocomplete="new-password" required minlength="8"></label>
         \\  <label>Confirm password<input type="password" name="password_confirm" autocomplete="new-password" required minlength="8"></label>
-        \\  <div class="actions"><button class="primary" type="submit">Create admin access</button></div>
+        \\  <div class="actions"><button class="primary" type="submit">Create account</button></div>
         \\</form>
         \\</div></div>
         \\
@@ -173,7 +173,6 @@ pub fn renderAdminLoginPage(allocator: std.mem.Allocator, cfg: *const ServerConf
     try appendAdminShellStart(&out, allocator, cfg, "Login");
     try out.appendSlice(allocator,
         \\<h1>Admin login</h1>
-        \\<p class="lede">Use the local admin account created during first launch. The dashboard is served by Layerline itself, under the configured admin path.</p>
         \\<div class="panel"><div class="panel-inner">
         \\
     );
@@ -221,11 +220,11 @@ fn appendAdminUpstreamSummary(out: *std.ArrayList(u8), allocator: std.mem.Alloca
 pub fn appendAdminActiveSites(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     try out.appendSlice(allocator,
         \\<section class="block span-all" id="sites">
-        \\  <div class="section-head"><div><h2>Sites</h2><p>Active virtual hosts loaded into this process.</p></div></div>
+        \\  <div class="section-head"><h2>Running sites</h2></div>
         \\
     );
     if (cfg.domains.items.len == 0) {
-        try out.appendSlice(allocator, "<p class=\"notice\">No domain configs are active yet. Add a site below, then use managed restart until in-memory reload lands.</p></section>\n");
+        try out.appendSlice(allocator, "<p class=\"notice\">No sites loaded. Add a site, then reload the config.</p></section>\n");
         return;
     }
     try out.appendSlice(allocator,
@@ -255,7 +254,7 @@ pub fn appendAdminActiveSites(out: *std.ArrayList(u8), allocator: std.mem.Alloca
 pub fn appendAdminDomainFiles(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     try out.appendSlice(allocator,
         \\<section class="block" id="config-files">
-        \\  <div class="section-head"><div><h2>Enabled files</h2><p>Files under the configured domain directory.</p></div></div>
+        \\  <div class="section-head"><h2>Site files on disk</h2></div>
         \\
     );
     const dir_path = cfg.domain_config_dir orelse {
@@ -306,7 +305,7 @@ pub fn appendAdminDomainFiles(io: std.Io, out: *std.ArrayList(u8), allocator: st
 pub fn appendAdminCacheControls(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     try out.appendSlice(allocator,
         \\<section class="block" id="cache">
-        \\  <div class="section-head"><div><h2>Cache</h2><p>Clear in-process static and buffered response cache entries without restarting Layerline.</p></div><span class="pill">memory cache</span></div>
+        \\  <div class="section-head"><h2>Cache</h2></div>
         \\  <div class="panel"><div class="panel-inner">
         \\  <form class="stack" method="post" action="
     );
@@ -395,7 +394,7 @@ pub fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Alloc
     defer allocator.free(proxy_value);
     try out.appendSlice(allocator,
         \\<section class="block span-all" id="settings">
-        \\  <div class="section-head"><div><h2>Settings</h2><p>Edit the main process config. Writes are staged to disk and take effect after managed restart until in-memory reload lands.</p></div><span class="pill">main config</span></div>
+        \\  <div class="section-head"><div><h2>Settings</h2><p>Saving writes to disk. Reload to apply compatible edits; listener changes need a restart.</p></div></div>
         \\  <div class="panel"><div class="panel-inner">
         \\
     );
@@ -456,7 +455,7 @@ pub fn appendAdminSettingsForm(out: *std.ArrayList(u8), allocator: std.mem.Alloc
 
     try out.appendSlice(allocator,
         \\  </div>
-        \\  <div class="actions"><button class="primary" type="submit">Save settings</button><span class="muted">A backup is written beside the config before overwrite.</span></div>
+        \\  <div class="actions"><button class="primary" type="submit">Save settings</button><span class="muted">Keeps a backup beside the config.</span></div>
         \\</form>
         \\</div></div></section>
         \\
@@ -467,7 +466,7 @@ pub fn appendAdminAddSiteForm(out: *std.ArrayList(u8), allocator: std.mem.Alloca
     const disabled = cfg.domain_config_dir == null;
     try out.appendSlice(allocator,
         \\<section class="block" id="add-site">
-        \\  <div class="section-head"><div><h2>Add site</h2><p>Write a nginx-style per-domain config file from the browser.</p></div></div>
+        \\  <div class="section-head"><h2>Add site</h2></div>
         \\
     );
     if (disabled) {

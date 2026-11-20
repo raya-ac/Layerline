@@ -1,10 +1,11 @@
-# Layerline Deployment
+# deploying layerline
 
-This runbook is for replacing a front web server on a controlled host. It assumes the binary has already passed `zig build test`, a native release build, config validation, and at least one smoke test.
+build and test the exact revision you plan to run. validate the config and
+try the new binary on a separate listener before it takes public traffic.
 
-## Filesystem Layout
+## filesystem layout
 
-Use predictable paths so service files, certbot, and rollback scripts agree:
+these paths match the packaged service:
 
 ```text
 /usr/local/bin/layerline
@@ -16,7 +17,7 @@ Use predictable paths so service files, certbot, and rollback scripts agree:
 /var/log/layerline
 ```
 
-Create a service user:
+create a service user:
 
 ```bash
 sudo useradd --system --home /var/lib/layerline --shell /usr/sbin/nologin layerline
@@ -24,7 +25,7 @@ sudo mkdir -p /etc/layerline/domains-enabled /run/layerline /var/www/layerline/p
 sudo chown -R layerline:layerline /run/layerline /var/www/layerline /var/lib/layerline /var/log/layerline
 ```
 
-Install the binary and config:
+install the binary and config:
 
 ```bash
 zig build -Doptimize=ReleaseFast
@@ -35,7 +36,7 @@ sudo cp -R public/. /var/www/layerline/public/
 
 ## Linux systemd
 
-Install the unit:
+install the unit:
 
 ```bash
 sudo cp deploy/systemd/layerline.service /etc/systemd/system/layerline.service
@@ -44,7 +45,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now layerline
 ```
 
-Validate and apply config edits:
+validate and reload config edits:
 
 ```bash
 sudo -u layerline /usr/local/bin/layerline --validate-config --config /etc/layerline/server.conf
@@ -52,7 +53,11 @@ sudo systemctl reload layerline
 sudo journalctl -u layerline -f
 ```
 
-The packaged unit validates the config file first, then sends `SIGHUP` so Layerline can load a compatible config snapshot without dropping existing connections. Listener-bound edits still need `sudo systemctl restart layerline`. The unit grants `CAP_NET_BIND_SERVICE` so Layerline can bind ports below 1024 without running as root. Its file-descriptor ceiling is `LimitNOFILE=65536`; adjust it for the intended connection count and upstream pools without exceeding the host's global limits.
+the unit validates the config before sending `SIGHUP`. compatible edits
+reload without dropping existing connections. use `sudo systemctl restart
+layerline` for listener changes. `CAP_NET_BIND_SERVICE` lets Layerline
+listen below port 1024 without running as root. the unit sets
+`LimitNOFILE=65536`; size it for your connections and upstream pools.
 
 The unit uses `Type=notify` and `NotifyAccess=main`. Layerline sends native
 `READY=1` only after certificate setup, all configured listener binds and

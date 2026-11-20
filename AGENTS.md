@@ -1,9 +1,10 @@
 # writing in layerline
 
-use the README as the voice reference. keep project copy conversational and
-mostly lowercase. keep protocol names, commands and config keys exact.
+use the README as the voice reference for docs, UI copy, help text, comments
+and commit messages. write like you're telling someone how your server works.
+keep it mostly lowercase. keep protocol names, commands and config keys exact.
 
-say what works, what was tested, and what's still missing. skip slogans,
-release hype and assistant boilerplate. use short lowercase commit subjects
-that say what changed. comments should explain the reason a line needs to be
-there; don't narrate the code.
+say what works, what you checked and what still breaks. skip slogans, release
+hype and assistant boilerplate. keep commit subjects short and lowercase.
+write a comment when the reason for the code isn't obvious. don't explain the
+line back to whoever's reading it.

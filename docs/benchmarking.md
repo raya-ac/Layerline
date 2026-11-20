@@ -1,55 +1,50 @@
-# Layerline Benchmarking
+# benchmarking layerline
 
-This harness targets a running Layerline process. It does not build or start the
-server, so it can be used against a local dev process, a staging host, or a
-production origin behind a controlled test window.
+the script hits a server that's already running. it won't build or start one.
+use a local or staging server unless you've set aside time to load test prod.
 
-Start Layerline separately, for example:
+start the server first:
 
 ```bash
-zig build run -- --config server.conf
+zig build run -- --config examples/local.conf
 ```
 
-Then run the benchmark:
+then run the benchmark:
 
 ```bash
 ./scripts/benchmark-layerline.sh
 ```
 
-The default target is `http://127.0.0.1:8080`. Override it for another host:
+it defaults to `http://127.0.0.1:8080`. to test another address:
 
 ```bash
 LAYERLINE_URL=http://127.0.0.1:4000 ./scripts/benchmark-layerline.sh
 ```
 
-For a larger run:
+for a longer run with more connections:
 
 ```bash
 BENCH_DURATION=30s BENCH_CONNECTIONS=128 ./scripts/benchmark-layerline.sh
 ```
 
-## What It Measures
+## what it measures
 
-The script first performs production smoke checks for the HTTP/1 endpoints:
+it checks these over HTTP/1 first:
 
 - `GET /`
 - `GET /static/hello.txt`
 - `GET /health`
 
-It then benchmarks those same endpoints using the first available tool in this
-order: `oha`, `wrk`, `hey`, `ab`. The benchmark tool runs with keep-alive enabled
-where the tool supports it; `ab` is invoked with `-k`. `oha`, `wrk`, and `hey`
-use `BENCH_DURATION`; `ab` uses `BENCH_REQUESTS` because ApacheBench is
-request-count oriented.
+then it benchmarks those URLs with the first tool it finds: `oha`, `wrk`,
+`hey` or `ab`. it keeps connections open where it can and passes `-k` to
+`ab`. `ab` uses `BENCH_REQUESTS`; the other three use `BENCH_DURATION`.
 
-If OpenSSL exposes QUIC support through `openssl s_client -quic`, the harness
-also attempts a best-effort HTTP/3 smoke against `LAYERLINE_H3_URL`, defaulting
-to `https://127.0.0.1:8443/`. It writes a small stream payload and checks for
-Layerline's native default-page response. This is still not a full HTTP/3 load
-test. If the local OpenSSL build does not support QUIC, the check is reported as
-skipped.
+if `openssl s_client` has `-quic`, it also checks the default page at
+`LAYERLINE_H3_URL` (`https://127.0.0.1:8443/` by default). that tells you
+whether the page came back over HTTP/3. it isn't a load test. without QUIC
+support the script reports a skip.
 
-## Useful Knobs
+## settings
 
 ```bash
 LAYERLINE_URL=http://127.0.0.1:8080
@@ -65,30 +60,26 @@ BENCH_THREADS=4
 BENCH_REQUESTS=10000
 ```
 
-Use smoke-only mode for deployment checks:
+check the URLs without load testing:
 
 ```bash
 ./scripts/benchmark-layerline.sh --verify-only
 ```
 
-Skip the best-effort HTTP/3 probe when the native UDP listener is not expected
-to be running:
+skip HTTP/3 if the UDP listener is off:
 
 ```bash
 ./scripts/benchmark-layerline.sh --no-h3
 ```
 
-Make the HTTP/3 smoke fatal when a release candidate is expected to have native
-HTTP/3 enabled:
+fail the run if HTTP/3 is required but doesn't work:
 
 ```bash
 LAYERLINE_H3_REQUIRED=1 ./scripts/benchmark-layerline.sh --verify-only
 ```
 
-## Reading Results
+## reading results
 
-Treat the output as comparative data for the same machine, same server build,
-same config, and same benchmark tool. The useful fields are requests per second,
-latency distribution, non-2xx/3xx responses, socket errors, and transfer rate.
-For production runs, keep the window short, record the exact command, and avoid
-mixing results from different tools as if they were equivalent.
+keep the machine, config and tool the same when comparing builds. look at
+latency and errors as well as requests per second; fast errors don't count as
+an improvement. keep prod runs short and record the exact command.

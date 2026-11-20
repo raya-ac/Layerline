@@ -4,10 +4,11 @@ examples for setting up sites and operating layerline. read the [security notes]
 
 ## Config file
 
-Use `--config` to load a base config, then override values with CLI flags.
-From the project root, `server.conf` loads automatically when present unless you pass a custom `--config`.
-With `serve_static_root` enabled, unknown paths are checked against local static files first, then forwarded upstream.
-Validate a config without opening sockets:
+pass `--config` to pick a file. if you leave it out, Layerline looks for
+`server.conf` in the working directory. CLI flags win over the file.
+with `serve_static_root` on, unmatched paths try local files before proxying.
+
+check the config without starting the listener:
 
 ```bash
 zig build run -- --validate-config
@@ -19,9 +20,7 @@ zig build run -- --admin-command status
 zig build run -- --reload
 ```
 
-Config files are strict: unknown keys, malformed lines, invalid booleans, invalid numbers, invalid headers, and invalid redirects fail with a line-numbered error.
-
-Example `server.conf`:
+typos in keys or values fail with a line number. here's a `server.conf`:
 
 ```text
 # server.conf
@@ -60,7 +59,7 @@ proxy = off
 #upstream_keepalive_max_idle = 16
 #upstream_keepalive_idle_timeout_ms = 30000
 #upstream_keepalive_max_requests = 100
-# Active health checks are opt-in and mark unhealthy targets before user traffic hits them.
+# probe origins even when no requests are coming in.
 #upstream_health_check = false
 #upstream_health_check_path = /health
 #upstream_health_check_interval_ms = 5000
@@ -80,13 +79,12 @@ proxy = off
 #route = api /api/* proxy
 #route_proxy.api = http://127.0.0.1:9000, http://127.0.0.1:9001
 #route_proxy_timeout_ms.api = 15000
-# Nginx-style per-domain files live outside this main runtime config.
-# Put .conf files in domains-enabled/ and enable this:
+# keep one file per site in this directory.
 #domain_config_dir = domains-enabled
 # Use proxy or named proxy routes for native HTTP/1 and HTTP/2 clients.
 # Local admin socket: status, validate activation config, diff activation config, redacted config inspection, cache purge, restart, routes, upstreams, cert-renew, certs, metrics.
 #admin_socket = /tmp/layerline-admin.sock
-# Browser admin UI is disabled by default and creates access on first launch.
+# web admin stays off until enabled. setup needs a token from the server.
 #admin_ui = false
 #admin_ui_path = /_layerline/admin
 #admin_credentials_path = .layerline-admin
@@ -150,17 +148,13 @@ max_concurrent_connections = 1024
 
 ## HTTP/2 and HTTP/3
 
-This server now terminates native TLS 1.3 on the TCP listener and uses ALPN to route HTTP/1.1 or HTTP/2 on the same socket:
+the TCP listener uses ALPN to pick HTTP/2 or HTTP/1.1 over TLS 1.3. clients
+without ALPN get HTTP/1.1. cleartext clients can use h2c. that doesn't mean
+Layerline speaks HTTP/2 to an origin; the origin side still uses HTTP/1.1.
 
-- Native HTTPS supports TLS 1.3 with X25519, TLS_AES_128_GCM_SHA256, ECDSA P-256/SHA-256 certificates, RSA-PSS/SHA-256 certificates, and Ed25519 fallback.
-- HTTP/2 is served directly over TLS when the client selects `h2`, and HTTP/1.1 stays on the existing router when the client selects `http/1.1` or sends no ALPN.
-- HTTP/2 cleartext (`h2c`) is still supported for local or upstream cleartext workflows.
-- Native HTTP/3 can be started with `--http3 true --http3-port 8443`.
-- The current native HTTP/3 path decrypts QUIC v1 Initial packets, completes a TLS 1.3 `h3` handshake with an in-process self-signed Ed25519 certificate, derives Handshake and 1-RTT packet keys, accepts a client request stream, decodes simple QPACK request fields, assembles ordered and out-of-order DATA request bodies across stream frames, and reuses the buffered route builder for static, PHP/FastCGI, proxy, redirect, metrics, health, custom 404, or built-in Layerline responses as HTTP/3 HEADERS + DATA.
-- HTTP/3 connection state is tracked per QUIC connection ID with a bounded in-process table, so concurrent handshakes no longer share one global assembly buffer.
-- HTTP/3 request-body routing is intentionally still narrow: body methods are routed only when the DATA body has been assembled or Content-Length is zero; full flow-control behavior and broader client conformance remain open while HTTP/1 and HTTP/2 keep the full body-handling surface.
-
-Run with:
+HTTP/3 uses a separate UDP port and a self-signed certificate. it can handle
+requests and buffered routes, but full flow control and client compatibility
+aren't there yet. leave it off in production. to try it locally:
 
 ```bash
 zig build run -- --config server.conf --http3 true --http3-port 8443
@@ -258,7 +252,7 @@ snapshots, readers and owned reload-arena bytes (not full process RSS).
 
 ## Admin Web UI
 
-The browser admin UI is disabled by default. Enable it only on a trusted admin path:
+web admin is off by default. only turn it on where you trust the network:
 
 ```conf
 admin_ui = true
@@ -267,9 +261,24 @@ admin_credentials_path = /etc/layerline/admin.credentials
 domain_config_dir = domains-enabled
 ```
 
-On first launch, `GET /_layerline/admin` shows a setup form and creates a mode-0600 `.<credentials-basename>.setup-token` beside the credentials path. Read that token locally or over SSH and enter it in the form; it is never included in the page. Creating the account removes the token file. Sign-ins use random, expiring, revocable sessions. Non-loopback admin listeners require native TLS; cookies are Secure on TLS. Keep the credentials directory outside every public root. See [admin access](security.md#admin-access) for the full policy.
+open `/_layerline/admin` once to create the setup token. read
+`.<credentials-basename>.setup-token` beside the credentials file locally or
+over SSH. it's mode 0600 and never sent to the browser. enter the token to
+create an account. that removes the token file.
 
-The dashboard is now an actual control surface: it lists active virtual hosts, saves staged main-server settings with a backup, shows redacted previews of the main config and enabled domain files, validates and reloads the activation config, shows an activation diff against the running config, exposes status/routes/upstreams/certs/metrics, can eject or recover live upstream targets, can purge all or matching in-process cache entries through the form or authenticated JSON endpoint at `/api/cache/purge`, can trigger configured Let’s Encrypt renewal and TLS material reload, can create new nginx-style site files under `domain_config_dir`, and can request a graceful managed restart after preflight passes. Main-setting and site-file writes are deliberately staged: use reload for compatible route/domain/header/TLS-material changes, and use managed restart for listener-bound changes.
+sign-ins use random sessions that expire and can be revoked. admin needs
+native TLS outside loopback and sets Secure cookies on TLS. keep the credentials
+outside every public root. see [admin access](security.md#admin-access).
+
+saving settings backs up the main config and writes the new one to disk.
+adding a site writes a file under `domain_config_dir`. neither applies the
+change. check the diff, then reload for compatible site, route, header or
+certificate edits. listener changes need a managed restart.
+
+the dashboard shows running sites, routes, upstreams, certificates and
+metrics. secrets are redacted in config previews. you can eject or recover
+an upstream, renew configured certificates and clear all or matching cache
+entries. the authenticated JSON cache endpoint is `/api/cache/purge`.
 
 ## Access Logs
 
@@ -344,7 +353,8 @@ redirect = /docs/* /documentation/ 308
 
 ## Named Routes
 
-Named routes are the route-local config surface that future Caddy/nginx-class behavior will hang from. A route line has a name, a match pattern, and a handler:
+use named routes when a path needs its own handler or settings. give each
+route a name, a path or prefix, and a handler:
 
 ```conf
 route = assets /assets/* static

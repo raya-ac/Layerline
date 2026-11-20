@@ -160,7 +160,7 @@ fn appendMainConfigPreview(
 ) !void {
     try out.appendSlice(allocator,
         \\<section class="block span-all" id="config">
-        \\  <div class="section-head"><div><h2>Config management</h2><p>Activation preflight plus redacted previews of the main config and enabled site files.</p></div><span class="pill">managed restart applies writes</span></div>
+        \\  <div class="section-head"><div><h2>Config on disk</h2><p>Secrets are hidden in the preview.</p></div></div>
         \\
     );
     try out.appendSlice(allocator, "<pre>");
@@ -231,7 +231,7 @@ pub fn renderDashboardPage(
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try admin_ui.appendAdminShellStart(&out, allocator, cfg, "Dashboard");
-    try out.appendSlice(allocator, "<h1>Control surface</h1>\n<p class=\"lede\">Manage site files, inspect the live route table, validate config, and see the runtime state from the same Layerline process handling traffic.</p>\n");
+    try out.appendSlice(allocator, "<h1>Dashboard</h1>\n");
     try out.appendSlice(allocator, "<div class=\"dashboard\">\n");
     try out.appendSlice(allocator, "<div class=\"actions\"><form method=\"post\" action=\"");
     try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
@@ -261,7 +261,7 @@ pub fn renderDashboardPage(
     try admin_ui.appendAdminSettingsForm(&out, allocator, cfg);
     try admin_ui.appendAdminAddSiteForm(&out, allocator, cfg);
     try appendMainConfigPreview(io, &out, allocator, cfg, validate_config);
-    try out.appendSlice(allocator, "<section class=\"block span-all\" id=\"config-diff\"><div class=\"section-head\"><div><h2>Activation diff</h2><p>Changes staged on disk compared with the config this process is serving.</p></div><span class=\"pill\">preflight view</span></div><pre>");
+    try out.appendSlice(allocator, "<section class=\"block span-all\" id=\"config-diff\"><div class=\"section-head\"><div><h2>Config diff</h2><p>Saved config compared with what's running.</p></div></div><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, activation_diff);
     try out.appendSlice(allocator, "</pre></section>\n");
     try admin_ui.appendAdminDomainFiles(io, &out, allocator, cfg);
@@ -272,7 +272,7 @@ pub fn renderDashboardPage(
     try admin_support.appendHtmlEscaped(&out, allocator, upstreams);
     try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"routes\"><h2>Routes</h2><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, routes);
-    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><div class=\"section-head\"><div><h2>Certificates</h2><p>Configured TLS material and ACME renewal counters.</p></div><form method=\"post\" action=\"");
+    try out.appendSlice(allocator, "</pre></section>\n<section class=\"block\" id=\"certs\"><div class=\"section-head\"><h2>Certificates</h2><form method=\"post\" action=\"");
     try admin_support.appendHtmlEscaped(&out, allocator, cfg.admin_ui_path);
     try out.appendSlice(allocator, "/certs/renew\"><button type=\"submit\">Renew certificates</button></form></div><pre>");
     try admin_support.appendHtmlEscaped(&out, allocator, certs);

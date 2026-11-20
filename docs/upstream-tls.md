@@ -1,13 +1,12 @@
 # upstream TLS work
 
-HTTPS origins use authenticated TLS 1.2/1.3 in both reverse-proxy paths and active
-health probes. The backend HTTP protocol is still HTTP/1.1, including when the
-downstream client uses HTTP/2. There is no plaintext downgrade or insecure mode.
-TLS on the client-facing listener is configured separately.
+Layerline verifies the origin's certificate for HTTPS proxy requests and
+health checks. it uses TLS 1.2 or 1.3 and HTTP/1.1 to the origin, even when the
+client uses HTTP/2. it won't fall back to plain HTTP or skip verification.
+configure the client-facing certificate separately.
 
-The certificate and channel probes remain developer-only executables, not server
-commands. Source support and passing local tests are not a production deployment
-receipt or a claim of complete TLS/PKIX conformance.
+the certificate and channel probes are test binaries. they don't ship with the
+server. the [remaining gaps](#remaining-boundaries) matter when picking an origin.
 
 ## configuration and ownership
 

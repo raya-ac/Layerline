@@ -135,7 +135,7 @@ fn handleValidatePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
         try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, null, message, 400, "Bad Request");
         return;
     };
-    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Activation config is valid. A managed restart can apply staged writes.", null, 200, "OK");
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Saved config passed validation. Nothing has been applied.", null, 200, "OK");
 }
 
 fn handleRestartPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
@@ -147,7 +147,7 @@ fn handleRestartPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cf
     };
 
     callbacks.request_restart();
-    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Graceful restart requested after activation config preflight passed.", null, 202, "Accepted");
+    try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, "Restart requested.", null, 202, "Accepted");
 }
 
 fn handleReloadPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cfg: *const ServerConfig, credentials: AdminCredentials, callbacks: Callbacks) !void {
@@ -309,7 +309,7 @@ fn handleAddSitePost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, cf
     };
     defer allocator.free(path);
 
-    const message = try std.fmt.allocPrint(allocator, "Created {s}. Restart Layerline for the new site to become active.", .{path});
+    const message = try std.fmt.allocPrint(allocator, "Created {s}. Reload the config to add the site.", .{path});
     defer allocator.free(message);
     try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, message, null, 201, "Created");
 }
@@ -447,7 +447,7 @@ fn handleSettingsPost(io: std.Io, reply: *Reply, allocator: std.mem.Allocator, c
     };
     defer allocator.free(path);
 
-    const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}. A backup was written when the file already existed. Restart Layerline for these changes to become active.", .{path});
+    const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}. Reload to apply compatible edits. Listener changes need a restart.", .{path});
     defer allocator.free(message);
     try callbacks.send_dashboard_page(io, reply, allocator, cfg, credentials, message, null, 200, "OK");
 }

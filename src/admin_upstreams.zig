@@ -276,7 +276,7 @@ fn appendPoolRows(
 pub fn appendAdminPanel(io: std.Io, out: *std.ArrayList(u8), allocator: std.mem.Allocator, cfg: *const ServerConfig) !void {
     try out.appendSlice(allocator,
         \\<section class="block span-all" id="upstreams">
-        \\  <div class="section-head"><div><h2>Upstreams</h2><p>Live proxy targets with manual ejection and recovery controls.</p></div><span class="pill">runtime state</span></div>
+        \\  <div class="section-head"><h2>Upstreams</h2></div>
         \\
     );
 
