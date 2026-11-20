@@ -329,17 +329,39 @@ curl --http2-prior-knowledge -fsSI http://127.0.0.1:8080/
 
 ## Rollback
 
-Keep release directories and switch a symlink:
+keep releases in separate directories and point the unit at the current one:
 
 ```text
 /opt/layerline/releases/<git-sha>/layerline
 /opt/layerline/current -> /opt/layerline/releases/<git-sha>
 ```
 
-Point `ExecStart` at `/opt/layerline/current/layerline`. Roll back by moving the symlink, validating the old config, and restarting:
+rehearse this with a separate unit and loopback port first. keep binaries and
+configs outside `/tmp` and `/var/tmp` when the unit uses `PrivateTmp=true`.
+those paths aren't the same inside the unit.
+
+point `ExecStart` at `/opt/layerline/current/layerline`. use the previous
+release's config if the current config no longer works with it. validate as the
+service user before moving the pointer. build the new link on the same filesystem
+so the rename replaces `current` without leaving it missing:
 
 ```bash
-sudo ln -sfn /opt/layerline/releases/<previous-sha> /opt/layerline/current
-sudo /opt/layerline/current/layerline --validate-config --config /etc/layerline/server.conf
-sudo systemctl restart layerline
+previous=/opt/layerline/releases/previous-release-sha
+sudo bash -s -- "$previous" <<'SH'
+set -eu
+release=$1
+runuser -u layerline -- "$release/layerline" --validate-config --config /etc/layerline/server.conf
+pending=$(mktemp -d /opt/layerline/.switch.XXXXXXXX)
+trap 'rm -f -- "$pending/current"; rmdir -- "$pending"' EXIT
+ln -s -- "$release" "$pending/current"
+mv -T -- "$pending/current" /opt/layerline/current
+systemctl restart layerline
+systemctl is-active layerline
+pid=$(systemctl show layerline -P MainPID)
+sha256sum "/proc/$pid/exe"
+SH
 ```
+
+compare that hash with the previous release's saved hash, then check health and
+site responses. a symlink pointing at the right directory doesn't prove that
+the running service is using it.
