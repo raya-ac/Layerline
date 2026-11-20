@@ -59,6 +59,7 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     var validate_only = false;
     var dump_routes = false;
     var dump_certs = false;
+    var check_cert_names = false;
     var doctor = false;
     var admin_command: ?[]const u8 = null;
     while (args.next()) |arg| {
@@ -79,6 +80,8 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
             dump_routes = true;
         } else if (std.mem.eql(u8, arg, "--dump-certs") or std.mem.eql(u8, arg, "--certs") or std.mem.eql(u8, arg, "--certificates")) {
             dump_certs = true;
+        } else if (std.mem.eql(u8, arg, "--check-cert-names")) {
+            check_cert_names = true;
         } else if (std.mem.eql(u8, arg, "--doctor")) {
             doctor = true;
         } else if (std.mem.eql(u8, arg, "--admin-command") or std.mem.eql(u8, arg, "--admin-cmd")) {
@@ -688,6 +691,7 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     if (dump_certs) {
         callbacks.dump_certs(cfg);
     }
+    if (check_cert_names) try @import("tls_name_check.zig").run(init.io, allocator, cfg);
     if (doctor) {
         const failures = callbacks.doctor(init.io, cfg);
         if (failures > 0) return error.DoctorFailed;
@@ -695,7 +699,7 @@ pub fn prepare(init: std.process.Init, allocator: std.mem.Allocator, cfg: *Serve
     if (admin_command) |command| {
         try callbacks.admin_command(init.io, allocator, cfg, command);
     }
-    if (validate_only or dump_routes or dump_certs or doctor or admin_command != null) {
+    if (validate_only or dump_routes or dump_certs or check_cert_names or doctor or admin_command != null) {
         return false;
     }
 

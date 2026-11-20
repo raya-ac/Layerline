@@ -863,6 +863,9 @@ python3 "$ROOT_DIR/scripts/verify-tls-diagnostics.py" "$SERVER_BINARY"
 log "verifying origin trust before startup side effects"
 python3 "$ROOT_DIR/scripts/verify-startup-materials.py" "$SERVER_BINARY"
 
+log "checking listener certificate names before startup"
+python3 "$ROOT_DIR/scripts/verify-cert-names.py" "$SERVER_BINARY"
+
 log "verifying configured certificate keys and rejected reloads"
 python3 "$ROOT_DIR/scripts/verify-listener-materials.py" "$SERVER_BINARY"
 

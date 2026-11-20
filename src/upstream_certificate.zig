@@ -247,6 +247,10 @@ pub const Certificate = struct {
         if (now < self.not_before) return error.CertificateNotYetValid;
         if (now > self.not_after) return error.CertificateExpired;
     }
+
+    pub fn checkConfiguredName(self: Certificate, configured_name: []const u8) !void {
+        return verifyConfiguredName(self.policy.san, configured_name);
+    }
 };
 
 fn publicKey(algorithm: Node, key: []const u8) !X509.Parsed.PubKeyAlgo {
@@ -451,6 +455,19 @@ pub fn verifyIdentity(san: []const u8, reference_input: []const u8) !void {
     return error.CertificateHostMismatch;
 }
 
+fn verifyConfiguredName(san: []const u8, configured_name: []const u8) !void {
+    if (!std.mem.startsWith(u8, configured_name, "*.")) return verifyIdentity(san, configured_name);
+    if (san.len == 0 or !dnsValid(configured_name, true)) return error.CertificateHostMismatch;
+    try validateNames(san);
+    // one literal SAN can't cover a configured wildcard.
+    var names: Cursor = .{ .bytes = san };
+    while (!names.done()) {
+        const item = try names.next(null);
+        if (item.tag == 0x82 and std.ascii.eqlIgnoreCase(item.value, configured_name)) return;
+    }
+    return error.CertificateHostMismatch;
+}
+
 fn validateConstraints(bytes: []const u8) !void {
     var fields: Cursor = .{ .bytes = bytes };
     var seen: u2 = 0;
@@ -627,6 +644,17 @@ test "service identities use SAN DNS and exact IP bytes, not common names" {
     }
     try std.testing.expectError(error.CertificateHostMismatch, verifyIdentity("\x82\x09127.0.0.1", "127.0.0.1"));
     try std.testing.expectError(error.CertificateHostMismatch, verifyIdentity("", "common-name.test"));
+}
+
+test "a configured wildcard needs the same wildcard in the certificate" {
+    const wildcard = "\x82\x0e*.example.test";
+    const literal = "\x82\x10api.example.test";
+    try verifyConfiguredName(wildcard, "*.EXAMPLE.TEST");
+    try verifyConfiguredName(wildcard, "api.example.test");
+    try std.testing.expectError(error.CertificateHostMismatch, verifyConfiguredName(literal, "*.example.test"));
+    try std.testing.expectError(error.CertificateHostMismatch, verifyConfiguredName(wildcard, "*.api.example.test"));
+    try std.testing.expectError(error.CertificateHostMismatch, verifyConfiguredName(wildcard, "*.*.example.test"));
+    try std.testing.expectError(error.CertificateMalformed, verifyConfiguredName(wildcard ++ "\x82\x01*", "*.example.test"));
 }
 
 test "calendar validation handles the UTC pivot and rejects impossible dates" {

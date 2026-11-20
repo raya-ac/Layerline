@@ -309,6 +309,12 @@ printf 'cert-renew\n' | nc -U /run/layerline/admin.sock
 ./scripts/benchmark-layerline.sh --verify-only --no-h3
 ```
 
+when Layerline terminates TLS for named sites, also check the certificates:
+
+```bash
+/usr/local/bin/layerline --check-cert-names --config /etc/layerline/server.conf
+```
+
 For a local release candidate before copying files onto the host, run the self-starting verifier:
 
 ```bash

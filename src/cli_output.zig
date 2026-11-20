@@ -332,7 +332,7 @@ pub fn usage() void {
     std.debug.print(
         "layerline: a web server, written in zig.\n\n" ++
             "usage:\n" ++
-            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--admin-command status|reload|restart] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
+            "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--check-cert-names] [--admin-command status|reload|restart] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
             "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] " ++

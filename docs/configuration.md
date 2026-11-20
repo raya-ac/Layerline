@@ -435,6 +435,14 @@ proxy_timeout_ms = 15000
 
 Set `tls = true` with global `tls_cert` and `tls_key` to load a fallback PEM certificate chain and private key directly into Layerline. Put `tls_cert` and `tls_key` in a domain config file when a virtual host needs its own certificate. Layerline selects the matching domain certificate from the ClientHello SNI name, then falls back to the global pair. If TLS is enabled without any cert/key pair, Layerline still accepts HTTPS with an ephemeral self-signed certificate for local testing.
 
+run `layerline --check-cert-names --config server.conf` after issuing the certs
+and before switching traffic. it checks the selected leaf's dates and SANs
+against the configured names without reading keys or opening listeners.
+a wildcard match only covers one label; it doesn't cover deeper subdomains
+that may match a wildcard route. catch-all names aren't checked. this doesn't
+verify the chain or prove what a running listener serves, so still test real
+connections with SNI and the expected trust store.
+
 Development TCP TLS reuses up to 64 hostname/signature-algorithm identities in
 memory for the process lifetime, including across config reloads. Restarting
 discards them; nothing is written to disk or made trusted. Configured certificates
