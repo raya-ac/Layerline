@@ -50,21 +50,28 @@ pub const Context = struct {
 };
 
 const Workers = struct {
-    threads: [8]?std.Thread = @splat(null),
-    count: usize = 0,
+    const Kind = enum(u8) { none, accept_wake, redirect, reload, health, http3, admin, acme };
 
-    fn start(self: *Workers, comptime task: anytype, args: anytype) !void {
+    threads: [8]?std.Thread = @splat(null),
+    kinds: [8]Kind = @splat(.none),
+    count: usize = 0,
+    joining: std.atomic.Value(Kind) = .init(.none),
+
+    fn start(self: *Workers, kind: Kind, comptime task: anytype, args: anytype) !void {
         if (self.count == self.threads.len) return error.TooManyBackgroundWorkers;
         self.threads[self.count] = try std.Thread.spawn(.{}, task, args);
+        self.kinds[self.count] = kind;
         self.count += 1;
     }
 
     fn join(self: *Workers) void {
         while (self.count > 0) {
             self.count -= 1;
+            self.joining.store(self.kinds[self.count], .release);
             self.threads[self.count].?.join();
             self.threads[self.count] = null;
         }
+        self.joining.store(.none, .release);
     }
 };
 
@@ -73,12 +80,33 @@ const ShutdownDeadlineContext = struct {
     complete: *std.atomic.Value(bool),
     workers_stopped: *std.atomic.Value(bool),
     connections: *concurrency_mod.State,
+    workers: *Workers,
     admin: ?*admin_listener.Listener,
 };
 
-fn forceShutdown(ctx: Context, connections: *concurrency_mod.State, admin: ?*admin_listener.Listener) noreturn {
+const ShutdownProgress = struct {
+    active_connections: usize,
+    background_workers_joined: bool,
+    joining_worker: Workers.Kind,
+
+    fn capture(connections: *concurrency_mod.State, workers: *Workers, stopped: *std.atomic.Value(bool)) ShutdownProgress {
+        return .{
+            .background_workers_joined = stopped.load(.acquire),
+            .active_connections = connections.active(),
+            .joining_worker = workers.joining.load(.acquire),
+        };
+    }
+
+    fn drained(self: ShutdownProgress) bool {
+        return self.background_workers_joined and self.active_connections == 0;
+    }
+};
+
+fn forceShutdown(ctx: Context, progress: ShutdownProgress, admin: ?*admin_listener.Listener) noreturn {
     _ = native_spawn.tryStopAll(ctx.io);
-    std.debug.print("{{\"event\":\"server.shutdown_timeout\",\"active_connections\":{d},\"timeout_ms\":{d}}}\n", .{ connections.active(), ctx.cfg.graceful_shutdown_timeout_ms });
+    // Child cancellation can finish a connection. Keep the state that actually
+    // triggered the guard, not a later zero that hides the unfinished owner.
+    std.debug.print("{{\"event\":\"server.shutdown_timeout\",\"active_connections\":{d},\"background_workers_joined\":{},\"joining_worker\":\"{s}\",\"timeout_ms\":{d}}}\n", .{ progress.active_connections, progress.background_workers_joined, @tagName(progress.joining_worker), ctx.cfg.graceful_shutdown_timeout_ms });
     if (admin) |listener| listener.removePath(ctx.io);
     // A worker may still borrow config, caches, or stack-owned state.
     // Let the OS reclaim them together; unwinding would free live memory.
@@ -109,8 +137,9 @@ fn shutdownDeadlineTask(state: ShutdownDeadlineContext) void {
         if (elapsed >= ctx.cfg.graceful_shutdown_timeout_ms) {
             // The main thread can still be asleep in its drain poll after the
             // last worker releases its lease. Nothing remains to force-kill.
-            if (state.workers_stopped.load(.acquire) and state.connections.active() == 0) return;
-            forceShutdown(ctx, state.connections, state.admin);
+            const progress = ShutdownProgress.capture(state.connections, state.workers, state.workers_stopped);
+            if (progress.drained()) return;
+            forceShutdown(ctx, progress, state.admin);
         }
         ctx.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
@@ -170,6 +199,7 @@ fn startShutdownWatcher(
     // closes them underneath accept. Windows retains its existing wake path.
     if (builtin.os.tag != .windows) return;
     workers.start(
+        .accept_wake,
         shutdownWatcherTask,
         .{ShutdownWatcherContext{
             .io = io,
@@ -238,6 +268,7 @@ fn startRedirectListener(
     try startShutdownWatcher(workers, ctx.io, redirect_server, redirect_closed, ctx.cfg, ctx.cfg.http_redirect_port, ctx.shutdown_requested, "HTTP redirect");
 
     workers.start(
+        .redirect,
         http1_runtime.serveHttpRedirectListenerTask,
         .{http1_runtime.HttpRedirectListenerContext{
             .io = ctx.io,
@@ -256,29 +287,29 @@ fn startRedirectListener(
 }
 
 fn startBackgroundWorkers(ctx: Context, workers: *Workers, h3: ?*http3_server.Listener, admin: ?*admin_listener.Listener, state: *listener_state.State) !void {
-    try workers.start(reloadSignalTask, .{ ctx, state });
+    try workers.start(.reload, reloadSignalTask, .{ ctx, state });
     {
-        workers.start(upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
+        workers.start(.health, upstream_runtime.healthCheckTask, .{upstream_runtime.HealthCheckContext{ .io = ctx.io, .acquire_config = ctx.callbacks.acquire_config, .callbacks = ctx.callbacks.upstream }}) catch |err| {
             std.debug.print("Failed to start upstream health checker: {}\n", .{err});
             return err;
         };
         if (config_mod.configCanRunHealthChecks(ctx.cfg)) std.debug.print("Active upstream health checks enabled for configured upstream pools\n", .{});
     }
     if (h3) |listener| {
-        workers.start(http3Task, .{ ctx, listener, state }) catch |err| {
+        workers.start(.http3, http3Task, .{ ctx, listener, state }) catch |err| {
             std.debug.print("Failed to start HTTP/3 native listener: {}\n", .{err});
             return err;
         };
     }
     if (admin) |listener| {
         const admin_socket_path = ctx.cfg.admin_socket_path orelse ctx.default_admin_socket_path;
-        workers.start(admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = ctx.io, .cfg = ctx.cfg, .socket_path = admin_socket_path, .listener = listener, .state = state, .callbacks = ctx.callbacks.admin }}) catch |err| {
+        workers.start(.admin, admin_runtime.serveSocketTask, .{admin_runtime.SocketContext{ .io = ctx.io, .cfg = ctx.cfg, .socket_path = admin_socket_path, .listener = listener, .state = state, .callbacks = ctx.callbacks.admin }}) catch |err| {
             std.debug.print("Failed to start admin socket: {}\n", .{err});
             return err;
         };
     }
     if (ctx.cfg.tls_auto) {
-        workers.start(acme_renewal.renewalTask, .{acme_renewal.Context{
+        workers.start(.acme, acme_renewal.renewalTask, .{acme_renewal.Context{
             .io = ctx.io,
             .acquire_config = ctx.callbacks.acquire_config,
             .shutdown_requested = ctx.shutdown_requested,
@@ -368,7 +399,7 @@ pub fn run(ctx: Context) !void {
     var workers = Workers{};
     var shutdown_complete = std.atomic.Value(bool).init(false);
     var workers_stopped = std.atomic.Value(bool).init(false);
-    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .workers_stopped = &workers_stopped, .connections = &concurrency, .admin = if (admin) |*value| value else null }});
+    const deadline_worker = try std.Thread.spawn(.{}, shutdownDeadlineTask, .{ShutdownDeadlineContext{ .ctx = ctx, .complete = &shutdown_complete, .workers_stopped = &workers_stopped, .connections = &concurrency, .workers = &workers, .admin = if (admin) |*value| value else null }});
     defer {
         ctx.shutdown_requested.store(true, .release);
         ctx.supervisor.stopping(ctx.io);
@@ -380,7 +411,7 @@ pub fn run(ctx: Context) !void {
         if (concurrency.active() != 0) {
             // The independent deadline guard exits before this wait can overrun.
             // Do not return through stack/config destructors with live readers.
-            forceShutdown(ctx, &concurrency, if (admin) |*value| value else null);
+            forceShutdown(ctx, ShutdownProgress.capture(&concurrency, &workers, &workers_stopped), if (admin) |*value| value else null);
         }
         shutdown_complete.store(true, .release);
         deadline_worker.join();
@@ -415,9 +446,30 @@ test "managed workers remain joinable after a later startup failure" {
     var workers = Workers{};
     defer workers.join();
     var counter = std.atomic.Value(usize).init(0);
-    for (0..workers.threads.len) |_| try workers.start(testWorker, .{&counter});
-    try std.testing.expectError(error.TooManyBackgroundWorkers, workers.start(testWorker, .{&counter}));
+    for (0..workers.threads.len) |_| try workers.start(.health, testWorker, .{&counter});
+    try std.testing.expectError(error.TooManyBackgroundWorkers, workers.start(.health, testWorker, .{&counter}));
     workers.join();
     try std.testing.expectEqual(workers.threads.len, counter.load(.monotonic));
     try std.testing.expectEqual(0, workers.count);
+    try std.testing.expectEqual(Workers.Kind.none, workers.joining.load(.acquire));
+}
+
+test "shutdown timeout evidence retains its decision state after workers finish" {
+    var metrics = ServerMetrics.init();
+    var connections = concurrency_mod.State.init(&metrics);
+    var workers = Workers{};
+    var stopped = std.atomic.Value(bool).init(false);
+    workers.joining.store(.health, .release);
+    try std.testing.expect(connections.tryAcquire(1));
+    const pending = ShutdownProgress.capture(&connections, &workers, &stopped);
+    connections.release();
+    workers.joining.store(.none, .release);
+    stopped.store(true, .release);
+    try std.testing.expect(!pending.drained());
+    try std.testing.expectEqual(1, pending.active_connections);
+    try std.testing.expect(!pending.background_workers_joined);
+    try std.testing.expectEqual(Workers.Kind.health, pending.joining_worker);
+    try std.testing.expect(ShutdownProgress.capture(&connections, &workers, &stopped).drained());
+    stopped.store(false, .release);
+    try std.testing.expect(!ShutdownProgress.capture(&connections, &workers, &stopped).drained());
 }

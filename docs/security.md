@@ -280,6 +280,9 @@ starts. A peer's write-half-close alone does not cancel a valid HTTP/1 request.
 If a connection or background operation is still
 stuck at the deadline, a separate guard logs `server.shutdown_timeout`, removes
 the admin socket, and exits with status 1 without unwinding runtime destructors.
+The event retains the active connection count, background-join completion and
+current background join at the guard's decision, before child cleanup can change
+those values. These diagnostics do not extend the deadline or waive a failure.
 The OS then reclaims process memory together instead of freeing config/caches
 while another thread might still access them. Outstanding requests can be lost
 at that deadline. Owned CGI and certificate-tool groups also receive shutdown
