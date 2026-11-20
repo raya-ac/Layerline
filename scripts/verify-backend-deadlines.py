@@ -87,7 +87,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.flush()
             if kind == "combined":
-                time.sleep(0.21)
+                # Each delay fits 700 ms; together they don't.
+                time.sleep(0.60)
             if kind in ["okay", "pooled", "combined"]:
                 self.wfile.write(b"ok")
                 return
@@ -205,7 +206,10 @@ with tempfile.TemporaryDirectory(prefix="ll-backend-", dir="/tmp") as temporary:
             routes = ""
             for kind in ["headers", "fixed", "chunked", "unknown", "combined", "okay", "pooled", "buffered", "retry", "retry-late", "retry-write-h1", "retry-write-h2", "upload", "upgrade"]:
                 targets = backends[:2] if kind.startswith("retry") else backends[:1]
-                routes += f"route = {kind} /{kind}/* proxy\nroute_proxy.{kind} = " + " ".join(f"http://localhost:{backend.server_port}" for backend in targets) + "\n"
+                host = "127.0.0.1" if kind == "combined" else "localhost"
+                routes += f"route = {kind} /{kind}/* proxy\nroute_proxy.{kind} = " + " ".join(f"http://{host}:{backend.server_port}" for backend in targets) + "\n"
+                if kind == "combined":
+                    routes += "route_proxy_timeout_ms.combined = 700\n"
                 if kind.startswith("retry"):
                     routes += f"route_upstream_policy.{kind} = sticky_cookie\n"
                 if kind == "buffered":
