@@ -13,6 +13,7 @@ const backend_deadline = @import("backend_deadline.zig");
 const upstream_reader = @import("upstream_reader.zig");
 const upstream_tls = @import("upstream_tls.zig");
 const upstream_connection = @import("upstream_connection.zig");
+const relay = @import("http2_relay.zig");
 
 const H2BufferedResponse = h2_support.BufferedResponse;
 const ServerConfig = config_mod.ServerConfig;
@@ -78,7 +79,16 @@ fn appendForwardedRequestHeaders(
     if (request_id.len > 0) try out.print(allocator, "X-Request-Id: {s}\r\n", .{request_id});
 }
 
-fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks) !H2BufferedResponse {
+fn stickyHeaders(allocator: std.mem.Allocator, original: []const h2_native.Header, index: usize) ![]const h2_native.Header {
+    const cookie = try upstream_mod.stickyCookieValue(allocator, index);
+    errdefer allocator.free(cookie);
+    const headers = try allocator.alloc(h2_native.Header, original.len + 1);
+    @memcpy(headers[0..original.len], original);
+    headers[original.len] = .{ .name = "set-cookie", .value = cookie };
+    return headers;
+}
+
+fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: request_mod.HttpRequest, cfg: *const ServerConfig, runtime_policy: UpstreamRuntimePolicy, callbacks: Callbacks, sticky: ?usize) !H2BufferedResponse {
     var phase: enum { connect, configure, request, response_head, response_body } = .connect;
     errdefer |err| if (!@import("builtin").is_test and err == error.Unexpected) {
         std.debug.print("{{\"event\":\"server.upstream_failure_detail\",\"protocol\":\"h2\",\"phase\":\"{s}\",\"error\":\"{s}\"}}\n", .{ @tagName(phase), @errorName(err) });
@@ -133,22 +143,46 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     };
     try reader.beginBody(req.method, head.framing, cfg.max_static_file_bytes);
     phase = .response_body;
-    var body = std.ArrayList(u8).empty;
-    defer body.deinit(allocator);
-    while (try reader.nextData()) |data| try body.appendSlice(allocator, data);
-    lease.end();
     const content_type = if (!proxy_utils.isConnectionField(head.fields, "Content-Type"))
         if (http_headers.findHeaderValue(head.fields, "Content-Type")) |value| try allocator.dupe(u8, value) else "application/octet-stream"
     else
         "application/octet-stream";
+    const status = head.framing.status_code.?;
+    const bodyless = proxy_utils.responseHasNoBody(req.method, status);
+    if (relay.active) |sink| {
+        const may_replace_body = status >= 400 and status <= 599 and std.mem.startsWith(u8, content_type, "text/html");
+        if (!bodyless and !may_replace_body) {
+            var headers: []const h2_native.Header = try h2_support.collectUpstreamHeaders(allocator, head.fields, head.fields);
+            if (sticky) |index| headers = try stickyHeaders(allocator, headers, index);
+            const limit = backend_deadline.forStream(upstream_conn).?.deadline;
+            try backend_deadline.checkReadCompletion(upstream_conn);
+            try sink.start(allocator, .{ .status_code = status, .content_type = content_type, .headers = headers, .content_length = head.framing.content_length });
+            while (try reader.nextData()) |data| {
+                try backend_deadline.checkReadCompletion(upstream_conn);
+                try sink.data(sink.context, data, limit);
+            }
+            try backend_deadline.checkReadCompletion(upstream_conn);
+            lease.end();
+            return .{
+                .status_code = status,
+                .content_type = content_type,
+                .body = "",
+                .trailers = try h2_support.collectUpstreamHeaders(allocator, reader.trailers(), head.fields),
+            };
+        }
+    }
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    while (try reader.nextData()) |data| try body.appendSlice(allocator, data);
+    lease.end();
     return .{
-        .status_code = head.framing.status_code.?,
+        .status_code = status,
         .content_type = content_type,
         .body = try body.toOwnedSlice(allocator),
         .headers = try h2_support.collectUpstreamHeaders(allocator, head.fields, head.fields),
         .trailers = try h2_support.collectUpstreamHeaders(allocator, reader.trailers(), head.fields),
         .informational = try informational.toOwnedSlice(allocator),
-        .content_length = if (proxy_utils.responseHasNoBody(req.method, head.framing.status_code)) head.framing.content_length else null,
+        .content_length = if (bodyless) head.framing.content_length else null,
         .omit_content_length = std.mem.eql(u8, req.method, "HEAD") and head.framing.content_length == null,
     };
 }
@@ -185,23 +219,22 @@ pub fn fetchPoolResponse(
         if (attempts > 0) callbacks.metrics.upstreamRetried();
         attempts += 1;
         callbacks.metrics.upstreamRequestStarted();
-        var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks) catch |err| {
-            if (err == error.Canceled or err == error.OutOfMemory or err == error.BackendCapacity) return err;
+        const sticky = if (policy == .sticky_cookie) upstream_index else null;
+        var response = fetchResponse(allocator, upstream, req, cfg, runtime_policy, callbacks, sticky) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory or err == error.BackendCapacity or err == error.Http2BackpressureTimeout) return err;
             if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.upstream_failure\",\"protocol\":\"h2\",\"error\":\"{s}\"}}\n", .{@errorName(err)});
             last_error = err;
             callbacks.metrics.upstreamRequestFailed();
             if (upstream_mod.upstreamRecordFailure(upstream, callbacks.upstream_now_ms(), runtime_policy.max_failures, runtime_policy.fail_timeout_ms)) {
                 callbacks.metrics.upstreamEjected();
             }
+            if (relay.active) |sink| if (sink.status != null) return err;
             continue;
         };
-        if (policy == .sticky_cookie) {
-            const cookie_value = try upstream_mod.stickyCookieValue(allocator, upstream_index);
-            const headers = try allocator.alloc(h2_native.Header, response.headers.len + 1);
-            if (response.headers.len > 0) @memcpy(headers[0..response.headers.len], response.headers);
-            headers[response.headers.len] = .{ .name = "set-cookie", .value = cookie_value };
-            response.headers = headers;
-        }
+        const streamed = if (relay.active) |sink| sink.status != null else false;
+        if (!streamed) if (sticky) |index| {
+            response.headers = try stickyHeaders(allocator, response.headers, index);
+        };
         upstream_mod.upstreamRecordSuccess(upstream, callbacks.upstream_now_ms(), runtime_policy.slow_start_ms);
         return response;
     }

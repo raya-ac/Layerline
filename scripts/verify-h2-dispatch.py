@@ -50,6 +50,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
+        if self.path.endswith("/early"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "9")
+            self.end_headers()
+            try:
+                self.wfile.write(b"first")
+                self.server.entered.set()
+                if self.server.release.wait(6):
+                    self.wfile.write(b"tail")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         self.server.entered.set()
         self.server.release.wait(6)
         body = b"released backend\n"
@@ -265,6 +278,52 @@ graceful_shutdown_timeout_ms = 1200
                 assert resources()["layerline_upstream_failures_total"] == 0, "client cancellation counted as backend failure"
                 backend.release.set()
 
+                backend.release.clear()
+                backend.entered.clear()
+                client = Client(port, secure)
+                client.request(1, b"/slow/early")
+                assert backend.entered.wait(1)
+                client.until(lambda items: any(k == 1 and s == 1 for k, _, s, _ in items))
+                assert not client.body(1) and not client.ended(1)
+                client.window(1, 2)
+                client.until(lambda _: client.body(1) == b"fi")
+                client.request(3, b"/health")
+                client.window(3, 3)
+                client.until(lambda _: client.ended(3))
+                assert client.body(3) == b"ok\n"
+                assert client.body(1) == b"fi", "proxy sent more than the stream window"
+                client.window(1, 3)
+                client.until(lambda _: client.body(1) == b"first")
+                assert not client.ended(1), "client got END_STREAM before the origin finished"
+                backend.release.set()
+                client.window(1, 4)
+                client.until(lambda _: client.ended(1))
+                assert client.body(1) == b"firsttail"
+                head = next(p for k, _, s, p in client.frames if k == 1 and s == 1)
+                # HPACK literal with static name index 28 (content-length).
+                assert b"\x0f\x0d\x019" in head, head
+                client.close()
+                client = None
+                quiescent(memory=True)
+
+                backend.release.clear()
+                backend.entered.clear()
+                client = Client(port, secure)
+                client.request(1, b"/slow/early")
+                assert backend.entered.wait(1)
+                client.until(lambda items: any(k == 1 and s == 1 for k, _, s, _ in items))
+                client.send(3, 0, 1, (8).to_bytes(4, "big"))
+                quiescent()
+                client.request(3, b"/health")
+                client.window(3, 3)
+                client.until(lambda _: client.ended(3))
+                assert client.body(3) == b"ok\n" and not client.body(1)
+                assert resources()["layerline_upstream_failures_total"] == 0
+                backend.release.set()
+                client.close()
+                client = None
+                quiescent(memory=True)
+
                 if not secure:
                     backend.release.clear()
                     backend.entered.clear()
@@ -307,4 +366,4 @@ graceful_shutdown_timeout_ms = 1200
                     process.wait(timeout=3)
             backend.shutdown()
             backend.server_close()
-        print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 backend isolation, deadlines, routing caps, canceled replies and joined disconnect cleanup")
+        print(f"ok: {'TLS' if secure else 'plain'} HTTP/2 streaming, window credit, deadlines and cancellation")

@@ -661,9 +661,11 @@ they finish. HTTPS origins enforce a 1 MiB worker-stack minimum. Raising the
 effective stack requires restart, not reload; start with
 `worker_stack_size = 1048576` if the first HTTPS route must be added by reload.
 [Origin TLS details](upstream-tls.md) cover bounds, tests and compatibility gaps.
-Backend HTTP remains HTTP/1.1 even for H2 clients; final H2 responses are still
-buffered. The legacy `h2_upstream`/`--h2-upstream` setting no longer routes native
-H2 traffic: use `proxy` or a named proxy route.
+Layerline still speaks HTTP/1.1 to the origin. it can stream the response to
+an HTTP/2 client without waiting for the whole body. requests eligible for
+the response cache or gzip still buffer, as do bodyless replies and HTML error
+pages that might be replaced. a late origin failure resets that stream.
+use `proxy` or a named proxy route; the old `h2_upstream` setting doesn't route.
 
 ## PHP support
 

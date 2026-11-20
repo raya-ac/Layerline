@@ -533,11 +533,26 @@ fn deliverHttp2Request(stream: std.Io.net.Stream, allocator: std.mem.Allocator, 
     try http2_runtime.deliverRequest(stream, allocator, stream_id, req, result, http2CompleteContext());
 }
 
+fn encodeHttp2StreamHead(allocator: std.mem.Allocator, head: @import("http2_relay.zig").Head) ![]u8 {
+    return http2_runtime.encodeStreamHead(allocator, head, http2SendContext());
+}
+
+fn finishHttp2Stream(result: *h2_dispatch.Result, bytes: usize) void {
+    runtime_state.setAccessLogContext(&result.access, result.request_id);
+    defer runtime_state.clearAccessLogContext();
+    if (result.stream_error) |err| runtime_state.accessLogSetError(@errorName(err));
+    http1_response_bridge.recordProxyResponse(result.response.status_code, bytes, result.stream_error == null);
+}
+
 fn http2Callbacks() h2_server.Callbacks {
     return .{
         .send_response = sendHttp2Response,
         .error_response = h2CoolErrorResponse,
-        .dispatch = .{ .prepare = prepareHttp2Request, .deliver = deliverHttp2Request },
+        .dispatch = .{
+            .prepare = prepareHttp2Request,
+            .deliver = deliverHttp2Request,
+            .streaming = .{ .encode_head = encodeHttp2StreamHead, .finish = finishHttp2Stream },
+        },
         .write_all = streamWriteAll,
         .finish_tls_output = stream_runtime.finishTlsOutput,
         .shutdown_requested = &runtime_state.shutdown_requested,

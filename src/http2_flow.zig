@@ -11,6 +11,7 @@ const Pending = struct {
     trailers: ?[]u8 = null,
     sent: usize = 0,
     deadline: Deadline = .{},
+    streaming: bool = false,
 };
 
 // The runtime handles a connection synchronously on one worker, like its TLS
@@ -134,7 +135,7 @@ pub const State = struct {
 
     pub fn queueResponse(self: *State, id: u32, body: []const u8, trailers: []const u8) !void {
         const i = self.find(id) orelse return error.BadRequest;
-        if (self.streams.items[i].body != null) return error.BadRequest;
+        if (self.streams.items[i].body != null or self.streams.items[i].streaming) return error.BadRequest;
         if (body.len > max_queued_bytes - self.queued_bytes) return error.QueueLimit;
         if (trailers.len > max_queued_bytes - self.queued_bytes - body.len) return error.QueueLimit;
         const owned_body = try self.allocator.dupe(u8, body);
@@ -153,10 +154,43 @@ pub const State = struct {
         return item.deadline;
     }
 
+    pub fn writeData(self: *State, stream: std.Io.net.Stream, id: u32, bytes: []const u8, end_stream: bool, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !usize {
+        const i = self.find(id) orelse return error.BadRequest;
+        return self.writeDataAt(stream, i, bytes, end_stream, write);
+    }
+
+    fn writeDataAt(self: *State, stream: std.Io.net.Stream, i: usize, bytes: []const u8, end_stream: bool, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !usize {
+        const item = &self.streams.items[i];
+        const credit = @min(item.window, self.connection_window);
+        if (bytes.len > 0 and credit <= 0) return 0;
+        const count = if (bytes.len == 0) 0 else @min(bytes.len, 16384, @as(usize, @intCast(credit)));
+        const previous = write_deadline.push(.{ .io = self.io, .handle = stream.socket.handle, .deadline = item.deadline, .restore_timeout_ms = self.write_timeout_ms, .stream_id = item.id });
+        defer write_deadline.restore(previous);
+        const flags: u8 = if (end_stream and count == bytes.len) h2.FLAG_END_STREAM else 0;
+        try support.sendFrame(stream, h2.FRAME_DATA, flags, item.id, bytes[0..count], write);
+        item.window -= @intCast(count);
+        self.connection_window -= @intCast(count);
+        return count;
+    }
+
+    pub fn startStreaming(self: *State, id: u32) !void {
+        const item = &self.streams.items[self.find(id) orelse return error.BadRequest];
+        if (item.body != null or item.streaming) return error.BadRequest;
+        item.streaming = true;
+        _ = try self.startResponse(id);
+    }
+
+    pub fn writeStreamHeaders(self: *State, stream: std.Io.net.Stream, id: u32, block: []const u8, end_stream: bool, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
+        const item = self.streams.items[self.find(id) orelse return error.BadRequest];
+        const previous = write_deadline.push(.{ .io = self.io, .handle = stream.socket.handle, .deadline = item.deadline, .restore_timeout_ms = self.write_timeout_ms, .stream_id = id });
+        defer write_deadline.restore(previous);
+        try support.sendHeaderBlock(stream, id, block, end_stream, write);
+    }
+
     pub fn nextDeadline(self: *const State) Deadline {
         var deadline = Deadline{};
         for (self.streams.items) |item| {
-            if (item.body != null) deadline = Deadline.earliest(deadline, item.deadline);
+            if (item.body != null or item.streaming) deadline = Deadline.earliest(deadline, item.deadline);
         }
         return deadline;
     }
@@ -171,7 +205,7 @@ pub const State = struct {
 
     fn expireAt(self: *State, i: usize, now: std.Io.Timestamp, stream: std.Io.net.Stream, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !bool {
         const item = self.streams.items[i];
-        if (item.body == null or !item.deadline.expired(now)) return false;
+        if ((item.body == null and !item.streaming) or !item.deadline.expired(now)) return false;
         self.cancel(item.id);
         if (!@import("builtin").is_test) std.debug.print("{{\"event\":\"server.write_timeout\",\"protocol\":\"h2\",\"phase\":\"response\",\"stream_id\":{d}}}\n", .{item.id});
         try support.sendRst(stream, item.id, 8, write);
@@ -187,30 +221,26 @@ pub const State = struct {
             var i: usize = 0;
             while (i < self.streams.items.len) {
                 if (try self.expireAt(i, .now(self.io, .awake), stream, write)) continue;
-                const item = &self.streams.items[i];
+                const item = self.streams.items[i];
                 const body = item.body orelse {
                     i += 1;
                     continue;
                 };
-                if (item.sent < body.len and (item.window <= 0 or self.connection_window <= 0)) {
+                const count = if (item.sent < body.len or item.trailers == null)
+                    try self.writeDataAt(stream, i, body[item.sent..], item.trailers == null, write)
+                else
+                    0;
+                if (count == 0 and item.sent < body.len) {
                     i += 1;
                     continue;
                 }
-                const count = if (item.sent == body.len) 0 else @min(body.len - item.sent, 16384, @as(usize, @intCast(@min(item.window, self.connection_window))));
                 const end = item.sent + count;
-                {
+                if (end == body.len) if (item.trailers) |trailers| {
                     const previous = write_deadline.push(.{ .io = self.io, .handle = stream.socket.handle, .deadline = item.deadline, .restore_timeout_ms = self.write_timeout_ms, .stream_id = item.id });
                     defer write_deadline.restore(previous);
-                    if (count > 0 or item.trailers == null) {
-                        try support.sendFrame(stream, h2.FRAME_DATA, if (end == body.len and item.trailers == null) h2.FLAG_END_STREAM else 0, item.id, body[item.sent..end], write);
-                    }
-                    if (end == body.len) if (item.trailers) |trailers| {
-                        try support.sendHeaderBlock(stream, item.id, trailers, true, write);
-                    };
-                }
-                item.sent = end;
-                item.window -= @intCast(count);
-                self.connection_window -= @intCast(count);
+                    try support.sendHeaderBlock(stream, item.id, trailers, true, write);
+                };
+                self.streams.items[i].sent = end;
                 progressed = true;
                 if (end == body.len) {
                     self.cancel(item.id);
@@ -264,6 +294,27 @@ threadlocal var test_output_used: usize = 0;
 fn captureWrite(_: std.Io.net.Stream, bytes: []const u8) !void {
     @memcpy(test_output[test_output_used..][0..bytes.len], bytes);
     test_output_used += bytes.len;
+}
+
+test "streamed DATA uses both windows and ends only after the last byte" {
+    var state = State{ .allocator = std.testing.allocator, .io = std.testing.io, .initial_window = 2, .connection_window = 1 };
+    defer state.deinit();
+    try state.open(1);
+    try state.startStreaming(1);
+    try std.testing.expect(state.nextDeadline().at != null);
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = 123, .address = undefined } };
+    test_output_used = 0;
+    try std.testing.expectEqual(1, try state.writeData(stream, 1, "abc", true, captureWrite));
+    try std.testing.expectEqual(0, try state.writeData(stream, 1, "bc", true, captureWrite));
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x01\x00\x00\x00\x00\x00\x01a", test_output[0..test_output_used]);
+    try state.update(0, 2);
+    try std.testing.expectEqual(1, try state.writeData(stream, 1, "bc", true, captureWrite));
+    try std.testing.expectEqual(0, try state.writeData(stream, 1, "c", true, captureWrite));
+    try state.update(1, 1);
+    try std.testing.expectEqual(1, try state.writeData(stream, 1, "c", true, captureWrite));
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x01\x00\x01\x00\x00\x00\x01c", test_output[20..test_output_used]);
+    try std.testing.expectEqual(0, state.connection_window);
+    try std.testing.expectEqual(0, state.streams.items[0].window);
 }
 
 test "response expiry releases owned bodies and slots without renewing on credit" {

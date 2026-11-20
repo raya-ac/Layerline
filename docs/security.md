@@ -732,8 +732,14 @@ through a per-job queue capped at 16 blocks / 128 KiB, charged to its shared HTT
 allocator. Cancellation, connection teardown and allocation failure reclaim queued
 blocks. The connection thread remains the only frame/TLS writer; each informational
 write has its own write budget and does not spend the final body-transfer budget.
-This does not make the final HTTP/2 upstream body streaming: that body is still
-buffered within its configured limit before final headers are sent.
+for streamed HTTP/2 responses, the worker hands the connection thread one
+chunk of up to 16 KiB at a time. the worker waits until it has been sent under
+both flow-control windows before reading more. the original origin deadline
+and response size limit still apply. cache-eligible requests, gzip requests,
+bodyless replies and possible HTML error replacements keep the buffered path.
+after publishing final headers, a bad body resets the stream. it can't retry,
+send a second final status or end the stream as though the body was complete.
+the experimental HTTP/3 path still buffers.
 
 Valid response trailers remain separate from headers. HTTP/1 rechunks payloads
 and forwards scrubbed trailers only after validation; native HTTP/2 queues an
@@ -747,7 +753,10 @@ The experimental HTTP/3 buffered encoder also retains known/unknown lengths and
 encodes informational, final, DATA and trailer sections in order. These are
 codec/allocation checks, not external QUIC interoperability or live early-hint
 streaming guarantees.
-`scripts/verify-upstream-framing.py` checks these paths over plain and native TLS.
+`scripts/verify-upstream-framing.py` checks plain and TLS framing. the dispatch
+fixture holds back part of a body and checks early bytes, window credit, sibling
+streams and client reset. the HTTPS fixture checks that a truncated origin
+response resets the stream without a clean end.
 
 HTTPS origins now authenticate the actual TLS handshake in H1/H2 proxy paths and
 health probes. [The origin TLS notes](upstream-tls.md) describe SAN-only identity,

@@ -16,6 +16,7 @@ const http2_content = @import("http2_content.zig");
 const metrics_mod = @import("metrics.zig");
 const request_mod = @import("request.zig");
 const response_body = @import("response_body.zig");
+const relay = @import("http2_relay.zig");
 
 const CompressionPolicy = config_mod.CompressionPolicy;
 const H2BufferedResponse = h2_support.BufferedResponse;
@@ -68,6 +69,37 @@ pub const ConnectionContext = struct {
     frame_callbacks: h2_server.Callbacks,
 };
 
+fn appendResponseHead(allocator: std.mem.Allocator, block: *std.ArrayList(u8), head: relay.Head, encoding: ?[]const u8, ctx: SendContext) !void {
+    try h2_native.appendStatus(allocator, block, head.status_code);
+    try h2_native.appendHeaderIndexedName(allocator, block, 54, ctx.server_header);
+    try h2_native.appendHeaderIndexedName(allocator, block, 31, head.content_type);
+    if (head.content_length) |length| {
+        var buffer: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "{d}", .{length});
+        try h2_native.appendHeaderIndexedName(allocator, block, 28, text);
+    }
+    if (ctx.request_id.len > 0) try h2_support.appendHeader(allocator, block, "x-request-id", ctx.request_id);
+    for (head.headers) |header| {
+        if (h2_support.isSkippedResponseHeader(header.name)) continue;
+        try h2_support.appendHeader(allocator, block, header.name, header.value);
+    }
+    if (encoding) |value| {
+        try h2_support.appendHeader(allocator, block, "content-encoding", value);
+        try h2_support.appendHeader(allocator, block, "vary", "Accept-Encoding");
+    }
+    for (ctx.response_headers) |header| {
+        if (h2_support.isSkippedResponseHeader(header.name) or std.ascii.eqlIgnoreCase(header.name, "x-request-id")) continue;
+        try h2_support.appendHeader(allocator, block, header.name, header.value);
+    }
+}
+
+pub fn encodeStreamHead(allocator: std.mem.Allocator, head: relay.Head, ctx: SendContext) ![]u8 {
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(allocator);
+    try appendResponseHead(allocator, &block, head, null, ctx);
+    return block.toOwnedSlice(allocator);
+}
+
 pub fn sendResponse(
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
@@ -102,36 +134,15 @@ pub fn sendResponse(
     });
     defer prepared.deinit(allocator);
 
-    try h2_native.appendStatus(allocator, &header_block, response.status_code);
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 54, ctx.server_header);
-    try h2_native.appendHeaderIndexedName(allocator, &header_block, 31, response.content_type);
-
-    var len_buf: [32]u8 = undefined;
     const body_len = if (http_response.canSendBody(response.status_code, is_head)) prepared.body.len else 0;
-    if ((http_response.canSendBody(response.status_code, false) or (response.status_code == 304 and response.content_length != null)) and
-        (!response.omit_content_length or custom_body != null))
-    {
-        const length = if ((is_head or response.status_code == 304) and custom_body == null) response.content_length orelse prepared.body.len else prepared.body.len;
-        const len_text = try std.fmt.bufPrint(&len_buf, "{d}", .{length});
-        try h2_native.appendHeaderIndexedName(allocator, &header_block, 28, len_text);
-    }
-    if (ctx.request_id.len > 0) {
-        try h2_support.appendHeader(allocator, &header_block, "x-request-id", ctx.request_id);
-    }
-
-    for (response.headers) |header| {
-        if (h2_support.isSkippedResponseHeader(header.name)) continue;
-        try h2_support.appendHeader(allocator, &header_block, header.name, header.value);
-    }
-    if (prepared.encoding) |encoding| {
-        try h2_support.appendHeader(allocator, &header_block, "content-encoding", encoding);
-        try h2_support.appendHeader(allocator, &header_block, "vary", "Accept-Encoding");
-    }
-    for (ctx.response_headers) |header| {
-        if (h2_support.isSkippedResponseHeader(header.name)) continue;
-        if (std.ascii.eqlIgnoreCase(header.name, "x-request-id")) continue;
-        try h2_support.appendHeader(allocator, &header_block, header.name, header.value);
-    }
+    const has_length = (http_response.canSendBody(response.status_code, false) or (response.status_code == 304 and response.content_length != null)) and
+        (!response.omit_content_length or custom_body != null);
+    try appendResponseHead(allocator, &header_block, .{
+        .status_code = response.status_code,
+        .content_type = response.content_type,
+        .headers = response.headers,
+        .content_length = if (!has_length) null else if ((is_head or response.status_code == 304) and custom_body == null) response.content_length orelse prepared.body.len else prepared.body.len,
+    }, prepared.encoding, ctx);
 
     const flow = flow_mod.active orelse return error.MissingHttp2Connection;
     var trailer_block = std.ArrayList(u8).empty;
@@ -204,15 +215,30 @@ pub fn prepareRequest(
 
     ctx.metrics.requestStarted();
     ctx.access_log_set_handler("h2");
-    const response = ctx.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| switch (err) {
-        error.OutOfMemory, error.Canceled => return err,
-        error.BackendCapacity, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => try ctx.cool_error_response(allocator, 503, "Service Unavailable", "Local server resources are exhausted."),
-        else => blk: {
-            ctx.access_log_set_error(@errorName(err));
-            break :blk try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request.");
-        },
+    var stream_error: ?anyerror = null;
+    const response = ctx.build_response_for_request(io, allocator, cfg, req, process_env) catch |err| blk: {
+        if (relay.active) |sink| if (sink.status) |status| {
+            stream_error = err;
+            break :blk h2_support.textResponse(status, "", "");
+        };
+        break :blk switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            error.BackendCapacity, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => try ctx.cool_error_response(allocator, 503, "Service Unavailable", "Local server resources are exhausted."),
+            else => failure: {
+                ctx.access_log_set_error(@errorName(err));
+                break :failure try ctx.cool_error_response(allocator, 500, "Internal Server Error", "Internal server error while routing HTTP/2 request.");
+            },
+        };
     };
-    return .{ .response = response, .request_id = request_id, .access = access_ctx, .response_headers = ctx.get_response_headers(), .compression_policy = ctx.get_compression_policy() };
+    return .{
+        .response = response,
+        .request_id = request_id,
+        .access = access_ctx,
+        .response_headers = ctx.get_response_headers(),
+        .compression_policy = ctx.get_compression_policy(),
+        .streamed = if (relay.active) |sink| sink.status != null else false,
+        .stream_error = stream_error,
+    };
 }
 
 pub fn deliverRequest(stream: std.Io.net.Stream, allocator: std.mem.Allocator, stream_id: u32, req: HttpRequest, result: *dispatch.Result, ctx: CompleteContext) !void {

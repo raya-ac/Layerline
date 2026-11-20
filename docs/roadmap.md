@@ -10,8 +10,10 @@ without checking what their sites actually need.
   each domain can have its own config. limits, retry rules and cache settings can
   vary by route instead of forcing every site to use the same defaults.
 - HTTP/1.1 and HTTP/2 share the main routing path. HTTP/2 has bounded streams,
-  flow control, trailers and graceful drain. HTTPS backends use native TLS 1.2
-  or 1.3 with certificate checks. the backend HTTP protocol is still HTTP/1.1.
+  flow control, trailers and graceful drain. proxy bodies can stream to HTTP/2
+  clients unless the route needs to buffer for cache, gzip or an error page.
+  HTTPS backends use TLS 1.2 or 1.3 with certificate checks and still speak
+  HTTP/1.1.
 - the TCP listener speaks TLS 1.3 and picks configured certificates by hostname.
   certbot can issue and renew certs. first-time webroot issuance still needs the
   challenge path to be reachable before Layerline starts.
@@ -37,9 +39,10 @@ including what doesn't pass.
    host, compare site behavior, then prove rollback with the real systemd unit.
    Test memory and descriptor pressure there too. A green CI run doesn't do
    those things. See the [replacement checklist](caddy-replacement-plan.md).
-3. stream final HTTP/2 proxy responses instead of buffering them. cover slow
-   clients, trailers and canceled streams with real upstreams. expand the
-   RFC 9113 checks; h2spec alone doesn't cover the current spec.
+3. run a longer HTTP/2 proxy soak with slow clients and large bodies.
+   loopback tests already cover early bytes, window credit, trailers, resets
+   and no retry after final headers. expand the RFC 9113 checks too; h2spec
+   alone doesn't cover the current spec.
 4. close the TLS gaps: first-boot HTTP-01, unattended renewal checks, more TCP
    listener profiles and absolute handshake write budgets. The origin
    certificate corpus still has mismatches and skips.

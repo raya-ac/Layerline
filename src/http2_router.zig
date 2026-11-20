@@ -83,6 +83,17 @@ fn fetchBufferedMicrocache(
     return null;
 }
 
+fn fetchProxyResponse(allocator: std.mem.Allocator, cfg: *ServerConfig, domain: ?*const DomainConfig, route: ?*const RouteConfig, pool: *UpstreamPoolConfig, policy: UpstreamPoolPolicy, req: HttpRequest, callbacks: Callbacks) !H2BufferedResponse {
+    const relay = @import("http2_relay.zig");
+    const previous = relay.active;
+    defer relay.active = previous;
+    // Keep buffering where we still need the full body for a cache fill or gzip.
+    const compression = config_mod.compressionPolicyFor(cfg, domain, route);
+    if (buffered_cache.requestCanUse(req, static_cache.policyForConfig(cfg, domain, route)) or
+        (compression.enabled and compression.gzip_enabled and @import("static_files.zig").acceptsContentCoding(req.headers, "gzip"))) relay.active = null;
+    return callbacks.fetch_upstream_pool_response(allocator, pool, policy, config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
+}
+
 fn storeBufferedMicrocache(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -175,7 +186,7 @@ pub fn buildResponseForRequest(
                 return cached;
             }
             callbacks.access_log_set_handler("domain_proxy");
-            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            const response = try fetchProxyResponse(allocator, cfg, domain, null, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, callbacks);
             return storeBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, response, callbacks);
         }
     }
@@ -242,7 +253,7 @@ pub fn buildResponseForRequest(
                 return cached;
             }
             callbacks.access_log_set_handler("domain_proxy");
-            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+            const response = try fetchProxyResponse(allocator, cfg, domain, null, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, callbacks);
             return storeBufferedMicrocache(io, allocator, cfg, domain, null, "domain_proxy", req, response, callbacks);
         }
         callbacks.access_log_set_handler("not_found");
@@ -262,7 +273,7 @@ pub fn buildResponseForRequest(
     }
     if (routing_mod.domainUpstreamMutable(cfg, domain)) |pool| {
         callbacks.access_log_set_handler("domain_proxy");
-        return callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.domainUpstreamPolicy(cfg, domain), config_mod.upstreamRuntimePolicyFor(cfg, domain, null), req, cfg);
+        return fetchProxyResponse(allocator, cfg, domain, null, pool, routing_mod.domainUpstreamPolicy(cfg, domain), req, callbacks);
     }
     callbacks.access_log_set_handler("not_implemented");
     return callbacks.error_response(allocator, 501, "Not Implemented", "This server has not implemented that HTTP/2 behavior yet.");
@@ -308,7 +319,7 @@ fn buildRouteResponse(
                 route_pool
             else
                 routing_mod.domainUpstreamMutable(cfg, domain) orelse return callbacks.error_response(allocator, 502, "Bad Gateway", "Route proxy upstream is not configured.");
-            const response = try callbacks.fetch_upstream_pool_response(allocator, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), config_mod.upstreamRuntimePolicyFor(cfg, domain, route), req, cfg);
+            const response = try fetchProxyResponse(allocator, cfg, domain, route, pool, routing_mod.routeUpstreamPolicy(cfg, domain, route), req, callbacks);
             return storeBufferedMicrocache(io, allocator, cfg, domain, route, scope, req, response, callbacks);
         },
         .php => {

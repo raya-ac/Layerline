@@ -306,9 +306,9 @@ fn runFrames(
     const settings_deadline = Deadline.after(.now(io, .awake), cfg.read_header_timeout_ms);
 
     while (true) {
+        try flow.expire(stream, callbacks.write_all);
         try jobs.pump(stream, flow, callbacks.write_all);
         try expireBodies(io, stream, allocator, &body_states, flow, callbacks);
-        try flow.expire(stream, callbacks.write_all);
         if (callbacks.shutdown_requested.load(.acquire) and !draining) {
             try h2_support.sendGoaway(stream, flow.last_stream_id, ERROR_NO_ERROR, callbacks.write_all);
             draining = true;

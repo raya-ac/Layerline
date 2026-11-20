@@ -46,6 +46,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         started = time.monotonic()
         try:
             if self.server.fallback:
+                self.server.gets.append(self.path)
                 body = b"fallback"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -185,6 +186,7 @@ with tempfile.TemporaryDirectory(prefix="ll-backend-", dir="/tmp") as temporary:
     for fallback in [False, True]:
         backend = HTTP(("127.0.0.1", 0), Handler)
         backend.fallback, backend.pooled, backend.posts, backend.probe_times = fallback, set(), [], []
+        backend.gets = []
         backend.upload_started = None
         backend.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         backends.append(backend)
@@ -201,11 +203,13 @@ with tempfile.TemporaryDirectory(prefix="ll-backend-", dir="/tmp") as temporary:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
             routes = ""
-            for kind in ["headers", "fixed", "chunked", "unknown", "combined", "okay", "pooled", "retry", "retry-write-h1", "retry-write-h2", "upload", "upgrade"]:
+            for kind in ["headers", "fixed", "chunked", "unknown", "combined", "okay", "pooled", "buffered", "retry", "retry-late", "retry-write-h1", "retry-write-h2", "upload", "upgrade"]:
                 targets = backends[:2] if kind.startswith("retry") else backends[:1]
                 routes += f"route = {kind} /{kind}/* proxy\nroute_proxy.{kind} = " + " ".join(f"http://localhost:{backend.server_port}" for backend in targets) + "\n"
                 if kind.startswith("retry"):
                     routes += f"route_upstream_policy.{kind} = sticky_cookie\n"
+                if kind == "buffered":
+                    routes += "route_response_cache.buffered = true\n"
             config = folder / "server.conf"
             access = folder / ("tls-access.jsonl" if secure else "plain-access.jsonl")
             config.write_text(f"""host = 127.0.0.1
@@ -288,15 +292,24 @@ route_upstream_health_check_interval_ms.probe = 30000
                         for kind in ["headers", "fixed", "chunked", "unknown", "combined"]:
                             before = failures() if protocol == "--http1.1" and kind != "headers" else None
                             status, body, code = request(kind + "/check", protocol)
-                            expected = 200 if protocol == "--http1.1" and kind != "headers" else 504
+                            expected = 504 if kind == "headers" else 200
                             assert status == expected, (kind, protocol, status, body)
                             if expected == 200:
-                                assert (code == 0 if kind == "unknown" else code != 0) and len(body) < 64, (kind, body, code)
+                                # H1 can only close a close-delimited response.
+                                # H2 must reset instead of ending it cleanly.
+                                clean_close = kind == "unknown" and protocol == "--http1.1"
+                                assert (code == 0 if clean_close else code != 0) and len(body) < 64, (kind, body, code)
                             else:
                                 assert code == 0, (kind, code)
                             if before is not None:
                                 assert failures() == before, "streamed attempt timeout falsely penalized backend health"
                         assert request("okay/check", protocol) == (200, b"ok", 0)
+                        if protocol != "--http1.1":
+                            assert request("buffered/check", protocol)[::2] == (504, 0)
+                            fallback = len(backends[1].gets)
+                            status, body, code = request("retry-late/check", protocol)
+                            assert status == 200 and 0 < len(body) < 64 and code != 0, (status, body, code)
+                            assert len(backends[1].gets) == fallback, "retried after sending final headers"
                         for route in ["fpm", "unix"]:
                             for query in ["slow-header", "slow-body"]:
                                 reply = request(f"{route}/check?{query}", protocol)

@@ -9,6 +9,8 @@ const resource_budget = @import("resource_budget.zig");
 const h2 = @import("h2_native.zig");
 const write_deadline = @import("write_deadline.zig");
 const request_cancel = @import("request_cancel.zig");
+const relay = @import("http2_relay.zig");
+const Deadline = @import("read_deadline.zig").Deadline;
 
 pub const Result = struct {
     response: support.BufferedResponse,
@@ -16,11 +18,17 @@ pub const Result = struct {
     access: access_log.Context,
     response_headers: []const config.ResponseHeaderRule,
     compression_policy: config.CompressionPolicy,
+    streamed: bool = false,
+    stream_error: ?anyerror = null,
 };
 
 pub const Callbacks = struct {
     prepare: *const fn (std.Io, std.mem.Allocator, *config.ServerConfig, request.HttpRequest, *const std.process.Environ.Map) anyerror!Result,
     deliver: *const fn (std.Io.net.Stream, std.mem.Allocator, u32, request.HttpRequest, *Result) anyerror!void,
+    streaming: ?struct {
+        encode_head: *const fn (std.mem.Allocator, relay.Head) anyerror![]u8,
+        finish: *const fn (*Result, usize) void,
+    } = null,
 };
 
 const admitted = &resource_budget.http2_jobs;
@@ -38,6 +46,9 @@ const Job = struct {
     progress: std.ArrayList([]u8) = .empty,
     progress_count: usize = 0,
     progress_bytes: usize = 0,
+    response_slot: std.atomic.Value(?*relay.Slot) = .init(null),
+    chunk_offset: usize = 0,
+    streamed_bytes: usize = 0,
     result: anyerror!Result = undefined,
 };
 
@@ -57,7 +68,7 @@ pub const Dispatcher = struct {
     }
 
     pub fn deinit(self: *Dispatcher) void {
-        for (self.jobs) |maybe| if (maybe) |job| job.canceled.store(true, .release);
+        for (self.jobs) |maybe| if (maybe) |job| self.stop(job);
         // No task may retain the connection, request arena or wake descriptor
         // after the connection thread returns to its TLS/config cleanup.
         self.group.cancel(self.io);
@@ -113,6 +124,10 @@ pub const Dispatcher = struct {
         const previous = support.informational_sink;
         support.informational_sink = .{ .context = &sink, .emit = publishInformational };
         defer support.informational_sink = previous;
+        const previous_relay = relay.active;
+        var output = relay.Sink{ .context = &sink, .begin = publishHead, .data = publishData };
+        relay.active = if (self.callbacks.streaming != null) &output else null;
+        defer relay.active = previous_relay;
         job.result = if (job.canceled.load(.acquire)) error.Canceled else self.callbacks.prepare(self.io, job.arena.allocator(), self.cfg, job.req, self.env);
         job.done.store(true, .release);
         self.wake.signal();
@@ -121,6 +136,7 @@ pub const Dispatcher = struct {
     fn destroy(self: *Dispatcher, job: *Job) void {
         for (job.progress.items) |block| self.allocator.free(block);
         job.progress.deinit(self.allocator);
+        if (job.response_slot.load(.acquire)) |slot| self.allocator.destroy(slot);
         self.request_bytes -= job.bytes;
         job.arena.deinit();
         self.allocator.destroy(job);
@@ -129,18 +145,28 @@ pub const Dispatcher = struct {
 
     pub fn cancel(self: *Dispatcher, id: u32) void {
         for (self.jobs) |maybe| if (maybe) |job| {
-            if (job.stream_id == id) job.canceled.store(true, .release);
+            if (job.stream_id == id) self.stop(job);
         };
+    }
+
+    fn stop(self: *Dispatcher, job: *Job) void {
+        job.canceled.store(true, .release);
+        if (job.response_slot.load(.acquire)) |slot| slot.close(self.io);
     }
 
     pub fn pump(self: *Dispatcher, stream: std.Io.net.Stream, flow: *flow_mod.State, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void) !void {
         for (&self.jobs) |*maybe| {
             const job = maybe.* orelse continue;
-            try self.drainInformational(job, stream, flow, write);
-            if (!job.done.load(.acquire)) continue;
-            // A final publication can race the first drain. The done acquire
-            // makes every preceding informational publication visible now.
-            try self.drainInformational(job, stream, flow, write);
+            const done = job.done.load(.acquire);
+            if (flow.find(job.stream_id) == null) self.stop(job);
+            if (!job.canceled.load(.acquire)) {
+                try self.drainInformational(job, stream, flow, write);
+                if (job.response_slot.load(.acquire)) |slot| {
+                    try self.drainResponse(job, slot, stream, flow, write, done);
+                    if (slot.next() != null) continue;
+                }
+            }
+            if (!done) continue;
             maybe.* = null;
             defer self.destroy(job);
             if (job.canceled.load(.acquire) or flow.find(job.stream_id) == null) continue;
@@ -149,11 +175,81 @@ pub const Dispatcher = struct {
                 flow.cancel(job.stream_id);
                 continue;
             };
-            try self.callbacks.deliver(stream, job.arena.allocator(), job.stream_id, job.req, result);
+            if (result.streamed) {
+                try self.finishResponse(job, stream, flow, write, result);
+            } else try self.callbacks.deliver(stream, job.arena.allocator(), job.stream_id, job.req, result);
         }
     }
 
     const ProgressContext = struct { dispatcher: *Dispatcher, job: *Job };
+
+    fn publishHead(pointer: *anyopaque, allocator: std.mem.Allocator, head: relay.Head) !void {
+        const context: *ProgressContext = @ptrCast(@alignCast(pointer));
+        const self = context.dispatcher;
+        const job = context.job;
+        try request_cancel.check();
+        const encoded = try self.callbacks.streaming.?.encode_head(allocator, head);
+        errdefer allocator.free(encoded);
+        const slot = try self.allocator.create(relay.Slot);
+        slot.* = relay.Slot.init(encoded);
+        job.response_slot.store(slot, .release);
+        self.wake.signal();
+    }
+
+    fn publishData(pointer: *anyopaque, bytes: []const u8, limit: Deadline) !void {
+        const context: *ProgressContext = @ptrCast(@alignCast(pointer));
+        const self = context.dispatcher;
+        try request_cancel.check();
+        const slot = context.job.response_slot.load(.acquire).?;
+        try slot.publish(self.io, bytes, limit);
+        self.wake.signal();
+        // Stop reading the origin while this chunk is waiting for client credit.
+        try slot.waitForEmpty(self.io, limit);
+    }
+
+    fn drainResponse(self: *Dispatcher, job: *Job, slot: *relay.Slot, stream: std.Io.net.Stream, flow: *flow_mod.State, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void, done: bool) !void {
+        const message = slot.next() orelse return;
+        switch (message) {
+            .head => |block| {
+                // The head's release also publishes every preceding 1xx.
+                try self.drainInformational(job, stream, flow, write);
+                try flow.startStreaming(job.stream_id);
+                try flow.writeStreamHeaders(stream, job.stream_id, block, false, write);
+            },
+            .data => |length| {
+                const failed = if (done) if (job.result) |result| result.stream_error != null else |_| true else false;
+                if (!failed) {
+                    const sent = try flow.writeData(stream, job.stream_id, slot.bytes[job.chunk_offset..length], false, write);
+                    job.chunk_offset += sent;
+                    job.streamed_bytes += sent;
+                    if (job.chunk_offset < length) return;
+                }
+                job.chunk_offset = 0;
+            },
+        }
+        slot.consume(self.io);
+    }
+
+    fn finishResponse(self: *Dispatcher, job: *Job, stream: std.Io.net.Stream, flow: *flow_mod.State, write: *const fn (std.Io.net.Stream, []const u8) anyerror!void, result: *Result) !void {
+        const allocator = job.arena.allocator();
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(allocator);
+        if (result.stream_error == null) for (result.response.trailers) |header| {
+            support.appendHeader(allocator, &block, header.name, header.value) catch |err| {
+                result.stream_error = err;
+                break;
+            };
+        };
+        if (result.stream_error) |err| {
+            try support.sendRst(stream, job.stream_id, if (err == error.Http2BackpressureTimeout) 8 else 2, write);
+        } else if (block.items.len > 0) {
+            try flow.writeStreamHeaders(stream, job.stream_id, block.items, true, write);
+        } else {
+            _ = try flow.writeData(stream, job.stream_id, "", true, write);
+        }
+        flow.cancel(job.stream_id);
+        self.callbacks.streaming.?.finish(result, job.streamed_bytes);
+    }
 
     fn publishInformational(pointer: *anyopaque, reply: support.Informational) !void {
         if (reply.status_code < 102 or reply.status_code >= 200) return error.BadGateway;

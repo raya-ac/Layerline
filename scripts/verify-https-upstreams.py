@@ -33,6 +33,27 @@ results = []
 body = b"layerline authenticated origin\n" * 512
 
 
+def read_aborted_response(client, stream):
+    heads, partial = [], bytearray()
+
+    def aborted(kind, flags, number, payload):
+        if number != stream:
+            return False
+        assert not (kind in (0, 1) and flags & 1), "incomplete response ended cleanly"
+        if kind == 1:
+            heads.append(payload)
+        if kind == 0:
+            partial.extend(payload)
+        if kind != 3:
+            return False
+        assert payload == b"\0\0\0\x02", ("unexpected reset", payload)
+        return True
+
+    client.until(aborted)
+    assert len(heads) == 1 and heads[0].startswith(b"\x88"), heads
+    return bytes(partial)
+
+
 def openssl(*arguments):
     subprocess.run(["openssl", *map(str, arguments)], check=True, capture_output=True, timeout=20)
 
@@ -724,7 +745,9 @@ with tempfile.TemporaryDirectory(prefix="layerline-https-proxy-", dir="/tmp") as
                     client.request(1, b"/eof-clean")
                     assert client.response(1) == (200, body)
                     client.request(3, b"/eof-truncated")
-                    assert client.response(3)[0] == 502, "accepted unauthenticated transport EOF as an HTTP response boundary"
+                    read_aborted_response(client, 3)
+                    client.request(5, b"/fixed")
+                    assert client.response(5) == (200, body)
                 finally:
                     client.close()
             results.append({"version": version.name, "case": "authenticated EOF vs truncated TLS response"})
@@ -765,7 +788,8 @@ with tempfile.TemporaryDirectory(prefix="layerline-https-proxy-", dir="/tmp") as
                     # H2 opens a fresh origin channel. Its total budget must
                     # fit the real Debug handshake, but not the 2.8s trickle.
                     client.request(1, b"/slow-h2")
-                    assert client.response(1)[0] == 504
+                    partial = read_aborted_response(client, 1)
+                    assert 0 < len(partial) < len(body) and body.startswith(partial), len(partial)
                     assert any(path == "/slow-h2" for path, _, _ in origin.requests[before:]), "H2 timed out before exercising the TLS body"
                     assert time.monotonic() - started < 3, "H2 HTTPS reset the backend body budget"
                 finally:
