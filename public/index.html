@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#f4f7f6">
-  <title>Layerline - a web server, written in zig.</title>
-  <meta name="description" content="Static files, PHP, reverse proxies and native TLS. Layerline is a web server written in Zig, with per-site configs and an optional admin UI. HTTP/3 is experimental.">
+  <title>Layerline | a web server written in Zig</title>
+  <meta name="description" content="A web server written in Zig. Serve files, run PHP through FastCGI or proxy an app. One config file per site. HTTP/3 is experimental.">
   <meta property="og:title" content="Layerline">
-  <meta property="og:description" content="a web server, written in zig. static files, php and apps. served directly.">
+  <meta property="og:description" content="a web server written in Zig. static files, PHP and reverse proxying.">
   <meta property="og:type" content="website">
   <meta property="og:image" content="https://layerline.dev/static/laina-v2.png">
   <meta property="og:image:alt" content="Laina, Layerline's black-haired and teal-accented anime mascot, waving hello.">
@@ -37,10 +37,10 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="wrap hero-inner">
         <div class="hero-copy">
-          <p class="eyebrow entrance">your sites. your server.</p>
+          <p class="eyebrow entrance">raya-ac / layerline</p>
           <h1 class="entrance" id="hero-title">Layerline</h1>
           <p class="hero-tagline entrance">a web server, written in zig.</p>
-          <p class="hero-description entrance">Static files, PHP and apps. Served directly.</p>
+          <p class="hero-description entrance">i built it to run my sites. it can serve your files, talk to PHP-FPM or sit in front of an app.</p>
           <div class="actions entrance">
             <a class="button primary" href="#setup">get started <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="18" height="18"></a>
             <a class="text-link" href="https://github.com/raya-ac/Layerline">read the source <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a>
@@ -48,7 +48,7 @@
         </div>
         <figure class="hero-art">
           <img class="mascot" src="/static/laina-v2.png" width="1024" height="1536" fetchpriority="high" alt="Laina waves hello: black and teal twin tails, coral clips, a teal scarf and an off-white utility jacket.">
-          <figcaption><span class="caption-rule"></span>laina <span>/ keeping an eye on the routes</span></figcaption>
+          <figcaption><span class="caption-rule"></span>laina</figcaption>
         </figure>
       </div>
     </section>
@@ -66,7 +66,7 @@
         <div class="config-copy reveal">
           <p class="eyebrow">01 / configuration</p>
           <h2 id="config-title">one file per site.</h2>
-          <p>Keep the listener settings in one place. Give each domain its own config. Static site, PHP app or proxy: same server.</p>
+          <p>ports and server settings go in <code>server.conf</code>. put each site in its own file.</p>
           <div class="main-config">
             <h3>server.conf</h3>
             <pre><code id="main-config">host = 127.0.0.1
@@ -90,7 +90,7 @@ admin_ui = false</code></pre>
 root = /srv/www/example
 index = index.html
 serve_static_root = true</code></pre>
-              <p class="editor-note">Files, ranges, ETags and precompressed sidecars.</p>
+              <p class="editor-note">serves files from the directory set in root.</p>
             </div>
             <div class="code-panel" id="config-proxy" role="tabpanel" aria-labelledby="tab-proxy" tabindex="0">
               <h3 class="example-label">reverse proxy</h3>
@@ -99,7 +99,7 @@ serve_static_root = false
 proxy = http://127.0.0.1:3000, http://127.0.0.1:3001
 upstream_policy = least_connections
 proxy_timeout_ms = 15000</code></pre>
-              <p class="editor-note">An HTTP upstream pool with health and retry controls.</p>
+              <p class="editor-note">sends requests to the app with fewer active connections.</p>
             </div>
             <div class="code-panel" id="config-php" role="tabpanel" aria-labelledby="tab-php" tabindex="0">
               <h3 class="example-label">php / fastcgi</h3>
@@ -110,31 +110,31 @@ php_root = /srv/www/app/public
 php_fastcgi = unix:/run/php/php-fpm.sock
 php_index = index.php
 php_front_controller = true</code></pre>
-              <p class="editor-note">Use your PHP-FPM socket path. PHP runs separately.</p>
+              <p class="editor-note">PHP runs in php-fpm. point this at its socket.</p>
             </div>
           </div>
-          <div class="editor-footer"><span>plain text. no generated config required.</span><span aria-hidden="true">.conf</span></div>
+          <div class="editor-footer"><span>domains-enabled/</span><span aria-hidden="true">.conf</span></div>
         </div>
       </div>
     </section>
 
     <section class="section features" id="features" aria-labelledby="features-title">
       <div class="wrap">
-        <div class="section-heading reveal"><p class="eyebrow">02 / in the server</p><h2 id="features-title">the useful bits,<br>already in the tree.</h2></div>
+        <div class="section-heading reveal"><p class="eyebrow">02 / in the server</p><h2 id="features-title">what works now</h2></div>
         <div class="feature-list">
-          <article class="feature reveal"><span class="feature-number">01</span><div><h3>files and caching</h3><p>Byte ranges, ETags, gzip, precompressed files and scoped cache policies.</p></div></article>
-          <article class="feature reveal"><span class="feature-number">02</span><div><h3>apps and upstreams</h3><p>HTTP proxy pools, health checks, bounded attempts and direct FastCGI for PHP-FPM.</p></div></article>
-          <article class="feature reveal"><span class="feature-number">03</span><div><h3>native TLS</h3><p>TLS 1.3, ALPN and per-domain SNI certificates. Certificate automation integrates with certbot.</p></div></article>
-          <article class="feature reveal"><span class="feature-number">04</span><div><h3>configs that stay yours</h3><p>Per-domain files, route overrides, config validation and compatible in-memory reloads.</p></div></article>
-          <article class="feature reveal"><span class="feature-number">05</span><div><h3>logs and visibility</h3><p>Structured access logs, metrics, route inspection and upstream diagnostics.</p></div></article>
-          <article class="feature reveal"><span class="feature-number">06</span><div><h3>an optional control panel</h3><p>Site management, staged config edits and runtime controls. Off by default; first setup needs a local token.</p><a href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md#admin-access">admin setup and security <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="14" height="14"></a></div></article>
+          <article class="feature reveal"><span class="feature-number">01</span><div><h3>files and caching</h3><p>byte ranges, ETags and gzip. set cache rules per site or route.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">02</span><div><h3>reverse proxy and PHP</h3><p>proxy to HTTP or HTTPS apps. group backends, check their health and cap retries. PHP uses FastCGI.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">03</span><div><h3>native TLS</h3><p>TLS 1.3 on the listener, with a certificate per hostname. certbot handles issuance and renewal.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">04</span><div><h3>config reload</h3><p>validate changes before applying them. route edits can reload; listener changes still need a restart.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">05</span><div><h3>logs and metrics</h3><p>see the route, response and upstream for a request in the access log.</p></div></article>
+          <article class="feature reveal"><span class="feature-number">06</span><div><h3>optional web admin</h3><p>add sites, stage edits and reload. it's off by default and the first account needs a local token.</p><a href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md#admin-access">admin setup <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="14" height="14"></a></div></article>
         </div>
       </div>
     </section>
 
     <section class="section compare" id="compare" aria-labelledby="compare-title">
       <div class="wrap">
-        <div class="section-heading reveal"><p class="eyebrow">03 / where it fits</p><h2 id="compare-title">same job.<br>different starting point.</h2><p>Caddy and nginx have years of production use behind them. Layerline is younger. Here's the comparison without pretending otherwise.</p></div>
+        <div class="section-heading reveal"><p class="eyebrow">03 / compare</p><h2 id="compare-title">layerline, caddy and nginx</h2><p>here's how they handle the things i use most. this isn't a benchmark.</p></div>
         <div class="table-wrap reveal" role="region" aria-label="Web server comparison" tabindex="0">
           <table>
             <caption class="sr-only">Selected capabilities, not performance benchmarks or a claim of feature parity.</caption>
@@ -154,12 +154,12 @@ php_front_controller = true</code></pre>
     </section>
 
     <section class="status-section" aria-labelledby="status-title">
-      <div class="wrap status-layout reveal"><div><p class="eyebrow">a note before you deploy</p><h2 id="status-title">still being built.</h2></div><div><p>I'm building this to run sites without Caddy or nginx in front. It's not a drop-in replacement yet. HTTP/3 interoperability, longer soak tests and more runtime hardening are still on the list.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/roadmap.md">the actual roadmap <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md">security notes <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div></div>
+      <div class="wrap status-layout reveal"><div><p class="eyebrow">before you deploy</p><h2 id="status-title">what i'd leave off</h2></div><div><p>i run sites on layerline, but i wouldn't swap it in blind. leave HTTP/3 off for now and check the things your site needs before moving traffic.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/roadmap.md">roadmap <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/security.md">security notes <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div></div>
     </section>
 
     <section class="section setup" id="setup" aria-labelledby="setup-title">
       <div class="wrap setup-layout">
-        <div class="reveal"><p class="eyebrow">04 / give it a run</p><h2 id="setup-title">build it.<br>point it at a site.</h2><p>You'll need Zig 0.16. This starts a local server on port 8080, with the admin UI off.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/deployment.md">deployment guide <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div>
+        <div class="reveal"><p class="eyebrow">04 / setup</p><h2 id="setup-title">run it locally</h2><p>you'll need Zig 0.16. the example listens on port 8080 with web admin off.</p><a class="text-link" href="https://github.com/raya-ac/Layerline/blob/main/docs/deployment.md">deployment guide <img class="icon" src="/static/icons/arrow-up-right.svg" alt="" width="16" height="16"></a></div>
         <div class="setup-commands reveal">
           <div class="command-heading"><h3>from source</h3><button class="icon-button copy-button" type="button" data-copy="quickstart" aria-label="Copy quick start commands" title="Copy quick start commands" hidden><img src="/static/icons/copy.svg" width="18" height="18" alt=""></button></div>
           <pre><code id="quickstart">git clone https://github.com/raya-ac/Layerline.git

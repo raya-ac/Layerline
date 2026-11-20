@@ -1,350 +1,84 @@
-# Layerline Roadmap
+# layerline roadmap
 
-Layerline should become a production web server, not a demo binary. The target is broad compatibility with the useful nginx and Caddy surface area, then a set of Layerline-native features that make the server worth choosing on its own.
+i want layerline to be the server i put in front of my sites. it already does
+that for a real deployment. i wouldn't tell someone to swap out caddy or nginx
+without checking what their sites actually need.
 
-## September 2026 Audit Gate
+## what works now
 
-October follow-up: HTTP/2 send windows and bounded queues, split header blocks,
-admin bootstrap/session/origin controls, static handle containment, PHP alias
-diagnostic gating, cache metadata accounting, and config reader-lease reclamation
-are implemented. Native PHP2Shell input controls and exposed-version update
-notices are covered by [the security policy and tests](security.md). Remaining
-work includes wider HTTP/2 conformance and upstream streaming, portable
-OS resource limits and command sandboxing, and full HTTP/3 interoperability.
+- static sites, PHP through CGI or FastCGI, and HTTP/HTTPS reverse proxying.
+  each domain can have its own config. limits, retry rules and cache settings can
+  vary by route instead of forcing every site to use the same defaults.
+- HTTP/1.1 and HTTP/2 share the main routing path. HTTP/2 has bounded streams,
+  flow control, trailers and graceful drain. HTTPS backends use native TLS 1.2
+  or 1.3 with certificate checks. the backend HTTP protocol is still HTTP/1.1.
+- the TCP listener speaks TLS 1.3 and picks configured certificates by hostname.
+  certbot can issue and renew certs. first-time webroot issuance still needs the
+  challenge path to be reachable before Layerline starts.
+- compatible config changes reload while old requests finish on the previous
+  config. listener changes need a restart. the optional admin UI can add sites,
+  stage edits, show diffs and run the same validation and reload as the local
+  socket. it's off by default, including first-account setup.
+- HTTP/3 can serve the homepage and health route to an independent curl client.
+  it has buffered routing for other responses and can decode all 99 static QPACK
+  entries plus Huffman literals. that isn't enough to put it on by default.
 
-Reloads reclaim retired arenas and HTTP idle pools after their last reader exits;
-the 32-generation ceiling now bounds simultaneous readers/cleanup rather than
-lifetime reload count. Health checks and certificate renewal use current config.
-Wire tests hold HTTP/1, HTTP/2, flow-blocked output and a backend job across 96
-replacements, including TLS, pool cleanup and immediate admin revocation.
+the [September audit](audit-2026-09-05.md) explains why the release gates exist.
+the [security notes](security.md) cover the limits, failure behavior and wire
+checks. [origin TLS](upstream-tls.md) has the certificate corpus results,
+including what doesn't pass.
 
-The HTTP/2 follow-up accepts validated terminal request trailers without merging
-them into request headers, keeps HPACK synchronized on refused streams, bounds
-decoded header bytes, advertises actual stream/header limits, restores connection
-credit for discarded DATA, and reports frame-size errors with the correct code.
-Raw wire tests cover these paths; this is not a claim of full HTTP/2 conformance.
+## what i'm doing first
 
-Independent h2spec coverage now has a pinned, isolated loopback harness with raw
-JUnit and binary hashes, plus native plain/TLS stream-state tests. Protocol errors
-reset malformed requests; bounded connection history distinguishes skipped,
-half-closed and reset streams without losing HPACK state. New refused/malformed
-stream attempts also consume the configured request cap. Terminal GOAWAY delivery
-uses a bounded transport half-close/drain. The legacy cleartext invalid-preface
-test has an explicit shared-listener qualification, cross-checked against an
-HTTP/1 400 and the passing TLS case; raw failures remain visible. This is an
-external RFC 7540/7541 corpus gate, not full RFC 9113/HTTP/2 feature acceptance.
-Peer graceful GOAWAY also drains existing requests instead of abandoning them.
+1. close out the shutdown and pressure tests on Linux and macOS. A CI failure
+   needs an explanation even if the next run passes. Linux CI uses the x86-64
+   baseline CPU and a glibc 2.35 target for the units, server and test helper.
+2. make releases repeatable. run a candidate off the live ports on the actual
+   host, compare site behavior, then prove rollback with the real systemd unit.
+   Test memory and descriptor pressure there too. A green CI run doesn't do
+   those things. See the [replacement checklist](caddy-replacement-plan.md).
+3. stream final HTTP/2 proxy responses instead of buffering them. cover slow
+   clients, trailers and canceled streams with real upstreams. expand the
+   RFC 9113 checks; h2spec alone doesn't cover the current spec.
+4. close the TLS gaps: first-boot HTTP-01, unattended renewal checks, more TCP
+   listener profiles and absolute handshake write budgets. The origin
+   certificate corpus still has mismatches and skips.
+5. finish the QUIC transport before calling HTTP/3 ready: configured certs, flow
+   control, loss recovery, connection and stream lifetimes, and an independent
+   client matrix for more than a small GET. Keep dynamic QPACK off until its
+   memory and blocking behavior are tested.
 
-Both proxy paths now use bounded message framing rather than treating EOF as the
-only response boundary. HTTP/2 checks edge whitespace and preserves HEAD/304
-length metadata. Hop-field nominations across repeated Connection headers are
-scrubbed. Informational replies are forwarded while upstream work is in progress,
-and validated response trailers end HTTP/2 streams after flow-controlled DATA.
-Trailer responses bypass microcache/recompression until those features preserve
-their metadata; streaming final HTTP/2 upstream bodies remains separate work.
-HTTP/1 chunked and HTTP/2 terminal request trailers now survive dispatch and
-reach reverse proxies as a separate chunked trailer section. Actual field names
-replace client declarations, duplicates retain order, and requests with trailers
-bypass microcache. Metadata/count limits, strict chunk syntax, original body
-deadlines and the native security guard cover both request paths. CGI/FastCGI
-environment mapping and experimental HTTP/3 request-trailer decoding are not
-included in this forwarding support.
-The experimental HTTP/3 buffered encoder preserves the same section ordering and
-HEAD/304 length metadata, with codec and allocation-failure tests; this does not
-close its external interoperability, flow-control or live streaming gaps.
+## after that
 
-Native HTTPS origins now use the authenticated TLS 1.2/1.3 channel in both proxy
-paths and active health probes, carrying original attempt deadlines and
-cancellation. Immutable snapshot-owned roots, strict endpoint/SNI options,
-encrypted H1 pools, joined tunnels and the 1 MiB worker/reload boundary are wired.
-Real wire fixtures cover nested RSA/P384/Ed25519/large-certificate handshakes,
-identity refusal, pooling, TLS half-close, requested origin key updates, H2
-reset/disconnect cleanup and root rotation with pinned old readers. H2 backend
-responses are still buffered and the backend HTTP protocol remains HTTP/1.1.
-The independent certificate corpus is not entirely passing; [the TLS work notes](upstream-tls.md)
-retain profile differences, unsupported algorithms and wider conformance/release
-gates. The native listener now reassembles TLS 1.3 KeyUpdate messages, rotates
-before its record cap, requests fresh peer keys, and sends authenticated closure
-on normal HTTP/1 and HTTP/2 termination. Focused unit and independent OpenSSL
-fixtures cover key ordering, interrupted/split input and concurrent writers.
-Broader TLS profiles, mTLS/resumption, backend HTTP/2/3 and revocation remain gaps.
-Handshake failures now preserve their write epoch: after server Finished, alerts
-use application keys rather than plaintext. Failed flight writes close without
-appending another record. An independent OpenSSL peer covers held/corrupt client
-Finished and wrong-record failures across H1/H2 ALPN, plus early ALPN refusal.
-Development TCP TLS identities now use a process-owned cache of at most 64
-host/algorithm pairs, avoiding repeated key and certificate creation for common
-hosts. Configured certificates take precedence, and full caches keep the uncached
-fallback instead of rejecting hosts or evicting borrowed identities. Preparation
-checks cancellation and the original header deadline between crypto stages and
-before publishing ServerHello; it does not preempt an individual crypto operation.
-Configured listener material now has bounded DER envelope/SPKI admission,
-P-256 point and RSA modulus/exponent matching, key-strength limits and read-only
-CLI checks. Global/SNI tests cover bad material before DNS, rejected reloads and
-verified certificate rotation. Private RSA admission now checks the complete
-two-prime tuple and CRT consistency, with canonical DER and bounded input sizes.
-SEC1 also checks its version, canonical nonzero scalar, optional P-256 curve and
-matching compressed/uncompressed public point, including PKCS8 wrappers.
-Legacy parameter-free P-256 inputs remain supported. This is not full PKIX,
-factor-primality or key-generation-quality validation.
-Startup certbot webroot issuance runs before normal listeners and still needs
-an already reachable challenge endpoint; native first-boot HTTP-01 bootstrap is
-not complete. Origin trust preflight and fake-helper tests do not close that gap.
+- **proxying:** HTTP/2 and HTTP/3 to backends, CONNECT and extended CONNECT,
+  signed affinity, more circuit breaker controls, and response interception.
+  add header and path rewrites without trusting arbitrary forwarded headers.
+- **static and cache:** directory indexes and MIME overrides, brotli and zstd,
+  HTTP/1 microcache, disk cache, stale serving and request coalescing. check
+  ranges and backpressure before adding any media transforms.
+- **PHP:** better `try_files` chains, route-local environment, explicit handling
+  of refused FastCGI multiplexing, and php-fpm tests under load.
+- **TLS:** resumption, mTLS, OCSP and revocation policy; more ACME challenge
+  options. listener key checks aren't a full PKIX or key-quality guarantee.
+- **request policy:** route-local rate limits and auth, trusted proxies, more
+  useful deny/allow rules and a way to report matches without blocking traffic.
+  keep tokens and secret values out of config dumps and diagnostic output.
+- **operations:** least privilege and tighter child-process containment,
+  portable resource ceilings, systemd watchdog and socket activation, signed
+  release packages, admin change history, richer upstream timing and H3 logs.
 
-The [September 5 code audit](audit-2026-09-05.md) takes priority over the historical feature order below. This pass fixed ambiguous request framing, decoded-header injection, origin cache restrictions, static validators/ranges, QPACK literal encoding, and PHP source disclosure through static aliases. HTTP/1 and HTTP/2 now share the static path restrictions and conditional behavior; H3 codec tests are part of the normal test target.
+## things i'd like to build here
 
-Worker shutdown ownership now retains/joins background threads before cleanup;
-an independent deadline guard exits without freeing borrowed runtime state if a
-worker remains stuck. A bounded cleanup reserve now cancels connection-owned
-backend work and tunnel pumps before that guard, while health probes cancel
-immediately on shutdown. Valid half-closed HTTP/1 requests can still finish during
-the drain. Wire/process tests cover active HTTP/1 and HTTP/2 drain,
-new-stream refusal, blocked reads/writes, and zero-window deadline expiry.
-Absolute client read deadlines now cover HTTP/1 header/body phases, TLS reads,
-HTTP/2 frame/header-block assembly, and independent pending uploads. Real trickle
-clients and partial TLS/frame resumption tests cover both plain and TLS paths.
-HTTP/2 response transfer deadlines now bound queued headers/DATA and both
-flow-control windows without renewal by PINGs or tiny credit updates. Expiry
-releases body memory/stream slots; partial wire-write failures close the
-connection instead of appending corrupt frame bytes. Wire tests cover plain/TLS,
-healthy-stream progress, partial input resumption, and blocked socket writes.
-HTTP/1 responses now have a first-write-to-finish budget too, including Darwin
-sendfile and forwarded proxy body waits. Partial upstream responses never retry
-or append another HTTP status line. Interim replies, keep-alive requests, and
-upgraded tunnels retain separate lifetimes; plain/TLS wire tests cover them.
-Direct HTTP/1 proxy replies now record one final access entry and response metric,
-including partial responses. Their `response_complete` flag distinguishes a
-finished message from an aborted transfer; `bytes` excludes headers, chunk framing
-and trailers. Plain writes count socket-accepted payload bytes, while TLS counts
-payload in fully written records, not incomplete ciphertext or delivery ACKs.
-Upgrade handshakes are recorded before tunnel traffic begins. Early hints and
-backend retries do not create duplicate final-response entries, and disabling
-access logging does not disable response metrics. Wire tests cover plain/TLS,
-HEAD, empty replies, truncation, invalid trailers, timeouts and PHP update notices;
-this completion field is not yet emitted by every response handler/protocol.
-HTTP/2 backend routing now uses bounded concurrent tasks (eight per connection,
-64 process-wide), while frame parsing, HPACK, TLS output, and flow control stay on
-the connection thread. A blocked backend no longer stalls PINGs or independent
-stream deadlines. Shared HTTP/2 allocator requests have a 256 MiB sublimit inside
-the application heap budget described below; this is not RSS or kernel-memory
-accounting. Plain/TLS wire
-tests cover admission, idle rearming, resets, and joined disconnect cleanup.
-Proxy/FastCGI attempts and health probes now use absolute backend budgets across
-dialing, writes, and reads. Automatic proxy retries exclude non-idempotent
-methods; each permitted attempt has a fresh budget. Plain/TLS wire tests cover
-trickling backends, FastCGI TCP/Unix records, stale sockets, and tunnel lifetimes.
-Successful backend reads and writes recheck the original absolute budget
-after the syscall too: delayed kernel timer wakeups cannot accept a late backend
-reply as success. Bytes already written remain accounted before a late write is
-aborted. Downstream partial TLS/frame input is not discarded by this check.
-POSIX socket IO now handles peer-reset timeout updates and normal `EAGAIN`
-without entering Zig's blocking-IO panic paths. Nonblocking reads/writes carry
-the original deadline into bounded poll waits and check IO cancellation between
-waits, preserving joined backend cleanup and partial TLS/frame resumption.
-The original Debug disconnect and deadline tests pass. The traced Darwin
-backend-connect failure reported `ISCONN` after an interrupted handshake; the
-native nonblocking TCP/Unix connector now accepts that completed connection and
-checks asynchronous completion with `SO_ERROR`. Hostname lookup still uses the
-standard resolver and races candidate addresses, with cancelable result
-publication and owned cleanup for losing sockets. It does not add HTTP retries
-or reset the outer backend-attempt deadline.
-CGI and external certificate/DNS commands now use an owned native process runner
-with concurrent bounded pipes, absolute deadlines, failed-exec reaping, a shared
-64-child admission limit, and shutdown group cleanup. Certificate commands have
-a separate positive `external_command_timeout_ms` setting (300000 by default).
-Raw command output is not logged; Cloudflare authorization travels through stdin.
-Cloudflare auto-DNS setup now uses typed JSON envelopes and serialized request
-bodies, escapes query components, and rejects ambiguous lookups and unsafe IDs.
-Malformed lookups cannot trigger a create/update; invalid mutation replies stop
-readiness without claiming to roll back a provider-side write. A local fake API
-covers create/update, zone lookup, escaping, malformed replies and bounded failure.
-RSA signing is isolated on bounded joined worker stacks, rather than overflowing
-the default small connection stack in Debug. Initial protocol selection no longer
-retains a duplicate HTTP request handler during TLS, and CGI environment encoding
-avoids general formatting on that stack. These controls do not sandbox child
-code or cover uninterruptible kernel operations. Listener startup now prepares every
-configured endpoint before accepting traffic, propagates fatal listener failures
-through joined shutdown, and protects Unix control socket ownership with a lock,
-kernel peer credentials and crash-recovery checks. Tests cover occupied ports,
-path collisions, malformed datagrams, restart and cross-UID access. Portable OS
-resource limits and wider HTTP/2 frame/stream conformance remain open.
-The explicit application heap is now shared across protocols, TLS, caches,
-configurations, logging and background tasks, with a restart-only configurable
-page-accounted limit and protected Unix-control/emergency-response capacity.
-Overload tests hold incomplete uploads until allocations fail, check plaintext
-and encrypted 503s plus admin access, then verify repeated recovery and cache
-reclamation. HTTP/3 retained slots now age out instead of persisting forever.
-Native TCP TLS also reserves bounded record workspaces before its handshake
-flight, so request-heap exhaustion cannot strand an established record reader
-before the protected overload writer runs. The extra per-connection storage is
-charged to the existing normal/shared heap, not taken from control capacity.
-Allocator-failure tests retain fatal authentication/write semantics; wire tests
-still require complete encrypted GET/HEAD overload responses and recovery.
-The owned Zig I/O runtime now shares the heap hierarchy for bootstrap and task
-allocations and has explicit restart-only worker/stack limits. DNS work uses
-rejectable concurrent admission rather than running inline when saturated.
-The packaged Linux unit adds memory, task and descriptor ceilings, including
-child processes; hard cgroup exhaustion can kill/restart the service. These do
-not turn allocator counters into RSS accounting or provide portable OS limits.
-Managed descriptor reservation/admission now covers Linux/macOS I/O and native
-socket/pipe paths, with OS-clamped restart-only limits, protected Unix control,
-bounded early rejection and per-pool metrics. Low-RLIMIT plaintext/TLS tests
-exercise H1/H2 overload, control/reload, partial CGI rollback and recovery.
-Private resolver/filesystem allowances and inherited handles are not exact OS
-handle accounting. Child execs now use a descriptor allowlist: Linux closes all
-but standard I/O and its temporary status pipe with `close_range` or a fail-closed
-raw `/proc` fallback; macOS uses native `CLOEXEC_DEFAULT` spawn actions. Tests
-exercise inherited high handles above soft nofile, CGI/certificate helpers,
-concurrent HTTP/2 churn and forced Linux fallback. Parent handles stay intact;
-child credentials/environment/filesystem access are not sandboxed. macOS DNS
-now uses the same binary's private resolver mode before configuration bootstrap,
-with no inherited environment and a bounded versioned address reply. The owned
-runner kills/reaps stalled libc lookups on the original backend deadline,
-HTTP/2 cancellation or shutdown. Injected real-libc stalls verify plain/TLS
-deadlines, shared lookup/response budgets, cleanup and recovery; Linux retains
-its in-process resolver. HTTP/2 reset flags also reach native socket waits,
-child launch/capture and the existing dial timer, releasing held backend jobs
-before the backend responds without another watcher task. Kernel/filesystem/spawn stalls and wider protocol
-conformance remain outside this acceptance claim.
-Native connection stacks now enforce a 256 KiB floor (512 KiB for compression):
-the old 64 KiB setting could overflow software TLS in the Linux Debug CGI path.
-Systemd startup now waits for Layerline's native readiness signal after all
-configured listeners and background workers are prepared. Reloads are serialized
-against the current snapshot, rejected reloads preserve the working config, and
-stopping cannot be undone by a late reload. CLI helpers stay silent and external
-commands inherit no notify/watchdog environment authority. Filesystem/abstract
-datagram tests include full queues and sender credentials; an optional real
-systemd gate checks activation, delayed certificate setup, reloads and listener
-failure. This is not backend-health verification, watchdog monitoring or socket
-activation support.
-Hosted verification now has a checked-in workflow for Linux/macOS Debug and
-ReleaseFast unit/wire suites plus ReleaseSafe units, with pinned tools and
-source-bound result artifacts. Linux units and wire artifacts use an explicit
-x86-64 baseline CPU and glibc 2.35 target; macOS remains native. The workflow
-has no production credentials or automatic
-deployment. Real manager/resource tests, namespace-isolated candidate checks,
-live-site comparisons and guarded promotion remain separate release work.
-HTTP/3 remains experimental. An independent curl HTTP/3 client checks health
-and byte-exact homepage delivery, including Huffman-coded request fields. This
-does not cover the full QPACK table, configured certificate integration,
-flow control, loss recovery or broader client interoperability. Disk caching
-and broad feature expansion follow these gates.
+- compare two configs and replay a scrubbed request against the candidate before
+  a reload. the config diff already exists; replay doesn't.
+- a local page that shows which protocol was negotiated and why a request hit
+  a route, a cache entry or an upstream. keep it opt-in.
+- per-route CPU, allocations and upstream wait times. i'd rather make a slow
+  site explain itself than ship a dashboard full of counters nobody reads.
+- named policy bundles for common setups. a PHP app and a public fileserver
+  shouldn't need the same hand-written limits copied into every site file.
+- a local test setup for slow, reset and truncated upstream replies, with no
+  effect on production traffic.
 
-This plan is based on the current local code plus the public feature surfaces documented by Caddy and NGINX:
-
-- Caddy: automatic HTTPS, config API, pluggable modules, static file server, reverse proxy, HTTP/1.1, HTTP/2, HTTP/3, and FastCGI transport.
-- NGINX: static web serving, reverse proxying, caching, HTTP load balancing, media serving, mail proxying, and HTTP/TCP/UDP proxy and load balancing.
-
-Sources:
-
-- https://caddyserver.com/features
-- https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
-- https://docs.nginx.com/nginx/
-- https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/
-
-## Ground Rules
-
-- Keep the binary dependency-light. Optional integrations can exist, but the core runtime should stay Zig-owned.
-- Make config declarative, reloadable, and testable before expanding the directive set heavily.
-- Prefer measured behavior over feature claims. Every major feature needs a conformance test or a live smoke check.
-- Do not expose diagnostic surfaces by default. `/test.php`, the Unix admin socket, and the browser admin UI all require explicit config.
-- Split features into stable modules internally even if they ship as one binary.
-
-## Phase 1: Core Server Correctness
-
-- Harden HTTP/1 parsing and response framing: request-line limits, header count limits, duplicate header policy, chunked trailers, absolute-form requests, HEAD/error response body suppression, and strict keep-alive semantics. Initial header field validation, a 100-field cap, conflicting duplicate `Content-Length` rejection, absolute-form target normalization, and invalid target rejection are implemented.
-- Add request and response timeout controls: read header timeout, body timeout, idle timeout, write timeout, upstream timeout, and graceful shutdown timeout. Initial socket-level timeout config, route/domain backend timeout overrides, and SIGINT/SIGTERM drain are implemented; richer request-body and client-write route policy remain next.
-- Add config validation: report unknown keys, invalid values, unsafe combinations, and line numbers. Initial strict key/value validation, route-local validation, domain block validation, and `--validate-config` are implemented; richer diagnostics remain next.
-- Add hot reload: validate new config, swap atomically, keep existing connections alive, expose reload through signal and authenticated admin control. Activation preflight, managed graceful restart, in-memory snapshot reload for compatible config changes, and SIGHUP reload are implemented; live listener rebinding remains next.
-- Add structured logs: access logs, error logs, JSON logs, request IDs, latency, bytes, upstream timing, and TLS/protocol fields. Initial opt-in JSON access logs are implemented for HTTP/1 and HTTP/2 request handling with request IDs, method, path, query, host, protocol, status, bytes, latency, handler, route error, and upstream target fields; TLS fields, richer upstream timing, and h3 logging remain.
-- Expand tests around route precedence, PHP gating, static file behavior, parser failures, and proxy errors.
-- Expand the admin control UI beyond the implemented first-launch setup/login dashboard, activation preflight, activation diff, in-memory reload, managed graceful restart, site-file controls, live upstream eject/recover, cache purge, manual certificate renewal, and redacted config inspection into richer write APIs and audit trails.
-
-## Phase 2: Static Files and Content Handling
-
-- Directory index controls: index file priority lists, directory browse templates, and browse disable by default.
-- MIME database and override config. Initial common web, font, media, archive, and document MIME table is implemented; config-level overrides remain.
-- Strong caching: ETag, Last-Modified, Cache-Control policies, immutable assets, conditional range requests, Cache-Status, and stale-while-revalidate headers. Initial static ETag/Last-Modified validators, `If-None-Match`, `If-Modified-Since`, HTTP/1 `If-Range`, `cache_control`, `server_cache_control.NAME`, `route_cache_control.NAME`, `server_route_cache_control.DOMAIN.ROUTE`, stale directive shortcuts, static Cache-Status headers, an opt-in shared memory cache for eligible static responses, and a conservative HTTP/2/HTTP/3 buffered GET microcache are implemented on top of inherited response-header policy.
-- Compression: gzip, brotli, zstd, precompressed asset serving, Vary handling, minimum size, and content-type filters. Initial opt-in dynamic gzip covers buffered HTTP/1.1 and HTTP/2 text responses with inherited global/domain/route policy overrides; brotli/zstd remain.
-- Static transforms: safe template mode, include variables, generated headers, and route-local error pages.
-- Large-file performance: sendfile on supported targets, fallback streaming, mmap evaluation, rate limiting, and backpressure tests.
-
-## Phase 3: Reverse Proxy and Load Balancing
-
-- Multiple upstreams per route with round-robin, random, least-connections, weighted, consistent-hash, and sticky-session policies. Initial comma/space-separated upstream pools with configurable round-robin/random/least-connections/weighted/consistent-hash/sticky-cookie selection and per-target `weight=N` options are implemented for global, domain, and route proxy settings.
-- Active and passive health checks with slow start, outlier ejection, retry budgets, and circuit breakers. Initial upstream attempt/failure/retry/ejection metrics, bounded retry budgets, config-owned health state, passive target cooldown, circuit breaker half-open probes, weighted slow start after recovery, and opt-in active HTTP probes are implemented; per-route health policy and richer circuit thresholds remain next.
-- Upstream connection pools with keep-alive limits, per-host caps, DNS re-resolution, happy-eyeballs dialing, and Unix socket upstreams. Initial per-target HTTP/1 upstream keep-alive pooling with idle caps, idle expiry, max-use rotation, framed fixed/chunked response handling, and connection-pool metrics is implemented.
-- WebSocket and CONNECT tunneling. Initial HTTP/1.1 WebSocket/Upgrade proxy tunneling is implemented for route/domain proxy targets; CONNECT and HTTP/2 extended CONNECT remain next.
-- Header rewrite rules: set, append, delete, regex map, forwarded headers, trusted proxy CIDRs, and host/SNI override. Initial inherited response header policy is implemented for global, domain, and route scopes and is applied to Layerline-generated responses plus normal HTTP/1 proxy responses.
-- Response interception: status/header matchers, custom error fallback, maintenance responses, and retry-on conditions.
-- Upstream TLS: SNI, trust store, client certs, certificate pinning, TLS versions, and HTTP/2 or HTTP/3 upstream transport.
-
-## Phase 4: PHP and Dynamic Apps
-
-- Add FastCGI support alongside current CGI: Unix socket and TCP FastCGI, request multiplex safety, stderr capture, and timeout controls. Direct FastCGI transport is implemented for TCP and Unix-socket php-fpm targets with bounded stdout/stderr capture, route/domain timeout overrides, FCGI_KEEP_CONN pooling, idle caps, idle expiry, max-use rotation, and forced close on unsafe responses; multiplex refusal handling remains next.
-- PHP front-controller support: `try_files`, split PATH_INFO, index.php fallback, framework-friendly rewrites, and per-route env vars. Initial opt-in CGI front-controller routing is implemented globally, per-domain, and per-route with `php_index`, `php_front_controller`, SCRIPT_NAME, SCRIPT_FILENAME, PATH_INFO, PATH_TRANSLATED, and REQUEST_URI handling; richer `try_files` chains and per-route env vars remain next.
-- Per-route dynamic handlers: CGI, FastCGI, proxy, static, redirect, and internal response.
-- Worker process pools for CGI-like execution where useful, with max process count and kill timeouts.
-- Safe diagnostic routes: opt-in phpinfo, runtime environment report, and redacted config view.
-
-## Phase 5: TLS, ACME, and Protocols
-
-- Native TLS termination in Zig with modern defaults, certificate chain loading, OCSP stapling, session tickets, ALPN, SNI, and client certificate auth. Initial native TLS 1.3 termination is implemented for X25519 + TLS_AES_128_GCM_SHA256 with ALPN dispatch to HTTP/1.1 or HTTP/2, ECDSA P-256 and RSA configured certificate loading, RSA-PSS CertificateVerify, SNI certificate selection for domain configs, self-signed local fallback, and manual/admin reload of configured certificate material; session resumption, OCSP stapling, automated live renewal reload, and mTLS remain next.
-- ACME automation: HTTP-01, TLS-ALPN-01, DNS-01 provider interface, renewal scheduler, certificate storage, staging mode, and multi-domain certs. Initial certbot/webroot startup issuance, HTTP-01 challenge serving from certbot webroots, a companion HTTP redirect/ACME listener for port 80, periodic `certbot renew` scheduling, admin cert visibility, renewal metrics, and authenticated manual renewal with TLS material reload are implemented.
-- HTTP/2 server implementation: HPACK, streams, flow control, prioritization stance, graceful GOAWAY, and h2c upgrade. Initial h2 route parity now covers static routes, redirects, health/metrics, reverse proxy routes, inherited response headers, FastCGI PHP routes, bounded DATA request bodies, content-length validation, WINDOW_UPDATE for consumed body bytes, and graceful GOAWAY on request caps/shutdown; richer flow-control behavior and prioritization stance remain next.
-- HTTP/3 full routing: route all app responses over QUIC, not just the default page; QPACK dynamic table policy; stream lifecycle; connection migration stance; anti-amplification limits. Initial minimal QPACK request decoding, query-safe path handling, packet splitting, ordered and out-of-order DATA body assembly across stream frames, buffered route dispatch for static/PHP/FastCGI/proxy/redirect/health responses, and best-effort external curl smoke are implemented; flow-control depth and broad client conformance remain.
-- Protocol conformance tests using external clients and captured packet tests.
-
-## Phase 6: Security Controls
-
-- Rate limits by IP, token, route, header, and upstream.
-- Connection limits, body limits, header limits, method allowlists, and per-route auth.
-- Basic auth, bearer auth, mTLS auth, JWT verification, OIDC forward-auth, and signed URL support.
-- WAF-lite rule engine: path/header/body matchers, regex and prefix rules, bot traps, deny/allow lists, and audit-only mode.
-- Security headers presets: HSTS, CSP, X-Frame-Options, COOP/COEP, referrer policy, and permissions policy.
-- Secret handling: env references, external secret command, config redaction, and safe debug dumps.
-
-## Phase 7: Caching and Edge Behavior
-
-- HTTP cache: memory and disk backends, cache keys, vary keys, TTL, stale-if-error, stale-while-revalidate, purge API, and cache status header. Initial in-memory static response caching and HTTP/2/HTTP/3 buffered GET microcaching are implemented with global/domain/route caps, per-entry caps, TTL, Cache-Status store/hit detail, private-response bypasses, metrics, full/matching-key admin socket purge, browser purge controls, and an authenticated HTTP purge API; disk cache remains.
-- Microcache for dynamic upstreams. Initial route/domain-aware buffered GET microcache is implemented for HTTP/2/HTTP/3 proxy and built-in buffered responses with full and matching-key in-memory purge; HTTP/1 parity and stale controls remain.
-- Request coalescing to prevent thundering-herd fills.
-- CDN-like rules: path maps, header maps, redirects, canonical host, trailing slash policy, and language/device variants.
-- Image/media options later: byte-range correctness first, then optional resizing/transcoding only if the project wants that scope.
-
-## Phase 8: Admin, Operations, and Developer Experience
-
-- Local admin API over Unix socket by default: status, activation config validate, runtime validate, redacted config inspection, reload, managed restart, metrics, route dump, upstream health/eject/recover, cert status, and cert renewal.
-- CLI: `layerline validate`, `layerline fmt`, `layerline reload`, `layerline bench`, `layerline routes`, `layerline certs`, and `layerline doctor`. Initial `--doctor` checks config-adjacent runtime prerequisites before opening sockets, `--certs` reports configured TLS and ACME material without starting listeners, and `--admin-command`/`--reload` bridge local CLI operations to the Unix admin socket.
-- Config language evolution: keep simple key/value for now, add named routes/upstreams/listeners, then consider a structured adapter. Initial host-based domain configs are implemented, including nginx-style per-domain files loaded from `domain_config_dir`; file loading, domain-file discovery, line scanning, and diagnostics now live in `config_loader.zig` instead of the directive model.
-- Prometheus metrics plus optional OpenTelemetry traces.
-- Systemd/launchd templates, Docker image, Homebrew tap, and reproducible release builds.
-- Crash reporting primitives: panic log, build info, runtime profile, and redacted support bundle.
-
-## Layerline-Native Features
-
-- Origin Surface: first-class origin personality pages for error states, health, diagnostics, and protocol demos.
-- Protocol Observatory: built-in debug routes that show negotiated HTTP version, TLS, QUIC, compression, cache, and upstream timing.
-- Config Replay: record a request and replay it against a candidate config before reload.
-- Route Diff: compare the activation config with the running config and show which listener, route, domain, upstream, TLS, cache, and security-facing settings changed. Initial admin `diff`/`config-diff` command and browser activation diff are implemented; richer header/security-rule detail remains.
-- Self-Profiling Mode: expose per-route CPU, allocations, bytes, and upstream wait time under an admin-only endpoint.
-- Failure Lab: controlled fault injection for upstream latency, resets, body truncation, and timeout testing.
-- Policy Bundles: reusable named bundles for secure-static, php-app, api-gateway, private-admin, and edge-cache routes.
-- Native Protocol Showcase: demo pages for HTTP/1.1, HTTP/2, HTTP/3, TLS, PHP, proxy, caching, and compression that can be disabled in production.
-
-## Immediate Build Order
-
-1. Config validation and route gates.
-2. Named route model and route-local settings. Initial exact/prefix route table with route-local static, PHP, proxy, backend timeout, static size, response-cache, security preset, and upstream retry/health/breaker policy is implemented. Host-based domain configs with per-domain routes and `domain_config_dir` file loading are implemented; route-local TLS policy remains next.
-3. Timeouts and graceful shutdown.
-4. Reverse proxy upstream pools. Initial multi-target pools, round-robin/random/least-connections/weighted/consistent-hash/sticky-cookie policies, target weights, durable per-upstream state, upstream attempt/failure/retry/ejection/connect-reuse metrics, bounded retry budgets, passive cooldown, circuit breaker half-open probes, weighted slow start, opt-in active HTTP probes, route/domain-local upstream policy overrides, and upstream keep-alive sockets are implemented; richer per-cookie naming and signed affinity remain future work.
-5. FastCGI and PHP front-controller. FastCGI transport, route/domain backend timeouts, FCGI_KEEP_CONN pooling, and CGI front-controller fallback are implemented; richer framework rewrites and multiplex refusal handling remain next.
-6. Native TLS termination. Initial TLS 1.3 TCP termination, ALPN, configured ECDSA/RSA certificate loading, SNI certificate selection, HTTP/1.1 over TLS, and HTTP/2 over TLS are implemented.
-7. HTTP/2 server. Initial h2c and ALPN h2 request routing are implemented for static/proxy/redirect/metrics, FastCGI PHP routes, bounded request bodies, consumed-body WINDOW_UPDATE, and graceful GOAWAY on request caps/shutdown; prioritization stance and broader conformance tests remain next.
-8. HTTP/3 full routing. Initial QUIC/TLS plus minimal QPACK request decoding can serve static routes, static root, configured redirects, `/static/*`, `/health`, metrics, FastCGI PHP, proxy routes, custom 404s, ordered and out-of-order DATA request bodies across stream frames, and the fallback protocol page; flow-control depth and broad client conformance remain.
-9. Cache and compression. Initial inherited Cache-Control policy shortcuts, static ETag/Last-Modified validators, `If-None-Match`, `If-Modified-Since`, HTTP/1 `If-Range`, stale directive shortcuts, static Cache-Status detail, opt-in shared memory static response cache with route/domain knobs, conservative HTTP/2/HTTP/3 buffered GET microcache, admin full/matching-key cache purge through socket, browser, and HTTP API, and opt-in dynamic gzip for buffered HTTP/1.1 and HTTP/2 text responses are implemented with route/domain overrides; brotli/zstd, disk cache, and HTTP/1 microcache parity remain next.
-10. Admin API and hot reload. Initial Unix socket commands cover status, activation validation, runtime validation, activation diff, redacted config inspection, cache purge, in-memory reload, SIGHUP reload, managed restart, routes, upstream health/eject/recover, certs, cert-renew, and metrics; the browser admin UI covers first-launch setup, login, active site inventory, live upstream controls, cache purge, certificate renewal, enabled domain files, activation preflight, activation diff, reload, managed restart, and new site-file creation. Richer write APIs and audit trails remain.
-11. Deployment packaging. Initial systemd, launchd, cert renewal timer, runtime Dockerfile, Linux limit guidance, smoke checks, and rollback runbook are implemented. Native systemd readiness, serialized reload status, terminal stopping notifications and child environment isolation are covered by Unix datagram tests and an optional real-manager gate; watchdog heartbeats, socket activation and package-manager installers remain future work.
-12. Conformance harness. Initial self-starting verifier covers CLI doctor/certs, HTTP/1, parser hardening for malformed headers and conflicting content lengths, HEAD 404 framing, static files, static conditional validators, request IDs, gzip negotiation, native h2c, h2 request bodies, admin socket commands, redacted config inspection, upstream eject/recover, disabled cert-renew guard, in-memory config reload, SIGHUP config reload, admin UI cache purge, admin site-file creation, domain custom 404 documents, structured access logs, HTTP redirect/ACME listener behavior, and shutdown cleanup; broader h2load/autocannon/php-fpm/slow-upstream soak remains.
-
-The next engineering milestone is the remaining audit gate above: wider HTTP/2 conformance, resource-boundary verification and externally verified HTTP/3 interoperability. Keep new production behavior on the existing effective route/domain policy path instead of adding global-only toggles. Earlier implementation summaries describe available code paths, not completed protocol conformance or release acceptance.
+keep the server in Zig. when a tool is optional, call it optional. a demo,
+a wire test and a deployment each prove different things.

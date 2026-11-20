@@ -7,11 +7,11 @@
   <a href="docs/roadmap.md">roadmap</a>
 </div>
 
-i'm building layerline to run sites directly, without needing caddy or nginx in front of it.
+i wanted one server i could put in front of my sites. that's what i'm building layerline for.
 
-it handles static files, php/fpm, http/https reverse proxying and tls. there's native http/2, per-domain configs, caching, gzip, logs, metrics and an optional admin ui. http/3 is in the project too, but it's still experimental.
+it serves static files, talks to PHP-FPM and proxies apps over HTTP or HTTPS. TLS and HTTP/2 are built in. there's a config file per site and a web admin you can leave off.
 
-there's still work to do before i'd call it a drop-in caddy/nginx replacement. the [roadmap](docs/roadmap.md) and [security notes](docs/security.md) cover the gaps.
+HTTP/3 works for the homepage and health check. i'd still leave it off in production. this isn't a drop-in caddy/nginx replacement yet. see the [roadmap](docs/roadmap.md) for what i'd finish before telling someone to switch.
 
 ## run it
 
@@ -38,7 +38,7 @@ the [config guide](docs/configuration.md) has the examples for static sites, php
 
 ## admin
 
-the web ui is off by default. enabling it gives you site management, config editing and runtime controls on the same server. first-account setup needs a local token, so someone visiting an unconfigured server can't claim it. [setup and security details](docs/security.md#admin-access).
+the web ui is off by default. turn it on to add sites, stage config edits and reload. the first account needs a local setup token. [admin setup](docs/security.md#admin-access).
 
 ## tests
 
@@ -47,8 +47,7 @@ zig build test
 ./scripts/verify-layerline.sh
 ```
 
-the verifier starts temporary local servers. [benchmarking](docs/benchmarking.md) is separate.
-github also runs the unit and wire tests on linux and macos. it doesn't deploy automatically.
+the verifier starts temporary local servers. GitHub runs the unit and wire checks on Linux and macOS, but doesn't deploy. [benchmarks](docs/benchmarking.md) are separate.
 
 <p align="center">
   <img src="public/laina-v2.png" alt="laina, layerline's mascot" width="160">

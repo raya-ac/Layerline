@@ -10,6 +10,7 @@ const { chromium } = require("playwright");
 const root = path.resolve(__dirname, "..");
 const origin = new URL(process.env.LAYERLINE_SITE_URL || "http://127.0.0.1:8080/");
 const output = process.env.LAYERLINE_SITE_SCREENSHOTS || path.join(os.tmpdir(), "layerline-site-check");
+const binary = path.resolve(process.env.LAYERLINE_SITE_BINARY || path.join(root, "zig-out/bin/layerline"));
 
 async function main() {
   await fs.mkdir(output, { recursive: true });
@@ -99,7 +100,7 @@ async function main() {
     await fs.writeFile(path.join(temp, "server.conf"), mainConfig);
     for (const name of ["static", "proxy", "php"]) {
       await fs.writeFile(path.join(temp, "domains-enabled", "example.conf"), await page.locator(`#config-${name} code`).textContent());
-      execFileSync(path.join(root, "zig-out/bin/layerline"), ["--config", path.join(temp, "server.conf"), "--validate-config"], { cwd: root, stdio: "pipe" });
+      execFileSync(binary, ["--config", path.join(temp, "server.conf"), "--validate-config"], { cwd: root, stdio: "pipe" });
     }
     console.log("all published config examples: valid");
 
