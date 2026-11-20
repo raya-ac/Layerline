@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import resource
 import ssl
@@ -14,6 +15,26 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def build_profile(system, machine):
+    if (system, machine) == ("linux", "x86_64"):
+        return {"target": "x86_64-linux-gnu.2.35", "cpu": "baseline"}
+    if system == "darwin" and machine in {"arm64", "x86_64"}:
+        return {"target": "native", "cpu": "native"}
+    raise ValueError(f"unsupported verification host: {system}/{machine}")
+
+
+def zig_build(zig, profile, mode, step=None, prefix=None):
+    command = [zig, "build"]
+    if step is not None:
+        command.append(step)
+    command += ["-Doptimize=" + mode, "-j2"]
+    if profile["target"] != "native":
+        command += ["-Dtarget=" + profile["target"], "-Dcpu=" + profile["cpu"]]
+    if prefix is not None:
+        command += ["--prefix", str(prefix)]
+    return command
 
 
 def sha(path):
@@ -117,8 +138,10 @@ def main():
     checks, errors, artifacts = {}, [], {}
     receipt = {"revision": revision, "mode": args.mode, "sources": before, "checks": checks, "errors": errors, "artifacts": artifacts,
                "python": sys.version, "python_ssl": ssl.OPENSSL_VERSION, "status": "failed",
-               "scope": "hosted native unit/wire checks; not production activation, full PKIX, RFC9113 or HTTP3 acceptance"}
+               "scope": "hosted unit/wire checks; not production activation, full PKIX, RFC9113 or HTTP3 acceptance"}
     try:
+        profile = build_profile(sys.platform, platform.machine())
+        receipt["build_profile"] = profile
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         receipt["nofile_before"] = [soft, hard]
         assert hard == resource.RLIM_INFINITY or hard >= 8192, "CI requires a raisable nofile limit of 8192"
@@ -137,13 +160,13 @@ def main():
         record_run("memory-fixture-tests", [sys.executable, "scripts/test-memory-fixture.py", "-v"], output, checks)
         record_run("format", [paths["zig"], "fmt", "--check", "build.zig", "src"], output, checks)
         record_run("shell-syntax", ["bash", "-n", "scripts/verify-layerline.sh"], output, checks)
-        record_run("units", [paths["zig"], "build", "test", "-Doptimize=" + args.mode, "--summary", "all", "-j2"], output, checks)
+        record_run("units", zig_build(paths["zig"], profile, args.mode, "test") + ["--summary", "all"], output, checks)
         if args.mode == "Debug":
-            record_run("safe-units", [paths["zig"], "build", "test", "-Doptimize=ReleaseSafe", "--summary", "all", "-j2"], output, checks)
+            record_run("safe-units", zig_build(paths["zig"], profile, "ReleaseSafe", "test") + ["--summary", "all"], output, checks)
         server = output / "server"
         helper = output / "test-tools"
-        record_run("build", [paths["zig"], "build", "-Doptimize=" + args.mode, "--prefix", str(server), "-j2"], output, checks)
-        record_run("build-helper", [paths["zig"], "build", "test-tools", "-Doptimize=ReleaseFast", "--prefix", str(helper), "-j2"], output, checks)
+        record_run("build", zig_build(paths["zig"], profile, args.mode, prefix=server), output, checks)
+        record_run("build-helper", zig_build(paths["zig"], profile, "ReleaseFast", "test-tools", helper), output, checks)
         binary, child = server / "bin/layerline", helper / "bin/child-process-worker"
         artifacts.update(server=sha(binary), child_worker=sha(child))
         env = {**os.environ, "LAYERLINE_VERIFY_BINARY": str(binary), "LAYERLINE_CHILD_WORKER": str(child), "LAYERLINE_H2SPEC": paths["h2spec"]}

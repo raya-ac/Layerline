@@ -274,6 +274,11 @@ archive includes the raw JUnit reports, including the existing cleartext
 shared-listener exception; generated TLS private keys are excluded. Failed or
 incomplete checks cannot produce a passing receipt. Tool bootstrap failures are
 reported in the job log before verification starts.
+Linux verification runs the units, server and child fixture with the same
+explicit `x86_64-linux-gnu.2.35` target and baseline CPU. The receipt records
+that profile and the actual build commands. macOS verification remains native.
+This avoids depending on the Linux runner's CPU features; it does not replace
+running the resulting binaries on the intended deployment host.
 Both clients must support HTTP/2; macOS also requires HTTP/3 so a changed curl
 build cannot silently skip that coverage. The HTTP/3 smoke checks health and
 the homepage HTML byte-for-byte, not every asset or full QUIC conformance.

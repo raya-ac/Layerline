@@ -219,13 +219,16 @@ failure. This is not backend-health verification, watchdog monitoring or socket
 activation support.
 Hosted verification now has a checked-in workflow for Linux/macOS Debug and
 ReleaseFast unit/wire suites plus ReleaseSafe units, with pinned tools and
-source-bound result artifacts. It has no production credentials or automatic
+source-bound result artifacts. Linux units and wire artifacts use an explicit
+x86-64 baseline CPU and glibc 2.35 target; macOS remains native. The workflow
+has no production credentials or automatic
 deployment. Real manager/resource tests, namespace-isolated candidate checks,
 live-site comparisons and guarded promotion remain separate release work.
-HTTP/3 remains experimental: configured
-certificate integration, Huffman decoding, flow control, and external client
-acceptance are incomplete. Disk caching and broad feature expansion follow these
-gates, not precede them.
+HTTP/3 remains experimental. An independent curl HTTP/3 client checks health
+and byte-exact homepage delivery, including Huffman-coded request fields. This
+does not cover the full QPACK table, configured certificate integration,
+flow control, loss recovery or broader client interoperability. Disk caching
+and broad feature expansion follow these gates.
 
 This plan is based on the current local code plus the public feature surfaces documented by Caddy and NGINX:
 

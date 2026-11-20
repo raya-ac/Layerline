@@ -24,6 +24,33 @@ tools, verify = module("ci-tools"), module("ci-verify")
 
 
 class ToolChecks(unittest.TestCase):
+    def test_linux_units_and_artifacts_share_the_baseline_profile(self):
+        profile = verify.build_profile("linux", "x86_64")
+        self.assertEqual(profile, {"target": "x86_64-linux-gnu.2.35", "cpu": "baseline"})
+        for mode, step, prefix in [("Debug", "test", None), ("ReleaseSafe", "test", None),
+                                   ("ReleaseFast", "test", None), ("ReleaseFast", None, "server"),
+                                   ("ReleaseFast", "test-tools", "helper")]:
+            with self.subTest(mode=mode, step=step):
+                command = verify.zig_build("zig", profile, mode, step, prefix)
+                self.assertEqual(command[:2], ["zig", "build"])
+                self.assertIn("-Doptimize=" + mode, command)
+                self.assertIn("-Dtarget=x86_64-linux-gnu.2.35", command)
+                self.assertIn("-Dcpu=baseline", command)
+                if step is not None:
+                    self.assertEqual(command[2], step)
+                if prefix is not None:
+                    self.assertEqual(command[-2:], ["--prefix", prefix])
+
+    def test_darwin_stays_native_and_unknown_hosts_fail_closed(self):
+        for machine in ["arm64", "x86_64"]:
+            profile = verify.build_profile("darwin", machine)
+            self.assertEqual(profile, {"target": "native", "cpu": "native"})
+            self.assertEqual(verify.zig_build("zig", profile, "Debug", "test"),
+                             ["zig", "build", "test", "-Doptimize=Debug", "-j2"])
+        for system, machine in [("linux", "aarch64"), ("win32", "x86_64")]:
+            with self.assertRaisesRegex(ValueError, "unsupported verification host"):
+                verify.build_profile(system, machine)
+
     def test_client_features_cannot_silently_remove_http3_coverage(self):
         verify.require_curl_features("curl fixture\nFeatures: HTTP2 HTTP3 SSL\n", "darwin")
         verify.require_curl_features("curl fixture\nFeatures: HTTP2 SSL\n", "linux")
