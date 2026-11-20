@@ -717,14 +717,23 @@ with tempfile.TemporaryDirectory(prefix="layerline-https-proxy-", dir="/tmp") as
                     assert origin.sni[-1] == "origin.example.test", origin.sni
                     assert request(port, secure, "/chunked") == (200, body)
                     assert request(port, secure, "/php-version")[0] == 503
+                    assert request(port, secure) == (200, body)
+                    shared_socket = origin.requests[-1][2]
                     client = H2(port, secure)
                     try:
                         client.request(1, b"/fixed")
                         assert client.response(1) == (200, body)
+                        assert origin.requests[-1][2] == shared_socket, "HTTP/2 opened a new TLS origin connection"
                         client.request(3, b"/chunked")
                         assert client.response(3) == (200, body)
+                        assert origin.requests[-1][2] == shared_socket, "HTTP/2 didn't reuse its TLS origin connection"
+                        assert request(port, secure) == (200, body)
+                        assert origin.requests[-1][2] == shared_socket, "HTTP/2 didn't return the TLS origin connection"
                         client.request(5, b"/php-version")
                         assert client.response(5)[0] == 503
+                        client.request(7, b"/fixed")
+                        assert client.response(7) == (200, body)
+                        assert origin.requests[-1][2] != shared_socket, "reused the connection after withholding a PHP response"
                     finally:
                         client.close()
                     assert request(port, secure, "/poison") == (200, body)

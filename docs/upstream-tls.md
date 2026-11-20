@@ -42,17 +42,15 @@ target later must be reloadable. There are at most 32 simultaneous origin TLS
 handshakes process-wide. Capacity or secure-entropy failure is local overload,
 not evidence that an origin should be ejected.
 
-Dialing, handshake and HTTP I/O share the original attempt deadline and
-cancellation. HTTP/1 pools own the socket and TLS channel together; buffered input,
-pending protocol state or readable idle sockets prevent reuse. This conservative
-check may discard a connection with harmless pending session tickets too.
-Eviction, failed requests, retirement and shutdown release the channel before its
-socket. Upgraded tunnels bind the two independent TLS directions in both joined
-pump threads and send encrypted close-notify before a TCP write-half-close.
+dialing, handshake and HTTP I/O share one attempt deadline. HTTP/1 and HTTP/2
+clients share the same origin pool within each config target. a pooled socket
+keeps its TLS channel. pending data, a TLS close or a readable idle socket keeps
+it out of the next request. that can also discard a harmless session ticket.
+eviction, failed requests and shutdown free the channel before closing the socket.
+upgraded tunnels send encrypted close-notify before a TCP write-half-close.
 
-HTTP/2 clients can receive streamed proxy bodies. Layerline still opens a new
-HTTP/1.1 origin connection for each of those requests; there's no origin
-pooling or HTTP/2 ALPN on that path.
+the origin side still speaks HTTP/1.1. streaming to an HTTP/2 client doesn't
+change that. Layerline doesn't pool the experimental HTTP/3 proxy path.
 
 ## channel implementation
 

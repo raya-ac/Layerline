@@ -43,7 +43,12 @@ class Backend(http.server.ThreadingHTTPServer):
     def __init__(self):
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.early_sockets = []
         super().__init__(("127.0.0.1", 0), Handler)
+
+    def handle_error(self, request, address):
+        if not isinstance(sys.exception(), (ConnectionResetError, BrokenPipeError)):
+            super().handle_error(request, address)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -51,6 +56,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.endswith("/early"):
+            self.server.early_sockets.append(self.connection)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", "9")
@@ -312,6 +318,7 @@ graceful_shutdown_timeout_ms = 1200
                 client.request(1, b"/slow/early")
                 assert backend.entered.wait(1)
                 client.until(lambda items: any(k == 1 and s == 1 for k, _, s, _ in items))
+                canceled_origin = backend.early_sockets[-1]
                 client.send(3, 0, 1, (8).to_bytes(4, "big"))
                 quiescent()
                 client.request(3, b"/health")
@@ -320,6 +327,11 @@ graceful_shutdown_timeout_ms = 1200
                 assert client.body(3) == b"ok\n" and not client.body(1)
                 assert resources()["layerline_upstream_failures_total"] == 0
                 backend.release.set()
+                client.request(5, b"/slow/early")
+                client.window(5, 9)
+                client.until(lambda _: client.ended(5))
+                assert client.body(5) == b"firsttail"
+                assert backend.early_sockets[-1] is not canceled_origin, "canceled origin socket was returned to the pool"
                 client.close()
                 client = None
                 quiescent(memory=True)

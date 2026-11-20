@@ -43,6 +43,7 @@ fn appendForwardedRequestHeaders(
     req: request_mod.HttpRequest,
     upstream: *const UpstreamConfig,
     cfg: *const ServerConfig,
+    keepalive: bool,
     callbacks: Callbacks,
 ) !void {
     var authority_buffer: [512]u8 = undefined;
@@ -56,7 +57,10 @@ fn appendForwardedRequestHeaders(
     else
         "http";
 
-    try out.print(allocator, "Host: {s}\r\nConnection: close\r\n", .{http_headers.trimValue(forwarded_host)});
+    try out.print(allocator, "Host: {s}\r\nConnection: {s}\r\n", .{
+        http_headers.trimValue(forwarded_host),
+        if (keepalive) "keep-alive" else "close",
+    });
 
     var saw_forwarded_host = false;
     var saw_forwarded_proto = false;
@@ -99,8 +103,17 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     const upstream_label = try std.fmt.allocPrint(allocator, "{f}", .{upstream.url()});
     callbacks.access_log_set_upstream(upstream_label);
 
-    const lease = try upstream_connection.open(allocator, upstream, runtime_policy.timeout_ms, callbacks);
-    defer lease.close(callbacks);
+    const keepalive = std.mem.eql(u8, req.version, "HTTP/2.0") and upstream_connection.keepaliveConfigured(cfg);
+    const lease = if (keepalive)
+        try upstream_connection.acquire(allocator, upstream, cfg, runtime_policy.timeout_ms, callbacks)
+    else
+        try upstream_connection.open(allocator, upstream, runtime_policy.timeout_ms, callbacks);
+    var completed: ?bool = null;
+    defer if (completed) |reusable| {
+        upstream_connection.release(upstream, cfg, lease, keepalive and reusable, callbacks);
+    } else {
+        lease.close(callbacks);
+    };
     const upstream_conn = lease.stream;
     const previous_tls = upstream_tls.bind(lease.tls_channel);
     defer _ = upstream_tls.bind(previous_tls);
@@ -113,7 +126,7 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
     var request = std.ArrayList(u8).empty;
     defer request.deinit(allocator);
     try request.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ req.method, proxy_path });
-    try appendForwardedRequestHeaders(allocator, &request, req, upstream, cfg, callbacks);
+    try appendForwardedRequestHeaders(allocator, &request, req, upstream, cfg, keepalive, callbacks);
     try @import("proxy_request_body.zig").appendFraming(allocator, &request, req, false);
     try callbacks.stream_write_all(upstream_conn, request.items);
     try @import("proxy_request_body.zig").write(upstream_conn, req, callbacks.stream_write_all);
@@ -161,21 +174,21 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
                 try backend_deadline.checkReadCompletion(upstream_conn);
                 try sink.data(sink.context, data, limit);
             }
-            try backend_deadline.checkReadCompletion(upstream_conn);
-            lease.end();
-            return .{
+            const response: H2BufferedResponse = .{
                 .status_code = status,
                 .content_type = content_type,
                 .body = "",
                 .trailers = try h2_support.collectUpstreamHeaders(allocator, reader.trailers(), head.fields),
             };
+            try backend_deadline.checkReadCompletion(upstream_conn);
+            completed = reader.reusable(head.framing);
+            return response;
         }
     }
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     while (try reader.nextData()) |data| try body.appendSlice(allocator, data);
-    lease.end();
-    return .{
+    const response: H2BufferedResponse = .{
         .status_code = status,
         .content_type = content_type,
         .body = try body.toOwnedSlice(allocator),
@@ -185,6 +198,9 @@ fn fetchResponse(allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: r
         .content_length = if (bodyless) head.framing.content_length else null,
         .omit_content_length = std.mem.eql(u8, req.method, "HEAD") and head.framing.content_length == null,
     };
+    try backend_deadline.checkReadCompletion(upstream_conn);
+    completed = reader.reusable(head.framing);
+    return response;
 }
 
 pub fn fetchPoolResponse(

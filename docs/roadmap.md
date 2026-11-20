@@ -12,8 +12,8 @@ without checking what their sites actually need.
 - HTTP/1.1 and HTTP/2 share the main routing path. HTTP/2 has bounded streams,
   flow control, trailers and graceful drain. proxy bodies can stream to HTTP/2
   clients unless the route needs to buffer for cache, gzip or an error page.
-  HTTPS backends use TLS 1.2 or 1.3 with certificate checks and still speak
-  HTTP/1.1.
+  both client protocols can reuse HTTP/1.1 origin connections. HTTPS backends
+  use TLS 1.2 or 1.3 with certificate checks.
 - the TCP listener speaks TLS 1.3 and picks configured certificates by hostname.
   certbot can issue and renew certs. first-time webroot issuance still needs the
   challenge path to be reachable before Layerline starts.

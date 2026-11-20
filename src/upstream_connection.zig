@@ -3,6 +3,7 @@ const config = @import("config.zig");
 const budget = @import("resource_budget.zig");
 const runtime = @import("stream_runtime.zig");
 const deadline = @import("backend_deadline.zig");
+const idle_socket = @import("upstream_idle.zig");
 const tls = @import("upstream_tls.zig");
 
 pub const Lease = struct {
@@ -20,6 +21,69 @@ pub const Lease = struct {
         if (self.tls_channel) |channel| channel.end() catch {};
     }
 };
+
+pub fn keepaliveConfigured(cfg: *const config.ServerConfig) bool {
+    return cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0;
+}
+
+fn quiet(channel: ?*tls.Channel, target: *const config.UpstreamConfig) bool {
+    return if (channel) |value| value.quiet() else !target.https;
+}
+
+fn fromIdle(conn: config.UpstreamIdleConnection) Lease {
+    return .{ .stream = conn.stream, .tls_channel = conn.tls_channel, .requests_served = conn.requests_served };
+}
+
+pub fn acquire(allocator: std.mem.Allocator, target: *config.UpstreamConfig, cfg: *const config.ServerConfig, timeout_ms: u32, callbacks: anytype) !Lease {
+    if (keepaliveConfigured(cfg)) {
+        const io = callbacks.active_io();
+        const now_ms = callbacks.upstream_now_ms();
+        const pool = &target.keepalive_pool;
+        pool.mutex.lockUncancelable(io);
+        defer pool.mutex.unlock(io);
+
+        while (pool.idle.pop()) |conn| {
+            const lease = fromIdle(conn);
+            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests or
+                !quiet(conn.tls_channel, target) or !idle_socket.reusable(conn.stream))
+            {
+                lease.close(callbacks);
+                continue;
+            }
+            callbacks.metrics.upstreamConnectionReused();
+            return lease;
+        }
+    }
+    return open(allocator, target, timeout_ms, callbacks);
+}
+
+pub fn release(target: *config.UpstreamConfig, cfg: *const config.ServerConfig, lease: Lease, reusable: bool, callbacks: anytype) void {
+    const served = lease.requests_served + 1;
+    if (!reusable or !keepaliveConfigured(cfg) or served >= cfg.upstream_keepalive_max_requests or !quiet(lease.tls_channel, target)) {
+        lease.end();
+        lease.close(callbacks);
+        return;
+    }
+
+    const io = callbacks.active_io();
+    const pool = &target.keepalive_pool;
+    pool.mutex.lockUncancelable(io);
+    defer pool.mutex.unlock(io);
+
+    while (pool.idle.items.len >= cfg.upstream_keepalive_max_idle) {
+        fromIdle(pool.idle.orderedRemove(0)).close(callbacks);
+    }
+    pool.idle.append(budget.allocator(), .{
+        .stream = lease.stream,
+        .tls_channel = lease.tls_channel,
+        .expires_at_ms = callbacks.upstream_now_ms() + @as(i64, cfg.upstream_keepalive_idle_timeout_ms),
+        .requests_served = served,
+    }) catch {
+        lease.close(callbacks);
+        return;
+    };
+    callbacks.metrics.upstreamConnectionPooled();
+}
 
 // Dial, authentication and HTTP I/O all retain the caller's original attempt
 // budget. The TLS state outlives a request arena when the lease enters a pool.

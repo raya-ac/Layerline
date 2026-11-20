@@ -8,7 +8,6 @@ const metrics_mod = @import("metrics.zig");
 const proxy_utils = @import("proxy_utils.zig");
 const request_mod = @import("request.zig");
 const upstream_mod = @import("upstream.zig");
-const upstream_idle = @import("upstream_idle.zig");
 const read_deadline = @import("read_deadline.zig");
 const write_deadline = @import("write_deadline.zig");
 const backend_deadline = @import("backend_deadline.zig");
@@ -20,7 +19,6 @@ const upstream_connection = @import("upstream_connection.zig");
 const HttpRequest = request_mod.HttpRequest;
 const ServerConfig = config_mod.ServerConfig;
 const UpstreamConfig = config_mod.UpstreamConfig;
-const UpstreamIdleConnection = config_mod.UpstreamIdleConnection;
 const UpstreamPoolConfig = config_mod.UpstreamPoolConfig;
 const UpstreamPoolPolicy = config_mod.UpstreamPoolPolicy;
 const UpstreamRuntimePolicy = config_mod.UpstreamRuntimePolicy;
@@ -61,18 +59,6 @@ pub const HealthCheckContext = struct {
     callbacks: Callbacks,
     maintenance_wake: *std.Io.Event,
 };
-
-const UpstreamConnectionLease = upstream_connection.Lease;
-
-fn keepaliveConfigured(cfg: *const ServerConfig) bool {
-    return cfg.upstream_keepalive_enabled and cfg.upstream_keepalive_max_idle > 0;
-}
-
-fn closeIdleConnection(conn: UpstreamIdleConnection, callbacks: Callbacks) void {
-    if (conn.tls_channel) |channel| channel.destroy();
-    callbacks.stream_close(conn.stream);
-    callbacks.metrics.upstreamConnectionDiscarded();
-}
 
 pub fn deinitConfigPools(io: std.Io, cfg: *ServerConfig, metrics: *metrics_mod.ServerMetrics, close: *const fn (std.Io.net.Stream) void) void {
     const Cleanup = struct {
@@ -132,66 +118,6 @@ test "retired global route domain and domain-route pools close all idle descript
     try std.testing.expectEqual(5, Fake.closed);
     try std.testing.expectEqual(0, cfg.h2_upstream.?.keepalive_pool.idle.capacity);
     for (pools) |pool| try std.testing.expectEqual(0, pool.targets.items[0].keepalive_pool.idle.capacity);
-}
-
-fn acquireConnection(allocator: std.mem.Allocator, upstream: *UpstreamConfig, cfg: *const ServerConfig, timeout_ms: u32, now_ms: i64, callbacks: Callbacks) !UpstreamConnectionLease {
-    if (keepaliveConfigured(cfg)) {
-        const io = callbacks.active_io();
-        upstream.keepalive_pool.mutex.lockUncancelable(io);
-        defer upstream.keepalive_pool.mutex.unlock(io);
-
-        while (upstream.keepalive_pool.idle.pop()) |conn| {
-            if (conn.expires_at_ms <= now_ms or conn.requests_served >= cfg.upstream_keepalive_max_requests or (if (conn.tls_channel) |channel| !channel.quiet() else upstream.https) or !upstream_idle.reusable(conn.stream)) {
-                closeIdleConnection(conn, callbacks);
-                continue;
-            }
-
-            callbacks.metrics.upstreamConnectionReused();
-            return .{
-                .stream = conn.stream,
-                .tls_channel = conn.tls_channel,
-                .requests_served = conn.requests_served,
-            };
-        }
-    }
-
-    return upstream_connection.open(allocator, upstream, timeout_ms, callbacks);
-}
-
-fn releaseConnection(upstream: *UpstreamConfig, cfg: *const ServerConfig, lease: UpstreamConnectionLease, reusable: bool, now_ms: i64, callbacks: Callbacks) void {
-    if (!reusable or !keepaliveConfigured(cfg) or (if (lease.tls_channel) |channel| !channel.quiet() else upstream.https)) {
-        lease.end();
-        lease.close(callbacks);
-        return;
-    }
-
-    const served = lease.requests_served + 1;
-    if (served >= cfg.upstream_keepalive_max_requests) {
-        lease.end();
-        lease.close(callbacks);
-        return;
-    }
-
-    const idle_conn = UpstreamIdleConnection{
-        .stream = lease.stream,
-        .tls_channel = lease.tls_channel,
-        .expires_at_ms = now_ms + @as(i64, @intCast(cfg.upstream_keepalive_idle_timeout_ms)),
-        .requests_served = served,
-    };
-
-    const io = callbacks.active_io();
-    upstream.keepalive_pool.mutex.lockUncancelable(io);
-    defer upstream.keepalive_pool.mutex.unlock(io);
-
-    while (upstream.keepalive_pool.idle.items.len >= cfg.upstream_keepalive_max_idle) {
-        closeIdleConnection(upstream.keepalive_pool.idle.orderedRemove(0), callbacks);
-    }
-
-    upstream.keepalive_pool.idle.append(resource_budget.allocator(), idle_conn) catch {
-        lease.close(callbacks);
-        return;
-    };
-    callbacks.metrics.upstreamConnectionPooled();
 }
 
 fn forwardFields(stream: std.Io.net.Stream, fields: []const u8, connection_fields: []const u8, callbacks: Callbacks) !void {
@@ -368,10 +294,10 @@ fn responseFailure(stream: std.Io.net.Stream, upstream_conn: std.Io.net.Stream, 
 
 fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, upstream: *UpstreamConfig, req: HttpRequest, cfg: *const ServerConfig, timeout_ms: u32, sticky_cookie_header: ?[]const u8, callbacks: Callbacks) !void {
     const upgrade_request = proxy_utils.isHttpUpgradeHeaders(req.headers);
-    const keepalive_enabled = keepaliveConfigured(cfg) and !upgrade_request;
+    const keepalive_enabled = upstream_connection.keepaliveConfigured(cfg) and !upgrade_request;
     const previous_backend = backend_deadline.push(callbacks.active_io(), timeout_ms);
     defer backend_deadline.restore(previous_backend);
-    const lease = try acquireConnection(allocator, upstream, cfg, timeout_ms, callbacks.upstream_now_ms(), callbacks);
+    const lease = try upstream_connection.acquire(allocator, upstream, cfg, timeout_ms, callbacks);
     var lease_released = false;
     defer if (!lease_released) {
         lease.close(callbacks);
@@ -452,7 +378,7 @@ fn forwardToUpstream(stream: std.Io.net.Stream, allocator: std.mem.Allocator, up
     const result = forwardResponse(stream, allocator, lease.stream, req, sticky_cookie_header, timeout_ms, callbacks) catch |err| {
         return responseFailure(stream, lease.stream, err, callbacks);
     };
-    releaseConnection(upstream, cfg, lease, result.reusable, callbacks.upstream_now_ms(), callbacks);
+    upstream_connection.release(upstream, cfg, lease, result.reusable, callbacks);
     lease_released = true;
 
     return error.CloseConnection;

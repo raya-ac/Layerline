@@ -668,6 +668,9 @@ Layerline still speaks HTTP/1.1 to the origin. it can stream the response to
 an HTTP/2 client without waiting for the whole body. requests eligible for
 the response cache or gzip still buffer, as do bodyless replies and HTML error
 pages that might be replaced. a late origin failure resets that stream.
+HTTP/1 and HTTP/2 clients share the same `upstream_keepalive` pool for each
+configured target. Layerline only returns a socket after reading a complete,
+self-delimited response. it checks idle sockets again before reuse.
 use `proxy` or a named proxy route; the old `h2_upstream` setting doesn't route.
 
 ## PHP support

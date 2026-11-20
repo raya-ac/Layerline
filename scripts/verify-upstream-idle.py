@@ -2,6 +2,7 @@
 """A pooled origin socket must still be quiet and open before its next request."""
 import http.client
 import http.server
+import os
 import pathlib
 import socket
 import ssl
@@ -45,7 +46,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     do_POST = answer
 
 
-def request(port, secure, path, method="GET", body=None):
+def request(port, secure, path, method="GET", body=None, h2=False):
+    if h2:
+        command = [
+            "curl", "-skS", "--max-time", "3", "--http2" if secure else "--http2-prior-knowledge",
+            "-w", "%{response_code}/%{http_version}\n",
+        ]
+        if method == "HEAD":
+            command += ["--head", "-o", os.devnull]
+        if body is not None:
+            command += ["--data-binary", "@-"]
+        scheme = "https" if secure else "http"
+        result = subprocess.run(command + [f"{scheme}://127.0.0.1:{port}/pool/{path}"], input=body, capture_output=True, check=True)
+        assert result.stdout == (b"" if method == "HEAD" else b"ok") + b"200/2\n", result.stdout
+        return
     connection = (http.client.HTTPSConnection("127.0.0.1", port, timeout=3, context=ssl._create_unverified_context())
                   if secure else http.client.HTTPConnection("127.0.0.1", port, timeout=3))
     try:
@@ -77,6 +91,7 @@ tls = {str(secure).lower()}
 admin_socket = off
 upstream_keepalive = true
 upstream_keepalive_idle_timeout_ms = 30000
+upstream_keepalive_max_requests = 4
 upstream_retries = 0
 upstream_max_failures = 0
 route = pool /pool/* proxy
@@ -97,29 +112,36 @@ route_proxy.pool = http://127.0.0.1:{origin.server_port}
                     request(port, secure, "quiet", "HEAD")
                     with origin.lock:
                         original = origin.seen[-1][2]
-                    request(port, secure, "quiet")
+                    request(port, secure, "quiet", h2=True)
                     with origin.lock:
-                        assert origin.seen[-1][2] is original, "healthy idle connection was discarded"
+                        assert origin.seen[-1][2] is original, "HTTP/2 didn't reuse the HTTP/1 origin socket"
+                    request(port, secure, "quiet-again")
+                    with origin.lock:
+                        assert origin.seen[-1][2] is original, "HTTP/2 didn't return the socket to the shared pool"
 
-                    for case, method, payload in [("closed-get", "GET", None), ("closed-post", "POST", b"once"), ("unsolicited", "GET", None)]:
-                        request(port, secure, case + "-seed", "HEAD")
-                        with origin.lock:
-                            old_socket = origin.seen[-1][2]
-                        if case == "unsolicited":
-                            old_socket.sendall(b"HTTP/1.1 200 Poisoned\r\nContent-Length: 6\r\n\r\npoison")
-                        else:
-                            old_socket.shutdown(socket.SHUT_RDWR)
-                            old_socket.close()
-                        # Let the loopback FIN/data reach the pool's endpoint.
-                        time.sleep(.05)
-                        request(port, secure, case, method, payload)
-                        with origin.lock:
-                            matches = [entry for entry in origin.seen if entry[0] == "/pool/" + case]
-                            assert len(matches) == 1, ("request was retried", case, len(matches))
-                            assert matches[0][2] is not old_socket, ("unsafe socket reused", case)
-                            if method == "POST":
-                                assert matches[0][3] == b"once"
-                    print(f"ok: {'TLS' if secure else 'plain'} idle upstream EOF/unsolicited bytes discarded, quiet sockets reused, POST sent once", flush=True)
+                    for h2 in [False, True]:
+                        for case, method, payload in [("closed-get", "GET", None), ("closed-post", "POST", b"once"), ("unsolicited", "GET", None)]:
+                            path = f"{'h2' if h2 else 'h1'}-{case}"
+                            request(port, secure, path + "-seed", "HEAD", h2=h2)
+                            with origin.lock:
+                                old_socket = origin.seen[-1][2]
+                                if path == "h1-closed-get":
+                                    assert old_socket is not original, "shared socket exceeded the four-request cap"
+                            if case == "unsolicited":
+                                old_socket.sendall(b"unexpected bytes")
+                            else:
+                                old_socket.shutdown(socket.SHUT_RDWR)
+                                old_socket.close()
+                            # Wait for the loopback FIN or bytes to reach the idle socket.
+                            time.sleep(.05)
+                            request(port, secure, path, method, payload, h2=h2)
+                            with origin.lock:
+                                matches = [entry for entry in origin.seen if entry[0] == "/pool/" + path]
+                                assert len(matches) == 1, ("request was retried", path, len(matches))
+                                assert matches[0][2] is not old_socket, ("unsafe socket reused", path)
+                                if method == "POST":
+                                    assert matches[0][3] == b"once"
+                    print(f"ok: {'TLS' if secure else 'plain'} HTTP/1 and HTTP/2 share origin sockets, discard idle EOF/bytes and send POST once", flush=True)
                 finally:
                     process.terminate()
                     try:
