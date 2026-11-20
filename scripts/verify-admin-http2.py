@@ -134,7 +134,7 @@ graceful_shutdown_timeout_ms = 1000
         stop()
         start(True)
         _, body = request(headers=["Accept-Encoding: gzip"])
-        assert b"Create admin access" in body, "HTTP/2 did not serve first-launch setup"
+        assert b'name="setup_token"' in body, "HTTP/2 did not serve first-launch setup"
         token = token_path.read_text().strip()
         assert len(token) == 64 and token.encode() not in body
         assert token_path.stat().st_mode & 0o777 == 0o600
@@ -151,8 +151,8 @@ graceful_shutdown_timeout_ms = 1000
         assert fields["location"] == [ADMIN] and "Secure" in fields["set-cookie"][0]
         assert not token_path.exists() and credentials.stat().st_mode & 0o777 == 0o600
         _, body = request(authenticated=True)
-        for label in [b"Control surface", b"Add site", b"Save settings", b"Activation diff", b"Live proxy targets"]:
-            assert label in body, label
+        for marker in [b'<h1>Dashboard</h1>', b'/sites/add"', b'/settings/save"', b'id="config-diff"', b'id="upstreams"']:
+            assert marker in body, marker
         request(ADMIN + "/api/cache/purge", data={"target": ""}, expected=401)
         _, body = request(ADMIN + "/api/cache/purge", data={"target": ""}, authenticated=True)
         assert json.loads(body)["ok"] is True
@@ -180,7 +180,7 @@ graceful_shutdown_timeout_ms = 1000
         assert b"Saved settings to " in body and config.with_suffix(".conf.bak").exists()
         assert "tls = true" in config.read_text() and "admin_ui = true" in config.read_text()
         _, body = request(ADMIN + "/validate", data={}, authenticated=True)
-        assert b"Activation config is valid" in body
+        assert b"Saved config passed validation" in body
         _, body = request(ADMIN + "/reload", data={}, authenticated=True)
         assert b"Config reloaded in memory" in body
         for _ in range(8):
@@ -214,7 +214,7 @@ graceful_shutdown_timeout_ms = 1000
                         break
                 else:
                     raise AssertionError("split-cookie response never ended")
-                assert b"Control surface" in response, "split HTTP/2 Cookie fields lost admin session"
+                assert b"<h1>Dashboard</h1>" in response, "split HTTP/2 Cookie fields lost admin session"
         request(ADMIN + "/logout", data={}, authenticated=True, expected=303)
         request(ADMIN + "/api/cache/purge", data={"target": ""}, authenticated=True, expected=401)
         request(ADMIN + "/api/cache/purge", data={"target": ""}, headers=["Cookie: " + cookie.decode()], expected=401)

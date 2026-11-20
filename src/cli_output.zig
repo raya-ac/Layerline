@@ -330,12 +330,12 @@ pub fn doctor(io: std.Io, cfg: *const ServerConfig) usize {
 
 pub fn usage() void {
     std.debug.print(
-        "Layerline HTTP server\n\n" ++
-            "Usage:\n" ++
+        "layerline: a web server, written in zig.\n\n" ++
+            "usage:\n" ++
             "  zig build run -- [--config server.conf] [--validate-config] [--doctor] [--dump-routes] [--certs] [--admin-command status|reload|restart] [--host 127.0.0.1] [--port PORT] [--dir STATIC_DIR] " ++
             "[--index INDEX.html] [--serve-static true|false] [--php-root PHP_ROOT] [--php-bin /usr/bin/php-cgi] [--php-fastcgi 127.0.0.1:9000|unix:/run/php.sock] [--php-index index.php] [--php-front-controller true|false] [--php-info-page true|false] " ++
             "[--domain-config-dir domains-enabled] " ++
-            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] [--h2-upstream http://HOST:PORT[/path]] " ++
+            "[--proxy http://HOST:PORT[/path][,http://HOST:PORT[/path]]] [--upstream-policy round_robin|random|least_connections|weighted|consistent_hash|sticky_cookie] " ++
             "[--http3 true|false] [--http3-port PORT] [--admin true|false] [--admin-socket /run/layerline/admin.sock] [--admin-ui true|false] [--admin-ui-path /_layerline/admin] [--admin-credentials-path .layerline-admin] [--access-log off|stderr|PATH] [--compression true|false] [--compression-min-bytes N] [--compression-max-bytes N] [--security-headers off|basic|strict] [--response-cache true|false] [--response-cache-max-bytes N] [--response-cache-max-entry-bytes N] [--response-cache-ttl-ms N] [--tls true|false] [--tls-cert path] [--tls-key path] " ++
             "[--tls-auto true|false] [--letsencrypt-email EMAIL] [--letsencrypt-domains example.com,www.example.com] " ++
             "[--external-command-timeout-ms N] [--memory-budget-bytes N] [--descriptor-limit N] [--io-thread-limit N] [--io-stack-size N] " ++
@@ -361,9 +361,7 @@ pub fn usage() void {
             "route_php_bin.NAME, route_php_fastcgi.NAME, route_php_index.NAME, route_php_front_controller.NAME, route_php_info_page.NAME, route_proxy.NAME, route_upstream_policy.NAME, route_upstream_timeout_ms.NAME, route_upstream_retries.NAME, route_upstream_max_failures.NAME, route_upstream_health_check.NAME, route_strip_prefix.NAME, route_header.NAME, route_cache_control.NAME, route_response_cache.NAME, route_security_headers.NAME, server/domain/vhost, " ++
             "server_name.NAME, server_root.NAME, server_index.NAME, server_serve_static_root.NAME, server_header.NAME, server_cache_control.NAME, server_response_cache.NAME, server_security_headers.NAME, server_proxy.NAME, " ++
             "server_upstream_policy.NAME, server_upstream_timeout_ms.NAME, server_upstream_retries.NAME, server_upstream_max_failures.NAME, server_upstream_health_check.NAME, server_php_fastcgi.NAME, server_php_index.NAME, server_php_front_controller.NAME, server_tls_cert.NAME, server_tls_key.NAME, server_redirect.NAME, server_route.NAME, server_route_dir.DOMAIN.ROUTE, server_route_max_static_file_bytes.DOMAIN.ROUTE, server_route_header.DOMAIN.ROUTE, server_route_cache_control.DOMAIN.ROUTE, server_route_response_cache.DOMAIN.ROUTE, server_route_security_headers.DOMAIN.ROUTE, server_route_php_fastcgi.DOMAIN.ROUTE, server_route_php_index.DOMAIN.ROUTE, server_route_php_front_controller.DOMAIN.ROUTE, server_route_proxy.DOMAIN.ROUTE, server_route_upstream_policy.DOMAIN.ROUTE, server_route_upstream_timeout_ms.DOMAIN.ROUTE, server_route_upstream_retries.DOMAIN.ROUTE, server_route_upstream_health_check.DOMAIN.ROUTE\n" ++
-            "  HTTP/1 is served directly. HTTP/2 cleartext can be passed through with --h2-upstream. " ++
-            "Native HTTP/3 serves routed static, PHP/FastCGI, proxy, health, redirect, and fallback responses over QUIC on --http3-port.\n\n" ++
-            "Examples:\n" ++
+            "\nexamples:\n" ++
             "  zig build run\n" ++
             "  zig build run -- --validate-config\n" ++
             "  zig build run -- --doctor\n" ++
@@ -387,14 +385,11 @@ pub fn usage() void {
             "  zig build run -- --admin-ui true --admin-ui-path /_layerline/admin\n" ++
             "  zig build run -- --access-log /var/log/layerline/access.log\n" ++
             "  zig build run -- --tls-auto true --letsencrypt-email admin@example.com --letsencrypt-domains example.com\n" ++
-            "  zig build run -- --cf-auto-deploy true --cf-token xxxxx --cf-zone-name example.com --cf-record-name www.example.com\n" ++
-            "  zig build run -- --h2-upstream http://127.0.0.1:9001\n\n" ++
-            "Notes:\n" ++
-            "  HTTP/1 client handling is still thread-per-connection. Upstream keep-alive pooling\n" ++
-            "  removes backend reconnect churn, but very high fan-in still needs strict timeout\n" ++
-            "  and connection management policies.\n" ++
-            "  Native HTTP/3 currently covers the buffered route surface, with broader client\n" ++
-            "  conformance and flow-control behavior still being hardened.\n",
+            "  zig build run -- --http3 true --http3-port 8443\n\n" ++
+            "  HTTP/1.1 and HTTP/2 share the TCP listener. HTTP/3 is experimental.\n" ++
+            "  use --proxy for origins. --h2-upstream no longer routes requests.\n" ++
+            "  keep Cloudflare tokens in a private config, not on the command line.\n" ++
+            "  see docs/configuration.md for site files and route options.\n",
         .{},
     );
 }
