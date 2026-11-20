@@ -315,7 +315,7 @@ route_security_headers.app = off
 server_route_header.main.app = X-App-Policy: isolated
 ```
 
-Cache policy has a first-class shortcut that emits `Cache-Control` at the same scopes:
+set `cache_control` to add a `Cache-Control` header at that scope:
 
 ```conf
 cache_control = public, max-age=60
@@ -381,7 +381,9 @@ Patterns ending in `*` are prefix routes; other patterns are exact routes. Prefi
 
 ## Per-Domain Config Files
 
-Keep `server.conf` for the actual web server runtime: listener, limits, global headers, default PHP binary, HTTP/3 port, ACME/Cloudflare, and other process-level behavior. Domain configs can live in separate files loaded from `domain_config_dir`, which is closer to nginx `sites-enabled`.
+keep ports, limits and shared defaults in `server.conf`. point
+`domain_config_dir` at the directory with one file per site, like nginx's
+`sites-enabled`:
 
 ```text
 # server.conf
@@ -392,7 +394,8 @@ php_bin = /opt/homebrew/bin/php-cgi
 domain_config_dir = domains-enabled
 ```
 
-Each `*.conf` file in that directory defines one virtual host. The file name becomes the internal server name unless you set `name` or `server` inside the file.
+each `*.conf` is one site. its file name is the internal name unless you set
+`name` or `server` in the file.
 
 ```conf
 # domains-enabled/example.conf

@@ -1,8 +1,8 @@
-# Security behavior
+# security notes
 
-Layerline applies its native request guard before redirects, static files, PHP,
-admin routes, caches, and proxy dispatch. HTTP/1 uses the same policy as the
-buffered HTTP/2 and HTTP/3 router. There is no external WAF dependency.
+Layerline checks requests before they reach files, redirects, PHP, admin,
+caches or an upstream. HTTP/1, HTTP/2 and HTTP/3 use the same checks. there's
+no separate WAF to install.
 
 ## PHP2Shell
 
@@ -19,12 +19,10 @@ Blocked requests receive HTTP 403 and:
 
 > Nice try. This is a web server, not a shell vending machine.
 
-Security denials produce JSON `security.block` records even when access logging
-is disabled. Each contains the rule, timestamp, method, protocol, status, and a
-SHA-256 fingerprint of the path. It does not contain the body, cookies,
-authorization, or raw query. The ordinary access record for a denied request
-also redacts its path and query. With access logging enabled, the security
-record goes to that sink; otherwise it goes to stderr/journald.
+blocked requests get a JSON `security.block` record with the rule, time,
+method, protocol, status and SHA-256 of the path. the record leaves out
+bodies, cookies, auth and raw queries. the access entry also hides the path
+and query. the block record goes to the access log, or stderr if it's off.
 
 These request checks reduce exposure, but cannot repair PHP's allocator or
 worker lifecycle. PHP's [OOM advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
@@ -47,11 +45,9 @@ Development, alpha, beta, and release-candidate builds at a minimum fixed
 version are not accepted as proof of a patched release. Notices and log events
 mark them as pre-releases; ordinary distribution package suffixes remain valid.
 
-This checks what the backend advertises; it does not probe third-party hosts,
-inspect hidden PHP installations, or prove an undisclosed runtime is patched.
-Some vendors backport fixes without changing the upstream version. Owners must
-verify the exact package against their vendor advisory; a version string alone
-cannot certify a backport. Upgrade and restart all relevant PHP workers.
+this only checks the backend's response headers. a missing version doesn't
+mean PHP is patched. if your vendor backported a fix, check the exact package
+against their advisory. update and restart every affected PHP worker.
 
 ## Admin access
 

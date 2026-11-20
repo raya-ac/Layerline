@@ -260,11 +260,10 @@ With `letsencrypt_renew = true`, Layerline starts a background `certbot renew --
 
 ## Hosted Checks
 
-The `verify` GitHub Actions workflow runs on pushes to `main`, pull requests and
-manual dispatch. Ubuntu 24.04 and macOS 15 each run Debug and ReleaseFast unit
-and complete local wire suites; the Debug jobs also run ReleaseSafe units.
-The jobs raise only their own soft descriptor limit to 8192 when necessary;
-the low-limit fixtures still set and test their original smaller limits.
+GitHub runs `verify` on pushes to `main`, pull requests and manual runs.
+Ubuntu 24.04 and macOS 15 run Debug and ReleaseFast unit and wire tests.
+the Debug jobs also run ReleaseSafe units. only the job's own soft descriptor
+limit is raised to 8192; the low-limit tests still use their smaller limits.
 
 Zig 0.16.0 archives and the existing h2spec source revision are checksum-pinned.
 The h2spec client is built with pinned Go 1.27.3, read-only module inputs and no
@@ -273,26 +272,20 @@ runtime dependency. Python 3.13 drives the fixtures. Actions use full commit pin
 read-only repository permission, no persisted checkout credentials and no caches.
 No production credentials or deployment commands are part of this workflow.
 
-Each started verification retains its checkout/source hashes, tool and server
-hashes, per-command exit codes, logs and result receipt for 14 days. The H2
-archive includes the raw JUnit reports, including the existing cleartext
-shared-listener exception; generated TLS private keys are excluded. Failed or
-incomplete checks cannot produce a passing receipt. Tool bootstrap failures are
-reported in the job log before verification starts.
-Linux verification runs the units, server and child fixture with the same
-explicit `x86_64-linux-gnu.2.35` target and baseline CPU. The receipt records
-that profile and the actual build commands. macOS verification remains native.
-This avoids depending on the Linux runner's CPU features; it does not replace
-running the resulting binaries on the intended deployment host.
-Both clients must support HTTP/2; macOS also requires HTTP/3 so a changed curl
-build cannot silently skip that coverage. The HTTP/3 smoke checks health and
-the homepage HTML byte-for-byte, not every asset or full QUIC conformance.
+the artifacts keep hashes, commands, exit codes, logs and receipts for 14
+days. they include the raw h2spec JUnit reports and the known cleartext
+shared-listener exception. generated TLS keys stay out of the archive.
+a failed or incomplete check can't write a passing receipt. tool setup errors
+are in the job log.
 
-Hosted jobs use temporary loopback fixtures as the ordinary runner user. They do
-not perform the separate root/PID1 systemd and cgroup/OOM tests, namespace-isolated
-release checks, per-site origin comparisons, public certificate checks, mail
-acceptance or rollback drills. A green workflow is not deployment authorization,
-full protocol/PKIX conformance, or a reason to waive an unexplained failed run.
+Linux builds the tests, server and child fixture for
+`x86_64-linux-gnu.2.35` with the baseline CPU. macOS builds for the runner.
+both need curl with HTTP/2; macOS needs HTTP/3 too. the HTTP/3 check verifies
+health and exact homepage bytes. it doesn't check every asset or QUIC behavior.
+
+the wire tests use loopback and run as the runner user. test systemd,
+cgroups/OOM, the isolated release, public certificates, each site's responses,
+webmail and rollback on the actual host before moving traffic.
 
 ## Smoke Checks
 
